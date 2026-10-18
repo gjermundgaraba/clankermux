@@ -57,7 +57,7 @@ export class Decoder {
   private filled = 0;
   private consumed = 0;
   private term: Terminal | undefined;
-  private finished = false;
+  private complete = false;
 
   constructor(
     readonly engine: Engine,
@@ -99,7 +99,7 @@ export class Decoder {
   }
 
   stepAvailable(): boolean {
-    return !this.finished && stepEnd(this.source, this.consumed, this.filled) !== undefined;
+    return !this.complete && stepEnd(this.source, this.consumed, this.filled) !== undefined;
   }
 
   /** Decodes through `READY`; the terminal is then renderable. */
@@ -118,7 +118,7 @@ export class Decoder {
     const code = this.engine.call("ghostty_snapshot_decoder_next", this.decoder);
     this.consumed = end;
     if (code === this.engine.result.NO_VALUE) {
-      this.finished = true;
+      this.complete = true;
       return false;
     }
     if (code !== this.engine.result.SUCCESS) throw new EngineError("ghostty_snapshot_decoder_next", code);
@@ -127,6 +127,11 @@ export class Decoder {
 
   terminal(): Terminal | undefined {
     return this.term;
+  }
+
+  /** Whether `FINISH` was validated: the snapshot is complete. */
+  finished(): boolean {
+    return this.complete;
   }
 
   /** Frees the decoder and its buffer; the terminal, finished or not, is the caller's. */

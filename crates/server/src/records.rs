@@ -31,19 +31,11 @@ fn text(value: String) -> Option<String> {
 }
 
 impl Records {
-    /// Records loaded from a park file, minus the transient ones, in the
-    /// order of their last updates.
-    pub fn load(mut records: Vec<StatusRecord>) -> Self {
-        records.retain(|r| !transient(r));
-        // Instants, not strings: jiff writes fractions of varying length.
-        let instant = |r: &StatusRecord| r.updated_at.parse::<jiff::Timestamp>().ok();
-        records.sort_by(|a, b| {
-            instant(a)
-                .cmp(&instant(b))
-                .then(a.updated_at.cmp(&b.updated_at))
-        });
+    /// Records loaded from a park file, minus the transient ones; the file
+    /// holds them in the order of their last updates ([`Records::all`]).
+    pub fn load(records: Vec<StatusRecord>) -> Self {
         let mut out = Records::default();
-        for record in records {
+        for record in records.into_iter().filter(|r| !transient(r)) {
             out.insert(record);
         }
         out
@@ -133,9 +125,12 @@ impl Records {
         ids
     }
 
-    /// The records as reported: every key of their last report.
+    /// The records as reported (every key of their last report), least
+    /// recently updated first.
     pub fn all(&self) -> Vec<StatusRecord> {
-        self.by_id.values().map(|(r, _)| r.clone()).collect()
+        let mut records: Vec<_> = self.by_id.values().collect();
+        records.sort_by_key(|(_, tick)| *tick);
+        records.into_iter().map(|(r, _)| r.clone()).collect()
     }
 
     /// The records for `inspect`: `app` taken from the nearest ancestor
@@ -259,9 +254,9 @@ mod tests {
     #[test]
     fn loading_drops_transient_records_and_keeps_the_update_order() {
         let mut loaded = Records::load(vec![
-            record("a", "working", "t3"),
-            record("b", "error", "t2"),
             record("c", "done", "t1"),
+            record("b", "error", "t2"),
+            record("a", "working", "t3"),
         ]);
         assert_eq!(loaded.all().len(), 2);
         // `c` was updated before `b`, so it is evicted first.
@@ -270,13 +265,16 @@ mod tests {
     }
 
     #[test]
-    fn loading_orders_by_time_not_text() {
-        // As text, ".15Z" sorts before ".1Z"; as instants it is later.
-        let mut loaded = Records::load(vec![
-            record("later", "done", "2026-01-01T00:00:00.15Z"),
-            record("earlier", "done", "2026-01-01T00:00:00.1Z"),
-        ]);
-        let c = loaded.apply(report(ProgramStatusState::Done, "d", ""), 2, "t4");
-        assert_eq!(c.removed, vec!["earlier".to_string()]);
+    fn all_lists_the_least_recently_updated_first() {
+        let mut r = Records::default();
+        r.apply(report(ProgramStatusState::Done, "b", ""), 10, "t1");
+        r.apply(report(ProgramStatusState::Done, "a", ""), 10, "t2");
+        r.apply(report(ProgramStatusState::Done, "b", ""), 10, "t3");
+        let ids: Vec<_> = r.all().into_iter().map(|x| x.id).collect();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+        // Loaded in that order, `a` is evicted first.
+        let mut loaded = Records::load(r.all());
+        let c = loaded.apply(report(ProgramStatusState::Done, "c", ""), 2, "t4");
+        assert_eq!(c.removed, vec!["a".to_string()]);
     }
 }

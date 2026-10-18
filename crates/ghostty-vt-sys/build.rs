@@ -25,6 +25,8 @@ fn main() {
             zig_target(&env::var("TARGET").unwrap())
         ))
         .arg(format!("-Dversion-string={}", version.trim()))
+        // `ghostty_build_info` reports the library's own version.
+        .arg(format!("-Dlib-version-string={}", version.trim()))
         .arg("--prefix")
         .arg(out.join("zig-out"))
         // Outside the vendored tree, which rerun-if-changed watches, and

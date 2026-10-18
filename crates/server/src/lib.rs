@@ -91,7 +91,7 @@ async fn accept_failed(err: io::Error) {
 /// accepted.
 pub(crate) async fn serve_tcp_with<F, Fut>(
     listener: TcpListener,
-    registry: &Registry,
+    connections: tokio_util::task::TaskTracker,
     handle: F,
 ) -> io::Result<()>
 where
@@ -107,15 +107,15 @@ where
             }
         };
         let _ = stream.set_nodelay(true);
-        registry.connections.spawn(handle(stream, Instant::now()));
+        connections.spawn(handle(stream, Instant::now()));
     }
 }
 
 /// Serves `listener` until cancelled: plaintext frames. Trust is the
 /// caller's: the binary binds the tailnet address only.
 pub async fn serve_tcp(listener: TcpListener, registry: Arc<Registry>) -> io::Result<()> {
-    let connections = registry.clone();
-    serve_tcp_with(listener, &connections, move |stream, accepted| {
+    let connections = registry.connections.clone();
+    serve_tcp_with(listener, connections, move |stream, accepted| {
         connection::serve_connection(stream, registry.clone(), accepted)
     })
     .await
@@ -134,7 +134,7 @@ pub fn state_dir() -> PathBuf {
 
 /// `$XDG_RUNTIME_DIR/clankermux/sock`, else `sock` in the state directory.
 pub fn socket_path() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
+    match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir).join("clankermux/sock"),
         None => state_dir().join("sock"),
     }

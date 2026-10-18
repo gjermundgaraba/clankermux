@@ -23,6 +23,9 @@ pub enum Error {
     Io(io::Error),
     /// The server broke the protocol or the connection ended unexpectedly.
     Protocol(String),
+    /// A stream frame did not continue from the cursor: the attachment
+    /// lost its place and a fresh `OPEN` recovers it.
+    Desync(String),
     /// A server error reply.
     Server(ErrorMessage),
     /// The connection is closed.
@@ -36,6 +39,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "{e}"),
             Error::Protocol(m) => write!(f, "protocol error: {m}"),
+            Error::Desync(m) => write!(f, "out of sync: {m}"),
             Error::Server(e) => write!(f, "{}: {}", e.code, e.message),
             Error::Closed => write!(f, "connection closed"),
             Error::Usage(m) => write!(f, "{m}"),

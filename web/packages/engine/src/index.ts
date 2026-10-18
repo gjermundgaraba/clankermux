@@ -37,7 +37,7 @@ export class EngineError extends Error {
 export class Engine {
   readonly types: Record<string, TypeInfo>;
   /** The `GhosttyResult` members the wrapper branches on. */
-  readonly result: { SUCCESS: number; OUT_OF_SPACE: number; NO_VALUE: number };
+  readonly result: { SUCCESS: number; OUT_OF_SPACE: number; NO_VALUE: number; INVALID_VALUE: number };
 
   private constructor(
     private readonly exports: Record<string, Function> & { memory: WebAssembly.Memory },
@@ -45,7 +45,12 @@ export class Engine {
     const ptr = this.call("ghostty_type_json") as number;
     this.types = JSON.parse(this.cString(ptr)).types;
     const result = (member: string) => this.enumValue("GhosttyResult", member);
-    this.result = { SUCCESS: result("SUCCESS"), OUT_OF_SPACE: result("OUT_OF_SPACE"), NO_VALUE: result("NO_VALUE") };
+    this.result = {
+      SUCCESS: result("SUCCESS"),
+      OUT_OF_SPACE: result("OUT_OF_SPACE"),
+      NO_VALUE: result("NO_VALUE"),
+      INVALID_VALUE: result("INVALID_VALUE"),
+    };
   }
 
   static async load(wasm: BufferSource | WebAssembly.Module): Promise<Engine> {

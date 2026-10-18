@@ -33,16 +33,22 @@ pub struct Handle {
     pub read_only: bool,
     session: Weak<std::sync::Mutex<Session>>,
     close: mpsc::UnboundedSender<Ending>,
-    /// Set by the task, before it queues its `CLOSED` or ending `ERROR`.
+    /// Set by the task once it has detached and will send nothing but
+    /// its ending.
     ended: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Handle {
-    /// Whether the channel is still in use: until the task has queued
-    /// `CLOSED` or an ending `ERROR`.
+    /// Whether the attachment still takes frames; a channel is free again
+    /// only once the task is [`Handle::done`].
     pub fn is_open(&self) -> bool {
         !self.ended.load(Ordering::Acquire)
+    }
+
+    /// Whether the task has queued its last frame.
+    pub fn done(&self) -> bool {
+        self.task.is_finished()
     }
 
     pub fn session(&self) -> Option<Shared> {
@@ -246,6 +252,7 @@ impl Task {
                 }
             }
         }
+        let wake = self.session.lock().unwrap().wake.clone();
         loop {
             // A close is observed every iteration, not only when idle.
             match self.close.try_recv() {
@@ -253,7 +260,6 @@ impl Task {
                 Err(mpsc::error::TryRecvError::Disconnected) => return None,
                 Err(mpsc::error::TryRecvError::Empty) => {}
             }
-            let wake = self.session.lock().unwrap().wake.clone();
             let notified = wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();

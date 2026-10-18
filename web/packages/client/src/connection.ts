@@ -21,7 +21,9 @@ export interface Transport {
   onClose: (() => void) | undefined;
 }
 
-export type ErrorKind = "protocol" | "server" | "closed";
+/** `desync`: a stream frame did not continue from the cursor; a fresh
+ * OPEN recovers it, where any other fault would only repeat. */
+export type ErrorKind = "protocol" | "desync" | "server" | "closed";
 
 export class ClientError extends Error {
   constructor(
@@ -34,6 +36,10 @@ export class ClientError extends Error {
 
   static protocol(message: string): ClientError {
     return new ClientError("protocol", message);
+  }
+
+  static desync(message: string): ClientError {
+    return new ClientError("desync", message);
   }
 
   static fromServer(error: ErrorMessage): ClientError {

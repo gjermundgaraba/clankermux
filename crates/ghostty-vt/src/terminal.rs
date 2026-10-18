@@ -75,11 +75,6 @@ pub enum SemanticPromptKind {
     CommandEnd,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SemanticPrompt {
-    pub kind: SemanticPromptKind,
-}
-
 /// Effects raised by the engine while it parses, the ones clankermux
 /// acts on; the rest (clipboard, bell, resize requests) are left unset
 /// at the engine, which ignores them. Every method has a default that
@@ -90,7 +85,7 @@ pub trait Handler: Send + 'static {
     /// reports.
     fn write_pty(&mut self, _data: &[u8]) {}
     fn program_status(&mut self, _report: ProgramStatus) {}
-    fn semantic_prompt(&mut self, _event: SemanticPrompt) {}
+    fn semantic_prompt(&mut self, _kind: SemanticPromptKind) {}
     /// Answer to CSI ? 996 n; `None` leaves the query unanswered.
     fn color_scheme(&mut self) -> Option<ColorScheme> {
         None
@@ -203,12 +198,16 @@ impl Term {
     }
 }
 
-/// An owned terminal with its effect handler.
+/// A terminal with its effect handler. Owned, except for the view a
+/// [`snapshot::Decoder`](crate::snapshot::Decoder) hands out while it
+/// decodes: that one frees nothing, so replacing it cannot free the
+/// terminal the library still holds.
 pub struct Terminal<H: Handler = ()> {
     term: Term,
     /// Heap slot the callbacks reach through userdata; a raw pointer so
     /// that Rust-side access and the callbacks share one provenance.
     slot: *mut Slot<H>,
+    owned: bool,
 }
 
 // SAFETY: libghostty-vt keeps no thread-local state, so a terminal may be
@@ -225,30 +224,27 @@ impl<H: Handler> std::ops::Deref for Terminal<H> {
 
 impl Terminal<()> {
     pub fn new(cols: u16, rows: u16) -> Result<Self> {
-        let mut raw = ptr::null_mut();
-        // SAFETY: a null allocator selects the default allocator.
-        check(unsafe { sys::ghostty_terminal_new(ptr::null(), &mut raw, cols, rows) })?;
-        // SAFETY: raw is a fresh caller-owned terminal.
-        Ok(unsafe { Self::from_raw(raw) })
-    }
-
-    /// Wraps a caller-owned raw terminal.
-    pub(crate) unsafe fn from_raw(raw: sys::GhosttyTerminal) -> Self {
-        // SAFETY: forwarded from the caller.
-        unsafe { Terminal::install(raw, (), Vec::new()) }
+        Self::with_handler(cols, rows, ())
     }
 }
 
 impl<H: Handler> Terminal<H> {
+    /// A terminal whose effects go to `handler`.
+    pub fn with_handler(cols: u16, rows: u16, handler: H) -> Result<Self> {
+        let mut raw = ptr::null_mut();
+        // SAFETY: a null allocator selects the default allocator.
+        check(unsafe { sys::ghostty_terminal_new(ptr::null(), &mut raw, cols, rows) })?;
+        // SAFETY: raw is a fresh caller-owned terminal.
+        Ok(unsafe { Terminal::install(raw, handler) })
+    }
+
     /// Installs `handler` and the effect callbacks on a caller-owned raw
     /// terminal.
-    pub(crate) unsafe fn install(
-        raw: sys::GhosttyTerminal,
-        handler: H,
-        xtversion: Vec<u8>,
-    ) -> Self {
-        let has_xtversion = !xtversion.is_empty();
-        let slot = Box::into_raw(Box::new(Slot { handler, xtversion }));
+    pub(crate) unsafe fn install(raw: sys::GhosttyTerminal, handler: H) -> Self {
+        let slot = Box::into_raw(Box::new(Slot {
+            handler,
+            xtversion: Vec::new(),
+        }));
         // SAFETY: the slot lives as long as the terminal, and each callback
         // pointer has the type the option documents.
         unsafe {
@@ -293,17 +289,27 @@ impl<H: Handler> Terminal<H> {
                 sys::GHOSTTY_TERMINAL_OPT_RESET,
                 cb::reset::<H> as *const (),
             );
-            if has_xtversion {
-                set_fn(
-                    raw,
-                    sys::GHOSTTY_TERMINAL_OPT_XTVERSION,
-                    cb::xtversion::<H> as *const (),
-                );
-            }
+            // An empty answer reports the engine's default.
+            set_fn(
+                raw,
+                sys::GHOSTTY_TERMINAL_OPT_XTVERSION,
+                cb::xtversion::<H> as *const (),
+            );
         }
         Terminal {
             term: Term(raw),
             slot,
+            owned: true,
+        }
+    }
+
+    /// A second handle on this terminal that frees nothing; the owner
+    /// must outlive its use.
+    pub(crate) fn view(&self) -> Self {
+        Terminal {
+            term: Term(self.term.0),
+            slot: self.slot,
+            owned: false,
         }
     }
 
@@ -318,19 +324,6 @@ impl<H: Handler> Terminal<H> {
         unsafe { &mut *self.slot }
     }
 
-    /// Replaces the handler, keeping the terminal state.
-    pub fn with_handler<N: Handler>(self, handler: N) -> Terminal<N> {
-        let this = std::mem::ManuallyDrop::new(self);
-        // SAFETY: `this` is never dropped, so the slot is freed exactly once
-        // here and the raw terminal is adopted by the new wrapper.
-        let slot = unsafe { Box::from_raw(this.slot) };
-        let raw = this.term.0;
-        let xtversion = slot.xtversion.clone();
-        drop(slot);
-        // SAFETY: raw is the caller-owned terminal this wrapper held.
-        unsafe { Terminal::install(raw, handler, xtversion) }
-    }
-
     pub fn handler(&self) -> &H {
         &self.slot().handler
     }
@@ -339,17 +332,25 @@ impl<H: Handler> Terminal<H> {
         &mut self.slot_mut().handler
     }
 
-    /// Answer to XTVERSION.
+    /// Answer to XTVERSION; empty for the engine's default.
     pub fn set_xtversion(&mut self, version: &str) {
         self.slot_mut().xtversion = version.as_bytes().to_vec();
-        // SAFETY: the callback reads the slot's xtversion, which the slot owns.
-        unsafe {
-            set_fn(
-                self.term.0,
-                sys::GHOSTTY_TERMINAL_OPT_XTVERSION,
-                cb::xtversion::<H> as *const (),
-            )
+    }
+
+    /// The terminfo entry reported for XTGETTCAP `TN`; at most 128 bytes.
+    pub fn set_terminfo_name(&mut self, name: &str) -> Result<()> {
+        let value = sys::GhosttyString {
+            ptr: name.as_ptr(),
+            len: name.len(),
         };
+        // SAFETY: the option copies the string during the call.
+        check(unsafe {
+            sys::ghostty_terminal_set(
+                self.term.0,
+                sys::GHOSTTY_TERMINAL_OPT_TERMINFO_NAME,
+                &value as *const sys::GhosttyString as *const c_void,
+            )
+        })
     }
 
     pub fn vt_write(&mut self, data: &[u8]) {
@@ -410,6 +411,9 @@ impl<H: Handler> Terminal<H> {
 
 impl<H: Handler> Drop for Terminal<H> {
     fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
         // SAFETY: the terminal was created by the library and is freed once,
         // before the slot its callbacks point at, which Box::into_raw made.
         unsafe {
@@ -494,9 +498,7 @@ mod cb {
             sys::GHOSTTY_SEMANTIC_PROMPT_COMMAND_END => SemanticPromptKind::CommandEnd,
             _ => return,
         };
-        unsafe { slot::<H>(ud) }
-            .handler
-            .semantic_prompt(SemanticPrompt { kind });
+        unsafe { slot::<H>(ud) }.handler.semantic_prompt(kind);
     }
 
     pub(super) unsafe extern "C" fn color_scheme<H: Handler>(

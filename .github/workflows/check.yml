@@ -13,6 +13,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.98"
+          components: rustfmt, clippy
       - uses: jdx/mise-action@v2
       - uses: pnpm/action-setup@v4
         with:

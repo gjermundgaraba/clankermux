@@ -4,7 +4,16 @@
  */
 import { type Action, Attachment, ClientError, Connection, Osc52Scanner, type Transport, hello } from "@clankermux/client";
 import { ENGINE, Engine, KeyEncoder, RenderState, type Terminal } from "@clankermux/engine";
-import { type Event, FrameType, HEADER_LEN, type Page, type Profile, type Session, type Size } from "@clankermux/proto";
+import {
+  type ErrorMessage,
+  type Event,
+  FrameType,
+  HEADER_LEN,
+  type Page,
+  type Profile,
+  type Session,
+  type Size,
+} from "@clankermux/proto";
 
 import type { ToPage, ToWorker } from "./protocol.ts";
 
@@ -20,15 +29,8 @@ const post = (message: ToPage) => port.postMessage(message);
 const PAINT_MS = 16;
 const BACKOFF_MIN_MS = 250;
 const BACKOFF_MAX_MS = 5000;
-/** Ending errors that a new OPEN would only get again. */
-const PERMANENT = new Set<string>([
-  "no_such_session",
-  "engine_mismatch",
-  "invalid_request",
-  "protocol_error",
-  "version_mismatch",
-  "channel_in_use",
-]);
+/** Ending errors of an OPEN that a new OPEN would only get again. */
+const PERMANENT = new Set<ErrorMessage["code"]>(["no_such_session", "engine_mismatch", "invalid_request"]);
 
 /** A WebSocket as the client's message transport. */
 class SocketTransport implements Transport {
@@ -71,7 +73,9 @@ class Client {
   private channel = 0;
   /** The session attached or being attached. */
   private session: string | undefined;
-  private sessions: Session[] = [];
+  private sessions = new Map<string, Session>();
+  /** Pastes too long for one frame, as `write` requests in order. */
+  private writes: Promise<void> = Promise.resolve();
   private readonly clipboard = new Osc52Scanner();
   private paintTimer: ReturnType<typeof setTimeout> | undefined;
   /** Shared by reconnects and re-attaches after a failure; reset by a screen. */
@@ -122,13 +126,14 @@ class Client {
     };
     conn.onEvent = (event) => this.event(event);
     try {
-      const page = await conn.call<Page>("subscribe", {});
-      this.sessions = page.sessions;
-      let after = page.next;
-      while (after !== undefined) {
-        const more = await conn.call<Page>("list", { after });
-        this.sessions.push(...more.sessions);
-        after = more.next;
+      // Events arriving between pages are applied to the same map: a
+      // later page cannot hold a session removed before it was produced.
+      this.sessions.clear();
+      let page = await conn.call<Page>("subscribe", {});
+      for (;;) {
+        for (const s of page.sessions) this.sessions.set(s.id, s);
+        if (page.next === undefined) break;
+        page = await conn.call<Page>("list", { after: page.next });
       }
     } catch (err) {
       post({ type: "status", text: String(err) });
@@ -142,21 +147,19 @@ class Client {
   private event(event: Event): void {
     switch (event.event) {
       case "session_created":
-        this.sessions.push(event.session);
-        break;
       case "session_changed":
       case "session_exited":
-        this.sessions = this.sessions.map((s) => (s.id === event.session.id ? event.session : s));
+        this.sessions.set(event.session.id, event.session);
         break;
       case "session_removed":
-        this.sessions = this.sessions.filter((s) => s.id !== event.id);
+        this.sessions.delete(event.id);
         break;
     }
     this.postSessions();
   }
 
   private postSessions(): void {
-    post({ type: "sessions", sessions: this.sessions, current: this.session });
+    post({ type: "sessions", sessions: [...this.sessions.values()], current: this.session });
   }
 
   /** Opens a channel for `this.session`, resuming when the attachment can. */
@@ -180,9 +183,11 @@ class Client {
         try {
           actions = attachment.handle(frame);
         } catch (err) {
-          // A client-side protocol error: CLOSE and OPEN again, afresh.
+          // A lost place in the stream: CLOSE and OPEN again, afresh. Any
+          // other fault would only repeat.
           post({ type: "status", text: String(err) });
-          this.reopen();
+          if (err instanceof ClientError && err.kind === "desync") this.reopen();
+          else this.giveUp();
           return;
         }
         if (frame.header.type === FrameType.Attached && actions.length === 0) {
@@ -193,6 +198,13 @@ class Client {
     } catch (err) {
       post({ type: "status", text: String(err) });
     }
+  }
+
+  /** Detaches for good: a reconnect does not try the session again. */
+  private giveUp(): void {
+    this.detach();
+    this.session = undefined;
+    this.postSessions();
   }
 
   /** Detaches and attaches the same session again after a backoff. */
@@ -249,7 +261,7 @@ class Client {
         // (`too_slow`, a snapshot that could not be taken), unless a new
         // OPEN would fail the same way.
         if (this.attachment?.closed()) {
-          if (PERMANENT.has(action.error.code)) this.detach();
+          if (PERMANENT.has(action.error.code)) this.giveUp();
           else this.reopen();
         }
         break;
@@ -328,19 +340,34 @@ class Client {
     }
   }
 
-  /** Input for the session, dropped unless attached on a live connection;
-   * a paste longer than a frame goes as several. */
+  /** Input for the session, dropped unless attached on a live connection.
+   * What fits one frame goes as INPUT; a longer paste goes as `write`
+   * requests, each answered once the PTY took it, since INPUT frames are
+   * not acknowledged and would overflow the input queue. */
   private input(bytes: Uint8Array): void {
+    const conn = this.conn;
     const attachment = this.attachment;
-    if (bytes.length === 0 || !this.conn || !attachment || attachment.ended()) return;
-    const chunk = this.conn.welcome.limits.max_frame - HEADER_LEN;
-    try {
-      for (let at = 0; at < bytes.length; at += chunk) {
-        this.conn.send(FrameType.Input, this.channel, bytes.subarray(at, at + chunk));
+    const session = this.session;
+    if (bytes.length === 0 || !conn || !attachment || attachment.ended() || session === undefined) return;
+    if (bytes.length <= conn.welcome.limits.max_frame - HEADER_LEN) {
+      try {
+        conn.send(FrameType.Input, this.channel, bytes);
+      } catch {
+        // Reported through onEnd.
       }
-    } catch {
-      // Reported through onEnd.
+      return;
     }
+    // Each request's base64 fits the control body with room for the rest.
+    const chunk = Math.max(3, Math.floor((conn.welcome.limits.control_body - 1024) / 4) * 3);
+    this.writes = this.writes.then(async () => {
+      try {
+        for (let at = 0; at < bytes.length; at += chunk) {
+          await conn.call("write", { session, data: base64(bytes.subarray(at, at + chunk)) });
+        }
+      } catch (err) {
+        post({ type: "status", text: String(err) });
+      }
+    });
   }
 
   key(input: Extract<ToWorker, { type: "key" }>["input"]): void {
@@ -401,3 +428,11 @@ port.onmessage = (e) => {
       break;
   }
 };
+
+function base64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let at = 0; at < bytes.length; at += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(at, at + 0x8000));
+  }
+  return btoa(binary);
+}

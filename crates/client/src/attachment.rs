@@ -204,6 +204,9 @@ impl<H: Handler + Default> Attachment<H> {
                     unreachable!()
                 };
                 while decoder.step_available() && decoder.next_page().map_err(engine)? {}
+                if !decoder.finished() {
+                    return Err(Error::Protocol("SNAPSHOT_END before FINISH".into()));
+                }
                 let term = decoder
                     .into_terminal()
                     .ok_or_else(|| Error::Protocol("SNAPSHOT_END before READY".into()))?;
@@ -262,7 +265,7 @@ impl<H: Handler + Default> Attachment<H> {
                 let (offset, bytes) = parse_output(&frame.payload)
                     .ok_or_else(|| Error::Protocol("short OUTPUT".into()))?;
                 if offset != cursor.offset {
-                    return Err(Error::Protocol(format!(
+                    return Err(Error::Desync(format!(
                         "OUTPUT at {offset}, expected {}",
                         cursor.offset
                     )));
@@ -299,7 +302,7 @@ impl<H: Handler + Default> Attachment<H> {
 
     fn check_marker(&mut self, seq: u64, offset: u64) -> Result<(), Error> {
         if offset != self.cursor.offset || seq != self.cursor.marker + 1 {
-            return Err(Error::Protocol(format!(
+            return Err(Error::Desync(format!(
                 "marker {seq} at {offset}, expected {} at {}",
                 self.cursor.marker + 1,
                 self.cursor.offset
@@ -524,6 +527,27 @@ mod tests {
         // Nothing more is accepted on an ended attachment.
         assert!(a.handle(frame(FrameType::SnapshotEnd, vec![])).is_err());
         assert!(a.ended());
+    }
+
+    #[test]
+    fn a_snapshot_cut_before_finish_is_a_protocol_error() {
+        let bytes = snapshot_of(b"one\r\ntwo\r\n");
+        let ready = snapshot::ready_end(&bytes).unwrap();
+        let mut a: Attachment = Attachment::new();
+        a.open_on(&welcome("inc"));
+        a.handle(attached(0, 0, &bytes)).unwrap();
+        a.handle(frame(FrameType::Snapshot, bytes[..ready].to_vec()))
+            .unwrap();
+        a.handle(frame(FrameType::SnapshotReady, vec![])).unwrap();
+        a.handle(frame(
+            FrameType::Snapshot,
+            bytes[ready..bytes.len() - 1].to_vec(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            a.handle(frame(FrameType::SnapshotEnd, vec![])),
+            Err(Error::Protocol(m)) if m.contains("FINISH")
+        ));
     }
 
     #[test]

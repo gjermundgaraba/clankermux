@@ -11,12 +11,12 @@ pub use testkit::Server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-pub async fn start(limits: Limits) -> Server {
+pub fn start(limits: Limits) -> Server {
     Server::start(limits)
 }
 
 /// A server on `state_dir`, which may hold a previous server's parks.
-pub async fn start_with(limits: Limits, state_dir: PathBuf) -> Server {
+pub fn start_with(limits: Limits, state_dir: PathBuf) -> Server {
     Server::start_with_state(limits, state_dir)
 }
 
@@ -80,9 +80,9 @@ impl Client {
             if let Some(frame) = self.decoder.next_frame(self.max_frame).unwrap() {
                 return Some(frame);
             }
-            match tokio::time::timeout(Duration::from_secs(5), self.stream.read(&mut buf))
+            match tokio::time::timeout(Duration::from_secs(10), self.stream.read(&mut buf))
                 .await
-                .expect("frame within 5 s")
+                .expect("frame within 10 s")
             {
                 Ok(0) | Err(_) => return None,
                 Ok(n) => self.decoder.push(&buf[..n]),

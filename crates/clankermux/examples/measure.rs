@@ -354,8 +354,8 @@ async fn main() {
     }
 
     // The lab (its server and temporary directory) goes before the exit,
-    // which skips `Drop`; the exit itself is for the killed sessions'
-    // reader tasks, which a runtime drop would wait for.
+    // which skips `Drop`; the exit ends the process without the runtime's
+    // shutdown wait.
     drop(lab);
     std::process::exit(0);
 }

@@ -105,7 +105,8 @@ export class RenderState {
       tag: engine.bits("GhosttyCell", "content_tag"),
       codepoint: engine.bits("GhosttyCell", "content", "CODEPOINT", "codepoint"),
       wide: engine.bits("GhosttyCell", "wide"),
-    };    this.cursorStyles = new Map(
+    };
+    this.cursorStyles = new Map(
       CURSOR_STYLES.map((style) => [engine.enumValue("GhosttyRenderStateCursorVisualStyle", style.toUpperCase()), style]),
     );
   }
@@ -234,7 +235,7 @@ export class RenderState {
   private color(key: number, out: number): number {
     const e = this.engine;
     const code = e.call("ghostty_render_state_row_cells_get", this.cells, key, out);
-    if (code === e.enumValue("GhosttyResult", "INVALID_VALUE")) return NO_COLOR;
+    if (code === e.result.INVALID_VALUE) return NO_COLOR;
     if (code !== e.result.SUCCESS) throw new Error(`cell colour: ${code}`);
     return this.engine.readRgb(out);
   }

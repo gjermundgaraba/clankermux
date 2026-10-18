@@ -128,9 +128,7 @@ mod tests {
     use super::*;
 
     fn passthrough() -> Terminal<Expect> {
-        let mut term = Terminal::new(80, 24)
-            .unwrap()
-            .with_handler(Expect::default());
+        let mut term = Terminal::with_handler(80, 24, Expect::default()).unwrap();
         // The engine answers OSC 11 only with a background set; a
         // session's snapshot carries one.
         term.set_color(ColorKind::Background, Some(Rgb { r: 0, g: 0, b: 0 }))
@@ -179,9 +177,7 @@ mod tests {
 
     #[test]
     fn nothing_expected_without_passthrough() {
-        let mut term = Terminal::new(80, 24)
-            .unwrap()
-            .with_handler(Expect::default());
+        let mut term = Terminal::with_handler(80, 24, Expect::default()).unwrap();
         term.vt_write(b"\x1b[c\x1b[18t");
         assert_eq!(
             term.handler_mut().filter(b"\x1b[?1;2c\x1b[8;24;80t"),

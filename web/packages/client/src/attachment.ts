@@ -165,6 +165,7 @@ export class Attachment {
         if (this.state.kind !== "bootstrapping") throw ClientError.protocol("SNAPSHOT_END outside a bootstrap");
         const { decoder, held } = this.state;
         while (decoder.stepAvailable() && decoder.nextPage()) {}
+        if (!decoder.finished()) throw ClientError.protocol("SNAPSHOT_END before FINISH");
         const term = decoder.release();
         if (!term) throw ClientError.protocol("SNAPSHOT_END before READY");
         this.state = { kind: "streaming", term };
@@ -178,7 +179,9 @@ export class Attachment {
           this.state.held.push(frame);
           return;
         }
-        if (this.state.kind === "ended") throw ClientError.protocol(`${type} after the attachment ended`);
+        if (this.state.kind !== "bootstrapping" && this.state.kind !== "streaming") {
+          throw ClientError.protocol(`${type} outside the stream`);
+        }
         this.stream(frame, actions);
         break;
       case FrameType.Gap: {
@@ -211,7 +214,7 @@ export class Attachment {
         const output = parseOutput(frame.payload);
         if (!output) throw ClientError.protocol("short OUTPUT");
         if (output.offset !== this.cursor.offset) {
-          throw ClientError.protocol(`OUTPUT at ${output.offset}, expected ${this.cursor.offset}`);
+          throw ClientError.desync(`OUTPUT at ${output.offset}, expected ${this.cursor.offset}`);
         }
         const term = this.term();
         if (!term) throw ClientError.protocol("OUTPUT before the terminal exists");
@@ -239,7 +242,7 @@ export class Attachment {
 
   private checkMarker(seq: number, offset: number): void {
     if (offset !== this.cursor.offset || seq !== this.cursor.marker + 1) {
-      throw ClientError.protocol(
+      throw ClientError.desync(
         `marker ${seq} at ${offset}, expected ${this.cursor.marker + 1} at ${this.cursor.offset}`,
       );
     }

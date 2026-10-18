@@ -54,11 +54,16 @@ fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
         .map_err(|e| (ErrorCode::InvalidRequest, format!("bad params: {e}")))
 }
 
-/// Handles one request on a connection whose `subscribed` flag records
-/// whether it already receives events.
 /// `write`, which is answered once the PTY took the bytes; meanwhile the
-/// connection reads on.
-pub fn write(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
+/// connection reads on. Replies follow the previous `write`'s, so they
+/// come in request order.
+pub fn write(
+    registry: &Arc<Registry>,
+    writer: &Writer,
+    previous: &mut Option<tokio::task::JoinHandle<()>>,
+    id: i64,
+    p: Value,
+) {
     let started = (|| {
         let p: proto::WriteParams = params(p)?;
         let data = base64::engine::general_purpose::STANDARD
@@ -78,19 +83,21 @@ pub fn write(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
             .push(data)
             .ok_or((ErrorCode::InputOverflow, "input queue full".into()))
     })();
-    match started {
-        Err(fail) => reply(writer, id, Err(fail)),
-        Ok(wait) => {
-            let writer = writer.clone();
-            tokio::spawn(async move {
-                let outcome = wait
-                    .await
-                    .map(|()| json!({}))
-                    .map_err(|_| internal("the PTY refused the bytes"));
-                reply(&writer, id, outcome);
-            });
+    let writer = writer.clone();
+    let before = previous.take();
+    *previous = Some(tokio::spawn(async move {
+        if let Some(before) = before {
+            let _ = before.await;
         }
-    }
+        let outcome = match started {
+            Err(fail) => Err(fail),
+            Ok(wait) => wait
+                .await
+                .map(|()| json!({}))
+                .map_err(|_| internal("the PTY refused the bytes")),
+        };
+        reply(&writer, id, outcome);
+    }));
 }
 
 /// Handles one request but `write`.

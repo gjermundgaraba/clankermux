@@ -18,7 +18,7 @@ fn b64(s: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_bootstrap_then_stream_then_close() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     let session = c
         .create(json!({"argv": ["/bin/cat"], "cols": 20, "rows": 5}))
@@ -66,7 +66,7 @@ async fn snapshot_bootstrap_then_stream_then_close() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn open_checks_in_order() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     let welcome_incarnation = {
         let mut probe = Client::connect(&server).await;
@@ -156,8 +156,7 @@ async fn resume_when_retained_else_snapshot() {
     let server = start(Limits {
         ring: 64,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     let incarnation = {
         let mut probe = Client::connect(&server).await;
@@ -229,7 +228,7 @@ async fn resume_when_retained_else_snapshot() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn viewport_reports_coalesce_and_mark_the_stream() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     let session = c
         .create(json!({"argv": ["/bin/cat"], "cols": 20, "rows": 5}))
@@ -248,8 +247,12 @@ async fn viewport_reports_coalesce_and_mark_the_stream() {
     );
     assert_eq!(boot.terminal().cols(), 30);
 
-    c.send_json(FrameType::Viewport, 1, &json!({"cols": 40, "rows": 10}))
-        .await;
+    c.send_json(
+        FrameType::Viewport,
+        1,
+        &json!({"cols": 40, "rows": 10, "cell_width": 9, "cell_height": 18}),
+    )
+    .await;
     c.send_json(FrameType::Viewport, 1, &json!({"cols": 30, "rows": 8}))
         .await;
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -320,7 +323,7 @@ async fn viewport_reports_coalesce_and_mark_the_stream() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn exit_ends_the_stream_and_removal_closes() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     let mut events = client(&server).await;
     events.ok("subscribe", json!({})).await;
@@ -353,8 +356,7 @@ async fn exit_ends_the_stream_and_removal_closes() {
     let server = start(Limits {
         remove_grace: 60_000,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     let mut events = client(&server).await;
     events.ok("subscribe", json!({})).await;
@@ -391,8 +393,7 @@ async fn gap_when_the_client_falls_behind() {
     let server = start(Limits {
         ring: 256 * 1024,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     let mut events = client(&server).await;
     events.ok("subscribe", json!({})).await;
@@ -435,8 +436,7 @@ async fn gap_during_a_bootstrap_retries_once_then_too_slow() {
         ring: 16 * 1024,
         max_frame: 16 * 1024,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     let mut ctl = client(&server).await;
     ctl.ok("subscribe", json!({})).await;
@@ -493,8 +493,7 @@ async fn input_overflow_keeps_the_attachment() {
     let server = start(Limits {
         input_queue: 16,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     let session = c.create(json!({"argv": ["/bin/sleep", "5"]})).await;
     c.open(1, json!({"session": session.id})).await;
@@ -507,7 +506,7 @@ async fn input_overflow_keeps_the_attachment() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn queries_are_answered_from_the_latest_profile_and_cell_size() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", "stty raw -echo; echo READY; exec cat"]}))
@@ -526,6 +525,10 @@ async fn queries_are_answered_from_the_latest_profile_and_cell_size() {
 
     c.send(FrameType::Input, 1, b"\x1b[>0q").await;
     c.output_until(1, b"\x1bP>|clankermux test\x1b\\").await;
+    // XTGETTCAP TN names the terminfo entry the session runs under.
+    c.send(FrameType::Input, 1, b"\x1bP+q544E\x1b\\").await;
+    c.output_until(1, b"\x1bP1+r544E=787465726D2D67686F73747479\x1b\\")
+        .await;
     c.send(FrameType::Input, 1, b"\x1b[?996n").await;
     c.output_until(1, b"\x1b[?997;1n").await;
     c.send(FrameType::Input, 1, b"\x1b]10;?\x1b\\").await;
@@ -554,6 +557,20 @@ async fn queries_are_answered_from_the_latest_profile_and_cell_size() {
     c.output_until(1, b"\x1b[?997;2n").await;
     c.send(FrameType::Input, 1, b"\x1b[16t").await;
     c.output_until(1, b"\x1b[6;16;8t").await;
+
+    // Two reports in one coalescing window: the cell size of the earlier
+    // one survives the later one that omitted it.
+    c.send_json(
+        FrameType::Viewport,
+        1,
+        &json!({"cols": 81, "rows": 24, "cell_width": 9, "cell_height": 18}),
+    )
+    .await;
+    c.send_json(FrameType::Viewport, 1, &json!({"cols": 80, "rows": 24}))
+        .await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    c.send(FrameType::Input, 1, b"\x1b[16t").await;
+    c.output_until(1, b"\x1b[6;18;9t").await;
 
     // Without a scheme the background decides.
     other

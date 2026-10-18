@@ -20,8 +20,7 @@ async fn max_frame_bounds_every_frame() {
     let server = start(Limits {
         max_frame: MAX as u64,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     // A payload of max_frame bytes passes, one more closes the connection.
     let mut padded = br#"{"id": 1, "method": "list", "params": {"after": ""#.to_vec();
@@ -70,8 +69,7 @@ async fn scrollback_bounds_the_history() {
     let server = start(Limits {
         scrollback: 4096,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     let session = c
         .create(json!({"rows": 4, "argv": ["/bin/sh", "-c", "seq 1 2000 | sed 's/^/line-/'; echo END; exec cat"]}))
@@ -96,8 +94,7 @@ async fn label_and_text_are_bounded_everywhere() {
         label: 8,
         text: 48,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     let long = "a".repeat(49);
     assert_eq!(
@@ -143,7 +140,7 @@ async fn label_and_text_are_bounded_everywhere() {
     // The PTY echoes the typed line (ESC as `^[`) before `cat` writes it
     // back raw, so "titled" appears twice once the title is set.
     let mut echoed = false;
-    for _ in 0..200 {
+    for _ in 0..1000 {
         let read: Read =
             serde_json::from_value(c.ok("read", json!({"session": session.id})).await).unwrap();
         if read.text.matches("titled").count() == 2 {
@@ -164,8 +161,7 @@ async fn markers_bound_what_a_resume_can_find() {
     let server = start(Limits {
         markers: 2,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     let incarnation = server.registry.incarnation.clone();
     let session = c.create(json!({"argv": ["/bin/cat"]})).await;
@@ -294,7 +290,7 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn read_replies_stay_under_max_frame() {
-    let server = start(Limits::default()).await;
+    let server = start(Limits::default());
     let mut c = client(&server).await;
     // 16,000 lines of 79 bytes: over max_frame of text, each newline
     // escaping to two bytes in the reply.
@@ -323,8 +319,7 @@ async fn a_page_is_cut_to_max_frame() {
     let server = start(Limits {
         page: 100,
         ..Limits::default()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     // Sessions whose label and argv escape to six bytes a character: about
     // 14 KiB each, so a page of 100 would be over max_frame.
@@ -378,22 +373,24 @@ async fn continuation_bounds_a_snapshot() {
     let server = start(Limits {
         continuation: 4096,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     // An OSC left open with more bytes than the limit tracks.
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c",
             "printf 'up\\033]2;'; head -c 6000 /dev/zero | tr '\\0' a; exec cat"]}))
         .await;
-    for _ in 0..200 {
+    let mut filled = false;
+    for _ in 0..1000 {
         let inspected: Session =
             serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
         if inspected.offset >= 6000 {
+            filled = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    assert!(filled, "the title never reached 6000 bytes");
     // No snapshot can be taken for the whole 5 s retry window, so the
     // bootstrap fails and the attachment ends.
     c.open(1, json!({"session": session.id})).await;

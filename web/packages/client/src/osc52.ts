@@ -6,7 +6,8 @@
  * clipboard effect through a callback, which from wasm would need a JS
  * function in the module's function table (a generated wrapper per
  * signature); the scan is less machinery. OSC 1337 and 5522 clipboard
- * forms are not scanned for.
+ * forms are not scanned for, and an OSC 52 inside another string (a DCS
+ * passthrough) is taken as one, where the engine would not.
  */
 const ESC = 0x1b;
 const BEL = 0x07;

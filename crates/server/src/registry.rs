@@ -125,7 +125,10 @@ impl Registry {
                     return;
                 };
                 for session in registry.sessions() {
-                    registry.park(&session).await;
+                    let running = session.lock().unwrap().status() == Status::Running;
+                    if running {
+                        registry.park(&session).await;
+                    }
                 }
             }
         });
@@ -142,7 +145,7 @@ impl Registry {
             .collect()
     }
 
-    fn is_stopping(&self) -> bool {
+    pub(crate) fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::Acquire)
     }
 
@@ -159,7 +162,6 @@ impl Registry {
         } = loaded;
         let info = file.session;
         let limits = &self.config.limits;
-        let exited = info.status == Status::Exited;
         let session = Session {
             id: info.id.clone(),
             label: info.label,
@@ -167,12 +169,8 @@ impl Registry {
             cwd: info.cwd,
             on_exit: info.on_exit,
             created_at: info.created_at,
-            // An exited session always has its time; the park's stands in
-            // for a file that lacks it.
-            exited_at: info
-                .exited_at
-                .or_else(|| exited.then(|| file.parked_at.clone())),
-            exit: info.exit.filter(|_| exited),
+            exited_at: info.exited_at,
+            exit: info.exit,
             wake: Arc::new(Notify::new()),
             text_limit: limits.text as usize,
             records_limit: limits.records as usize,
@@ -180,6 +178,7 @@ impl Registry {
             records: Records::load(info.program_status.unwrap_or_default()),
             events: Vec::new(),
             removed: false,
+            announced: Default::default(),
             park_lock: Default::default(),
             last_generation: 0,
             body: Body::Parked(Parked {
@@ -257,18 +256,27 @@ impl Registry {
     /// the connections have flushed (each wait bounded by `STOP_GRACE`).
     pub async fn stop(self: &Arc<Self>) {
         self.stopping.store(true, Ordering::Release);
+        // Taking a park lock joins a park in flight; a later one does
+        // nothing, so every live session is parked here (a kept session
+        // that exited may still be waiting for its final park), all at
+        // once so the phase lasts one snapshot retry at most.
+        let mut parks = tokio::task::JoinSet::new();
         for session in self.sessions() {
-            // Taking the park lock joins a park in flight; a later one
-            // does nothing.
-            let (park_lock, running) = {
-                let s = session.lock().unwrap();
-                (s.park_lock.clone(), s.status() == Status::Running)
-            };
-            let _one_at_a_time = park_lock.lock().await;
-            if running {
-                self.park_locked(&session).await;
-            }
+            let registry = self.clone();
+            parks.spawn(async move {
+                let park_lock = session.lock().unwrap().park_lock.clone();
+                let _one_at_a_time = park_lock.lock().await;
+                let live = {
+                    let s = session.lock().unwrap();
+                    let gone = s.removed || (s.on_exit == OnExit::Remove && s.exited_at.is_some());
+                    s.live().is_some() && !gone
+                };
+                if live {
+                    registry.park_locked(&session).await;
+                }
+            });
         }
+        while parks.join_next().await.is_some() {}
         for session in self.sessions() {
             let s = session.lock().unwrap();
             s.close_attachments(ClosedReason::Stopping, false);
@@ -407,10 +415,10 @@ impl Registry {
         env.extend(params.env.unwrap_or_default());
 
         // Everything that can fail is tried before the child exists.
-        let mut term = ghostty_vt::Terminal::new(cols, rows)
-            .map_err(internal)?
-            .with_handler(Effects::default());
+        let mut term =
+            ghostty_vt::Terminal::with_handler(cols, rows, Effects::default()).map_err(internal)?;
         term.set_xtversion(&format!("clankermux {}", self.config.version));
+        term.set_terminfo_name("xterm-ghostty").map_err(internal)?;
         for kind in [
             ghostty_vt::ColorKind::Foreground,
             ghostty_vt::ColorKind::Background,
@@ -460,6 +468,7 @@ impl Registry {
             records: Records::default(),
             events: Vec::new(),
             removed: false,
+            announced: Default::default(),
             park_lock: Default::default(),
             last_generation: 0,
             body: Body::Live(Box::new(Live {
@@ -627,6 +636,10 @@ impl Registry {
         if all_finished {
             self.remove_now(id);
         } else {
+            // The files go now, as at the end of an `on_exit: remove`
+            // stream: a stop within the grace must not bring it back.
+            session.lock().unwrap().removed = true;
+            park::remove(&self.sessions_dir(), id);
             self.remove_after_grace(id.to_string());
         }
         Ok(())

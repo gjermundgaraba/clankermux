@@ -35,7 +35,7 @@ async fn full_attach(c: &mut Client) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tcp_carries_frames() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let addr = server.listen_tcp().await;
     let mut c = Client::over(TcpStream::connect(addr).await.unwrap());
     c.hello().await;
@@ -70,7 +70,7 @@ fn refused(result: Result<ClientWs, WsError>) -> StatusCode {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_websocket_admits_allowed_origins_only() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let ws = serve_ws(&server, vec!["http://allowed".into()]).await;
     assert_eq!(refused(ws.connect(None).await), StatusCode::FORBIDDEN);
     assert_eq!(
@@ -160,7 +160,7 @@ async fn ends_with_protocol_error(raw: &mut ClientWs) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn each_message_is_exactly_one_frame() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let ws = serve_ws(&server, vec!["http://allowed".into()]).await;
     let mut raw = greeted(&ws).await;
     raw.send(json(
@@ -245,6 +245,18 @@ async fn each_message_is_exactly_one_frame() {
         );
     }
 
+    // A message over the ceiling, too.
+    let mut raw = greeted(&ws).await;
+    let over = vec![0u8; Limits::default().max_frame as usize + HEADER_LEN + 1];
+    // The server refuses it from its header, before the bytes are all
+    // written, so the send itself may fail.
+    let _ = raw.send(Message::Binary(over.into())).await;
+    assert!(
+        ends_with_protocol_error(&mut raw)
+            .await
+            .contains("too long")
+    );
+
     // A bad header is reported as on any carrier.
     let mut raw = greeted(&ws).await;
     let mut bad = encode_frame(FrameType::Request, 0, b"{}");
@@ -258,7 +270,7 @@ async fn each_message_is_exactly_one_frame() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_connection_closes_within_hello_timeout() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let ws = serve_ws(&server, vec!["http://allowed".into()]).await;
     let started = std::time::Instant::now();
     // Nothing sent: no TLS handshake, no upgrade.

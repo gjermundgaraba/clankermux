@@ -187,22 +187,32 @@ pub fn shape(seq: &[u8]) -> Option<Shape> {
 /// 2, ctrl 4, super 8), as the terminal sends them when a program
 /// enabled the protocol. A release (event 3) is `None`.
 pub fn kitty_key(seq: &[u8]) -> Option<(u32, u32)> {
+    let (code, mods, event) = kitty_event(seq)?;
+    (event != 3).then_some((code, mods))
+}
+
+/// Whether `seq` is a kitty key release.
+pub fn kitty_release(seq: &[u8]) -> bool {
+    kitty_event(seq).is_some_and(|(_, _, event)| event == 3)
+}
+
+/// Any kitty key event: code, modifier bits and event type (1 press, 2
+/// repeat, 3 release).
+fn kitty_event(seq: &[u8]) -> Option<(u32, u32, u32)> {
     let body = seq.strip_prefix(b"\x1b[")?.strip_suffix(b"u")?;
     let body = std::str::from_utf8(body).ok()?;
     let mut fields = body.split(';');
     let code = fields.next()?.split(':').next()?.parse().ok()?;
-    let mods = match fields.next() {
+    let (mods, event) = match fields.next() {
         Some(mods) => {
             let mut parts = mods.split(':');
             let mods = parts.next()?.parse::<u32>().ok()?.saturating_sub(1);
-            if parts.next() == Some("3") {
-                return None;
-            }
-            mods
+            let event = parts.next().map_or(Some(1), |e| e.parse().ok())?;
+            (mods, event)
         }
-        None => 0,
+        None => (0, 1),
     };
-    Some((code, mods))
+    Some((code, mods, event))
 }
 
 #[cfg(test)]

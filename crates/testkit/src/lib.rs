@@ -57,7 +57,10 @@ impl Server {
         let (started, ready) = std::sync::mpsc::channel();
         let listen_on = socket.clone();
         let thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
+            // Worker threads, as in the binary: ordering claims between
+            // the connection and attachment tasks need real concurrency.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .unwrap();

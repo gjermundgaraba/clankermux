@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ghostty_vt::{
-    ColorKind, ColorScheme, Handler, ProgramStatus, Rgb, SemanticPrompt, SemanticPromptKind,
-    SizeReport, Terminal, color_scheme_report, formatter, snapshot,
+    ColorKind, ColorScheme, Handler, ProgramStatus, Rgb, SemanticPromptKind, SizeReport, Terminal,
+    color_scheme_report, formatter, snapshot,
 };
 use proto::{
     ClosedReason, ErrorCode, Event, Exit, OnExit, Profile, Scheme, Size, Status, Viewport,
@@ -98,8 +98,8 @@ impl Handler for Effects {
         self.status.push(StatusEvent::Report(report));
     }
 
-    fn semantic_prompt(&mut self, event: SemanticPrompt) {
-        if event.kind == SemanticPromptKind::PromptStart {
+    fn semantic_prompt(&mut self, kind: SemanticPromptKind) {
+        if kind == SemanticPromptKind::PromptStart {
             self.status.push(StatusEvent::PromptStart);
         }
     }
@@ -294,6 +294,8 @@ pub struct Session {
     /// Set by removal before the files go, so a park in flight deletes
     /// what it wrote.
     pub removed: bool,
+    /// The title and pwd last announced by `session_changed`.
+    pub announced: (String, String),
     /// Parks of this session run one at a time.
     pub park_lock: Arc<tokio::sync::Mutex<()>>,
     /// The last generation written, so the next is larger whatever the
@@ -439,9 +441,12 @@ impl Session {
             }
         }
         if changed {
-            self.events.push(Event::SessionChanged {
-                session: self.to_proto(false),
-            });
+            let session = self.to_proto(false);
+            let identity = (session.title.clone(), session.pwd.clone());
+            if identity != self.announced {
+                self.announced = identity;
+                self.events.push(Event::SessionChanged { session });
+            }
         }
     }
 
@@ -647,7 +652,19 @@ pub fn report(registry: &Arc<Registry>, session: &Shared, report: Viewport, imme
     let Some(live) = s.live_mut() else {
         return;
     };
-    live.pending = Some(report);
+    // The latest dimensions, and the profile and cell size of the latest
+    // report that carried them.
+    live.pending = Some(match live.pending.take() {
+        Some(earlier) => Viewport {
+            size: Size {
+                cell_width: report.size.cell_width.or(earlier.size.cell_width),
+                cell_height: report.size.cell_height.or(earlier.size.cell_height),
+                ..report.size
+            },
+            profile: report.profile.or(earlier.profile),
+        },
+        None => report,
+    });
     if live.timer_running {
         return;
     }
@@ -674,10 +691,34 @@ pub fn report(registry: &Arc<Registry>, session: &Shared, report: Viewport, imme
 
 /// The path of an OSC 7 `file://host/path` value; other values unchanged.
 pub fn pwd_path(value: &str) -> String {
-    match value.strip_prefix("file://") {
-        Some(rest) => rest.find('/').map_or("", |i| &rest[i..]).to_string(),
-        None => value.to_string(),
+    let path = match value.split_once("://") {
+        // `file://host/path`, or `kitty-shell-cwd://host/path` from
+        // Ghostty's shell integration: the path, percent-decoded.
+        Some((_, rest)) => rest.find('/').map_or("", |i| &rest[i..]),
+        None => value,
+    };
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = match bytes.get(i + 1..i + 3) {
+            Some(hex) if bytes[i] == b'%' => std::str::from_utf8(hex)
+                .ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok()),
+            _ => None,
+        };
+        match decoded {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
     }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The first at most `max` bytes of `text`, on a character boundary.
@@ -748,6 +789,11 @@ mod tests {
         assert_eq!(pwd_path("file://mac.local/Users/me"), "/Users/me");
         assert_eq!(pwd_path("file:///tmp"), "/tmp");
         assert_eq!(pwd_path("/plain"), "/plain");
+        assert_eq!(
+            pwd_path("kitty-shell-cwd://mac.local/Users/me/a%20b"),
+            "/Users/me/a b"
+        );
+        assert_eq!(pwd_path("file:///x%2"), "/x%2");
     }
 
     #[test]

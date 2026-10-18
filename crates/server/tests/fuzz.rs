@@ -90,7 +90,7 @@ proptest! {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let server = start(fast_limits()).await;
+            let server = start(fast_limits());
             let mut c = client(&server).await;
             let session = c.create(json!({"argv": ["/bin/cat"]})).await;
             let mut bytes = Vec::new();

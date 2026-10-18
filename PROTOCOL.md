@@ -275,7 +275,8 @@ A writable `OPEN` with `viewport` or `profile` on a running session is
 applied as a viewport report at once (at the session's size when
 `viewport` is absent), before the snapshot is taken, bypassing coalescing.
 On any other session it is ignored. A `cols` or `rows` of 0, in `OPEN` or
-`VIEWPORT`, is `invalid_request`, checked before the checks above.
+`VIEWPORT`, is `invalid_request`, checked after the channel check and
+before the session check.
 
 ### ATTACHED
 
@@ -287,13 +288,14 @@ On any other session it is ignored. A `cols` or `rows` of 0, in `OPEN` or
 | `cols`    | int     |                                                         |
 | `rows`    | int     |                                                         |
 | `session` | Session |                                                         |
-| `snapshot_bytes` | int? | Mode `snapshot` only: the total length of the snapshot that follows (the sum of the `SNAPSHOT` payloads), so a client can size its buffer |
+| `snapshot_bytes` | int? | Required in mode `snapshot`, absent otherwise: the total length of the snapshot that follows (the sum of the `SNAPSHOT` payloads), so a client can size its buffer |
 
 `resume` is chosen when `OPEN.resume.incarnation` equals the server's
 incarnation, `OPEN.resume.offset` lies within the retained stream, and
 every marker with `seq` above `OPEN.resume.marker` is retained. Otherwise
-`snapshot`. A `marker` above the session's latest `seq` fails with
-`invalid_request`.
+`snapshot`. Under the server's incarnation, a `marker` above the session's
+latest `seq` fails with `invalid_request`; a cursor from another
+incarnation is not compared.
 
 ### Bootstrap, mode `snapshot`
 
@@ -479,7 +481,7 @@ the park time as Unix epoch milliseconds, mode 0700, files 0600:
 
 | File                | Contents                                                     |
 | ------------------- | ------------------------------------------------------------ |
-| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines}`: the `inspect` object (with `program_status`, `attachments: 0`, no `pid`) and how many leading lines of `screen.txt` are history |
+| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines}`: the `inspect` object (`attachments: 0`, no `pid`, `program_status` as reported with no inherited `app`, least recently updated first) and how many leading lines of `screen.txt` are history |
 | `snapshot.ghostsnp` | The snapshot bytes                                           |
 | `screen.txt`        | The `read` text with all retained history, at `parked_at`   |
 

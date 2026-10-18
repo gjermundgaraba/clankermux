@@ -34,8 +34,8 @@ pub async fn serve_ws(
     let origins = Arc::new(origins);
     let max_frame = registry.config.limits.max_frame;
     let hello_timeout = Duration::from_millis(registry.config.limits.hello_timeout);
-    let connections = registry.clone();
-    crate::serve_tcp_with(listener, &connections, move |stream, accepted| {
+    let connections = registry.connections.clone();
+    crate::serve_tcp_with(listener, connections, move |stream, accepted| {
         let acceptor = tls.acceptor();
         let registry = registry.clone();
         let origins = origins.clone();
@@ -155,8 +155,12 @@ fn frame_len(bytes: &[u8], max_frame: u64) -> Option<usize> {
 }
 
 fn other(error: tokio_tungstenite::tungstenite::Error) -> io::Error {
+    use tokio_tungstenite::tungstenite::Error;
     match error {
-        tokio_tungstenite::tungstenite::Error::Io(e) => e,
+        Error::Io(e) => e,
+        // A message over the ceiling is the peer's protocol error, reported
+        // as on any carrier.
+        Error::Capacity(e) => io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
         e => io::Error::other(e),
     }
 }

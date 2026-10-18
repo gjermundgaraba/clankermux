@@ -605,7 +605,12 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             // Each request's base64 fits the server's control body with
             // room for the rest of the JSON.
             let chunk = (conn.welcome.limits.control_body as usize).saturating_sub(1024) / 4 * 3;
-            for chunk in data.chunks(chunk.max(3)) {
+            let chunks: Vec<&[u8]> = if data.is_empty() {
+                vec![&[]]
+            } else {
+                data.chunks(chunk.max(3)).collect()
+            };
+            for chunk in chunks {
                 conn.request(
                     "write",
                     WriteParams {

@@ -15,7 +15,7 @@ use tokio::io::AsyncWriteExt;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_open_error_frees_the_channel() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", "echo up; exec cat"]}))
@@ -44,7 +44,7 @@ async fn nothing_follows_an_id_less_error() {
     // An OPEN starts an attach task that queues ATTACHED and the
     // snapshot concurrently with the connection's own frames. A closing
     // error right behind it must still be the last frame written.
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let session = {
         let mut c = client(&server).await;
         c.create(json!({"argv": ["/bin/sh", "-c", "echo up; exec cat"]}))

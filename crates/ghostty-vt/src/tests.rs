@@ -194,7 +194,37 @@ fn decoder_refuses_a_replaced_terminal() {
         Terminal::new(80, 24).unwrap(),
     ));
     assert_eq!(decoder.next_page(), Err(Error::InvalidValue));
-    assert_eq!(decoder.decode().err(), Some(Error::InvalidValue));
+    // Nor when the replacement took the adopted terminal's address: the
+    // decoder keeps that one alive, so the address stays taken.
+    let mut decoder = snapshot::Decoder::new().unwrap();
+    decoder.push(&bytes);
+    let handed_out = decoder.ready().unwrap();
+    let adopted = handed_out.raw();
+    for _ in 0..64 {
+        let replacement = Terminal::new(80, 24).unwrap();
+        assert_ne!(replacement.raw(), adopted);
+        drop(std::mem::replace(decoder.terminal().unwrap(), replacement));
+    }
+    assert_eq!(decoder.next_page(), Err(Error::InvalidValue));
+    assert!(decoder.into_terminal().is_none());
+}
+
+#[test]
+fn decoder_reports_finish_and_releases_an_unfinished_terminal() {
+    let bytes = snapshot::encode(&filled(5000)).unwrap();
+    let ready = snapshot::ready_end(&bytes).unwrap();
+    let mut decoder = snapshot::Decoder::new().unwrap();
+    decoder.push(&bytes[..ready]);
+    decoder.ready().unwrap();
+    assert!(!decoder.step_available());
+    assert!(!decoder.finished());
+    let mut decoder = snapshot::Decoder::new().unwrap();
+    decoder.push(&bytes);
+    decoder.ready().unwrap();
+    while decoder.step_available() && decoder.next_page().unwrap() {}
+    assert!(decoder.finished());
+    assert!(!decoder.step_available());
+    assert!(decoder.into_terminal().is_some());
 }
 
 #[derive(Default)]
@@ -214,8 +244,8 @@ impl Handler for Shared {
     fn program_status(&mut self, report: ProgramStatus) {
         self.0.lock().unwrap().statuses.push(report);
     }
-    fn semantic_prompt(&mut self, event: SemanticPrompt) {
-        self.0.lock().unwrap().prompts.push(event.kind);
+    fn semantic_prompt(&mut self, kind: SemanticPromptKind) {
+        self.0.lock().unwrap().prompts.push(kind);
     }
     fn color_scheme(&mut self) -> Option<ColorScheme> {
         Some(ColorScheme::Dark)
@@ -235,9 +265,7 @@ impl Handler for Shared {
 
 fn recorded() -> (Terminal<Shared>, Arc<Mutex<Recorder>>) {
     let rec = Arc::new(Mutex::new(Recorder::default()));
-    let term = Terminal::new(80, 24)
-        .unwrap()
-        .with_handler(Shared(rec.clone()));
+    let term = Terminal::with_handler(80, 24, Shared(rec.clone())).unwrap();
     (term, rec)
 }
 
@@ -314,4 +342,26 @@ fn modes_and_colors() {
     assert!(!vt.is_empty());
     assert!(ENGINE.starts_with("ghostty-vt@"));
     assert_eq!(color_scheme_report(ColorScheme::Dark), b"\x1b[?997;1n");
+}
+
+#[test]
+fn the_engine_id_names_the_linked_build() {
+    let mut version = ghostty_vt_sys::GhosttyString {
+        ptr: std::ptr::null(),
+        len: 0,
+    };
+    // SAFETY: the version string's output type is GhosttyString, and the
+    // bytes are static.
+    let bytes = unsafe {
+        assert_eq!(
+            ghostty_vt_sys::ghostty_build_info(
+                ghostty_vt_sys::GHOSTTY_BUILD_INFO_VERSION_STRING,
+                &mut version as *mut _ as *mut std::ffi::c_void,
+            ),
+            ghostty_vt_sys::GHOSTTY_SUCCESS
+        );
+        std::slice::from_raw_parts(version.ptr, version.len)
+    };
+    let built = std::str::from_utf8(bytes).unwrap();
+    assert_eq!(ENGINE, format!("ghostty-vt@{built}"));
 }

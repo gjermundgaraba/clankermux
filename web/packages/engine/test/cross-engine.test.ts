@@ -30,3 +30,11 @@ test("a fresh terminal accepts input", async () => {
 test("engine id equals the native engine id", () => {
   expect(ENGINE).toBe(readFileSync(`${fixtures}engine.txt`, "utf8"));
 });
+
+test("the wasm build reports the engine id", async () => {
+  const engine = await Engine.load(readFileSync(`${here}../ghostty-vt.wasm`));
+  engine.scratch(engine.sizeOf("GhosttyString"), (out) => {
+    engine.check("ghostty_build_info", engine.enumValue("GhosttyBuildInfo", "VERSION_STRING"), out);
+    expect(`ghostty-vt@${engine.readString(out)}`).toBe(ENGINE);
+  });
+});

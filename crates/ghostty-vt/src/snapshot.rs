@@ -99,12 +99,15 @@ unsafe extern "C" fn read_source(
 pub struct Decoder<H: Handler = ()> {
     raw: sys::GhosttySnapshotDecoder,
     source: *mut Source,
+    /// The terminal the library retains between steps, owned here until
+    /// released so that nothing done through `terminal` can free it.
+    owner: Option<Terminal<H>>,
+    /// The view handed out; it must still be the owner's terminal.
     terminal: Option<Terminal<H>>,
-    /// The raw terminal the library retains between steps; `terminal`
-    /// must still be it, or the library would use a freed one.
-    adopted: sys::GhosttyTerminal,
     /// Installed on the terminal once it exists.
     handler: Option<H>,
+    /// `FINISH` was validated.
+    finished: bool,
 }
 
 impl Decoder<()> {
@@ -139,29 +142,37 @@ impl<H: Handler> Decoder<H> {
         Ok(Decoder {
             raw,
             source,
+            owner: None,
             terminal: None,
-            adopted: ptr::null_mut(),
             handler: Some(handler),
+            finished: false,
         })
     }
 
     /// Wraps the terminal the library just returned, with the handler.
     unsafe fn adopt(&mut self, raw: sys::GhosttyTerminal) -> &mut Terminal<H> {
         let handler = self.handler.take().expect("one terminal per decoder");
-        self.adopted = raw;
         // SAFETY: raw is a caller-owned terminal from the decoder.
-        self.terminal
-            .insert(unsafe { Terminal::install(raw, handler, Vec::new()) })
+        let owner = unsafe { Terminal::install(raw, handler) };
+        let view = owner.view();
+        self.owner = Some(owner);
+        self.terminal.insert(view)
     }
 
     /// Refuses to go on when the terminal handed out was replaced (safe
     /// code can `mem::replace` through the `&mut`), since the library
-    /// still holds the one it returned.
+    /// still holds the one it returned. The owner keeps that one alive,
+    /// so another terminal cannot take its address.
     fn intact(&self) -> Result<()> {
-        match &self.terminal {
-            Some(terminal) if terminal.raw() != self.adopted => Err(Error::InvalidValue),
+        match (&self.terminal, &self.owner) {
+            (Some(view), Some(owner)) if view.raw() != owner.raw() => Err(Error::InvalidValue),
             _ => Ok(()),
         }
+    }
+
+    /// Whether `FINISH` was validated: the snapshot is complete.
+    pub fn finished(&self) -> bool {
+        self.finished
     }
 
     fn source(&self) -> &Source {
@@ -204,7 +215,7 @@ impl<H: Handler> Decoder<H> {
 
     pub fn step_available(&self) -> bool {
         let source = self.source();
-        step_end(&source.data, source.pos).is_some()
+        !self.finished && step_end(&source.data, source.pos).is_some()
     }
 
     /// Decodes through `READY`; the terminal is then renderable.
@@ -226,20 +237,22 @@ impl<H: Handler> Decoder<H> {
         let result = unsafe { sys::ghostty_snapshot_decoder_next(self.raw) };
         self.compact();
         if result == sys::GHOSTTY_NO_VALUE {
+            self.finished = true;
             return Ok(false);
         }
         check(result)?;
         Ok(true)
     }
 
-    /// Decodes a complete snapshot in one call.
+    /// Decodes a complete snapshot in one call; the engine refuses it
+    /// after `ready`.
     pub fn decode(&mut self) -> Result<&mut Terminal<H>> {
-        self.intact()?;
         let mut raw = ptr::null_mut();
         // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_decode(self.raw, &mut raw) };
         self.compact();
         check(result)?;
+        self.finished = true;
         // SAFETY: on success raw is a caller-owned terminal.
         Ok(unsafe { self.adopt(raw) })
     }
@@ -250,9 +263,12 @@ impl<H: Handler> Decoder<H> {
         self.terminal.as_mut()
     }
 
-    /// Frees the decoder and releases the terminal, finished or not.
+    /// Frees the decoder and releases the terminal, finished or not;
+    /// `None` before `READY` or when the view was replaced.
     pub fn into_terminal(mut self) -> Option<Terminal<H>> {
-        self.terminal.take()
+        self.intact().ok()?;
+        self.terminal.take();
+        self.owner.take()
     }
 
     fn compact(&mut self) {

@@ -9,11 +9,15 @@ use base64::Engine as _;
 use common::*;
 use proto::*;
 use serde_json::json;
+
+/// What `read` may return under `max_frame` 8192: the server keeps the
+/// rest for the JSON around the text.
+const TEXT_BUDGET: usize = 8192 - 4096;
 use tokio::io::AsyncWriteExt;
 
 #[tokio::test]
 async fn handshake_and_protocol_errors() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
 
     let mut c = Client::connect(&server).await;
     let welcome = c.hello().await;
@@ -97,7 +101,7 @@ async fn handshake_and_protocol_errors() {
 
 #[tokio::test]
 async fn session_lifecycle() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     let mut events = client(&server).await;
     let first: Page = serde_json::from_value(events.ok("subscribe", json!({})).await).unwrap();
@@ -239,7 +243,7 @@ async fn session_lifecycle() {
 
 #[tokio::test]
 async fn exit_code_and_removal_on_exit() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     c.ok("subscribe", json!({})).await;
     let session = c.create(json!({"argv": ["/bin/sh", "-c", "exit 3"]})).await;
@@ -262,7 +266,7 @@ async fn exit_code_and_removal_on_exit() {
 
 #[tokio::test]
 async fn end_sends_hangup() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     c.ok("subscribe", json!({})).await;
     let session = c
@@ -278,7 +282,7 @@ async fn end_sends_hangup() {
 
 #[tokio::test]
 async fn create_defaults_and_limits() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     let session = c.create(json!({})).await;
     assert_eq!(session.argv, ["/bin/sh"]);
@@ -317,7 +321,7 @@ async fn create_defaults_and_limits() {
 
     let env = c.create(json!({"argv": ["/bin/sh", "-c", "printf '%s|%s' \"$TERM\" \"$FOO\"; sleep 10"], "env": {"FOO": "bar"}})).await;
     let mut text = String::new();
-    for _ in 0..200 {
+    for _ in 0..500 {
         let read: Read =
             serde_json::from_value(c.ok("read", json!({"session": env.id})).await).unwrap();
         text = read.text;
@@ -333,7 +337,7 @@ async fn create_defaults_and_limits() {
 
 #[tokio::test]
 async fn list_pages_by_id() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     let mut ids: Vec<String> = Vec::new();
     for _ in 0..5 {
@@ -364,7 +368,7 @@ async fn list_pages_by_id() {
 
 #[tokio::test]
 async fn events_are_ordered_with_replies() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     c.ok("subscribe", json!({})).await;
     let session = c.create(json!({"argv": ["/bin/sleep", "5"]})).await;
@@ -380,13 +384,13 @@ async fn events_are_ordered_with_replies() {
 
 #[tokio::test]
 async fn read_returns_scrollback_then_screen() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", "i=1; while [ $i -le 50 ]; do echo line$i; i=$((i+1)); done; sleep 5"], "cols": 20, "rows": 5}))
         .await;
     let mut lines = Vec::new();
-    for _ in 0..100 {
+    for _ in 0..500 {
         let read: Read = serde_json::from_value(
             c.ok("read", json!({"session": session.id, "scrollback": 3}))
                 .await,
@@ -410,7 +414,7 @@ async fn read_returns_scrollback_then_screen() {
 
 #[tokio::test]
 async fn malformed_requests_pipelining_and_the_hello_deadline() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
 
     // HELLO and a request in one write are both handled.
     let mut c = Client::connect(&server).await;
@@ -484,7 +488,7 @@ async fn malformed_requests_pipelining_and_the_hello_deadline() {
 
 #[tokio::test]
 async fn subscribed_connections_close_on_errors_and_get_each_event_once() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     c.ok("subscribe", json!({})).await;
     c.ok("subscribe", json!({})).await;
@@ -503,7 +507,7 @@ async fn subscribed_connections_close_on_errors_and_get_each_event_once() {
 
 #[tokio::test]
 async fn signals_by_name_and_sizes_are_validated() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     c.ok("subscribe", json!({})).await;
     let session = c
@@ -562,8 +566,7 @@ async fn read_screen_only_after_clear_and_bounded_replies() {
     let server = start(Limits {
         max_frame: 8192,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", "i=1; while [ $i -le 1000 ]; do echo line$i; i=$((i+1)); done; printf '\\033[H\\033[2Jonly\\n'; sleep 5"], "cols": 20, "rows": 5}))
@@ -582,7 +585,7 @@ async fn read_screen_only_after_clear_and_bounded_replies() {
             .await,
     )
     .unwrap();
-    assert!(read.text.len() <= 8192 - 4096);
+    assert!(read.text.len() <= TEXT_BUDGET);
     assert!(
         read.text.starts_with("line"),
         "whole lines are dropped: {:?}",
@@ -597,7 +600,7 @@ async fn read_screen_only_after_clear_and_bounded_replies() {
         .create(json!({"argv": ["/bin/sh", "-c", "i=0; while [ $i -lt 6000 ]; do printf x; i=$((i+1)); done; printf 'END\n'; sleep 5"], "cols": 200, "rows": 5}))
         .await;
     let read = wait_text(&mut c, &session.id, "END").await;
-    assert!(read.text.len() <= 8192 - 4096);
+    assert!(read.text.len() <= TEXT_BUDGET);
     assert!(
         read.text.ends_with("xxxEND\n"),
         "{:?}",
@@ -614,8 +617,7 @@ async fn a_connection_that_stops_reading_is_closed() {
     let server = start(Limits {
         max_frame: 16 * 1024,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     let mut idle = client(&server).await;
     idle.ok("subscribe", json!({})).await;

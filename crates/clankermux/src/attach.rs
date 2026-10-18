@@ -223,17 +223,19 @@ impl Shell {
             Action::Screen => {
                 self.passthrough();
                 self.paint();
-                // A session whose stream ended sends no EXITED.
+                // A session whose stream ended sends no EXITED. A running
+                // one may carry its child's exit while a descendant holds
+                // the PTY; its EXITED comes with the end of the stream.
                 match self.attachment.session.as_ref() {
                     Some(s) if s.status == proto::Status::Restored => {
                         return Some(Outcome::Restored);
                     }
-                    Some(s) => {
+                    Some(s) if s.status == proto::Status::Exited => {
                         if let Some(exit) = s.exit.clone() {
                             return Some(Outcome::Exited(exit));
                         }
                     }
-                    None => {}
+                    _ => {}
                 }
             }
             Action::Output(bytes) => {
@@ -312,6 +314,12 @@ impl Shell {
             pos += len;
             match self.armed.take() {
                 Some(prefix) => {
+                    // The prefix's own release, when the program asked for
+                    // release events, is not the next key.
+                    if vt::kitty_release(unit) {
+                        self.armed = Some(prefix);
+                        continue;
+                    }
                     if unit == b"d" || vt::kitty_key(unit) == Some((u32::from(b'd'), 0)) {
                         return Keys::Detach;
                     }
@@ -436,7 +444,11 @@ pub async fn run(opts: Options) -> Result<ExitCode, Error> {
                                 break outcome;
                             }
                         }
-                        Err(_) => shell.reopen = true,
+                        // A lost place in the stream is recovered by a fresh
+                        // OPEN, as the protocol says; any other fault would
+                        // only repeat.
+                        Err(Error::Desync(_)) => shell.reopen = true,
+                        Err(err) => break Outcome::Failed(err.to_string()),
                     }
                     if shell.reopen {
                         // Afresh, on a new connection: the attachment's
@@ -588,6 +600,17 @@ mod tests {
             "ctrl+\\ under kitty arms"
         );
         assert_eq!(feed(&mut s, b"\x1b[100u"), None, "kitty d detaches");
+        // With release events reported, the prefix's release comes first.
+        let mut s = shell(0x1c);
+        assert_eq!(feed(&mut s, b"\x1b[92;5u"), Some(vec![]));
+        assert_eq!(feed(&mut s, b"\x1b[92;5:3u"), Some(vec![]), "still armed");
+        assert_eq!(feed(&mut s, b"\x1b[100u"), None);
+        let mut s = shell(0x1c);
+        assert_eq!(
+            feed(&mut s, b"\x1b[97;1:3u"),
+            Some(b"\x1b[97;1:3u".to_vec()),
+            "other releases pass"
+        );
         let mut s = shell(0x1c);
         assert_eq!(
             feed(&mut s, b"\x1b[92;3u"),

@@ -119,7 +119,7 @@ test("bootstraps, holds after a resize, and resumes", () => {
   expect(a.resume()).toBeUndefined();
   // The terminal stays for display but takes no more of the stream.
   expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo\nxy");
-  expect(() => a.handle(output(102, "late"))).toThrow(/after the attachment ended/);
+  expect(() => a.handle(output(102, "late"))).toThrow(/outside the stream/);
   expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo\nxy");
   a.free();
 });
@@ -139,6 +139,19 @@ test("an EXITED during a bootstrap waits for SNAPSHOT_END", () => {
   expect(a.ended()).toBe(true);
   expect(() => a.handle(frame(FrameType.SnapshotEnd, new Uint8Array()))).toThrow(/outside a bootstrap/);
   expect(a.ended()).toBe(true);
+  a.free();
+});
+
+test("a snapshot cut before FINISH is a protocol error", () => {
+  const bytes = snapshotOf("one\r\ntwo\r\n");
+  const ready = readyEnd(bytes)!;
+  const a = new Attachment(engine);
+  a.openOn(welcome("inc"));
+  a.handle(attached(0, 0, bytes));
+  a.handle(frame(FrameType.Snapshot, bytes.subarray(0, ready)));
+  a.handle(frame(FrameType.SnapshotReady, new Uint8Array()));
+  a.handle(frame(FrameType.Snapshot, bytes.subarray(ready, bytes.length - 1)));
+  expect(() => a.handle(frame(FrameType.SnapshotEnd, new Uint8Array()))).toThrow(/FINISH/);
   a.free();
 });
 

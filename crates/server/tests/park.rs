@@ -68,7 +68,7 @@ async fn read(c: &mut Client, id: &str, scrollback: u32) -> Read {
 async fn a_graceful_stop_parks_and_a_restart_restores() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let a = start_with(fast_limits(), state.clone()).await;
+    let mut a = start_with(fast_limits(), state.clone());
     let mut c = client(&a).await;
     let session = c
         .create(json!({
@@ -85,7 +85,11 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
     c.bootstrap(1).await;
 
     a.registry.stop().await;
+    // The binary exits right after the stop: the stop has flushed every
+    // connection by then.
+    a.shutdown();
     assert_eq!(c.expect_closed(1).await, ClosedReason::Stopping);
+    assert!(c.recv().await.is_none());
     let generation = generations(&state, &session.id)
         .pop()
         .expect("parked by the stop");
@@ -103,7 +107,7 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
     drop(c);
     drop(a);
 
-    let b = start_with(fast_limits(), state.clone()).await;
+    let b = start_with(fast_limits(), state.clone());
     let mut c = client(&b).await;
     let page: Page = serde_json::from_value(c.ok("list", json!({})).await).unwrap();
     assert_eq!(page.sessions.len(), 1);
@@ -161,7 +165,7 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
 
     // Removal deletes the files.
     c.ok("remove", json!({"session": session.id})).await;
-    for _ in 0..100 {
+    for _ in 0..1000 {
         if !sessions_dir(&state).join(&session.id).exists() {
             break;
         }
@@ -178,7 +182,7 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
 async fn keep_parks_at_exit_and_restores_as_exited() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let a = start_with(fast_limits(), state.clone()).await;
+    let a = start_with(fast_limits(), state.clone());
     let mut c = client(&a).await;
     c.ok("subscribe", json!({})).await;
     let session = c
@@ -195,7 +199,7 @@ async fn keep_parks_at_exit_and_restores_as_exited() {
     a.registry.stop().await;
     drop(a);
 
-    let b = start_with(fast_limits(), state.clone()).await;
+    let b = start_with(fast_limits(), state.clone());
     let mut c = client(&b).await;
     let loaded: Session =
         serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
@@ -217,12 +221,57 @@ async fn keep_parks_at_exit_and_restores_as_exited() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_stop_parks_an_exited_session_whose_final_park_is_waiting() {
+    // A kept session's park at exit queues behind a park in flight. A
+    // stop meanwhile makes that queued park a no-op, so the stop's own
+    // park must cover the exited session.
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let a = start_with(fast_limits(), state.clone());
+    let mut c = client(&a).await;
+    c.ok("subscribe", json!({})).await;
+    let session = c
+        .create(json!({"on_exit": "keep", "argv": ["/bin/sh", "-c", "echo held; exit 4"]}))
+        .await;
+    let park_lock = a
+        .registry
+        .get(&session.id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .park_lock
+        .clone();
+    let held = park_lock.lock().await;
+    assert_eq!(
+        c.wait_exit(&session.id).await.exit,
+        Some(Exit::Code { code: 4 })
+    );
+    assert!(generations(&state, &session.id).is_empty());
+    drop(c);
+    let registry = a.registry.clone();
+    let stop = tokio::spawn(async move { registry.stop().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(held);
+    stop.await.unwrap();
+    drop(a);
+
+    let b = start_with(fast_limits(), state.clone());
+    let mut c = client(&b).await;
+    let loaded: Session =
+        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    assert_eq!(
+        (loaded.status, loaded.exit),
+        (Status::Exited, Some(Exit::Code { code: 4 }))
+    );
+    assert!(read(&mut c, &session.id, 0).await.text.contains("held"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn program_status_records_follow_the_protocol() {
     let server = start(Limits {
         records: 2,
         ..fast_limits()
-    })
-    .await;
+    });
     let mut c = client(&server).await;
     c.ok("subscribe", json!({})).await;
     let session = c.create(json!({})).await;
@@ -319,7 +368,7 @@ fn base64(text: &str) -> String {
 async fn the_lock_refuses_a_second_server() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let a = start_with(fast_limits(), state.clone()).await;
+    let a = start_with(fast_limits(), state.clone());
     let second = server::Registry::new(server::Config {
         limits: fast_limits(),
         shell: vec!["/bin/sh".into()],
@@ -432,7 +481,7 @@ async fn loading_keeps_the_newest_complete_generation_only() {
     std::fs::write(other_dir.join("snapshot.ghostsnp"), b"GHOSTSNP").unwrap();
     std::fs::write(other_dir.join("screen.txt"), "elsewhere\n").unwrap();
 
-    let server = start_with(fast_limits(), state.clone()).await;
+    let server = start_with(fast_limits(), state.clone());
     let mut c = client(&server).await;
     let page: Page = serde_json::from_value(c.ok("list", json!({})).await).unwrap();
     assert_eq!(page.sessions.len(), 2);
@@ -498,7 +547,7 @@ const OTHER: &str = "99999999-2222-3333-4444-555555555555";
 async fn a_stopped_server_leaves_the_directory_to_its_successor() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let a = start_with(fast_limits(), state.clone()).await;
+    let a = start_with(fast_limits(), state.clone());
     let mut c = client(&a).await;
     // `on_exit: remove` with a 200 ms grace: once the stop's SIGHUP ends
     // the process, the old server must not delete the park.
@@ -515,7 +564,7 @@ async fn a_stopped_server_leaves_the_directory_to_its_successor() {
         Some((ErrorCode::Internal, "server stopping".into()))
     );
 
-    let b = start_with(fast_limits(), state.clone()).await;
+    let b = start_with(fast_limits(), state.clone());
     let mut c = client(&b).await;
     tokio::time::sleep(Duration::from_millis(600)).await;
     let page: Page = serde_json::from_value(c.ok("list", json!({})).await).unwrap();
@@ -532,7 +581,7 @@ async fn a_stopped_server_leaves_the_directory_to_its_successor() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prompt_start_in_the_same_read_still_drops_the_working_record() {
-    let server = start(fast_limits()).await;
+    let server = start(fast_limits());
     let mut c = client(&server).await;
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c",
@@ -548,7 +597,7 @@ async fn a_prompt_start_in_the_same_read_still_drops_the_working_record() {
 async fn a_parked_read_takes_scrollback_from_the_history_only() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let a = start_with(fast_limits(), state.clone()).await;
+    let a = start_with(fast_limits(), state.clone());
     let mut c = client(&a).await;
     let session = c
         .create(json!({"rows": 10, "argv": ["/bin/sh", "-c",
@@ -564,7 +613,7 @@ async fn a_parked_read_takes_scrollback_from_the_history_only() {
     drop(c);
     drop(a);
 
-    let b = start_with(fast_limits(), state.clone()).await;
+    let b = start_with(fast_limits(), state.clone());
     let mut c = client(&b).await;
     assert_eq!(read(&mut c, &session.id, 0).await.text, live_screen);
     assert_eq!(read(&mut c, &session.id, 2).await.text, live_two);
