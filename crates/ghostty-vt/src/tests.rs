@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use crate::formatter::{self, Format, Options};
+use crate::formatter::{self, Format, Options, Region};
 use crate::snapshot;
 use crate::*;
 
@@ -40,7 +40,7 @@ fn formats_a_tail_of_rows() {
                 &term,
                 Options {
                     trim: true,
-                    start_row: Some(start_row),
+                    region: Region::FromRow(start_row),
                     ..Default::default()
                 },
             )
@@ -51,6 +51,42 @@ fn formats_a_tail_of_rows() {
     assert_eq!(tail(4), "line5\nline6");
     assert_eq!(tail(2), "line3\nline4\nline5\nline6");
     assert_eq!(tail(0), "line1\nline2\nline3\nline4\nline5\nline6");
+
+    let clipped = formatter::format(
+        &term,
+        Options {
+            trim: true,
+            region: Region::Clip { cols: 3, rows: 2 },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(String::from_utf8(clipped).unwrap(), "lin\nlin");
+}
+
+#[test]
+fn vt_format_carries_modes_and_history() {
+    let mut term = Terminal::new(10, 3).unwrap();
+    term.vt_write(b"one\r\ntwo\r\nthree\r\nfour\x1b[?1049h\x1b[?2004halt");
+    let vt = formatter::format(
+        &term,
+        Options {
+            format: Format::Vt,
+            modes: true,
+            cursor: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let vt = String::from_utf8(vt).unwrap();
+    assert!(vt.contains("\x1b[?1049h"), "{vt:?}");
+    assert!(vt.contains("\x1b[?2004h"), "{vt:?}");
+    assert!(vt.contains("alt"), "{vt:?}");
+    assert!(
+        !vt.contains("four"),
+        "the primary screen is not formatted: {vt:?}"
+    );
+    assert_eq!(term.active_screen(), Screen::Alternate);
 }
 
 #[test]

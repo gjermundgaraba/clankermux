@@ -7,7 +7,7 @@ use ghostty_vt_sys as sys;
 
 use crate::error::{Result, check};
 use crate::io;
-use crate::terminal::{Term, Terminal};
+use crate::terminal::{Handler, Term, Terminal};
 
 /// Bytes before the first record: the 8-byte magic and the u16 version.
 pub const ENVELOPE_LEN: usize = 10;
@@ -89,14 +89,24 @@ unsafe extern "C" fn read_source(
 /// callers check [`Decoder::ready_available`] or
 /// [`Decoder::step_available`] before [`Decoder::ready`] or
 /// [`Decoder::next_page`].
-pub struct Decoder {
+pub struct Decoder<H: Handler = ()> {
     raw: sys::GhosttySnapshotDecoder,
     source: *mut Source,
-    terminal: Option<Terminal>,
+    terminal: Option<Terminal<H>>,
+    /// Installed on the terminal once it exists.
+    handler: Option<H>,
 }
 
-impl Decoder {
+impl Decoder<()> {
     pub fn new() -> Result<Self> {
+        Self::with_handler(())
+    }
+}
+
+impl<H: Handler> Decoder<H> {
+    /// A decoder whose restored terminal gets `handler` as soon as it
+    /// exists, so effects raised while history is written reach it.
+    pub fn with_handler(handler: H) -> Result<Self> {
         let source = Box::into_raw(Box::new(Source {
             data: Vec::new(),
             pos: 0,
@@ -120,7 +130,16 @@ impl Decoder {
             raw,
             source,
             terminal: None,
+            handler: Some(handler),
         })
+    }
+
+    /// Wraps the terminal the library just returned, with the handler.
+    unsafe fn adopt(&mut self, raw: sys::GhosttyTerminal) -> &mut Terminal<H> {
+        let handler = self.handler.take().expect("one terminal per decoder");
+        // SAFETY: raw is a caller-owned terminal from the decoder.
+        self.terminal
+            .insert(unsafe { Terminal::install(raw, handler, Vec::new()) })
     }
 
     fn source(&self) -> &Source {
@@ -167,14 +186,14 @@ impl Decoder {
     }
 
     /// Decodes through `READY`; the terminal is then renderable.
-    pub fn ready(&mut self) -> Result<&mut Terminal> {
+    pub fn ready(&mut self) -> Result<&mut Terminal<H>> {
         let mut raw = ptr::null_mut();
         // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_ready(self.raw, &mut raw) };
         self.compact();
         check(result)?;
         // SAFETY: on success raw is a caller-owned terminal.
-        Ok(self.terminal.insert(unsafe { Terminal::from_raw(raw) }))
+        Ok(unsafe { self.adopt(raw) })
     }
 
     /// Decodes one history page into the terminal. Returns `false` once
@@ -191,24 +210,24 @@ impl Decoder {
     }
 
     /// Decodes a complete snapshot in one call.
-    pub fn decode(&mut self) -> Result<&mut Terminal> {
+    pub fn decode(&mut self) -> Result<&mut Terminal<H>> {
         let mut raw = ptr::null_mut();
         // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_decode(self.raw, &mut raw) };
         self.compact();
         check(result)?;
         // SAFETY: on success raw is a caller-owned terminal.
-        Ok(self.terminal.insert(unsafe { Terminal::from_raw(raw) }))
+        Ok(unsafe { self.adopt(raw) })
     }
 
     /// The terminal restored so far, for rendering and live input between
     /// pages.
-    pub fn terminal(&mut self) -> Option<&mut Terminal> {
+    pub fn terminal(&mut self) -> Option<&mut Terminal<H>> {
         self.terminal.as_mut()
     }
 
     /// Frees the decoder and releases the terminal, finished or not.
-    pub fn into_terminal(mut self) -> Option<Terminal> {
+    pub fn into_terminal(mut self) -> Option<Terminal<H>> {
         self.terminal.take()
     }
 
@@ -219,7 +238,7 @@ impl Decoder {
     }
 }
 
-impl Drop for Decoder {
+impl<H: Handler> Drop for Decoder<H> {
     fn drop(&mut self) {
         // SAFETY: raw was created by decoder_new and is freed once, before
         // the terminal it borrows (dropped after this) and the source.

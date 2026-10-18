@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 ghostty-vt-sys = { path = "crates/ghostty-vt-sys" }
 ghostty-vt = { path = "crates/ghostty-vt" }
+client = { path = "crates/client" }
 proto = { path = "crates/proto" }
 server = { path = "crates/server" }
 base64 = "0.22"
@@ -19,7 +20,7 @@ libc = "0.2"
 rustix = { version = "1", features = ["pty", "process", "termios", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "sync", "time", "macros", "signal", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }

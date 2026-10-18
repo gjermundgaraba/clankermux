@@ -298,7 +298,11 @@ impl Terminal<()> {
 impl<H: Handler> Terminal<H> {
     /// Installs `handler` and the effect callbacks on a caller-owned raw
     /// terminal.
-    unsafe fn install(raw: sys::GhosttyTerminal, handler: H, xtversion: Vec<u8>) -> Self {
+    pub(crate) unsafe fn install(
+        raw: sys::GhosttyTerminal,
+        handler: H,
+        xtversion: Vec<u8>,
+    ) -> Self {
         let has_xtversion = !xtversion.is_empty();
         let slot = Box::into_raw(Box::new(Slot { handler, xtversion }));
         // SAFETY: the slot lives as long as the terminal, and each callback

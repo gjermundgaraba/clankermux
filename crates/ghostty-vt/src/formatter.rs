@@ -31,9 +31,20 @@ pub struct Options {
     pub modes: bool,
     pub scrolling_region: bool,
     pub keyboard: bool,
-    /// Format only from this row (counted from the top of the scrollback)
-    /// to the end of the screen.
-    pub start_row: Option<u32>,
+    pub region: Region,
+}
+
+/// The part of the terminal to format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Region {
+    /// History and screen.
+    #[default]
+    All,
+    /// From this row (counted from the top of the scrollback) to the end
+    /// of the screen.
+    FromRow(u32),
+    /// The top-left `cols` by `rows` cells of the screen.
+    Clip { cols: u16, rows: u16 },
 }
 
 pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
@@ -65,9 +76,30 @@ pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
         },
         selection: ptr::null(),
     };
-    let selection = match options.start_row {
-        Some(row) => Some(tail_selection(term, row)?),
-        None => None,
+    let active = sys::GHOSTTY_POINT_TAG_ACTIVE;
+    let last_cell = point(
+        term,
+        active,
+        term.cols().saturating_sub(1),
+        u32::from(term.rows().saturating_sub(1)),
+    );
+    let selection = match options.region {
+        Region::All => None,
+        Region::FromRow(row) => Some(selection(
+            point(term, sys::GHOSTTY_POINT_TAG_SCREEN, 0, row)?,
+            last_cell?,
+            false,
+        )),
+        Region::Clip { cols, rows } => Some(selection(
+            point(term, active, 0, 0)?,
+            point(
+                term,
+                active,
+                cols.min(term.cols()).saturating_sub(1),
+                u32::from(rows.min(term.rows()).saturating_sub(1)),
+            )?,
+            true,
+        )),
     };
     if let Some(selection) = &selection {
         raw_options.selection = selection;
@@ -86,32 +118,32 @@ pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// A linear selection from column 0 of screen row `row` to the last cell
-/// of the active area. Valid until the terminal changes.
-fn tail_selection(term: &Term, row: u32) -> Result<sys::GhosttySelection> {
-    let point = |tag, x, y| sys::GhosttyPoint {
+/// The grid reference at a point. Valid until the terminal changes.
+fn point(term: &Term, tag: sys::GhosttyPointTag, x: u16, y: u32) -> Result<sys::GhosttyGridRef> {
+    let point = sys::GhosttyPoint {
         tag,
         value: sys::GhosttyPointValue {
             coordinate: sys::GhosttyPointCoordinate { x, y },
         },
     };
-    let grid_ref = |point| {
-        let mut out = sys::GhosttyGridRef {
-            size: size_of::<sys::GhosttyGridRef>(),
-            ..Default::default()
-        };
-        // SAFETY: term is live and out is a sized GhosttyGridRef.
-        check(unsafe { sys::ghostty_terminal_grid_ref(term.raw(), point, &mut out) })?;
-        Ok(out)
+    let mut out = sys::GhosttyGridRef {
+        size: size_of::<sys::GhosttyGridRef>(),
+        ..Default::default()
     };
-    Ok(sys::GhosttySelection {
+    // SAFETY: term is live and out is a sized GhosttyGridRef.
+    check(unsafe { sys::ghostty_terminal_grid_ref(term.raw(), point, &mut out) })?;
+    Ok(out)
+}
+
+fn selection(
+    start: sys::GhosttyGridRef,
+    end: sys::GhosttyGridRef,
+    rectangle: bool,
+) -> sys::GhosttySelection {
+    sys::GhosttySelection {
         size: size_of::<sys::GhosttySelection>(),
-        start: grid_ref(point(sys::GHOSTTY_POINT_TAG_SCREEN, 0, row))?,
-        end: grid_ref(point(
-            sys::GHOSTTY_POINT_TAG_ACTIVE,
-            term.cols().saturating_sub(1),
-            u32::from(term.rows().saturating_sub(1)),
-        ))?,
-        rectangle: false,
-    })
+        start,
+        end,
+        rectangle,
+    }
 }

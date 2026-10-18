@@ -10,7 +10,16 @@ name = "clankermux"
 path = "src/main.rs"
 
 [dependencies]
+base64 = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+client = { workspace = true }
+ghostty-vt = { workspace = true }
+proto = { workspace = true }
+rustix = { workspace = true }
+serde_json = { workspace = true }
 server = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

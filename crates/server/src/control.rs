@@ -128,7 +128,7 @@ pub async fn handle(
                 formatter::Options {
                     unwrap: true,
                     trim: true,
-                    start_row: Some(start_row as u32),
+                    region: formatter::Region::FromRow(start_row as u32),
                     ..Default::default()
                 },
             )

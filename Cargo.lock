@@ -141,8 +141,15 @@ dependencies = [
 name = "clankermux"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
+ "client",
+ "ghostty-vt",
+ "proto",
+ "rustix",
+ "serde_json",
  "server",
+ "tempfile",
  "tokio",
  "tracing-subscriber",
 ]
@@ -186,6 +193,19 @@ name = "clap_lex"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
+
+[[package]]
+name = "client"
+version = "0.1.0"
+dependencies = [
+ "ghostty-vt",
+ "proto",
+ "serde",
+ "serde_json",
+ "server",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "colorchoice"
