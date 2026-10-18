@@ -35,7 +35,13 @@ impl Records {
     /// order of their last updates.
     pub fn load(mut records: Vec<StatusRecord>) -> Self {
         records.retain(|r| !transient(r));
-        records.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        // Instants, not strings: jiff writes fractions of varying length.
+        let instant = |r: &StatusRecord| r.updated_at.parse::<jiff::Timestamp>().ok();
+        records.sort_by(|a, b| {
+            instant(a)
+                .cmp(&instant(b))
+                .then(a.updated_at.cmp(&b.updated_at))
+        });
         let mut out = Records::default();
         for record in records {
             out.insert(record);
@@ -261,5 +267,16 @@ mod tests {
         // `c` was updated before `b`, so it is evicted first.
         let c = loaded.apply(report(ProgramStatusState::Done, "d", ""), 2, "t4");
         assert_eq!(c.removed, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn loading_orders_by_time_not_text() {
+        // As text, ".15Z" sorts before ".1Z"; as instants it is later.
+        let mut loaded = Records::load(vec![
+            record("later", "done", "2026-01-01T00:00:00.15Z"),
+            record("earlier", "done", "2026-01-01T00:00:00.1Z"),
+        ]);
+        let c = loaded.apply(report(ProgramStatusState::Done, "d", ""), 2, "t4");
+        assert_eq!(c.removed, vec!["earlier".to_string()]);
     }
 }

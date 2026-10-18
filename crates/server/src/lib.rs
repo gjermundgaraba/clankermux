@@ -1,20 +1,20 @@
 //! The clankermux server.
 
-pub mod attach;
-pub mod connection;
-pub mod control;
+mod attach;
+mod connection;
+mod control;
 pub mod park;
 pub mod pty;
-pub mod records;
-pub mod registry;
+mod records;
+mod registry;
 pub mod session;
-pub mod stream;
+mod stream;
 pub mod tailscale;
 pub mod tls;
 pub mod ws;
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use proto::FrameType;
@@ -32,10 +32,9 @@ pub fn frame_json<T: serde::Serialize>(frame_type: FrameType, channel: u32, body
     )
 }
 
-/// Binds the Unix socket (directories it creates 0700, socket 0600) and
-/// serves connections from the server's own uid until the task is
-/// cancelled. Refuses to replace a socket another server is listening on.
-pub async fn serve_unix(socket: PathBuf, registry: Arc<Registry>) -> io::Result<()> {
+/// Binds the Unix socket: directories it creates are 0700, the socket
+/// 0600. Refuses to replace a socket another server is listening on.
+pub fn bind_unix(socket: &Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     if let Some(dir) = socket.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::DirBuilder::new()
@@ -43,15 +42,21 @@ pub async fn serve_unix(socket: PathBuf, registry: Arc<Registry>) -> io::Result<
             .mode(0o700)
             .create(dir)?;
     }
-    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!("another server is listening on {}", socket.display()),
         ));
     }
-    let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)?;
-    std::fs::set_permissions(&socket, PermissionsExt::from_mode(0o600))?;
+    let _ = std::fs::remove_file(socket);
+    let listener = UnixListener::bind(socket)?;
+    std::fs::set_permissions(socket, PermissionsExt::from_mode(0o600))?;
+    Ok(listener)
+}
+
+/// Serves connections from the server's own uid until the task is
+/// cancelled.
+pub async fn serve_unix(listener: UnixListener, registry: Arc<Registry>) -> io::Result<()> {
     let uid = rustix::process::getuid().as_raw();
     loop {
         let stream = match listener.accept().await {
@@ -63,7 +68,7 @@ pub async fn serve_unix(socket: PathBuf, registry: Arc<Registry>) -> io::Result<
         };
         match stream.peer_cred() {
             Ok(cred) if cred.uid() == uid => {
-                tokio::spawn(connection::serve_connection(
+                registry.connections.spawn(connection::serve_connection(
                     stream,
                     registry.clone(),
                     Instant::now(),
@@ -82,8 +87,13 @@ async fn accept_failed(err: io::Error) {
 }
 
 /// Serves `listener` until cancelled: `TCP_NODELAY` on every stream, then
-/// `handle` on its own task with the instant it was accepted.
-pub(crate) async fn serve_tcp_with<F, Fut>(listener: TcpListener, handle: F) -> io::Result<()>
+/// `handle` on a task of `registry.connections` with the instant it was
+/// accepted.
+pub(crate) async fn serve_tcp_with<F, Fut>(
+    listener: TcpListener,
+    registry: &Registry,
+    handle: F,
+) -> io::Result<()>
 where
     F: Fn(TcpStream, Instant) -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
@@ -97,22 +107,25 @@ where
             }
         };
         let _ = stream.set_nodelay(true);
-        tokio::spawn(handle(stream, Instant::now()));
+        registry.connections.spawn(handle(stream, Instant::now()));
     }
 }
 
 /// Serves `listener` until cancelled: plaintext frames. Trust is the
 /// caller's: the binary binds the tailnet address only.
 pub async fn serve_tcp(listener: TcpListener, registry: Arc<Registry>) -> io::Result<()> {
-    serve_tcp_with(listener, move |stream, accepted| {
+    let connections = registry.clone();
+    serve_tcp_with(listener, &connections, move |stream, accepted| {
         connection::serve_connection(stream, registry.clone(), accepted)
     })
     .await
 }
 
-/// `$XDG_STATE_HOME/clankermux`, else `~/.local/state/clankermux`.
+/// `$XDG_STATE_HOME/clankermux`, else `~/.local/state/clankermux`. An
+/// empty variable counts as unset, as the XDG specification says.
 pub fn state_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
         .unwrap_or_else(|| PathBuf::from("."))

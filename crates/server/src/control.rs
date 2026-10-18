@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use proto::{ErrorCode, Event, Request, Size, Viewport};
+use rustix::process::Signal;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::connection::Writer;
+use crate::connection::{Writer, reply};
 use crate::registry::{Fail, Registry, internal};
-use crate::session::{self, Report};
+use crate::session;
 
 /// JSON overhead allowed around `read`'s text within `max_frame`.
 const READ_REPLY_MARGIN: usize = 4096;
@@ -19,7 +20,8 @@ fn json_len(text: &str) -> usize {
     serde_json::to_string(text).map_or(usize::MAX, |s| s.len() - 2)
 }
 
-/// Drops the oldest lines of `text` until its JSON string fits `budget`.
+/// Drops the oldest lines of `text` until its JSON string fits `budget`;
+/// when not even the last line fits, its newest characters are kept.
 fn fit_json(text: &mut String, budget: usize) {
     if json_len(text) <= budget {
         return;
@@ -29,6 +31,16 @@ fn fit_json(text: &mut String, budget: usize) {
     for line in text.split_inclusive('\n').rev() {
         let len = json_len(line);
         if kept + len > budget {
+            if kept == 0 {
+                for (at, ch) in line.char_indices().rev() {
+                    let len = json_len(ch.encode_utf8(&mut [0; 4]));
+                    if kept + len > budget {
+                        break;
+                    }
+                    kept += len;
+                    start = text.len() - line.len() + at;
+                }
+            }
             break;
         }
         kept += len;
@@ -44,7 +56,45 @@ fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
 
 /// Handles one request on a connection whose `subscribed` flag records
 /// whether it already receives events.
-pub async fn handle(
+/// `write`, which is answered once the PTY took the bytes; meanwhile the
+/// connection reads on.
+pub fn write(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
+    let started = (|| {
+        let p: proto::WriteParams = params(p)?;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(&p.data)
+            .map_err(|e| {
+                (
+                    ErrorCode::InvalidRequest,
+                    format!("data is not base64: {e}"),
+                )
+            })?;
+        let session = registry.get(&p.session)?;
+        session
+            .lock()
+            .unwrap()
+            .running()?
+            .input
+            .push(data)
+            .ok_or((ErrorCode::InputOverflow, "input queue full".into()))
+    })();
+    match started {
+        Err(fail) => reply(writer, id, Err(fail)),
+        Ok(wait) => {
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                let outcome = wait
+                    .await
+                    .map(|()| json!({}))
+                    .map_err(|_| internal("the PTY refused the bytes"));
+                reply(&writer, id, outcome);
+            });
+        }
+    }
+}
+
+/// Handles one request but `write`.
+pub fn handle(
     registry: &Arc<Registry>,
     writer: &Writer,
     subscribed: &mut bool,
@@ -65,18 +115,15 @@ pub async fn handle(
         }
         "end" | "signal" => {
             let (id, signal) = if request.method == "end" {
-                (
-                    params::<proto::SessionParams>(p)?.session,
-                    "HUP".to_string(),
-                )
+                (params::<proto::SessionParams>(p)?.session, Signal::HUP)
             } else {
                 let p: proto::SignalParams = params(p)?;
-                (p.session, p.signal)
+                let signal = crate::pty::signal_by_name(&p.signal).ok_or((
+                    ErrorCode::InvalidRequest,
+                    format!("unknown signal {}", p.signal),
+                ))?;
+                (p.session, signal)
             };
-            let signal = crate::pty::signal_by_name(&signal).ok_or((
-                ErrorCode::InvalidRequest,
-                format!("unknown signal {signal}"),
-            ))?;
             let session = registry.get(&id)?;
             let (pgid, slave) = {
                 let s = session.lock().unwrap();
@@ -121,11 +168,9 @@ pub async fn handle(
             session::check_size(&size)?;
             let session = registry.get(&p.session)?;
             session.lock().unwrap().running()?;
-            let report = Report {
-                viewport: Viewport {
-                    size,
-                    profile: None,
-                },
+            let report = Viewport {
+                size,
+                profile: None,
             };
             session::report(registry, &session, report, true);
             Ok(json!({}))
@@ -137,13 +182,13 @@ pub async fn handle(
             let mut text = s
                 .read_text(p.scrollback.unwrap_or(0) as usize)
                 .map_err(internal)?;
+            if !text.is_empty() {
+                text.push('\n');
+            }
             fit_json(
                 &mut text,
                 (registry.config.limits.max_frame as usize).saturating_sub(READ_REPLY_MARGIN),
             );
-            if !text.is_empty() {
-                text.push('\n');
-            }
             let info = s.to_proto(false);
             Ok(json!(proto::Read {
                 text,
@@ -157,28 +202,6 @@ pub async fn handle(
                 status: s.status(),
             }))
         }
-        "write" => {
-            let p: proto::WriteParams = params(p)?;
-            let data = base64::engine::general_purpose::STANDARD
-                .decode(&p.data)
-                .map_err(|e| {
-                    (
-                        ErrorCode::InvalidRequest,
-                        format!("data is not base64: {e}"),
-                    )
-                })?;
-            let session = registry.get(&p.session)?;
-            let wait = session
-                .lock()
-                .unwrap()
-                .running()?
-                .input
-                .push(data)
-                .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?;
-            wait.await
-                .map_err(|_| internal("the PTY refused the bytes"))?;
-            Ok(json!({}))
-        }
         "subscribe" => {
             if *subscribed {
                 return Ok(json!(registry.page(None)));
@@ -187,5 +210,24 @@ pub async fn handle(
             Ok(json!(registry.subscribe(writer.clone())))
         }
         other => Err((ErrorCode::InvalidRequest, format!("unknown method {other}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_json;
+
+    #[test]
+    fn fitting_keeps_the_newest_lines_or_the_tail_of_one() {
+        // "bb\n" is four JSON bytes: the newline escapes to two.
+        let mut text = "aaaa\nbb\ncc\n".to_string();
+        fit_json(&mut text, 8);
+        assert_eq!(text, "bb\ncc\n");
+        let mut text = "xxxxxxxxxx\n".to_string();
+        fit_json(&mut text, 4);
+        assert_eq!(text, "xx\n");
+        let mut quoted = "a\"b\n".to_string();
+        fit_json(&mut quoted, 3);
+        assert_eq!(quoted, "b\n");
     }
 }

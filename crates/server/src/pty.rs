@@ -6,6 +6,7 @@ use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Mutex;
 
 use rustix::process::{Pid, Signal};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
@@ -26,6 +27,11 @@ pub fn spawn(
     cols: u16,
     rows: u16,
 ) -> io::Result<(Pty, Child)> {
+    // Where `posix_openpt` cannot take `O_CLOEXEC`, a fork between the
+    // open and the flag would inherit the master; the forks are here, so
+    // one spawn at a time keeps every master out of every other child.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _spawning = ONE_AT_A_TIME.lock().unwrap();
     let master = open_master()?;
     grantpt(&master)?;
     unlockpt(&master)?;

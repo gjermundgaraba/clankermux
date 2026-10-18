@@ -71,13 +71,14 @@ const REPAINT: Duration = Duration::from_millis(16);
 const CHANNEL: u32 = 1;
 
 /// Leaves every mode passthrough or a paint may have set: attributes,
-/// cursor hidden, main screen, mouse off (and its encodings), bracketed
-/// paste and focus off, modifyOtherKeys and kitty keys off, cursor keys
-/// and keypad normal, no scrolling region, origin mode off, autowrap on,
-/// default cursor style, synchronized output off.
-const RESET_MODES: &[u8] = b"\x1b[0m\x1b[?25l\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1015l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[>4;0m\x1b[<u\x1b[=0;1u\x1b[?1l\x1b>\x1b[r\x1b[?6l\x1b[?7h\x1b[0 q\x1b[?2026l";
-/// The reset written on exit: the modes, then the cursor shown.
-const RESET: &[u8] = b"\x1b[0m\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1015l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[>4;0m\x1b[<u\x1b[=0;1u\x1b[?1l\x1b>\x1b[r\x1b[?6l\x1b[?7h\x1b[0 q\x1b[?2026l\x1b[?25h";
+/// main screen, mouse off (and its encodings), bracketed paste and focus
+/// off, modifyOtherKeys and kitty keys off, cursor keys and keypad
+/// normal, no scrolling region, origin mode off, autowrap on, default
+/// cursor style, synchronized output off. A paint hides the cursor
+/// first; the exit shows it after.
+const RESET_MODES: &[u8] = b"\x1b[0m\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1015l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[>4;0m\x1b[<u\x1b[=0;1u\x1b[?1l\x1b>\x1b[r\x1b[?6l\x1b[?7h\x1b[0 q\x1b[?2026l";
+const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
+const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 
 /// Raw mode on stdin, restored on drop.
 struct Raw {
@@ -132,6 +133,10 @@ struct Shell {
     /// The detach prefix was pressed: its encoding, sent on if what
     /// follows is not `d`.
     armed: Option<Vec<u8>>,
+    /// The attachment is to be made afresh: a client-side protocol
+    /// error or `too_slow`, which the protocol has the client recover
+    /// from by attaching again.
+    reopen: bool,
 }
 
 /// Why the attach ended.
@@ -198,8 +203,7 @@ impl Shell {
             },
         );
         let visible = term.mode(25).unwrap_or(true) && cursor_col < clip.0;
-        let mut out = RESET_MODES.to_vec();
-        out.extend_from_slice(b"\x1b[H\x1b[2J");
+        let mut out = [HIDE_CURSOR, RESET_MODES, b"\x1b[H\x1b[2J"].concat();
         if let Ok(painted) = painted {
             out.extend_from_slice(&painted);
         }
@@ -209,7 +213,7 @@ impl Shell {
             format!("\x1b[{};{}H", cursor_row - from_row + 1, cursor_col + 1).as_bytes(),
         );
         if visible {
-            out.extend_from_slice(b"\x1b[?25h");
+            out.extend_from_slice(SHOW_CURSOR);
         }
         write_out(&out);
     }
@@ -244,10 +248,20 @@ impl Shell {
                 self.paint();
             }
             Action::Gap(_) => {}
-            Action::Exited(exit) => return Some(Outcome::Exited(exit)),
+            Action::Exited(exit) => {
+                // The final output may still be waiting for its repaint.
+                if self.repaint_at.is_some() {
+                    self.paint();
+                }
+                return Some(Outcome::Exited(exit));
+            }
             Action::Closed(reason) => return Some(Outcome::Closed(reason)),
             Action::Error(error) => {
                 if self.attachment.ended() {
+                    if error.code == proto::ErrorCode::TooSlow {
+                        self.reopen = true;
+                        return None;
+                    }
                     return Some(Outcome::Failed(Error::Server(error).to_string()));
                 }
                 write_out(b"\x07");
@@ -275,7 +289,13 @@ impl Shell {
             vt::complete_prefix(&self.pending, strings)
         };
         let bytes: Vec<u8> = self.pending.drain(..complete).collect();
-        self.keys_at = (!self.pending.is_empty()).then(|| Instant::now() + KEY_TIMEOUT);
+        // The wait for the rest of a sequence starts once, with its first
+        // byte.
+        self.keys_at = if self.pending.is_empty() {
+            None
+        } else {
+            self.keys_at.or_else(|| Some(Instant::now() + KEY_TIMEOUT))
+        };
         let bytes = match self.attachment.term() {
             Some(term) => term.handler_mut().filter(&bytes),
             None => bytes,
@@ -383,6 +403,7 @@ pub async fn run(opts: Options) -> Result<ExitCode, Error> {
         pending: Vec::new(),
         keys_at: None,
         armed: None,
+        reopen: false,
     };
     let mut link = match open(&mut shell, &conn) {
         Ok(frames) => Link::Up {
@@ -409,12 +430,21 @@ pub async fn run(opts: Options) -> Result<ExitCode, Error> {
         let keys = tokio::select! {
             event = link.next() => match event {
                 LinkEvent::Frame(frame) => {
-                    let actions = match shell.attachment.handle(frame) {
-                        Ok(actions) => actions,
-                        Err(err) => break Outcome::Failed(err.to_string()),
-                    };
-                    if let Some(outcome) = actions.into_iter().find_map(|a| shell.apply(a)) {
-                        break outcome;
+                    match shell.attachment.handle(frame) {
+                        Ok(actions) => {
+                            if let Some(outcome) = actions.into_iter().find_map(|a| shell.apply(a)) {
+                                break outcome;
+                            }
+                        }
+                        Err(_) => shell.reopen = true,
+                    }
+                    if shell.reopen {
+                        // Afresh, on a new connection: the attachment's
+                        // state is not to be trusted, and a new OPEN
+                        // after CLOSE needs the CLOSED first anyway.
+                        shell.reopen = false;
+                        shell.attachment = Attachment::new();
+                        link = Link::Down(reconnect(shell.opts.endpoint.clone()));
                     }
                     continue;
                 }
@@ -474,7 +504,7 @@ pub async fn run(opts: Options) -> Result<ExitCode, Error> {
             }
         }
     };
-    write_out(RESET);
+    write_out(&[RESET_MODES, SHOW_CURSOR].concat());
     drop(raw);
     let (message, code) = match outcome {
         Outcome::Detached => ("detached".to_string(), ExitCode::SUCCESS),
@@ -496,10 +526,7 @@ pub async fn run(opts: Options) -> Result<ExitCode, Error> {
         Outcome::Closed(ClosedReason::Removed) => {
             ("session removed".to_string(), ExitCode::SUCCESS)
         }
-        Outcome::Closed(reason) => (
-            format!("closed: {reason:?}").to_lowercase(),
-            ExitCode::SUCCESS,
-        ),
+        Outcome::Closed(reason) => (format!("closed: {reason}"), ExitCode::SUCCESS),
         Outcome::Failed(message) => (message, ExitCode::FAILURE),
     };
     eprintln!("\r\n[clankermux: {message}]");
@@ -529,6 +556,7 @@ mod tests {
             pending: Vec::new(),
             keys_at: None,
             armed: None,
+            reopen: false,
         }
     }
 

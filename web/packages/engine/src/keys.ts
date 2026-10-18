@@ -33,14 +33,15 @@ export function keyName(code: string): string {
     .toUpperCase();
 }
 
-/** Whether `key` is text the key produces rather than a key name. */
-function isText(key: string): boolean {
+/** Whether `key` is text the key produces rather than a key name such as
+ * "Enter" or "ArrowUp" (which, per UI Events, is ASCII letters and digits
+ * starting with a capital, two or more of them; text of that shape is one
+ * character). */
+export function isText(key: string): boolean {
   if (key.length === 0) return false;
   const cp = key.codePointAt(0)!;
   if (cp < 0x20 || cp === 0x7f) return false;
-  // A key name such as "Enter" or "ArrowUp" has several code points; text
-  // has one (or one grapheme such as an emoji).
-  return [...key].length === 1;
+  return key.length === 1 || !/^[A-Z][A-Za-z0-9]+$/.test(key);
 }
 
 /** Encodes browser key events with the engine, following the terminal's modes. */

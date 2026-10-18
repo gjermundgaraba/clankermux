@@ -4,20 +4,15 @@
 //!
 //!     cargo run --release -p clankermux --example measure
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use client::connection::hello;
 use client::{Connection, Endpoint};
 use proto::*;
 use serde_json::json;
-use tokio::net::{TcpListener, TcpStream};
+use testkit::connect_ws;
 use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::pki_types::pem::PemObject;
-use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const MIB: u64 = 1024 * 1024;
 /// A producer of `bytes` of distinct 80-column lines.
@@ -29,67 +24,21 @@ fn producer(bytes: u64) -> String {
 }
 
 struct Lab {
-    registry: Arc<server::Registry>,
-    socket: PathBuf,
+    server: testkit::Server,
     tcp: std::net::SocketAddr,
     wss: std::net::SocketAddr,
     connector: TlsConnector,
-    dir: tempfile::TempDir,
 }
 
 async fn lab() -> Lab {
-    let dir = tempfile::tempdir().unwrap();
-    let registry = server::Registry::new(server::Config {
-        limits: Limits::default(),
-        shell: vec!["/bin/sh".into()],
-        home: dir.path().to_path_buf(),
-        version: "measure".into(),
-        state_dir: dir.path().join("state"),
-    })
-    .unwrap();
-    let socket = dir.path().join("sock");
-    tokio::spawn(server::serve_unix(socket.clone(), registry.clone()));
-    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let tcp = tcp_listener.local_addr().unwrap();
-    tokio::spawn(server::serve_tcp(tcp_listener, registry.clone()));
-    // A certificate for the run, trusted by the client below.
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let cert = dir.path().join("cert.pem");
-    let key = dir.path().join("key.pem");
-    std::fs::write(&cert, certified.cert.pem()).unwrap();
-    std::fs::write(&key, certified.signing_key.serialize_pem()).unwrap();
-    let tls = server::tls::Tls::start(server::tls::Source::Files { cert, key })
-        .await
-        .unwrap();
-    let wss_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let wss = wss_listener.local_addr().unwrap();
-    tokio::spawn(server::ws::serve_ws(
-        wss_listener,
-        registry.clone(),
-        tls,
-        vec!["http://measure".into()],
-    ));
-    let mut roots = RootCertStore::empty();
-    roots
-        .add(CertificateDer::from_pem_slice(certified.cert.pem().as_bytes()).unwrap())
-        .unwrap();
-    let config = ClientConfig::builder_with_provider(Arc::new(
-        tokio_rustls::rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    while tokio::net::UnixStream::connect(&socket).await.is_err() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let server = testkit::Server::start(Limits::default());
+    let tcp = server.listen_tcp().await;
+    let (wss, connector) = server.listen_wss(vec!["http://measure".into()]).await;
     Lab {
-        registry,
-        socket,
+        server,
         tcp,
         wss,
-        connector: TlsConnector::from(Arc::new(config)),
-        dir,
+        connector,
     }
 }
 
@@ -97,26 +46,17 @@ impl Lab {
     async fn connect(&self, carrier: &str) -> Connection {
         let hello = hello("measure", Some(ghostty_vt::ENGINE));
         match carrier {
-            "unix" => Connection::connect_unix(&self.socket, hello).await.unwrap(),
+            "unix" => Connection::connect_unix(&self.server.socket, hello)
+                .await
+                .unwrap(),
             "tcp" => Endpoint::Tcp(self.tcp.to_string())
                 .connect(hello)
                 .await
                 .unwrap(),
             "wss" => {
-                let tcp = TcpStream::connect(self.wss).await.unwrap();
-                let _ = tcp.set_nodelay(true);
-                let tls = self
-                    .connector
-                    .connect(ServerName::try_from("localhost").unwrap(), tcp)
+                let ws = connect_ws(self.wss, &self.connector, "/", Some("http://measure"))
                     .await
                     .unwrap();
-                let mut request = format!("wss://localhost:{}/", self.wss.port())
-                    .into_client_request()
-                    .unwrap();
-                request
-                    .headers_mut()
-                    .insert("Origin", "http://measure".parse().unwrap());
-                let (ws, _) = tokio_tungstenite::client_async(request, tls).await.unwrap();
                 Connection::handshake(
                     server::ws::WsStream::new(ws, Limits::default().max_frame),
                     hello,
@@ -357,7 +297,15 @@ async fn main() {
         wait_text(&control, &session.id, "READY-MARK").await;
         let conn = lab.connect("unix").await;
         let (elapsed, size) = bootstrap(&conn, &session.id).await;
-        let rows = match &lab.registry.get(&session.id).unwrap().lock().unwrap().body {
+        let rows = match &lab
+            .server
+            .registry
+            .get(&session.id)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .body
+        {
             server::session::Body::Live(live) => live.term.scrollback_rows(),
             server::session::Body::Parked(_) => 0,
         };
@@ -381,11 +329,11 @@ async fn main() {
 
     println!("\n## Park\n");
     let big = big.unwrap();
-    let shared = lab.registry.get(&big).unwrap();
+    let shared = lab.server.registry.get(&big).unwrap();
     let started = Instant::now();
-    lab.registry.park(&shared).await;
+    lab.server.registry.park(&shared).await;
     let elapsed = started.elapsed();
-    let size = dir_size(&lab.dir.path().join("state/sessions").join(&big));
+    let size = dir_size(&lab.server.dir.path().join("state/sessions").join(&big));
     println!(
         "A session with 10 MiB of scrollback parks in {:.0} ms into {:.2} MiB of files.\n",
         elapsed.as_secs_f64() * 1000.0,
@@ -405,9 +353,9 @@ async fn main() {
         println!("| {carrier} | {rate:.0} | {gaps} |");
     }
 
-    // The temporary directory goes before the exit, which skips `Drop`;
-    // the exit itself is for the PTY reader threads of the killed
-    // sessions, which a runtime drop would wait for.
+    // The lab (its server and temporary directory) goes before the exit,
+    // which skips `Drop`; the exit itself is for the killed sessions'
+    // reader tasks, which a runtime drop would wait for.
     drop(lab);
     std::process::exit(0);
 }

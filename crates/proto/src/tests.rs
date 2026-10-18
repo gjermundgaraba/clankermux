@@ -30,7 +30,12 @@ fn frame_type_vectors() {
     for (name, value) in types {
         let value = value.as_u64().unwrap() as u8;
         let frame_type = FrameType::from_u8(value).unwrap_or_else(|| panic!("{name}"));
-        assert_eq!(serde_json::to_value(frame_type).unwrap(), name.as_str());
+        // The vectors name types in snake_case; the enum in CamelCase.
+        let camel: String = name
+            .split('_')
+            .map(|w| w[..1].to_uppercase() + &w[1..])
+            .collect();
+        assert_eq!(format!("{frame_type:?}"), camel);
     }
     let known: Vec<u64> = types.values().map(|v| v.as_u64().unwrap()).collect();
     for byte in 0..=u8::MAX {

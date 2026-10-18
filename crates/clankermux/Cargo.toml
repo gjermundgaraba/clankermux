@@ -2,12 +2,9 @@
 name = "clankermux"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-
-[[bin]]
-name = "clankermux"
-path = "src/main.rs"
 
 [dependencies]
 base64 = { workspace = true }
@@ -23,7 +20,7 @@ tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
-tempfile = "3"
+tempfile = { workspace = true }
+testkit = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }

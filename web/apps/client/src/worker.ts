@@ -4,7 +4,7 @@
  */
 import { type Action, Attachment, ClientError, Connection, Osc52Scanner, type Transport, hello } from "@clankermux/client";
 import { ENGINE, Engine, KeyEncoder, RenderState, type Terminal } from "@clankermux/engine";
-import { type Event, FrameType, type Page, type Profile, type Session, type Size } from "@clankermux/proto";
+import { type Event, FrameType, HEADER_LEN, type Page, type Profile, type Session, type Size } from "@clankermux/proto";
 
 import type { ToPage, ToWorker } from "./protocol.ts";
 
@@ -20,6 +20,15 @@ const post = (message: ToPage) => port.postMessage(message);
 const PAINT_MS = 16;
 const BACKOFF_MIN_MS = 250;
 const BACKOFF_MAX_MS = 5000;
+/** Ending errors that a new OPEN would only get again. */
+const PERMANENT = new Set<string>([
+  "no_such_session",
+  "engine_mismatch",
+  "invalid_request",
+  "protocol_error",
+  "version_mismatch",
+  "channel_in_use",
+]);
 
 /** A WebSocket as the client's message transport. */
 class SocketTransport implements Transport {
@@ -236,8 +245,13 @@ class Client {
         break;
       case "error":
         post({ type: "status", text: `${action.error.code}: ${action.error.message}` });
-        // A fatal error ended the attachment; attach again after a backoff.
-        if (this.attachment?.closed()) this.reopen();
+        // An error ended the attachment: attach again after a backoff
+        // (`too_slow`, a snapshot that could not be taken), unless a new
+        // OPEN would fail the same way.
+        if (this.attachment?.closed()) {
+          if (PERMANENT.has(action.error.code)) this.detach();
+          else this.reopen();
+        }
         break;
     }
   }
@@ -314,12 +328,16 @@ class Client {
     }
   }
 
-  /** Input for the session, dropped unless attached on a live connection. */
+  /** Input for the session, dropped unless attached on a live connection;
+   * a paste longer than a frame goes as several. */
   private input(bytes: Uint8Array): void {
     const attachment = this.attachment;
     if (bytes.length === 0 || !this.conn || !attachment || attachment.ended()) return;
+    const chunk = this.conn.welcome.limits.max_frame - HEADER_LEN;
     try {
-      this.conn.send(FrameType.Input, this.channel, bytes);
+      for (let at = 0; at < bytes.length; at += chunk) {
+        this.conn.send(FrameType.Input, this.channel, bytes.subarray(at, at + chunk));
+      }
     } catch {
       // Reported through onEnd.
     }

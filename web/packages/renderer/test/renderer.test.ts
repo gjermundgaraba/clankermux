@@ -2,7 +2,7 @@ import { expect, test } from "vitest";
 
 import { type Cell, FLAG, type Frame, NO_COLOR } from "@clankermux/engine";
 
-import { CanvasRenderer, type Context2D, type Metrics, css } from "../src/index.ts";
+import { CanvasRenderer, type Context2D, type Metrics } from "../src/index.ts";
 
 type Op = ["rect", string, number, number, number, number] | ["text", string, string, number, number];
 
@@ -40,16 +40,10 @@ const frame = (lines: Frame["lines"], cursor: Frame["cursor"], full = false): Fr
   cols: 3,
   rows: 2,
   full,
-  background: NO_COLOR,
-  foreground: NO_COLOR,
+  background: 0x000000,
+  foreground: 0xffffff,
   cursor,
   lines,
-});
-
-test("colours convert", () => {
-  expect(css(0xff0000, "x")).toBe("#ff0000");
-  expect(css(0x000001, "x")).toBe("#000001");
-  expect(css(NO_COLOR, "x")).toBe("x");
 });
 
 test("a full frame clears, rows draw their cells, and the cursor moves between frames", () => {
@@ -61,7 +55,7 @@ test("a full frame clears, rows draw their cells, and the cursor moves between f
         { y: 0, cells: [cell("a", { flags: FLAG.BOLD, fg: 0xff0000 }), cell("漢", { flags: FLAG.WIDE }), cell("", { flags: FLAG.SPACER })] },
         { y: 1, cells: [cell("b", { bg: 0x0000ff }), cell(" "), blank()] },
       ],
-      { x: 0, y: 1, visible: true, blinking: false, style: 1, color: NO_COLOR },
+      { x: 0, y: 1, visible: true, blinking: false, style: "block", color: NO_COLOR },
       true,
     ),
   );
@@ -79,7 +73,7 @@ test("a full frame clears, rows draw their cells, and the cursor moves between f
   // Only row 0 changed, but the cursor left row 1: that row is redrawn
   // from the cache without the cursor, and the cursor drawn on row 0.
   ctx.ops = [];
-  r.draw(frame([{ y: 0, cells: [cell("c"), blank(), blank()] }], { x: 2, y: 0, visible: true, blinking: false, style: 0, color: 0x00ff00 }));
+  r.draw(frame([{ y: 0, cells: [cell("c"), blank(), blank()] }], { x: 2, y: 0, visible: true, blinking: false, style: "bar", color: 0x00ff00 }));
   expect(ctx.ops[0]).toEqual(["rect", "#000000", 0, 0, 30, 20]);
   expect(ctx.texts()).toEqual(["c", "b"]);
   expect(ctx.ops.at(-1)).toEqual(["rect", "#00ff00", 20, 0, 2, 20]);
@@ -87,12 +81,12 @@ test("a full frame clears, rows draw their cells, and the cursor moves between f
   // Hiding the cursor on its own row erases it: row 0 is redrawn from
   // the cache without the cursor. Inverse swaps the colours.
   ctx.ops = [];
-  r.draw(frame([{ y: 1, cells: [cell("x", { flags: FLAG.INVERSE }), blank(), blank()] }], { x: 2, y: 0, visible: false, blinking: false, style: 0, color: 0x00ff00 }));
+  r.draw(frame([{ y: 1, cells: [cell("x", { flags: FLAG.INVERSE }), blank(), blank()] }], { x: 2, y: 0, visible: false, blinking: false, style: "bar", color: 0x00ff00 }));
   expect(ctx.ops).toContainEqual(["rect", "#ffffff", 0, 20, 10, 20]);
   expect(ctx.texts()).toEqual(["x", "c"]);
   expect(ctx.ops.filter((op) => op[1] === "#0f0" || op[1] === "#00ff00")).toEqual([]);
   // Nothing to erase the next time.
   ctx.ops = [];
-  r.draw(frame([], { x: 2, y: 0, visible: false, blinking: false, style: 0, color: 0x00ff00 }));
+  r.draw(frame([], { x: 2, y: 0, visible: false, blinking: false, style: "bar", color: 0x00ff00 }));
   expect(ctx.ops).toEqual([]);
 });

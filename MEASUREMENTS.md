@@ -9,7 +9,7 @@ run, wall clock. Numbers are indicative, not a benchmark.
 
 ## Idle cost
 
-Sessions created with the login shell (`/bin/sh`), 80x24, nobody attached. RSS is
+Sessions created with the example's default shell (`/bin/sh`), 80x24, nobody attached. RSS is
 the measuring process's (`ps`, one sample), which holds the server, the clients and
 the measurement itself and not the sessions' shells; CPU is the process's over 10 s,
 in percent of one core, at the 10 ms resolution of `ps`. A single sample is noisy
@@ -45,7 +45,7 @@ to two milliseconds at this size.
 ## Park
 
 A session with 10 MiB of scrollback written (the retained 14,624 rows) parks in
-20 ms into 2.27 MiB of files (`snapshot.ghostsnp`, `screen.txt`, `park.json`).
+20 ms into 2.27 MiB of files (`snapshot.ghostsnp`, `screen.txt`, `session.json`).
 
 ## Stream throughput
 
@@ -60,7 +60,9 @@ frames (none: the client kept up).
 | wss | 34 | 0 |
 
 The three carriers are within noise of each other, so the WebSocket's TLS and
-framing cost nothing visible at this rate. The bound is upstream of the carrier:
+framing cost nothing visible at this rate. The `wss` row drives the Rust client
+through the server's own WebSocket adapter (the Rust client has no WebSocket
+endpoint); it measures the carrier, not the browser client. The bound is upstream of the carrier:
 the `awk` pipeline alone writes 64 MiB to `/dev/null` at about 105 MiB/s, so it
 is the PTY, the engine's parse or the stream path, which this run does not
 separate.

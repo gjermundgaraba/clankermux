@@ -10,13 +10,13 @@ use crate::io;
 use crate::terminal::{Handler, Term, Terminal};
 
 /// Bytes before the first record: the 8-byte magic and the u16 version.
-pub const ENVELOPE_LEN: usize = 10;
+pub(crate) const ENVELOPE_LEN: usize = 10;
 /// Bytes in a record header: tag u16, payload length u32, CRC32C u32.
-pub const RECORD_HEADER_LEN: usize = 10;
+pub(crate) const RECORD_HEADER_LEN: usize = 10;
 
-pub const TAG_PAGE: u16 = 3;
-pub const TAG_READY: u16 = 5;
-pub const TAG_FINISH: u16 = 6;
+pub(crate) const TAG_PAGE: u16 = 3;
+pub(crate) const TAG_READY: u16 = 5;
+pub(crate) const TAG_FINISH: u16 = 6;
 
 /// Encodes the whole terminal, history included, into one buffer.
 pub fn encode(term: &Term) -> Result<Vec<u8>> {
@@ -35,7 +35,7 @@ pub fn encode(term: &Term) -> Result<Vec<u8>> {
 
 /// The record starting at `pos`: its tag and the position just past it,
 /// or `None` when the buffer ends before the record does.
-pub fn record_at(buf: &[u8], pos: usize) -> Option<(u16, usize)> {
+pub(crate) fn record_at(buf: &[u8], pos: usize) -> Option<(u16, usize)> {
     let header = buf.get(pos..pos + RECORD_HEADER_LEN)?;
     let tag = u16::from_le_bytes([header[0], header[1]]);
     let len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
@@ -51,7 +51,7 @@ pub fn ready_end(buf: &[u8]) -> Option<usize> {
 
 /// Position just past the next `PAGE` or `FINISH` record at or after
 /// `pos`, which is what one decoder `next_page` call consumes.
-pub fn step_end(buf: &[u8], pos: usize) -> Option<usize> {
+pub(crate) fn step_end(buf: &[u8], pos: usize) -> Option<usize> {
     end_of_step(buf, pos, |tag| tag == TAG_PAGE || tag == TAG_FINISH)
 }
 
@@ -100,6 +100,9 @@ pub struct Decoder<H: Handler = ()> {
     raw: sys::GhosttySnapshotDecoder,
     source: *mut Source,
     terminal: Option<Terminal<H>>,
+    /// The raw terminal the library retains between steps; `terminal`
+    /// must still be it, or the library would use a freed one.
+    adopted: sys::GhosttyTerminal,
     /// Installed on the terminal once it exists.
     handler: Option<H>,
 }
@@ -137,6 +140,7 @@ impl<H: Handler> Decoder<H> {
             raw,
             source,
             terminal: None,
+            adopted: ptr::null_mut(),
             handler: Some(handler),
         })
     }
@@ -144,9 +148,20 @@ impl<H: Handler> Decoder<H> {
     /// Wraps the terminal the library just returned, with the handler.
     unsafe fn adopt(&mut self, raw: sys::GhosttyTerminal) -> &mut Terminal<H> {
         let handler = self.handler.take().expect("one terminal per decoder");
+        self.adopted = raw;
         // SAFETY: raw is a caller-owned terminal from the decoder.
         self.terminal
             .insert(unsafe { Terminal::install(raw, handler, Vec::new()) })
+    }
+
+    /// Refuses to go on when the terminal handed out was replaced (safe
+    /// code can `mem::replace` through the `&mut`), since the library
+    /// still holds the one it returned.
+    fn intact(&self) -> Result<()> {
+        match &self.terminal {
+            Some(terminal) if terminal.raw() != self.adopted => Err(Error::InvalidValue),
+            _ => Ok(()),
+        }
     }
 
     fn source(&self) -> &Source {
@@ -206,6 +221,7 @@ impl<H: Handler> Decoder<H> {
     /// Decodes one history page into the terminal. Returns `false` once
     /// `FINISH` is validated.
     pub fn next_page(&mut self) -> Result<bool> {
+        self.intact()?;
         // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_next(self.raw) };
         self.compact();
@@ -218,6 +234,7 @@ impl<H: Handler> Decoder<H> {
 
     /// Decodes a complete snapshot in one call.
     pub fn decode(&mut self) -> Result<&mut Terminal<H>> {
+        self.intact()?;
         let mut raw = ptr::null_mut();
         // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_decode(self.raw, &mut raw) };

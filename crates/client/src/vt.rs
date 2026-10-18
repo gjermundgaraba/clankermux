@@ -182,22 +182,24 @@ pub fn shape(seq: &[u8]) -> Option<Shape> {
     }
 }
 
-/// A kitty keyboard protocol key event `CSI code ; mods [: event] u`:
-/// the Unicode key code and the modifier bits (shift 1, alt 2, ctrl 4,
-/// super 8), as the terminal sends them when a program enabled the
-/// protocol.
+/// A kitty keyboard protocol key press or repeat `CSI code ; mods [:
+/// event] u`: the Unicode key code and the modifier bits (shift 1, alt
+/// 2, ctrl 4, super 8), as the terminal sends them when a program
+/// enabled the protocol. A release (event 3) is `None`.
 pub fn kitty_key(seq: &[u8]) -> Option<(u32, u32)> {
     let body = seq.strip_prefix(b"\x1b[")?.strip_suffix(b"u")?;
     let body = std::str::from_utf8(body).ok()?;
     let mut fields = body.split(';');
     let code = fields.next()?.split(':').next()?.parse().ok()?;
     let mods = match fields.next() {
-        Some(mods) => mods
-            .split(':')
-            .next()?
-            .parse::<u32>()
-            .ok()?
-            .saturating_sub(1),
+        Some(mods) => {
+            let mut parts = mods.split(':');
+            let mods = parts.next()?.parse::<u32>().ok()?.saturating_sub(1);
+            if parts.next() == Some("3") {
+                return None;
+            }
+            mods
+        }
         None => 0,
     };
     Some((code, mods))
@@ -277,6 +279,8 @@ mod tests {
         assert_eq!(kitty_key(b"\x1b[92;5u"), Some((92, 4)));
         assert_eq!(kitty_key(b"\x1b[100u"), Some((100, 0)));
         assert_eq!(kitty_key(b"\x1b[100;1:1u"), Some((100, 0)));
+        assert_eq!(kitty_key(b"\x1b[100;5:2u"), Some((100, 4)), "repeat");
+        assert_eq!(kitty_key(b"\x1b[100;5:3u"), None, "release");
         assert_eq!(kitty_key(b"\x1b[97:65;2u"), Some((97, 1)));
         assert_eq!(kitty_key(b"\x1b[A"), None);
         assert_eq!(kitty_key(b"\x1b[1;2R"), None);

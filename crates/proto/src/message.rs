@@ -337,6 +337,20 @@ pub struct Gap {
     pub to: u64,
 }
 
+/// Displays a wire enum as its JSON name.
+macro_rules! wire_display {
+    ($($t:ty),*) => {$(
+        impl std::fmt::Display for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let value = serde_json::to_value(self).expect("serializable");
+                f.write_str(value.as_str().expect("a string"))
+            }
+        }
+    )*};
+}
+
+wire_display!(ErrorCode, Status, ClosedReason);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClosedReason {

@@ -3,22 +3,16 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
 use futures_util::{SinkExt, StreamExt};
 use proto::*;
 use serde_json::json;
+use testkit::{ClientWs, connect_ws};
 use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use tokio_rustls::client::TlsStream;
-use tokio_rustls::rustls::pki_types::pem::PemObject;
-use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
@@ -42,13 +36,10 @@ async fn full_attach(c: &mut Client) {
 #[tokio::test(flavor = "multi_thread")]
 async fn tcp_carries_frames() {
     let server = start(fast_limits()).await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(server::serve_tcp(listener, server.registry.clone()));
+    let addr = server.listen_tcp().await;
     let mut c = Client::over(TcpStream::connect(addr).await.unwrap());
     c.hello().await;
     full_attach(&mut c).await;
-    task.abort();
 }
 
 /// A WebSocket carrier on loopback with a self-signed certificate the
@@ -56,74 +47,16 @@ async fn tcp_carries_frames() {
 struct Ws {
     addr: SocketAddr,
     connector: TlsConnector,
-    _dir: tempfile::TempDir,
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-impl Drop for Ws {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
 }
 
 async fn serve_ws(server: &Server, origins: Vec<String>) -> Ws {
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let cert = dir.path().join("cert.pem");
-    let key = dir.path().join("key.pem");
-    std::fs::write(&cert, certified.cert.pem()).unwrap();
-    std::fs::write(&key, certified.signing_key.serialize_pem()).unwrap();
-    let tls = server::tls::Tls::start(server::tls::Source::Files { cert, key })
-        .await
-        .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(server::ws::serve_ws(
-        listener,
-        server.registry.clone(),
-        tls,
-        origins,
-    ));
-    let mut roots = RootCertStore::empty();
-    roots
-        .add(CertificateDer::from_pem_slice(certified.cert.pem().as_bytes()).unwrap())
-        .unwrap();
-    let config = ClientConfig::builder_with_provider(Arc::new(
-        tokio_rustls::rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    Ws {
-        addr,
-        connector: TlsConnector::from(Arc::new(config)),
-        _dir: dir,
-        task,
-    }
+    let (addr, connector) = server.listen_wss(origins).await;
+    Ws { addr, connector }
 }
-
-type ClientWs = WebSocketStream<TlsStream<TcpStream>>;
 
 impl Ws {
     async fn connect(&self, origin: Option<&str>) -> Result<ClientWs, WsError> {
-        let tcp = TcpStream::connect(self.addr).await.unwrap();
-        let tls = self
-            .connector
-            .connect(ServerName::try_from("localhost").unwrap(), tcp)
-            .await
-            .unwrap();
-        let mut request = format!("wss://localhost:{}/any/path", self.addr.port())
-            .into_client_request()
-            .unwrap();
-        if let Some(origin) = origin {
-            request
-                .headers_mut()
-                .insert("Origin", origin.parse().unwrap());
-        }
-        tokio_tungstenite::client_async(request, tls)
-            .await
-            .map(|(ws, _)| ws)
+        connect_ws(self.addr, &self.connector, "/any/path", origin).await
     }
 }
 
@@ -296,6 +229,21 @@ async fn each_message_is_exactly_one_frame() {
             .await
             .contains("binary messages")
     );
+
+    // A message shorter than a header, or empty, is not a frame either:
+    // two such messages must not add up to one.
+    for short in [&b"\x02\x00\x00\x00\x00"[..], &b""[..]] {
+        let mut raw = greeted(&ws).await;
+        raw.send(Message::Binary(short.to_vec().into()))
+            .await
+            .unwrap();
+        assert!(
+            ends_with_protocol_error(&mut raw)
+                .await
+                .contains("exactly one frame"),
+            "{short:?}"
+        );
+    }
 
     // A bad header is reported as on any carrier.
     let mut raw = greeted(&ws).await;

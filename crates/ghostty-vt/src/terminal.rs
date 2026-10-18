@@ -26,12 +26,6 @@ pub enum ColorScheme {
     Dark,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Screen {
-    Primary,
-    Alternate,
-}
-
 /// Answer to a size query: the grid size in cells and the cell size in
 /// pixels, zero when unknown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,27 +78,13 @@ pub enum SemanticPromptKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticPrompt {
     pub kind: SemanticPromptKind,
-    pub exit_code: Option<i32>,
-    pub command: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClipboardLocation {
-    Standard,
-    Selection,
-    Primary,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClipboardContent {
-    pub mime: String,
-    pub data: Vec<u8>,
-}
-
-/// Effects raised by the engine while it parses. Every method has a
-/// default that ignores the effect, except that clipboard writes are
-/// denied. The engine calls these from `extern "C"` trampolines, so a panic
-/// in a handler aborts the process.
+/// Effects raised by the engine while it parses, the ones clankermux
+/// acts on; the rest (clipboard, bell, resize requests) are left unset
+/// at the engine, which ignores them. Every method has a default that
+/// ignores the effect. The engine calls these from `extern "C"`
+/// trampolines, so a panic in a handler aborts the process.
 pub trait Handler: Send + 'static {
     /// Bytes the terminal wants written to the PTY: query answers and mode
     /// reports.
@@ -119,20 +99,12 @@ pub trait Handler: Send + 'static {
     fn size(&mut self) -> Option<SizeReport> {
         None
     }
-    /// OSC 52 write; an empty `contents` clears the clipboard. Returns
-    /// whether the write was applied, which the program is told.
-    fn clipboard_write(
-        &mut self,
-        _location: ClipboardLocation,
-        _contents: &[ClipboardContent],
-    ) -> bool {
-        false
-    }
-    /// CSI 8 t request to resize the grid.
-    fn resize_window(&mut self, _cols: u16, _rows: u16) {}
-    fn title_changed(&mut self, _term: &Term) {}
-    fn pwd_changed(&mut self, _term: &Term) {}
-    fn bell(&mut self) {}
+    /// The title is new; read it from the terminal after the callback.
+    fn title_changed(&mut self) {}
+    fn pwd_changed(&mut self) {}
+    /// A full reset (RIS): the title and pwd are cleared without the two
+    /// callbacks above.
+    fn reset(&mut self) {}
 }
 
 impl Handler for () {}
@@ -211,22 +183,9 @@ impl Term {
         unsafe { string(&s) }
     }
 
-    pub fn active_screen(&self) -> Screen {
-        match self.get::<sys::GhosttyTerminalScreen>(sys::GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN) {
-            Ok(sys::GHOSTTY_TERMINAL_SCREEN_ALTERNATE) => Screen::Alternate,
-            _ => Screen::Primary,
-        }
-    }
-
     pub fn scrollback_rows(&self) -> usize {
         self.get(sys::GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS)
             .unwrap_or(0)
-    }
-
-    /// Whether the VT parser is in the ground state.
-    pub fn vt_ground(&self) -> bool {
-        self.get(sys::GHOSTTY_TERMINAL_DATA_VT_GROUND)
-            .unwrap_or(true)
     }
 
     /// Current value of a DEC private mode such as 2031 or 2048.
@@ -241,21 +200,6 @@ impl Term {
             )
         })?;
         Ok(config.value)
-    }
-
-    /// Effective colour: the OSC override if any, else the default, else `None`.
-    pub fn color(&self, kind: ColorKind) -> Option<Rgb> {
-        let key = match kind {
-            ColorKind::Foreground => sys::GHOSTTY_TERMINAL_DATA_COLOR_FOREGROUND,
-            ColorKind::Background => sys::GHOSTTY_TERMINAL_DATA_COLOR_BACKGROUND,
-            ColorKind::Cursor => sys::GHOSTTY_TERMINAL_DATA_COLOR_CURSOR,
-        };
-        let c: sys::GhosttyColorRgb = self.get(key).ok()?;
-        Some(Rgb {
-            r: c.r,
-            g: c.g,
-            b: c.b,
-        })
     }
 }
 
@@ -336,16 +280,6 @@ impl<H: Handler> Terminal<H> {
             );
             set_fn(
                 raw,
-                sys::GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE,
-                cb::clipboard_write::<H> as *const (),
-            );
-            set_fn(
-                raw,
-                sys::GHOSTTY_TERMINAL_OPT_RESIZE_WINDOW,
-                cb::resize_window::<H> as *const (),
-            );
-            set_fn(
-                raw,
                 sys::GHOSTTY_TERMINAL_OPT_TITLE_CHANGED,
                 cb::title_changed::<H> as *const (),
             );
@@ -356,8 +290,8 @@ impl<H: Handler> Terminal<H> {
             );
             set_fn(
                 raw,
-                sys::GHOSTTY_TERMINAL_OPT_BELL,
-                cb::bell::<H> as *const (),
+                sys::GHOSTTY_TERMINAL_OPT_RESET,
+                cb::reset::<H> as *const (),
             );
             if has_xtversion {
                 set_fn(
@@ -472,14 +406,6 @@ impl<H: Handler> Terminal<H> {
             &bytes as *const usize as *const c_void,
         )
     }
-
-    pub fn set_mode(&mut self, mode: u16, value: bool) -> Result<()> {
-        let config = sys::GhosttyTerminalModeConfig { mode, value };
-        self.set(
-            sys::GHOSTTY_TERMINAL_OPT_MODE,
-            &config as *const sys::GhosttyTerminalModeConfig as *const c_void,
-        )
-    }
 }
 
 impl<H: Handler> Drop for Terminal<H> {
@@ -514,7 +440,7 @@ mod cb {
         len: usize,
     ) {
         // SAFETY: data points at len bytes for this call.
-        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        let bytes = unsafe { crate::io::bytes(data, len) };
         unsafe { slot::<H>(ud) }.handler.write_pty(bytes);
     }
 
@@ -568,13 +494,9 @@ mod cb {
             sys::GHOSTTY_SEMANTIC_PROMPT_COMMAND_END => SemanticPromptKind::CommandEnd,
             _ => return,
         };
-        let prompt = SemanticPrompt {
-            kind,
-            exit_code: e.has_exit_code.then_some(e.exit_code),
-            // SAFETY: the string is valid for this call.
-            command: unsafe { string(&e.command) },
-        };
-        unsafe { slot::<H>(ud) }.handler.semantic_prompt(prompt);
+        unsafe { slot::<H>(ud) }
+            .handler
+            .semantic_prompt(SemanticPrompt { kind });
     }
 
     pub(super) unsafe extern "C" fn color_scheme<H: Handler>(
@@ -619,85 +541,22 @@ mod cb {
         }
     }
 
-    pub(super) unsafe extern "C" fn clipboard_write<H: Handler>(
-        _t: sys::GhosttyTerminal,
-        ud: *mut c_void,
-        write: *const sys::GhosttyClipboardWrite,
-    ) {
-        // SAFETY: write and its contents array are valid for this call.
-        let w = unsafe { &*write };
-        let location = match w.location {
-            sys::GHOSTTY_CLIPBOARD_LOCATION_SELECTION => ClipboardLocation::Selection,
-            sys::GHOSTTY_CLIPBOARD_LOCATION_PRIMARY => ClipboardLocation::Primary,
-            _ => ClipboardLocation::Standard,
-        };
-        let contents: Vec<ClipboardContent> = if w.contents.is_null() {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(w.contents, w.contents_len) }
-                .iter()
-                .map(|c| ClipboardContent {
-                    // SAFETY: the strings are valid for this call.
-                    mime: unsafe { string(&c.mime) },
-                    data: if c.data.ptr.is_null() {
-                        Vec::new()
-                    } else {
-                        unsafe { std::slice::from_raw_parts(c.data.ptr, c.data.len) }.to_vec()
-                    },
-                })
-                .collect()
-        };
-        let applied = unsafe { slot::<H>(ud) }
-            .handler
-            .clipboard_write(location, &contents);
-        if let Some(reply) = w.reply {
-            let answer = sys::GhosttyClipboardWriteReply {
-                size: size_of::<sys::GhosttyClipboardWriteReply>(),
-                result: if applied {
-                    sys::GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS
-                } else {
-                    sys::GHOSTTY_CLIPBOARD_WRITE_RESULT_DENIED
-                },
-                remember: false,
-            };
-            // SAFETY: the request requires exactly this reply call during
-            // the callback.
-            unsafe { reply(write, &answer) };
-        }
-    }
-
-    pub(super) unsafe extern "C" fn resize_window<H: Handler>(
-        _t: sys::GhosttyTerminal,
-        ud: *mut c_void,
-        request: *const sys::GhosttyTerminalResizeWindow,
-    ) {
-        // SAFETY: request is valid for this call.
-        let r = unsafe { &*request };
-        if r.tag == sys::GHOSTTY_TERMINAL_RESIZE_WINDOW_GRID {
-            // SAFETY: the grid arm is active for this tag.
-            let grid = unsafe { r.value.grid };
-            unsafe { slot::<H>(ud) }
-                .handler
-                .resize_window(grid.columns, grid.rows);
-        }
-    }
-
     pub(super) unsafe extern "C" fn title_changed<H: Handler>(
-        t: sys::GhosttyTerminal,
+        _t: sys::GhosttyTerminal,
         ud: *mut c_void,
     ) {
-        unsafe { slot::<H>(ud) }.handler.title_changed(&Term(t));
+        unsafe { slot::<H>(ud) }.handler.title_changed();
     }
 
     pub(super) unsafe extern "C" fn pwd_changed<H: Handler>(
-        t: sys::GhosttyTerminal,
+        _t: sys::GhosttyTerminal,
         ud: *mut c_void,
     ) {
-        unsafe { slot::<H>(ud) }.handler.pwd_changed(&Term(t));
+        unsafe { slot::<H>(ud) }.handler.pwd_changed();
     }
 
-    pub(super) unsafe extern "C" fn bell<H: Handler>(_t: sys::GhosttyTerminal, ud: *mut c_void) {
-        unsafe { slot::<H>(ud) }.handler.bell();
+    pub(super) unsafe extern "C" fn reset<H: Handler>(_t: sys::GhosttyTerminal, ud: *mut c_void) {
+        unsafe { slot::<H>(ud) }.handler.reset();
     }
 
     pub(super) unsafe extern "C" fn xtversion<H: Handler>(

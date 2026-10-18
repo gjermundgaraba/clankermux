@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use client::{Connection, connection::hello};
@@ -11,41 +10,10 @@ use serde_json::json;
 use tokio::io::unix::AsyncFd;
 use tokio::process::Child;
 
-struct Server {
-    socket: PathBuf,
-    dir: tempfile::TempDir,
-    registry: std::sync::Arc<server::Registry>,
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
+use testkit::Server;
 
 async fn start() -> Server {
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("sock");
-    let registry = server::Registry::new(server::Config {
-        limits: Limits::default(),
-        shell: vec!["/bin/sh".into()],
-        home: dir.path().to_path_buf(),
-        version: "test".into(),
-        state_dir: dir.path().join("state"),
-    })
-    .unwrap();
-    let task = tokio::spawn(server::serve_unix(socket.clone(), registry.clone()));
-    // The socket file exists before the server listens on it.
-    while tokio::net::UnixStream::connect(&socket).await.is_err() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Server {
-        socket,
-        dir,
-        registry,
-        task,
-    }
+    Server::start(Limits::default())
 }
 
 /// Runs the binary with `args` and returns its stdout; the process must
@@ -254,14 +222,15 @@ async fn repaint_clips_a_larger_session_to_the_bottom() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn detaches_while_the_server_is_gone() {
-    let server = start().await;
+    let mut server = start().await;
     let conn = connect(&server).await;
     let session = create(&conn, json!({"argv": ["/bin/cat"], "cols": 80, "rows": 24})).await;
     let mut term = Term::attach(&server, 80, 24, &[&session.id]);
     term.read_until(b"\x1b[?25h").await;
     drop(conn);
-    drop(server);
-    // Reconnecting in the background; the prefix still works.
+    // The server goes away with its connections; the attach is
+    // reconnecting in the background, and the prefix still works.
+    server.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
     term.detach().await;
     assert_eq!(term.exit_code().await, 0);
@@ -293,14 +262,11 @@ async fn connect_reaches_a_tcp_carrier() {
     let server = start().await;
     let conn = connect(&server).await;
     let session = create(&conn, json!({"label": "over-tcp", "argv": ["/bin/cat"]})).await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let task = tokio::spawn(server::serve_tcp(listener, server.registry.clone()));
+    let addr = server.listen_tcp().await.to_string();
     let listed = run(&["--connect", &addr, "list"], &[]).await;
     assert!(listed.contains("over-tcp"), "{listed}");
     let read = run(&["--connect", &addr, "--json", "read", &session.id], &[]).await;
     assert!(read.contains("\"status\": \"running\""), "{read}");
-    task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -360,13 +326,21 @@ async fn the_relay_ends_when_the_server_side_does() {
 
 #[tokio::test]
 async fn websocket_flags_need_the_websocket() {
+    // Isolated, so that a regression of the check cannot start a server on
+    // the user's own socket and state directory.
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("sock");
     for args in [
-        ["serve", "--origin", "http://page.test"],
-        ["serve", "--tls-cert", "c"],
-        ["serve", "--tls-key", "k"],
+        ["--origin", "http://page.test"],
+        ["--tls-cert", "c"],
+        ["--tls-key", "k"],
     ] {
         let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
+            .arg("--socket")
+            .arg(&socket)
+            .arg("serve")
             .args(args)
+            .env("XDG_STATE_HOME", dir.path())
             .output()
             .await
             .unwrap();

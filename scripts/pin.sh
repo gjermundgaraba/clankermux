@@ -30,10 +30,6 @@ top=$(ls "$tmp/tree")
 rm -rf "$root/vendor/libghostty-vt"
 mkdir -p "$root/vendor"
 mv "$tmp/tree/$top" "$root/vendor/libghostty-vt"
-for patch in "$root"/vendor/patches/*.patch; do
-    [ -e "$patch" ] || continue
-    patch -d "$root/vendor/libghostty-vt" -p1 < "$patch"
-done
 jq -n --arg sha "$sha" --arg sha256 "$sum" \
     --arg version "$(tr -d '\n' < "$root/vendor/libghostty-vt/VERSION")" \
     --arg date "$(date -u +%Y-%m-%d)" \

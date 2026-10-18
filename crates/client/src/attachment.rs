@@ -50,8 +50,9 @@ enum State<H: Handler> {
         held: Vec<Frame>,
     },
     Streaming(Terminal<H>),
-    /// After the final marker, `CLOSED` or a fatal error.
-    Ended,
+    /// After the final marker, `CLOSED` or a fatal error. The terminal,
+    /// when there was one, stays renderable for the final screen.
+    Ended(Option<Terminal<H>>),
 }
 
 /// The attachment of one channel. `H` is the handler installed on the
@@ -110,7 +111,7 @@ impl<H: Handler + Default> Attachment<H> {
     }
 
     pub fn ended(&self) -> bool {
-        matches!(self.state, State::Ended)
+        matches!(self.state, State::Ended(_))
     }
 
     /// The local engine, once `READY` has been decoded.
@@ -118,8 +119,19 @@ impl<H: Handler + Default> Attachment<H> {
         match &mut self.state {
             State::Bootstrapping { decoder, .. } => decoder.terminal(),
             State::Streaming(term) => Some(term),
-            State::Opening | State::Ended => None,
+            State::Ended(term) => term.as_mut(),
+            State::Opening => None,
         }
+    }
+
+    /// Ends the attachment, keeping the terminal it had.
+    fn end(&mut self) {
+        let term = match std::mem::replace(&mut self.state, State::Opening) {
+            State::Streaming(term) | State::Ended(Some(term)) => Some(term),
+            State::Bootstrapping { decoder, .. } => decoder.into_terminal(),
+            State::Opening | State::Ended(None) => None,
+        };
+        self.state = State::Ended(term);
     }
 
     pub fn handle(&mut self, frame: Frame) -> Result<Vec<Action>, Error> {
@@ -207,6 +219,12 @@ impl<H: Handler + Default> Attachment<H> {
                     held.push(frame);
                     return Ok(());
                 }
+                if !matches!(
+                    self.state,
+                    State::Bootstrapping { .. } | State::Streaming(_)
+                ) {
+                    return Err(Error::Protocol(format!("{kind:?} outside the stream")));
+                }
                 self.stream(frame, actions)?;
             }
             FrameType::Gap => {
@@ -216,7 +234,7 @@ impl<H: Handler + Default> Attachment<H> {
             }
             FrameType::Closed => {
                 let closed: Closed = frame.json()?;
-                self.state = State::Ended;
+                self.end();
                 actions.push(Action::Closed(closed.reason));
             }
             FrameType::Error => {
@@ -227,7 +245,7 @@ impl<H: Handler + Default> Attachment<H> {
                         | proto::ErrorCode::NotRunning
                         | proto::ErrorCode::InputOverflow
                 ) {
-                    self.state = State::Ended;
+                    self.end();
                 }
                 actions.push(Action::Error(error));
             }
@@ -271,7 +289,7 @@ impl<H: Handler + Default> Attachment<H> {
             FrameType::Exited => {
                 let exited: Exited = frame.json()?;
                 self.check_marker(exited.seq, exited.offset)?;
-                self.state = State::Ended;
+                self.end();
                 actions.push(Action::Exited(exited.exit));
             }
             _ => unreachable!("only stream frames reach here"),

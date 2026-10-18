@@ -87,9 +87,10 @@ async fn open_checks_in_order() {
     );
     c.wait_attachments(&session.id, 0).await;
 
-    // A channel is in use until CLOSED. A pipelined CLOSE + OPEN is
-    // either refused, when the OPEN is read before the task has queued
-    // CLOSED, or accepted after it; never accepted before it.
+    // A channel is in use until CLOSED. A pipelined CLOSE + OPEN gets
+    // CLOSED first, then either `channel_in_use`, when the OPEN was read
+    // before the attachment had ended, or the new attachment; nothing of
+    // the new attachment precedes the old one's CLOSED.
     c.open(3, json!({"session": session.id})).await;
     c.bootstrap(3).await;
     let mut both = encode_frame(FrameType::Close, 3, b"");
@@ -99,19 +100,21 @@ async fn open_checks_in_order() {
         &serde_json::to_vec(&json!({"session": session.id})).unwrap(),
     ));
     c.stream.write_all(&both).await.unwrap();
+    assert_eq!(c.expect_closed(3).await, ClosedReason::Closed);
     let (header, payload) = c.recv_on(3).await;
     match header.frame_type {
         FrameType::Error => {
             let error: ErrorMessage = serde_json::from_slice(&payload).unwrap();
             assert_eq!(error.code, ErrorCode::ChannelInUse);
-            assert_eq!(c.expect_closed(3).await, ClosedReason::Closed);
         }
-        FrameType::Closed => {
-            c.bootstrap(3).await;
+        FrameType::Attached => {
+            let attached = serde_json::from_slice(&payload).unwrap();
+            let boot = c.ready_after(3, attached).await;
+            c.bootstrap_rest(3, boot).await;
             c.send(FrameType::Close, 3, b"").await;
             assert_eq!(c.expect_closed(3).await, ClosedReason::Closed);
         }
-        other => panic!("{other:?} first"),
+        other => panic!("{other:?} after CLOSED"),
     }
     c.wait_attachments(&session.id, 0).await;
 

@@ -27,7 +27,6 @@ pub struct Options {
     pub cursor: bool,
     pub style: bool,
     pub hyperlink: bool,
-    pub palette: bool,
     pub modes: bool,
     pub scrolling_region: bool,
     pub keyboard: bool,
@@ -59,7 +58,7 @@ pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
         trim: options.trim,
         extra: sys::GhosttyFormatterTerminalExtra {
             size: size_of::<sys::GhosttyFormatterTerminalExtra>(),
-            palette: options.palette,
+            palette: false,
             modes: options.modes,
             scrolling_region: options.scrolling_region,
             tabstops: false,

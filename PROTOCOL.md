@@ -190,7 +190,7 @@ reported by the program.
 | Event                    | Fields           | When                                            |
 | ------------------------ | ---------------- | ----------------------------------------------- |
 | `session_created`        | `session`        |                                                 |
-| `session_changed`        | `session`        | Label, size, title, or pwd changed              |
+| `session_changed`        | `session`        | Label, size, title, pwd or `attachments` changed |
 | `session_exited`         | `session`        | The stream ended; `exit` is set                 |
 | `session_removed`        | `id`             | Removed by request, or by `on_exit: remove`     |
 | `program_status_changed` | `id, record`     | One record was set; see Program status          |
@@ -275,7 +275,7 @@ A writable `OPEN` with `viewport` or `profile` on a running session is
 applied as a viewport report at once (at the session's size when
 `viewport` is absent), before the snapshot is taken, bypassing coalescing.
 On any other session it is ignored. A `cols` or `rows` of 0, in `OPEN` or
-`VIEWPORT`, is `invalid_request`.
+`VIEWPORT`, is `invalid_request`, checked before the checks above.
 
 ### ATTACHED
 
@@ -411,10 +411,10 @@ it.
 
 ### Removal on exit
 
-With `on_exit: remove`, removal begins `limits.remove_grace` after the
-stream ends, so a short-lived session can still be opened or read. At that
-moment every open attachment, finished or not, gets `CLOSED removed`, and
-the session's files are deleted.
+With `on_exit: remove`, the session's files are deleted when the stream
+ends, and removal itself begins `limits.remove_grace` later, so a
+short-lived session can still be opened or read. At that moment every
+open attachment, finished or not, gets `CLOSED removed`.
 
 ## Size
 
@@ -428,8 +428,9 @@ coalesced reports. Resize requests from the program (CSI 8 t) are ignored.
 A report carries a size and may carry a `profile` and a cell size; what
 it omits is unchanged (`set_size` carries neither). The session's profile
 and cell size are those of the latest reports that carried them. They
-answer the queries below, persist while no attachment is open, and are
-parked with the session. When the answer to the colour scheme query
+answer the queries below and persist while no attachment is open; a
+parked session has no process to answer, so they are not parked. When
+the answer to the colour scheme query
 changes and mode 2031 is set, the server writes the colour scheme report
 to the PTY. Default colours are not part of the stream: a client that
 reports a profile sets the same colours on its own terminal, as the server
@@ -478,7 +479,7 @@ the park time as Unix epoch milliseconds, mode 0700, files 0600:
 
 | File                | Contents                                                     |
 | ------------------- | ------------------------------------------------------------ |
-| `session.json`      | `{protocol: 1, engine, parked_at, session, profile, cell}`   |
+| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines}`: the `inspect` object (with `program_status`, `attachments: 0`, no `pid`) and how many leading lines of `screen.txt` are history |
 | `snapshot.ghostsnp` | The snapshot bytes                                           |
 | `screen.txt`        | The `read` text with all retained history, at `parked_at`   |
 
@@ -530,9 +531,10 @@ deliberate trade-off for version 1.
 ## Limits
 
 Announced in `WELCOME.limits`. `control_body` bounds client-sent JSON;
-server-sent JSON is bounded by `max_frame`; the defaults for `records`,
-`page`, `text`, and `label` keep the largest `inspect`, `list`, and
-`subscribe` replies under the default `max_frame`.
+server-sent JSON is bounded by `max_frame`: the defaults for `records`,
+`text`, and `label` keep the largest `inspect` reply under the default
+`max_frame`, and a `list` or `subscribe` page holds fewer than `page`
+sessions when more would not fit (`next` still names the last one sent).
 
 | Field          | Default    | Meaning                                       |
 | -------------- | ---------- | --------------------------------------------- |

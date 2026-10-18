@@ -1,13 +1,25 @@
 //! The 10-byte frame header and the raw payload shapes.
 
-use serde::{Deserialize, Serialize};
-
 pub const HEADER_LEN: usize = 10;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(u8)]
-pub enum FrameType {
+/// Defines the enum and the table `from_u8` searches from one list.
+macro_rules! frame_types {
+    ($($name:ident = $value:literal),* $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(u8)]
+        pub enum FrameType {
+            $($name = $value,)*
+        }
+
+        impl FrameType {
+            pub const ALL: [FrameType; frame_types!(@count $($name)*)] = [$(FrameType::$name,)*];
+        }
+    };
+    (@count) => { 0 };
+    (@count $head:ident $($tail:ident)*) => { 1 + frame_types!(@count $($tail)*) };
+}
+
+frame_types! {
     Hello = 0x01,
     Request = 0x02,
     Open = 0x10,
@@ -30,31 +42,6 @@ pub enum FrameType {
 }
 
 impl FrameType {
-    pub const ALL: [FrameType; 19] = {
-        use FrameType::*;
-        [
-            Hello,
-            Request,
-            Open,
-            Input,
-            Viewport,
-            Close,
-            Welcome,
-            Reply,
-            Event,
-            Error,
-            Attached,
-            Snapshot,
-            SnapshotReady,
-            SnapshotEnd,
-            Output,
-            Resized,
-            Exited,
-            Gap,
-            Closed,
-        ]
-    };
-
     pub fn from_u8(byte: u8) -> Option<Self> {
         Self::ALL.into_iter().find(|t| *t as u8 == byte)
     }

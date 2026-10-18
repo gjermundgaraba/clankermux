@@ -27,9 +27,9 @@ export interface Context2D {
   fillText(text: string, x: number, y: number): void;
 }
 
-export function css(color: number, fallback: string): string {
-  return color === NO_COLOR ? fallback : `#${color.toString(16).padStart(6, "0")}`;
-}
+const hex = (color: number) => `#${color.toString(16).padStart(6, "0")}`;
+/** A cell or cursor colour, or `fallback` when it has none. */
+const css = (color: number, fallback: string) => (color === NO_COLOR ? fallback : hex(color));
 
 /**
  * Draws frames onto a 2D context: changed rows only, then the cursor.
@@ -49,8 +49,9 @@ export class CanvasRenderer {
   ) {}
 
   draw(frame: Frame): void {
-    this.background = css(frame.background, "#000000");
-    this.foreground = css(frame.foreground, "#ffffff");
+    // The frame always carries the default colours.
+    this.background = hex(frame.background);
+    this.foreground = hex(frame.foreground);
     if (frame.full || frame.cols !== this.cols) {
       this.cols = frame.cols;
       this.rows.clear();
@@ -132,13 +133,13 @@ export class CanvasRenderer {
     this.ctx.globalAlpha = 1;
     this.ctx.fillStyle = color;
     switch (cursor.style) {
-      case 0:
+      case "bar":
         this.ctx.fillRect(x, y, 2, cellHeight);
         return;
-      case 2:
+      case "underline":
         this.ctx.fillRect(x, y + cellHeight - 2, cellWidth, 2);
         return;
-      case 3:
+      case "block_hollow":
         this.ctx.fillRect(x, y, cellWidth, 1);
         this.ctx.fillRect(x, y + cellHeight - 1, cellWidth, 1);
         this.ctx.fillRect(x, y, 1, cellHeight);

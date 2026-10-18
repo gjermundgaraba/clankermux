@@ -113,33 +113,14 @@ async fn relay(
 
 struct Server {
     tcp: SocketAddr,
-    _dir: tempfile::TempDir,
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
+    _server: testkit::Server,
 }
 
 async fn start(limits: Limits) -> Server {
-    let dir = tempfile::tempdir().unwrap();
-    let registry = server::Registry::new(server::Config {
-        limits,
-        shell: vec!["/bin/sh".into()],
-        home: dir.path().to_path_buf(),
-        version: "test".into(),
-        state_dir: dir.path().join("state"),
-    })
-    .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let tcp = listener.local_addr().unwrap();
-    let task = tokio::spawn(server::serve_tcp(listener, registry));
+    let server = testkit::Server::start(limits);
     Server {
-        tcp,
-        _dir: dir,
-        task,
+        tcp: server.listen_tcp().await,
+        _server: server,
     }
 }
 

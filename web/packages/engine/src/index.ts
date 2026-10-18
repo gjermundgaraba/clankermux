@@ -1,7 +1,7 @@
 import pin from "../../../../vendor/pin.json" with { type: "json" };
 
 export { Decoder, readyEnd } from "./decoder.ts";
-export { KeyEncoder, keyName } from "./keys.ts";
+export { KeyEncoder, isText, keyName } from "./keys.ts";
 export type { KeyInput } from "./keys.ts";
 export { FLAG, NO_COLOR, RenderState } from "./render.ts";
 export type { Cell, Frame, FrameRow } from "./render.ts";
@@ -24,13 +24,6 @@ export interface BitField {
   width: number;
 }
 
-export const RESULT = {
-  SUCCESS: 0,
-  INVALID_VALUE: -2,
-  OUT_OF_SPACE: -3,
-  NO_VALUE: -4,
-} as const;
-
 export class EngineError extends Error {
   constructor(
     readonly call: string,
@@ -43,12 +36,16 @@ export class EngineError extends Error {
 /** A loaded ghostty-vt.wasm instance. */
 export class Engine {
   readonly types: Record<string, TypeInfo>;
+  /** The `GhosttyResult` members the wrapper branches on. */
+  readonly result: { SUCCESS: number; OUT_OF_SPACE: number; NO_VALUE: number };
 
   private constructor(
     private readonly exports: Record<string, Function> & { memory: WebAssembly.Memory },
   ) {
     const ptr = this.call("ghostty_type_json") as number;
     this.types = JSON.parse(this.cString(ptr)).types;
+    const result = (member: string) => this.enumValue("GhosttyResult", member);
+    this.result = { SUCCESS: result("SUCCESS"), OUT_OF_SPACE: result("OUT_OF_SPACE"), NO_VALUE: result("NO_VALUE") };
   }
 
   static async load(wasm: BufferSource | WebAssembly.Module): Promise<Engine> {
@@ -75,7 +72,7 @@ export class Engine {
   /** Calls a function returning GhosttyResult and throws on failure. */
   check(name: string, ...args: number[]): void {
     const code = this.call(name, ...args);
-    if (code !== RESULT.SUCCESS) throw new EngineError(name, code);
+    if (code !== this.result.SUCCESS) throw new EngineError(name, code);
   }
 
   alloc(len: number): number {
@@ -219,8 +216,8 @@ export class Engine {
         this.scratch(4, (len) => {
           const code = encode(buf, cap, len);
           const n = this.view.getUint32(len, true);
-          if (code === RESULT.OUT_OF_SPACE) return n;
-          if (code !== RESULT.SUCCESS) throw new EngineError(name, code);
+          if (code === this.result.OUT_OF_SPACE) return n;
+          if (code !== this.result.SUCCESS) throw new EngineError(name, code);
           return this.memory.slice(buf, buf + n);
         }),
       );
@@ -277,10 +274,10 @@ export class Engine {
     return new TextDecoder().decode(this.memory.subarray(data, data + len));
   }
 
-  /** An RGB colour at `ptr` as 0xRRGGBB. */
+  /** A `GhosttyColorRgb` at `ptr` as 0xRRGGBB. */
   readRgb(ptr: number): number {
-    const mem = this.memory;
-    return ((mem[ptr]! << 16) | (mem[ptr + 1]! << 8) | mem[ptr + 2]!) >>> 0;
+    const channel = (key: string) => this.field("GhosttyColorRgb", ptr, key);
+    return ((channel("r") << 16) | (channel("g") << 8) | channel("b")) >>> 0;
   }
 
   terminalNew(cols: number, rows: number): Terminal {
@@ -371,8 +368,8 @@ export class Terminal {
         this.engine.enumValue("GhosttyTerminalData", "TITLE"),
         out,
       );
-      if (code === RESULT.NO_VALUE) return "";
-      if (code !== RESULT.SUCCESS) throw new EngineError("ghostty_terminal_get", code);
+      if (code === this.engine.result.NO_VALUE) return "";
+      if (code !== this.engine.result.SUCCESS) throw new EngineError("ghostty_terminal_get", code);
       return this.engine.readString(out);
     });
   }

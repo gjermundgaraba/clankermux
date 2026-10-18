@@ -89,8 +89,17 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
     let generation = generations(&state, &session.id)
         .pop()
         .expect("parked by the stop");
-    assert!(generation.join("session.json").is_file());
-    assert!(generation.join("snapshot.ghostsnp").is_file());
+    // Private to the user: directories 0700, files 0600, as the socket.
+    let mode = |path: &std::path::Path| {
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions())
+            & 0o777
+    };
+    assert_eq!(mode(&generation), 0o700);
+    for file in ["session.json", "snapshot.ghostsnp", "screen.txt"] {
+        assert!(generation.join(file).is_file(), "{file}");
+        assert_eq!(mode(&generation.join(file)), 0o600, "{file}");
+    }
+    assert_eq!(mode(&a.socket), 0o600);
     drop(c);
     drop(a);
 
@@ -318,7 +327,11 @@ async fn the_lock_refuses_a_second_server() {
         version: "test".into(),
         state_dir: state.clone(),
     });
-    assert!(second.is_err(), "the first server holds the lock");
+    assert_eq!(
+        second.err().map(|e| e.kind()),
+        Some(std::io::ErrorKind::WouldBlock),
+        "the first server holds the lock"
+    );
     a.registry.stop().await;
     assert!(
         server::Registry::new(server::Config {
@@ -494,9 +507,13 @@ async fn a_stopped_server_leaves_the_directory_to_its_successor() {
         .await;
     wait_text(&mut c, &session.id, "left-behind").await;
     a.registry.stop().await;
-    // And the old registry accepts nothing new.
-    assert_eq!(c.err("create", json!({})).await, ErrorCode::Internal);
-    drop(c);
+    // The stop closed the connection, and the old registry accepts
+    // nothing new.
+    assert!(c.recv().await.is_none(), "closed by the stop");
+    assert_eq!(
+        a.registry.create(Default::default()).map(|s| s.id).err(),
+        Some((ErrorCode::Internal, "server stopping".into()))
+    );
 
     let b = start_with(fast_limits(), state.clone()).await;
     let mut c = client(&b).await;

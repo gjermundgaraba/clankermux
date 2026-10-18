@@ -137,6 +137,21 @@ async fn session_lifecycle() {
     assert!(
         matches!(events.event().await, Event::SessionChanged { session: s } if (s.cols, s.rows, s.marker) == (40, 12, 1))
     );
+    // A title set by the program is announced, and so is its clearing
+    // by a full reset (RIS), which the engine reports separately.
+    // `cat` passes a line on once it is complete.
+    let data = base64::engine::general_purpose::STANDARD.encode("\x1b]2;titled\x07\n");
+    c.ok("write", json!({"session": session.id, "data": data}))
+        .await;
+    assert!(
+        matches!(events.event().await, Event::SessionChanged { session: s } if s.title == "titled")
+    );
+    let data = base64::engine::general_purpose::STANDARD.encode("\x1bc\n");
+    c.ok("write", json!({"session": session.id, "data": data}))
+        .await;
+    assert!(
+        matches!(events.event().await, Event::SessionChanged { session: s } if s.title.is_empty())
+    );
     c.ok(
         "set_size",
         json!({"session": session.id, "cols": 40, "rows": 12}),
@@ -287,6 +302,18 @@ async fn create_defaults_and_limits() {
         c.err("create", json!({"cols": "wide"})).await,
         ErrorCode::InvalidRequest
     );
+    for bad in [
+        json!({"argv": []}),
+        json!({"argv": ["/bin/sh", "a\0b"]}),
+        json!({"cwd": "/tmp\0"}),
+        json!({"env": {"A": "x\0"}}),
+    ] {
+        assert_eq!(
+            c.err("create", bad.clone()).await,
+            ErrorCode::InvalidRequest,
+            "{bad}"
+        );
+    }
 
     let env = c.create(json!({"argv": ["/bin/sh", "-c", "printf '%s|%s' \"$TERM\" \"$FOO\"; sleep 10"], "env": {"FOO": "bar"}})).await;
     let mut text = String::new();
@@ -562,6 +589,20 @@ async fn read_screen_only_after_clear_and_bounded_replies() {
         &read.text[..10]
     );
     assert!(read.text.ends_with("line996\nonly\n"));
+    c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
+        .await;
+
+    // One line longer than the budget: its newest characters are kept.
+    let session = c
+        .create(json!({"argv": ["/bin/sh", "-c", "i=0; while [ $i -lt 6000 ]; do printf x; i=$((i+1)); done; printf 'END\n'; sleep 5"], "cols": 200, "rows": 5}))
+        .await;
+    let read = wait_text(&mut c, &session.id, "END").await;
+    assert!(read.text.len() <= 8192 - 4096);
+    assert!(
+        read.text.ends_with("xxxEND\n"),
+        "{:?}",
+        &read.text[read.text.len() - 10..]
+    );
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
 }

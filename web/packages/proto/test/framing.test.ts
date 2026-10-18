@@ -56,22 +56,36 @@ function decodeAll(chunks: Uint8Array[]): { frames: Uint8Array[]; error: FrameEr
   return { frames, error: undefined };
 }
 
+interface Spec {
+  type: FrameType;
+  channel: number;
+  payload: Uint8Array;
+}
+
+/** Random frames: small payloads, and some at the frame limit. */
+function specs(r: () => number): Spec[] {
+  return Array.from({ length: int(r, 12) }, () => ({
+    type: types[int(r, types.length)]!,
+    channel: int(r, 0x1_0000_0000),
+    payload: bytes(r, r() < 0.2 ? MAX_FRAME - int(r, 3) : int(r, 300)),
+  }));
+}
+
+function concat(frames: Uint8Array[]): Uint8Array {
+  const stream = new Uint8Array(frames.reduce((n, f) => n + f.length, 0));
+  let pos = 0;
+  for (const f of frames) {
+    stream.set(f, pos);
+    pos += f.length;
+  }
+  return stream;
+}
+
 test("a valid stream decodes the same under every chunking", () => {
   for (let n = 0; n < CASES; n++) {
     const r = rng(n);
-    const frames = Array.from({ length: int(r, 12) }, () => ({
-      type: types[int(r, types.length)]!,
-      channel: int(r, 0x1_0000_0000),
-      // Small payloads, and some at the frame limit.
-      payload: bytes(r, r() < 0.2 ? MAX_FRAME - int(r, 3) : int(r, 300)),
-    }));
-    const encoded = frames.map((f) => encodeFrame(f.type, f.channel, f.payload));
-    const stream = new Uint8Array(encoded.reduce((n, f) => n + f.length, 0));
-    let pos = 0;
-    for (const f of encoded) {
-      stream.set(f, pos);
-      pos += f.length;
-    }
+    const frames = specs(r);
+    const stream = concat(frames.map((f) => encodeFrame(f.type, f.channel, f.payload)));
     const { frames: decoded, error } = decodeAll(chunk(r, stream));
     expect(error, `case ${n}`).toBeUndefined();
     expect(decoded.length, `case ${n}`).toBe(frames.length);
@@ -84,10 +98,20 @@ test("a valid stream decodes the same under every chunking", () => {
 });
 
 test("any bytes decode or fail with a FrameError", () => {
+  let decoded = 0;
   for (let n = 0; n < CASES; n++) {
     const r = rng(1000 + n);
-    const stream = bytes(r, int(r, 2048));
+    // Random bytes, or a valid stream with up to four bytes changed, so
+    // that frames decode before the damage.
+    let stream: Uint8Array;
+    if (r() < 0.5) {
+      stream = bytes(r, int(r, 2048));
+    } else {
+      stream = concat(specs(r).map((f) => encodeFrame(f.type, f.channel, f.payload)));
+      for (let i = int(r, 5); i > 0 && stream.length > 0; i--) stream[int(r, stream.length)] = int(r, 256);
+    }
     const { frames, error } = decodeAll(chunk(r, stream));
+    decoded += frames.length;
     // Each frame is a whole message a message parser accepts.
     let pos = 0;
     for (const f of frames) {
@@ -105,4 +129,5 @@ test("any bytes decode or fail with a FrameError", () => {
       expect(err, `case ${n}`).toBeInstanceOf(FrameError);
     }
   }
+  expect(decoded, "the frame assertions ran").toBeGreaterThan(CASES);
 });

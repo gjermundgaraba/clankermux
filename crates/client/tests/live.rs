@@ -1,50 +1,22 @@
 //! The client library against an in-process server: bootstrap, stream,
 //! reconnect with resume, events.
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use client::{Action, Attachment, Connection, Frame, connection::hello};
 use proto::*;
 use serde_json::json;
+use testkit::Server;
 use tokio::sync::mpsc;
 
-struct Server {
-    socket: PathBuf,
-    _dir: tempfile::TempDir,
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
+/// A test's whole wait for a condition.
+const DEADLINE: Duration = Duration::from_secs(10);
 
 async fn start() -> Server {
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("sock");
-    let registry = server::Registry::new(server::Config {
-        limits: Limits {
-            remove_grace: 200,
-            ..Limits::default()
-        },
-        shell: vec!["/bin/sh".into()],
-        home: dir.path().to_path_buf(),
-        version: "test".into(),
-        state_dir: dir.path().join("state"),
+    Server::start(Limits {
+        remove_grace: 200,
+        ..Limits::default()
     })
-    .unwrap();
-    let task = tokio::spawn(server::serve_unix(socket.clone(), registry));
-    // The socket file exists before the server listens on it.
-    while tokio::net::UnixStream::connect(&socket).await.is_err() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Server {
-        socket,
-        _dir: dir,
-        task,
-    }
 }
 
 fn text(a: &mut Attachment) -> String {
@@ -98,6 +70,7 @@ async fn bootstrap_stream_and_resume() {
         .unwrap();
     // The echo is on the screen before the attach, so it comes with the
     // snapshot rather than as OUTPUT.
+    let deadline = tokio::time::Instant::now() + DEADLINE;
     loop {
         let read: Read = conn
             .call("read", json!({"session": session.id}))
@@ -106,6 +79,7 @@ async fn bootstrap_stream_and_resume() {
         if read.text.contains("one\none") {
             break;
         }
+        assert!(tokio::time::Instant::now() < deadline, "{:?}", read.text);
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
@@ -189,8 +163,13 @@ async fn bootstrap_stream_and_resume() {
             signal: "KILL".into()
         }))
     );
+    let deadline = tokio::time::Instant::now() + DEADLINE;
     loop {
-        if let Event::SessionExited { session: s } = events.recv().await.unwrap() {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("session_exited in time")
+            .unwrap();
+        if let Event::SessionExited { session: s } = event {
             assert_eq!(s.id, session.id);
             break;
         }
@@ -211,10 +190,14 @@ async fn bootstrap_stream_and_resume() {
         matches!(&closed, client::Error::Server(e) if e.code == ErrorCode::ProtocolError),
         "{closed}"
     );
+    // Requests after the end fail with the reason, not a bare "closed".
     assert!(matches!(
         conn.request("list", json!({})).await,
-        Err(client::Error::Closed)
+        Err(client::Error::Server(e)) if e.code == ErrorCode::ProtocolError
     ));
-    assert!(matches!(conn.open(2, &open), Err(client::Error::Closed)));
+    assert!(matches!(
+        conn.open(2, &open),
+        Err(client::Error::Server(e)) if e.code == ErrorCode::ProtocolError
+    ));
     assert!(conn.events().recv().await.is_none());
 }

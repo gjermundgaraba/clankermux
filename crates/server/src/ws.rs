@@ -34,7 +34,8 @@ pub async fn serve_ws(
     let origins = Arc::new(origins);
     let max_frame = registry.config.limits.max_frame;
     let hello_timeout = Duration::from_millis(registry.config.limits.hello_timeout);
-    crate::serve_tcp_with(listener, move |stream, accepted| {
+    let connections = registry.clone();
+    crate::serve_tcp_with(listener, &connections, move |stream, accepted| {
         let acceptor = tls.acceptor();
         let registry = registry.clone();
         let origins = origins.clone();
@@ -184,7 +185,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
                 Some(Ok(Message::Binary(bytes))) => {
                     // A bad header passes through: the frame decoder
                     // reports it like on any other carrier.
-                    if frame_len(&bytes, this.max_frame).is_some_and(|len| len != bytes.len()) {
+                    if bytes.len() < HEADER_LEN
+                        || frame_len(&bytes, this.max_frame).is_some_and(|len| len != bytes.len())
+                    {
                         return Poll::Ready(Err(invalid("a message must hold exactly one frame")));
                     }
                     this.incoming = bytes;

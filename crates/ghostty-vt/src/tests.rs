@@ -97,7 +97,7 @@ fn vt_format_carries_modes_not_history() {
         !vt.contains("four"),
         "the primary screen is not formatted: {vt:?}"
     );
-    assert_eq!(term.active_screen(), Screen::Alternate);
+    assert!(term.mode(1049).unwrap(), "the alternate screen is active");
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn decode_in_chunks(bytes: &[u8], chunk: usize) -> (Terminal, usize) {
             if decoder.next_page().unwrap() {
                 pages += 1;
                 // Live output between pages goes to the same terminal.
-                decoder.terminal().unwrap().vt_write(b"");
+                decoder.terminal().unwrap().vt_write(b"\x1b]2;between\x07");
             } else {
                 finished = true;
             }
@@ -157,6 +157,7 @@ fn incremental_decode_at_arbitrary_splits() {
     for chunk in [1, 7, 4096, bytes.len()] {
         let (restored, pages) = decode_in_chunks(&bytes, chunk);
         assert!(pages >= 1, "chunk {chunk}");
+        assert_eq!(restored.title(), "between", "chunk {chunk}");
         assert_eq!(
             restored.scrollback_rows(),
             term.scrollback_rows(),
@@ -180,14 +181,28 @@ fn decoder_keeps_its_terminal_until_released() {
     assert!(plain(&term).contains("after"));
 }
 
+#[test]
+fn decoder_refuses_a_replaced_terminal() {
+    let bytes = snapshot::encode(&filled(5000)).unwrap();
+    let mut decoder = snapshot::Decoder::new().unwrap();
+    decoder.push(&bytes);
+    let handed_out = decoder.ready().unwrap();
+    // The library still holds the terminal it returned; dropping it
+    // through the `&mut` must not let the next step use freed memory.
+    drop(std::mem::replace(
+        handed_out,
+        Terminal::new(80, 24).unwrap(),
+    ));
+    assert_eq!(decoder.next_page(), Err(Error::InvalidValue));
+    assert_eq!(decoder.decode().err(), Some(Error::InvalidValue));
+}
+
 #[derive(Default)]
 struct Recorder {
     pty: Vec<u8>,
     statuses: Vec<ProgramStatus>,
     prompts: Vec<SemanticPromptKind>,
-    titles: Vec<String>,
-    resize: Option<(u16, u16)>,
-    clipboard: Vec<ClipboardContent>,
+    titles: usize,
 }
 
 struct Shared(Arc<Mutex<Recorder>>);
@@ -213,19 +228,8 @@ impl Handler for Shared {
             cell_height: 18,
         })
     }
-    fn clipboard_write(
-        &mut self,
-        _location: ClipboardLocation,
-        contents: &[ClipboardContent],
-    ) -> bool {
-        self.0.lock().unwrap().clipboard.extend_from_slice(contents);
-        true
-    }
-    fn resize_window(&mut self, cols: u16, rows: u16) {
-        self.0.lock().unwrap().resize = Some((cols, rows));
-    }
-    fn title_changed(&mut self, term: &Term) {
-        self.0.lock().unwrap().titles.push(term.title());
+    fn title_changed(&mut self) {
+        self.0.lock().unwrap().titles += 1;
     }
 }
 
@@ -276,35 +280,28 @@ fn effects_reach_the_handler() {
     );
 
     term.vt_write(b"\x1b]2;new title\x07");
-    assert_eq!(rec.lock().unwrap().titles, ["new title"]);
-
-    term.vt_write(b"\x1b[8;30;100t");
-    assert_eq!(rec.lock().unwrap().resize, Some((100, 30)));
-
-    term.vt_write(b"\x1b]52;c;aGVsbG8=\x07");
-    let clipboard = &rec.lock().unwrap().clipboard;
-    assert_eq!(clipboard.len(), 1);
-    assert_eq!(clipboard[0].data, b"hello");
+    assert_eq!(rec.lock().unwrap().titles, 1);
+    assert_eq!(term.title(), "new title");
 }
 
 #[test]
 fn modes_and_colors() {
-    let mut term = Terminal::new(10, 2).unwrap();
+    let (mut term, rec) = recorded();
     assert!(!term.mode(2031).unwrap());
     term.vt_write(b"\x1b[?2031h");
     assert!(term.mode(2031).unwrap());
-    assert_eq!(term.color(ColorKind::Background), None);
+    // Colours are observed as a program would, through OSC 11's answer.
+    term.vt_write(b"\x1b]11;?\x07");
+    assert_eq!(rec.lock().unwrap().pty, b"", "no background set, no answer");
     term.set_color(ColorKind::Background, Some(Rgb { r: 1, g: 2, b: 3 }))
         .unwrap();
+    term.vt_write(b"\x1b]11;?\x07");
     assert_eq!(
-        term.color(ColorKind::Background),
-        Some(Rgb { r: 1, g: 2, b: 3 })
+        std::mem::take(&mut rec.lock().unwrap().pty),
+        b"\x1b]11;rgb:0101/0202/0303\x07"
     );
-    term.vt_write(b"\x1b]11;#ff0000\x07");
-    assert_eq!(
-        term.color(ColorKind::Background),
-        Some(Rgb { r: 255, g: 0, b: 0 })
-    );
+    term.vt_write(b"\x1b]11;#ff0000\x07\x1b]11;?\x07");
+    assert_eq!(rec.lock().unwrap().pty, b"\x1b]11;rgb:ffff/0000/0000\x07");
     term.vt_write(b"\x1b[1mbold");
     let vt = formatter::format(
         &term,

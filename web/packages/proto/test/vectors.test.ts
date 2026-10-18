@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 
-import { FrameError, FrameType, encodeFrame, parseFrame, parseOutput } from "../src/index.ts";
+import { FrameError, FrameType, StreamFramer, encodeFrame, parseFrame, parseOutput } from "../src/index.ts";
 import type { Limits } from "../src/index.ts";
 import { vectors as messages } from "./messages.ts";
 
@@ -68,8 +68,7 @@ test("message vectors equal the typed literals", () => {
   expect(file).toEqual(messages);
 });
 
-test("a stream is split into frames at any chunk boundary", async () => {
-  const { StreamFramer } = await import("../src/stream.ts");
+test("a stream is split into frames at any chunk boundary", () => {
   const a = encodeFrame(FrameType.Input, 1, new TextEncoder().encode("abc"));
   const b = encodeFrame(FrameType.Close, 1, new Uint8Array());
   const all = new Uint8Array([...a, ...b]);

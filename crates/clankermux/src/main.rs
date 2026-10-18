@@ -165,33 +165,31 @@ fn parse_env(entries: &[String]) -> Result<BTreeMap<String, String>, Error> {
 
 /// Every session, page by page.
 async fn all_sessions(conn: &Connection) -> Result<Vec<Session>, Error> {
-    let mut after: Option<String> = None;
+    let first = conn.call("list", ListParams::default()).await?;
+    following_pages(conn, first).await
+}
+
+/// `first` and the pages after it.
+async fn following_pages(conn: &Connection, mut page: Page) -> Result<Vec<Session>, Error> {
     let mut sessions = Vec::new();
     loop {
-        let page: Page = conn
-            .call(
-                "list",
-                ListParams {
-                    after: after.take(),
-                },
-            )
-            .await?;
         sessions.extend(page.sessions);
-        match page.next {
-            Some(next) => after = Some(next),
-            None => return Ok(sessions),
-        }
+        let Some(after) = page.next else {
+            return Ok(sessions);
+        };
+        page = conn.call("list", ListParams { after: Some(after) }).await?;
     }
 }
 
 /// A session argument: an id, a unique id prefix, or a unique label.
 async fn resolve(conn: &Connection, needle: &str) -> Result<SessionParams, Error> {
-    let sessions = all_sessions(conn).await?;
-    if sessions.iter().any(|s| s.id == needle) {
-        return Ok(SessionParams {
-            session: needle.to_string(),
-        });
+    let exact = SessionParams {
+        session: needle.to_string(),
+    };
+    if conn.call::<_, Session>("inspect", &exact).await.is_ok() {
+        return Ok(exact);
     }
+    let sessions = all_sessions(conn).await?;
     let matches: Vec<&Session> = sessions
         .iter()
         .filter(|s| s.id.starts_with(needle) || s.label == needle)
@@ -239,7 +237,7 @@ fn session_line(s: &Session) {
         "{:<8} {:<12} {:<8}{:<9} {:>3}x{:<3} {} {}\n",
         &s.id[..8],
         s.label,
-        format!("{:?}", s.status).to_lowercase(),
+        s.status.to_string(),
         exit,
         s.cols,
         s.rows,
@@ -279,6 +277,9 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
         (Some(cert), Some(key)) => Some(server::tls::Source::Files { cert, key }),
         _ => None,
     };
+    // The state lock comes first: a second server learns of the first
+    // before any tailnet work.
+    let registry = server::Registry::new(server::default_config()).map_err(Error::Io)?;
     // One status request serves every carrier that needs the tailnet.
     let needs_tailnet = tcp.is_some()
         || matches!(ws_bind, Some(WsBind::Port(_)))
@@ -338,10 +339,10 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
         ws_listener = Some((listener, tls));
     }
 
-    let registry = server::Registry::new(server::default_config()).map_err(Error::Io)?;
     let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(server::serve_unix(socket.clone(), registry.clone()));
+    let unix_listener = server::bind_unix(&socket).map_err(Error::Io)?;
     eprintln!("listening on {}", socket.display());
+    tasks.spawn(server::serve_unix(unix_listener, registry.clone()));
     if let Some(listener) = tcp_listener {
         eprintln!(
             "listening on tcp://{}",
@@ -361,14 +362,17 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
             origins,
         ));
     }
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(Error::Io)?;
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate()).map_err(Error::Io)?;
+    let mut hangup = signal(SignalKind::hangup()).map_err(Error::Io)?;
     let result = tokio::select! {
         result = tasks.join_next() => result.unwrap().unwrap_or_else(|e| Err(std::io::Error::other(e))),
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = terminate.recv() => Ok(()),
+        _ = hangup.recv() => Ok(()),
     };
-    // A graceful stop parks every running session first.
+    // A graceful stop parks every running session and delivers `CLOSED
+    // stopping` before the process ends.
     registry.stop().await;
     result.map(|()| ExitCode::SUCCESS).map_err(Error::Io)
 }
@@ -396,22 +400,19 @@ async fn relay(socket: PathBuf) -> Result<ExitCode, Error> {
         .await
         .map_err(|e| usage(format!("cannot connect to {}: {e}", socket.display())))?;
     let (mut from_server, mut to_server) = unix.into_split();
-    let to_stdout = tokio::spawn(async move {
+    // Stdin EOF shuts down the socket's write half; the server then ends
+    // the connection, and its last bytes end the relay.
+    tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let _ = tokio::io::copy(&mut stdin, &mut to_server).await;
+        let _ = to_server.shutdown().await;
+    });
+    let copied = async {
         let mut stdout = tokio::io::stdout();
         tokio::io::copy(&mut from_server, &mut stdout).await?;
         stdout.flush().await
-    });
-    let to_server = async move {
-        let mut stdin = tokio::io::stdin();
-        let _ = tokio::io::copy(&mut stdin, &mut to_server).await;
-        // The server ends the connection at EOF; its last bytes follow.
-        let _ = to_server.shutdown().await;
-        std::future::pending::<()>().await
-    };
-    let copied = tokio::select! {
-        copied = to_stdout => copied.map_err(std::io::Error::other).and_then(|r| r),
-        () = to_server => unreachable!(),
-    };
+    }
+    .await;
     copied.map(|_| ExitCode::SUCCESS).map_err(Error::Io)
 }
 
@@ -601,19 +602,25 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                     data
                 }
             };
-            conn.request(
-                "write",
-                WriteParams {
-                    session: params.session,
-                    data: base64::engine::general_purpose::STANDARD.encode(data),
-                },
-            )
-            .await?;
+            // Each request's base64 fits the server's control body with
+            // room for the rest of the JSON.
+            let chunk = (conn.welcome.limits.control_body as usize).saturating_sub(1024) / 4 * 3;
+            for chunk in data.chunks(chunk.max(3)) {
+                conn.request(
+                    "write",
+                    WriteParams {
+                        session: params.session.clone(),
+                        data: base64::engine::general_purpose::STANDARD.encode(chunk),
+                    },
+                )
+                .await?;
+            }
         }
         Command::Events => {
             let mut events = conn.events();
             let page: Page = conn.call("subscribe", ListParams::default()).await?;
-            print(json, &page.sessions, |sessions| {
+            let sessions = following_pages(&conn, page).await?;
+            print(json, &sessions, |sessions| {
                 sessions.iter().for_each(session_line)
             });
             loop {

@@ -1,9 +1,9 @@
-import { type Engine, EngineError, RESULT, Terminal } from "./index.ts";
+import { type Engine, EngineError, Terminal } from "./index.ts";
 
 /** Bytes before the first record: the 8-byte magic and the u16 version. */
-export const ENVELOPE_LEN = 10;
+const ENVELOPE_LEN = 10;
 /** Bytes in a record header: tag u16, payload length u32, CRC32C u32. */
-export const RECORD_HEADER_LEN = 10;
+const RECORD_HEADER_LEN = 10;
 
 const TAG_PAGE = 3;
 const TAG_READY = 5;
@@ -44,11 +44,12 @@ export function stepEnd(buf: Uint8Array, pos: number, len = buf.length): number 
  * `nextPage` are called only once the bytes they consume are in place.
  *
  * This leans on the engine's behaviour, not its contract: the header asks
- * for an immutable buffer, but the wasm build cannot call back into JS
- * for a `GhosttyReader` (no function-type reflection to add a table
- * entry), so the buffer is filled behind the decoder instead. The engine
- * is pinned; its decoder test pushes the bytes piecewise, so an engine
- * that validated ahead would fail there before shipping.
+ * for an immutable buffer. A `GhosttyReader` callback from wasm would
+ * need a JS function placed in the module's function table, which takes
+ * a generated wasm wrapper per signature; filling the buffer behind the
+ * decoder is less machinery. The engine is pinned; its decoder test
+ * pushes the bytes piecewise, so an engine that validated ahead would
+ * fail there before shipping.
  */
 export class Decoder {
   private readonly buffer: number;
@@ -116,11 +117,11 @@ export class Decoder {
     if (end === undefined) throw new Error("next page not buffered");
     const code = this.engine.call("ghostty_snapshot_decoder_next", this.decoder);
     this.consumed = end;
-    if (code === RESULT.NO_VALUE) {
+    if (code === this.engine.result.NO_VALUE) {
       this.finished = true;
       return false;
     }
-    if (code !== RESULT.SUCCESS) throw new EngineError("ghostty_snapshot_decoder_next", code);
+    if (code !== this.engine.result.SUCCESS) throw new EngineError("ghostty_snapshot_decoder_next", code);
     return true;
   }
 

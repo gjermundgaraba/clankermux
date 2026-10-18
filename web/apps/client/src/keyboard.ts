@@ -1,4 +1,4 @@
-import type { KeyInput } from "@clankermux/engine";
+import { type KeyInput, isText } from "@clankermux/engine";
 
 /** The parts of a `KeyboardEvent` the mapping reads. */
 export interface KeyEventLike {
@@ -25,13 +25,6 @@ export interface Keyboard {
  * the terminal's. */
 export function browserKeeps(e: KeyEventLike): boolean {
   return e.metaKey || (e.ctrlKey && e.shiftKey && e.code === "KeyV");
-}
-
-/** Whether `key` is one character of text rather than a key name. */
-function isText(key: string): boolean {
-  if (key.length === 0) return false;
-  const cp = key.codePointAt(0)!;
-  return cp >= 0x20 && cp !== 0x7f && [...key].length === 1;
 }
 
 export function keyInput(e: KeyEventLike, keyboard: Keyboard): KeyInput {

@@ -36,10 +36,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "{e}"),
             Error::Protocol(m) => write!(f, "protocol error: {m}"),
-            Error::Server(e) => {
-                let code = serde_json::to_value(e.code).expect("serializable");
-                write!(f, "{}: {}", code.as_str().unwrap_or("error"), e.message)
-            }
+            Error::Server(e) => write!(f, "{}: {}", e.code, e.message),
             Error::Closed => write!(f, "connection closed"),
             Error::Usage(m) => write!(f, "{m}"),
         }
@@ -90,6 +87,8 @@ enum Ended {
     Server(ErrorMessage),
     /// The stream ended or broke.
     Lost(String),
+    /// The server closed the connection, as on a stop.
+    Eof,
 }
 
 impl From<&Ended> for Error {
@@ -97,6 +96,7 @@ impl From<&Ended> for Error {
         match ended {
             Ended::Server(error) => Error::Server(error.clone()),
             Ended::Lost(reason) => Error::Protocol(reason.clone()),
+            Ended::Eof => Error::Closed,
         }
     }
 }
@@ -193,7 +193,7 @@ impl Connection {
     pub fn send(&self, frame_type: FrameType, channel: u32, payload: &[u8]) -> Result<(), Error> {
         self.tx
             .send(encode_frame(frame_type, channel, payload))
-            .map_err(|_| Error::Closed)
+            .map_err(|_| self.ended().unwrap_or(Error::Closed))
     }
 
     pub fn send_json<T: Serialize>(
@@ -215,8 +215,8 @@ impl Connection {
         let (reply_tx, reply_rx) = oneshot::channel();
         {
             let mut routes = self.routes.lock().unwrap();
-            if routes.closed.is_some() {
-                return Err(Error::Closed);
+            if let Some(closed) = &routes.closed {
+                return Err(closed.into());
             }
             routes.pending.insert(id, reply_tx);
         }
@@ -232,7 +232,9 @@ impl Connection {
         match reply_rx.await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => Err(error.into()),
-            Err(_) => Err(Error::Closed),
+            // The connection ended, and says why (an id-less ERROR among
+            // the reasons).
+            Err(_) => Err(self.ended().unwrap_or(Error::Closed)),
         }
     }
 
@@ -252,8 +254,8 @@ impl Connection {
         let (tx, rx) = mpsc::unbounded_channel();
         {
             let mut routes = self.routes.lock().unwrap();
-            if routes.closed.is_some() {
-                return Err(Error::Closed);
+            if let Some(closed) = &routes.closed {
+                return Err(closed.into());
             }
             routes.channels.insert(channel, tx);
         }
@@ -311,7 +313,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
             Err(err) => break Ended::Lost(err.to_string()),
         }
         match reader.read(&mut buf).await {
-            Ok(0) => break Ended::Lost("connection closed by the server".into()),
+            Ok(0) => break Ended::Eof,
             Ok(n) => decoder.push(&buf[..n]),
             Err(err) => break Ended::Lost(err.to_string()),
         }
@@ -393,9 +395,9 @@ impl Endpoint {
             Endpoint::Ssh(destination) => {
                 // The child outlives this handle: it ends when the pipes
                 // close, and tokio reaps it. Its stderr would otherwise
-                // print into an attached terminal in raw mode; it is read
-                // into the error when the handshake fails and dropped
-                // afterwards.
+                // print into an attached terminal in raw mode; its last
+                // bytes are kept for the error when the handshake fails,
+                // and discarded for as long as the connection lives.
                 let mut child = tokio::process::Command::new("ssh")
                     .arg(destination)
                     .args(["clankermux", "--stdio"])
@@ -407,9 +409,18 @@ impl Endpoint {
                 let stdout = child.stdout.take().expect("piped");
                 let mut stderr = child.stderr.take().expect("piped");
                 let drain = tokio::spawn(async move {
-                    let mut text = String::new();
-                    let _ = tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut text).await;
-                    text
+                    const KEPT: usize = 4096;
+                    let mut tail = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n @ 1..) =
+                        tokio::io::AsyncReadExt::read(&mut stderr, &mut buf).await
+                    {
+                        tail.extend_from_slice(&buf[..n]);
+                        if tail.len() > KEPT {
+                            tail.drain(..tail.len() - KEPT);
+                        }
+                    }
+                    String::from_utf8_lossy(&tail).into_owned()
                 });
                 match Connection::handshake(tokio::io::join(stdout, stdin), hello).await {
                     Ok(connection) => Ok(connection),

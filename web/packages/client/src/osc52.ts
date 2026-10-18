@@ -1,7 +1,12 @@
 /**
- * Finds OSC 52 clipboard writes in output bytes, across chunk boundaries.
- * The engine raises the clipboard effect through a callback, which the
- * wasm build cannot reach, so the client scans the stream itself.
+ * Finds OSC 52 clipboard writes in output bytes, across chunk boundaries,
+ * ending them as the engine's parser does: BEL or any byte after ESC
+ * dispatches the sequence (ESC `\` is the string terminator; ESC `]`
+ * begins the next one), CAN and SUB abandon it. The engine raises the
+ * clipboard effect through a callback, which from wasm would need a JS
+ * function in the module's function table (a generated wrapper per
+ * signature); the scan is less machinery. OSC 1337 and 5522 clipboard
+ * forms are not scanned for.
  */
 const ESC = 0x1b;
 const BEL = 0x07;
@@ -15,7 +20,10 @@ export interface ClipboardWrite {
   text: string;
 }
 
-type State = "text" | "esc" | "osc" | "osc-esc";
+const CAN = 0x18;
+const SUB = 0x1a;
+
+type State = "text" | "esc" | "osc";
 
 export class Osc52Scanner {
   private state: State = "text";
@@ -52,7 +60,10 @@ export class Osc52Scanner {
           if (b === BEL) {
             this.finish(writes);
           } else if (b === ESC) {
-            this.state = "osc-esc";
+            this.finish(writes);
+            this.state = "esc";
+          } else if (b === CAN || b === SUB) {
+            this.reset();
           } else if (this.collecting) {
             this.payload.push(b);
             // Only a 52 is collected; anything else is skipped to its end.
@@ -62,12 +73,6 @@ export class Osc52Scanner {
               this.payload = [];
             }
           }
-          break;
-        case "osc-esc":
-          if (b === 0x5c) this.finish(writes);
-          // Another OSC may start before this one ended.
-          else if (b === 0x5d) this.startOsc();
-          else this.state = b === ESC ? "esc" : "text";
           break;
       }
     }

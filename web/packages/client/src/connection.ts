@@ -8,7 +8,10 @@ import {
   type Welcome,
   encodeFrame,
   parseFrame,
+  VERSION,
 } from "@clankermux/proto";
+
+import pkg from "../package.json" with { type: "json" };
 
 /** A message-oriented byte transport: one frame per message, as over WebSocket. */
 export interface Transport {
@@ -38,11 +41,12 @@ export class ClientError extends Error {
   }
 }
 
-/** Frames before `WELCOME` tells us the real limit. */
-const HELLO_MAX_FRAME = 16 * 1024 * 1024;
+/** Frames before `WELCOME` tells us the real limit: the protocol's
+ * default `max_frame`, as the Rust client. */
+const HELLO_MAX_FRAME = 1024 * 1024;
 
 export function hello(name: string, engine?: string): Hello {
-  const h: Hello = { version: 1, client: { name, version: "0.1.0" }, capabilities: [] };
+  const h: Hello = { version: VERSION, client: { name, version: pkg.version }, capabilities: [] };
   if (engine !== undefined) h.engine = engine;
   return h;
 }

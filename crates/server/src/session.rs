@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use ghostty_vt::{
     ColorKind, ColorScheme, Handler, ProgramStatus, Rgb, SemanticPrompt, SemanticPromptKind,
-    SizeReport, Term, Terminal, color_scheme_report, formatter, snapshot,
+    SizeReport, Terminal, color_scheme_report, formatter, snapshot,
 };
 use proto::{
     ClosedReason, ErrorCode, Event, Exit, OnExit, Profile, Scheme, Size, Status, Viewport,
@@ -16,6 +16,7 @@ use proto::{
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
+use crate::attach::Ending;
 use crate::park::ParkFile;
 use crate::records::Records;
 use crate::registry::{Fail, Registry};
@@ -25,6 +26,10 @@ pub type Shared = Arc<Mutex<Session>>;
 
 /// Coalescing window for `VIEWPORT` reports.
 pub const COALESCE: Duration = Duration::from_millis(25);
+
+/// How long a snapshot is retried while the continuation limit is
+/// exceeded, for a bootstrap and for a park.
+pub const SNAPSHOT_RETRY: Duration = Duration::from_secs(5);
 
 /// Effects the engine raises while parsing, collected under the session
 /// lock and drained by the caller of `vt_write`.
@@ -75,11 +80,17 @@ impl Handler for Effects {
         Some(self.size)
     }
 
-    fn title_changed(&mut self, _term: &Term) {
+    fn title_changed(&mut self) {
         self.changed = true;
     }
 
-    fn pwd_changed(&mut self, _term: &Term) {
+    fn pwd_changed(&mut self) {
+        self.changed = true;
+    }
+
+    /// A full reset clears the title and pwd without the two callbacks
+    /// above.
+    fn reset(&mut self) {
         self.changed = true;
     }
 
@@ -128,7 +139,7 @@ pub fn default_color(kind: ColorKind) -> Rgb {
 /// `#rrggbb`.
 pub fn parse_rgb(value: &str) -> Option<Rgb> {
     let hex = value.strip_prefix('#')?;
-    if hex.len() != 6 {
+    if hex.len() != 6 || !hex.is_ascii() {
         return None;
     }
     let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
@@ -174,11 +185,6 @@ impl InputQueue {
     }
 }
 
-/// A viewport report from an attachment or from `set_size`.
-pub struct Report {
-    pub viewport: Viewport,
-}
-
 /// `cols` and `rows` of a size are at least 1.
 pub fn check_size(size: &Size) -> Result<(), crate::registry::Fail> {
     if size.cols == 0 || size.rows == 0 {
@@ -195,7 +201,7 @@ pub struct Attachment {
     pub id: u64,
     /// Tells the attachment to send `CLOSED` and end. Weak, so that the
     /// connection dropping its handle ends the attachment.
-    pub close: mpsc::WeakUnboundedSender<ClosedReason>,
+    pub close: mpsc::WeakUnboundedSender<Ending>,
     /// Set once it has sent the final marker and, if bootstrapping,
     /// `SNAPSHOT_END`.
     pub finished: Arc<AtomicBool>,
@@ -214,10 +220,33 @@ pub struct Live {
     pub input: InputQueue,
     pub pty_eof: bool,
     /// The latest coalesced report, waiting for the timer.
-    pub pending: Option<Report>,
+    pub pending: Option<Viewport>,
     pub timer_running: bool,
-    /// The latest profile a report carried, for the park file.
-    pub profile: Profile,
+}
+
+impl Live {
+    /// History and screen as text, one logical line each, and how many
+    /// of the leading lines are history.
+    pub fn text(&self) -> Result<(String, usize), ghostty_vt::Error> {
+        let text = |region| {
+            formatter::format(
+                &self.term,
+                formatter::Options {
+                    unwrap: true,
+                    trim: true,
+                    region,
+                    ..Default::default()
+                },
+            )
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let all = text(formatter::Region::FromRow(0))?;
+        let screen = text(formatter::Region::FromRow(
+            self.term.scrollback_rows() as u32
+        ))?;
+        let history_lines = all.lines().count() - screen.lines().count();
+        Ok((all, history_lines))
+    }
 }
 
 /// A session loaded from a park file: a screen, no process.
@@ -287,13 +316,6 @@ impl Session {
     /// The live body of a running session, else `not_running`.
     pub fn running(&self) -> Result<&Live, Fail> {
         match (&self.body, &self.exited_at) {
-            (Body::Live(live), None) => Ok(live),
-            _ => Err((ErrorCode::NotRunning, "session is not running".into())),
-        }
-    }
-
-    pub fn running_mut(&mut self) -> Result<&mut Live, Fail> {
-        match (&mut self.body, &self.exited_at) {
             (Body::Live(live), None) => Ok(live),
             _ => Err((ErrorCode::NotRunning, "session is not running".into())),
         }
@@ -448,7 +470,7 @@ impl Session {
 
     /// Applies a viewport report at once, discarding any pending coalesced
     /// report. Returns the marker when the size changed.
-    pub fn apply_report(&mut self, report: Report) -> Option<Marker> {
+    pub fn apply_report(&mut self, report: Viewport) -> Option<Marker> {
         let Body::Live(live) = &mut self.body else {
             return None;
         };
@@ -465,7 +487,7 @@ impl Session {
                     cell_height,
                 },
             profile,
-        } = report.viewport;
+        } = report;
         if let Some(profile) = profile {
             self.set_profile(profile);
         }
@@ -534,7 +556,6 @@ impl Session {
         {
             tracing::warn!(session = id, "input queue full; scheme report dropped");
         }
-        live.profile = profile;
     }
 
     /// Called when the PTY reached EOF or the child was reaped; ends the
@@ -559,34 +580,15 @@ impl Session {
     }
 
     /// The text `read` serves: the screen preceded by the last `scrollback`
-    /// lines of history, one logical line each.
+    /// lines of history, one logical line each, the same text live or
+    /// parked.
     pub fn read_text(&self, scrollback: usize) -> Result<String, ghostty_vt::Error> {
-        match &self.body {
-            Body::Live(live) => {
-                let rows = usize::from(live.term.rows());
-                let wanted = rows + scrollback;
-                let start_row = (live.term.scrollback_rows() + rows).saturating_sub(wanted);
-                let formatted = formatter::format(
-                    &live.term,
-                    formatter::Options {
-                        unwrap: true,
-                        trim: true,
-                        region: formatter::Region::FromRow(start_row as u32),
-                        ..Default::default()
-                    },
-                )?;
-                Ok(String::from_utf8_lossy(&formatted).into_owned())
-            }
-            Body::Parked(parked) => {
-                let start = parked.history_lines.saturating_sub(scrollback);
-                Ok(parked
-                    .screen
-                    .lines()
-                    .skip(start)
-                    .collect::<Vec<_>>()
-                    .join("\n"))
-            }
-        }
+        let (text, history_lines) = match &self.body {
+            Body::Live(live) => blocking(|| live.text())?,
+            Body::Parked(parked) => (parked.screen.clone(), parked.history_lines),
+        };
+        let skip = history_lines.saturating_sub(scrollback);
+        Ok(text.lines().skip(skip).collect::<Vec<_>>().join("\n"))
     }
 
     /// The park file and `screen.txt` of a live session, as of `at`.
@@ -595,22 +597,7 @@ impl Session {
         live: &Live,
         at: jiff::Timestamp,
     ) -> Result<(ParkFile, String), ghostty_vt::Error> {
-        let text = |region| {
-            formatter::format(
-                &live.term,
-                formatter::Options {
-                    unwrap: true,
-                    trim: true,
-                    region,
-                    ..Default::default()
-                },
-            )
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        };
-        let all = text(formatter::Region::FromRow(0))?;
-        let screen = text(formatter::Region::FromRow(
-            live.term.scrollback_rows() as u32
-        ))?;
+        let (all, history_lines) = live.text()?;
         let file = ParkFile {
             protocol: crate::park::PROTOCOL,
             engine: ghostty_vt::ENGINE.into(),
@@ -621,7 +608,7 @@ impl Session {
                 program_status: Some(self.records.all()),
                 ..self.to_proto(false)
             },
-            history_lines: (all.lines().count() - screen.lines().count()) as u64,
+            history_lines: history_lines as u64,
         };
         Ok((file, all))
     }
@@ -640,7 +627,7 @@ impl Session {
             if (!finished_only || a.finished.load(Ordering::Acquire))
                 && let Some(close) = a.close.upgrade()
             {
-                let _ = close.send(reason);
+                let _ = close.send(Ending::Closed(reason));
             }
         }
     }
@@ -648,16 +635,13 @@ impl Session {
 
 /// Applies a viewport report, at once or after the coalescing window, and
 /// emits `session_changed` when the size changed.
-pub fn report(registry: &Arc<Registry>, session: &Shared, report: Report, immediate: bool) {
+pub fn report(registry: &Arc<Registry>, session: &Shared, report: Viewport, immediate: bool) {
     let mut s = session.lock().unwrap();
     if immediate {
         let changed = s.apply_report(report).map(|_| s.to_proto(false));
         let events = s.take_events();
         drop(s);
-        registry.emit_all(events);
-        if let Some(session) = changed {
-            registry.emit(&Event::SessionChanged { session });
-        }
+        registry.emit_session(events, changed);
         return;
     }
     let Some(live) = s.live_mut() else {
@@ -684,10 +668,7 @@ pub fn report(registry: &Arc<Registry>, session: &Shared, report: Report, immedi
                 .map(|_| s.to_proto(false));
             (changed, s.take_events())
         };
-        registry.emit_all(events);
-        if let Some(session) = changed {
-            registry.emit(&Event::SessionChanged { session });
-        }
+        registry.emit_session(events, changed);
     });
 }
 
@@ -715,6 +696,15 @@ pub fn now() -> String {
     jiff::Timestamp::now().to_string()
 }
 
+/// Runs engine work that holds the session still; on a multi-thread
+/// runtime the worker is released meanwhile.
+pub fn blocking<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::current().runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::CurrentThread => work(),
+        _ => tokio::task::block_in_place(work),
+    }
+}
+
 /// Encodes a live session's snapshot, retrying for up to `retry` while
 /// the continuation limit is exceeded, and runs `take` with the bytes
 /// under the session lock. `Ok(None)` when the session is not live.
@@ -724,8 +714,8 @@ pub async fn snapshot_with_retry<T>(
     mut take: impl FnMut(&Session, &Live, Vec<u8>) -> T,
 ) -> Result<Option<T>, ghostty_vt::Error> {
     let deadline = tokio::time::Instant::now() + retry;
+    let wake = session.lock().unwrap().wake.clone();
     loop {
-        let wake = session.lock().unwrap().wake.clone();
         let notified = wake.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -734,14 +724,7 @@ pub async fn snapshot_with_retry<T>(
             let Some(live) = s.live() else {
                 return Ok(None);
             };
-            // Encoding holds the session still; on a
-            // multi-thread runtime the worker is released meanwhile.
-            let encode = || snapshot::encode(&live.term);
-            let encoded = match tokio::runtime::Handle::current().runtime_flavor() {
-                tokio::runtime::RuntimeFlavor::CurrentThread => encode(),
-                _ => tokio::task::block_in_place(encode),
-            };
-            encoded.map(|bytes| take(&s, live, bytes))
+            blocking(|| snapshot::encode(&live.term).map(|bytes| take(&s, live, bytes)))
         };
         match taken {
             Ok(value) => return Ok(Some(value)),

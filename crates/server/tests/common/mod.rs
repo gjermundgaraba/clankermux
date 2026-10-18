@@ -1,5 +1,4 @@
-//! Shared test harness: an in-process server on a temp Unix socket and a
-//! framed client.
+//! Shared test harness: the test kit's server and a framed client.
 #![allow(dead_code)]
 
 use std::path::PathBuf;
@@ -8,58 +7,17 @@ use std::time::Duration;
 use ghostty_vt::{formatter, snapshot};
 use proto::*;
 use serde_json::{Value, json};
+pub use testkit::Server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-pub struct Server {
-    pub socket: PathBuf,
-    pub registry: std::sync::Arc<server::Registry>,
-    _dir: tempfile::TempDir,
-    /// The state directory, when this server owns it.
-    _state: Option<tempfile::TempDir>,
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 pub async fn start(limits: Limits) -> Server {
-    let dir = tempfile::tempdir().unwrap();
-    let mut server = start_with(limits, dir.path().join("state")).await;
-    server._state = Some(dir);
-    server
+    Server::start(limits)
 }
 
 /// A server on `state_dir`, which may hold a previous server's parks.
 pub async fn start_with(limits: Limits, state_dir: PathBuf) -> Server {
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("sock");
-    let registry = server::Registry::new(server::Config {
-        limits,
-        shell: vec!["/bin/sh".into()],
-        home: dir.path().to_path_buf(),
-        version: "test".into(),
-        state_dir,
-    })
-    .unwrap();
-    let task = tokio::spawn(server::serve_unix(socket.clone(), registry.clone()));
-    // The socket file exists before the server listens on it.
-    for _ in 0..100 {
-        if UnixStream::connect(&socket).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Server {
-        socket,
-        registry,
-        _dir: dir,
-        _state: None,
-        task,
-    }
+    Server::start_with_state(limits, state_dir)
 }
 
 pub fn fast_limits() -> Limits {
@@ -241,6 +199,11 @@ impl Client {
     /// Reads a `snapshot` bootstrap through `SNAPSHOT_READY`.
     pub async fn bootstrap_ready(&mut self, channel: u32) -> Bootstrap {
         let attached = self.attached(channel).await;
+        self.ready_after(channel, attached).await
+    }
+
+    /// The `READY` prefix that follows an `ATTACHED` already read.
+    pub async fn ready_after(&mut self, channel: u32, attached: Attached) -> Bootstrap {
         assert_eq!(attached.mode, AttachMode::Snapshot);
         let mut ready = Vec::new();
         loop {
@@ -262,7 +225,12 @@ impl Client {
 
     /// Reads a whole `snapshot` bootstrap through `SNAPSHOT_END`.
     pub async fn bootstrap(&mut self, channel: u32) -> Bootstrap {
-        let mut boot = self.bootstrap_ready(channel).await;
+        let boot = self.bootstrap_ready(channel).await;
+        self.bootstrap_rest(channel, boot).await
+    }
+
+    /// The rest of a bootstrap whose `READY` prefix was read.
+    pub async fn bootstrap_rest(&mut self, channel: u32, mut boot: Bootstrap) -> Bootstrap {
         loop {
             let (header, payload) = self.recv_on(channel).await;
             match header.frame_type {
@@ -319,7 +287,7 @@ impl Client {
 
     /// Polls `inspect` until the session reports `count` attachments.
     pub async fn wait_attachments(&mut self, id: &str, count: u32) {
-        for _ in 0..200 {
+        for _ in 0..1000 {
             let s: Session =
                 serde_json::from_value(self.ok("inspect", json!({"session": id})).await).unwrap();
             if s.attachments == count {
@@ -372,7 +340,7 @@ pub async fn client(server: &Server) -> Client {
 
 /// Polls `read` until `needle` appears on the screen.
 pub async fn wait_text(c: &mut Client, id: &str, needle: &str) -> Read {
-    for _ in 0..200 {
+    for _ in 0..1000 {
         let read: Read =
             serde_json::from_value(c.ok("read", json!({"session": id})).await).unwrap();
         if read.text.contains(needle) {

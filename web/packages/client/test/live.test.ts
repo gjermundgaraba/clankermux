@@ -20,7 +20,9 @@ import { type Action, Attachment, Connection, type Transport, hello } from "../s
 const here = fileURLToPath(new URL(".", import.meta.url));
 const root = `${here}../../../../`;
 const binary = `${root}target/debug/clankermux`;
-const built = existsSync(binary);
+// `just check` builds the binary before the web suites run; a missing one
+// is a failure, not a reason to skip.
+if (!existsSync(binary)) throw new Error(`${binary} is missing: run cargo build first`);
 
 /** Frames over a stream socket, one `onMessage` per frame. */
 class StreamTransport implements Transport {
@@ -91,7 +93,6 @@ let engine: Engine;
 const ORIGIN = "http://page.test";
 
 beforeAll(async () => {
-  if (!built) return;
   engine = await Engine.load(readFileSync(`${here}../../engine/ghostty-vt.wasm`));
   dir = mkdtempSync(join(tmpdir(), "cmx-"));
   socket = join(dir, "sock");
@@ -174,7 +175,7 @@ async function drive(
 
 const screen = (a: Attachment) => a.term()!.formatPlain().trimEnd();
 
-test.skipIf(!built)("bootstraps, streams, resumes and sees the exit", async () => {
+test("bootstraps, streams, resumes and sees the exit", async () => {
   const conn = await connect();
   expect(conn.welcome.engine).toBe(ENGINE);
   const session = await conn.call<Session>("create", { argv: ["/bin/cat"], cols: 20, rows: 5 });
@@ -233,7 +234,7 @@ test.skipIf(!built)("bootstraps, streams, resumes and sees the exit", async () =
   a.free();
 });
 
-test.skipIf(!built)("the TLS WebSocket carrier checks the origin and carries one frame per message", async () => {
+test("the TLS WebSocket carrier checks the origin and carries one frame per message", async () => {
   await expect(WsTransport.connect(wsUrl, "http://elsewhere.test")).rejects.toThrow(/403/);
   const conn = await Connection.connect(await WsTransport.connect(wsUrl, ORIGIN), hello("test", ENGINE));
   expect(conn.welcome.engine).toBe(ENGINE);

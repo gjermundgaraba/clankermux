@@ -361,6 +361,16 @@ async fn a_page_is_cut_to_max_frame() {
     }
     assert_eq!(seen, ids);
     assert!(pages >= 2);
+    // The first `subscribe` page is cut the same way.
+    let reply = c.ok("subscribe", json!({})).await;
+    let page: Page = serde_json::from_value(reply.clone()).unwrap();
+    let encoded = serde_json::to_vec(&json!({"id": 1, "result": reply})).unwrap();
+    assert!(encoded.len() as u64 <= Limits::default().max_frame);
+    assert!(page.sessions.len() < 100);
+    assert_eq!(
+        page.next.as_deref(),
+        Some(page.sessions.last().unwrap().id.as_str())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

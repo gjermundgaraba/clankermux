@@ -128,8 +128,7 @@ proptest! {
                     }
                 }
             }
-            let framed = !broke && consumed == bytes.len()
-                && bytes[..bytes.len() - trailing.len()].len() == consumed - trailing.len();
+            let framed = !broke && consumed == bytes.len();
             // The server may close before everything is written. The end
             // of input lets it close rather than wait for a frame the
             // garbage promised.

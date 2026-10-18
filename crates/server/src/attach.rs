@@ -2,7 +2,6 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use ghostty_vt::snapshot;
 use proto::{
@@ -13,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::connection::Writer;
 use crate::registry::Registry;
-use crate::session::{Attachment, Report, Session, Shared, snapshot_with_retry};
+use crate::session::{Attachment, SNAPSHOT_RETRY, Session, Shared, snapshot_with_retry};
 use crate::stream::MarkerKind;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -21,18 +20,22 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Bytes pulled from the stream per lock hold.
 const PULL_BUDGET: usize = 64 * 1024;
 
-/// How long a snapshot is retried while the continuation limit is exceeded.
-const SNAPSHOT_RETRY: Duration = Duration::from_secs(5);
+/// How an attachment ends, as the session or the connection decides it.
+/// The task sends the frame after whatever it had queued.
+pub enum Ending {
+    Closed(ClosedReason),
+    Error(ErrorCode, String),
+}
 
 /// The connection's side of an attachment. The task holds the session;
 /// the handle only reaches it while the task runs.
 pub struct Handle {
-    pub id: u64,
     pub read_only: bool,
     session: Weak<std::sync::Mutex<Session>>,
-    close: mpsc::UnboundedSender<ClosedReason>,
+    close: mpsc::UnboundedSender<Ending>,
     /// Set by the task, before it queues its `CLOSED` or ending `ERROR`.
     ended: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Handle {
@@ -48,7 +51,20 @@ impl Handle {
 
     /// `CLOSE`: the task sends `CLOSED closed` after its pending frames.
     pub fn close(&self) {
-        let _ = self.close.send(ClosedReason::Closed);
+        let _ = self.close.send(Ending::Closed(ClosedReason::Closed));
+    }
+
+    /// Asks the task to end with `ERROR code` after its pending frames.
+    /// False when the task is gone: it sends nothing more, and the caller
+    /// sends the error itself.
+    pub fn end(&self, code: ErrorCode, message: String) -> bool {
+        self.close.send(Ending::Error(code, message)).is_ok()
+    }
+
+    /// Waits for the task, which has queued every frame of the
+    /// attachment by then.
+    pub async fn finished(self) {
+        let _ = self.task.await;
     }
 }
 
@@ -70,11 +86,9 @@ pub fn open(
         // A writable OPEN's viewport and profile are one immediate report.
         if !open.read_only && (open.viewport.is_some() || open.profile.is_some()) {
             let size = open.viewport.unwrap_or_else(|| s.size());
-            s.apply_report(Report {
-                viewport: Viewport {
-                    size,
-                    profile: open.profile,
-                },
+            s.apply_report(Viewport {
+                size,
+                profile: open.profile,
             });
         }
         s.attached.push(Attachment {
@@ -84,24 +98,16 @@ pub fn open(
         });
         (s.take_events(), s.to_proto(false))
     };
-    registry.emit_all(events);
-    registry.emit(&Event::SessionChanged { session: snapshot });
-    let handle = Handle {
-        id,
-        read_only: open.read_only,
-        session: Arc::downgrade(&session),
-        close: close_tx,
-        ended: ended.clone(),
-    };
+    registry.emit_session(events, Some(snapshot));
     let task = Task {
         id,
         channel,
         writer: writer.clone(),
         registry: registry.clone(),
-        session,
+        session: session.clone(),
         close: close_rx,
         finished,
-        ended,
+        ended: ended.clone(),
         max_frame: registry.config.limits.max_frame as usize,
         cursor: Cursor {
             offset: 0,
@@ -110,8 +116,13 @@ pub fn open(
         snapshot: None,
         done: false,
     };
-    tokio::spawn(task.run(open.resume));
-    handle
+    Handle {
+        read_only: open.read_only,
+        session: Arc::downgrade(&session),
+        close: close_tx,
+        ended,
+        task: registry.attachments.spawn(task.run(open.resume)),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -129,19 +140,9 @@ struct PendingSnapshot {
     after_gap: bool,
 }
 
-/// The frame that ends an attachment, if any: the connection dropping
-/// the handle ends it silently.
-enum End {
-    Closed(ClosedReason),
-    Error(ErrorCode, String),
-    Silent,
-}
-
-impl From<Option<ClosedReason>> for End {
-    fn from(reason: Option<ClosedReason>) -> Self {
-        reason.map_or(End::Silent, End::Closed)
-    }
-}
+/// The frame that ends an attachment; `None` when the connection dropped
+/// the handle, which ends it silently.
+type End = Option<Ending>;
 
 enum Pull {
     Sent,
@@ -155,7 +156,7 @@ struct Task {
     writer: Writer,
     registry: Arc<Registry>,
     session: Shared,
-    close: mpsc::UnboundedReceiver<ClosedReason>,
+    close: mpsc::UnboundedReceiver<Ending>,
     finished: Arc<AtomicBool>,
     ended: Arc<AtomicBool>,
     max_frame: usize,
@@ -176,25 +177,37 @@ impl Task {
             self.ended.store(true, Ordering::Release);
             s.to_proto(false)
         };
-        match &end {
-            End::Closed(reason) => {
-                self.send_json(FrameType::Closed, &Closed { reason: *reason });
-            }
-            End::Error(code, message) => {
-                self.send_json(
-                    FrameType::Error,
-                    &ErrorMessage {
-                        id: None,
-                        code: *code,
-                        message: message.clone(),
-                    },
-                );
-            }
-            End::Silent => {}
+        let removed = matches!(end, Some(Ending::Closed(ClosedReason::Removed)));
+        if let Some(ending) = end {
+            self.send_ending(ending);
         }
-        if !matches!(end, End::Closed(ClosedReason::Removed)) {
+        // An ending the connection queued meanwhile (an `OPEN` on this
+        // channel before it read the `CLOSED`) follows in order; closing
+        // the channel first makes a later one fail, so the connection
+        // sends it after this task's frames.
+        self.close.close();
+        while let Ok(ending) = self.close.try_recv() {
+            if let Ending::Error(..) = ending {
+                self.send_ending(ending);
+            }
+        }
+        if !removed {
             self.registry
                 .emit(&Event::SessionChanged { session: snapshot });
+        }
+    }
+
+    fn send_ending(&self, ending: Ending) {
+        match ending {
+            Ending::Closed(reason) => self.send_json(FrameType::Closed, &Closed { reason }),
+            Ending::Error(code, message) => self.send_json(
+                FrameType::Error,
+                &ErrorMessage {
+                    id: None,
+                    code,
+                    message,
+                },
+            ),
         }
     }
 
@@ -236,8 +249,8 @@ impl Task {
         loop {
             // A close is observed every iteration, not only when idle.
             match self.close.try_recv() {
-                Ok(reason) => return End::Closed(reason),
-                Err(mpsc::error::TryRecvError::Disconnected) => return End::Silent,
+                Ok(ending) => return Some(ending),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
                 Err(mpsc::error::TryRecvError::Empty) => {}
             }
             let wake = self.session.lock().unwrap().wake.clone();
@@ -246,7 +259,7 @@ impl Task {
             notified.as_mut().enable();
             if self.writer.over_high_water() {
                 tokio::select! {
-                    reason = self.close.recv() => return reason.into(),
+                    ending = self.close.recv() => return ending,
                     _ = self.writer.drained() => {}
                 }
                 continue;
@@ -254,15 +267,15 @@ impl Task {
             match self.pull() {
                 Pull::Sent => {
                     if self.writer.is_closed() {
-                        return End::Silent;
+                        return None;
                     }
                 }
                 Pull::Gap => {
                     if self.snapshot.as_ref().is_some_and(|p| p.after_gap) {
-                        return End::Error(
+                        return Some(Ending::Error(
                             ErrorCode::TooSlow,
                             "fell behind again during a bootstrap".into(),
-                        );
+                        ));
                     }
                     if let Err(end) = self.bootstrap(Some(self.cursor.offset)).await {
                         return end;
@@ -273,7 +286,7 @@ impl Task {
                         continue;
                     }
                     tokio::select! {
-                        reason = self.close.recv() => return reason.into(),
+                        ending = self.close.recv() => return ending,
                         _ = notified => {}
                     }
                 }
@@ -288,10 +301,10 @@ impl Task {
         };
         let s = self.session.lock().unwrap();
         let above_latest = || {
-            Err(End::Error(
+            Err(Some(Ending::Error(
                 ErrorCode::InvalidRequest,
                 "resume marker above the latest".into(),
-            ))
+            )))
         };
         // A parked session has no stream to resume on.
         let live = match &s.body {
@@ -320,7 +333,7 @@ impl Task {
     /// after.
     async fn bootstrap(&mut self, gap_from: Option<u64>) -> Result<(), End> {
         self.done = false;
-        let internal = |message: String| End::Error(ErrorCode::Internal, message);
+        let internal = |message: String| Some(Ending::Error(ErrorCode::Internal, message));
         let parked_path = {
             let s = self.session.lock().unwrap();
             s.parked().map(|p| p.snapshot_path.clone())
@@ -357,7 +370,7 @@ impl Task {
                             s.to_proto(false),
                         )
                     }) => taken,
-                    reason = self.close.recv() => return Err(reason.into()),
+                    ending = self.close.recv() => return Err(ending),
                 };
                 match taken {
                     Ok(Some(taken)) => taken,
@@ -367,7 +380,7 @@ impl Task {
                             ghostty_vt::Error::LimitExceeded => ErrorCode::LimitExceeded,
                             _ => ErrorCode::Internal,
                         };
-                        return Err(End::Error(code, format!("snapshot failed: {err}")));
+                        return Err(Some(Ending::Error(code, format!("snapshot failed: {err}"))));
                     }
                 }
             }
@@ -398,7 +411,15 @@ impl Task {
                 snapshot_bytes: Some(bytes.len() as u64),
             },
         );
+        // Paced like the rest of the snapshot: a prefix can hold the whole
+        // continuation, more than the writer's ceiling.
         for chunk in bytes[..ready].chunks(self.max_frame) {
+            if self.writer.over_high_water() {
+                tokio::select! {
+                    ending = self.close.recv() => return Err(ending),
+                    _ = self.writer.drained() => {}
+                }
+            }
             self.send(FrameType::Snapshot, chunk);
         }
         self.send(FrameType::SnapshotReady, &[]);

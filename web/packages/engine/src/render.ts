@@ -1,4 +1,4 @@
-import { type BitField, type Engine, RESULT, type Terminal } from "./index.ts";
+import { type BitField, type Engine, type Terminal } from "./index.ts";
 
 /** Style flag bits of a [`Cell`]. */
 export const FLAG = {
@@ -30,6 +30,10 @@ export interface Cell {
   underline: number;
 }
 
+/** `GhosttyRenderStateCursorVisualStyle` by name. */
+export type CursorStyle = "bar" | "block" | "underline" | "block_hollow";
+const CURSOR_STYLES: CursorStyle[] = ["bar", "block", "underline", "block_hollow"];
+
 export interface FrameRow {
   y: number;
   cells: Cell[];
@@ -48,8 +52,7 @@ export interface Frame {
         y: number;
         visible: boolean;
         blinking: boolean;
-        /** `GhosttyRenderStateCursorVisualStyle`: 0 bar, 1 block, 2 underline, 3 hollow block. */
-        style: number;
+        style: CursorStyle;
         color: number;
       }
     | undefined;
@@ -70,6 +73,7 @@ export class RenderState {
   private readonly wide: { wide: number; tail: number };
   /** `GhosttyCell` bit fields, from the manifest. */
   private readonly cell: { tag: BitField; codepoint: BitField; wide: BitField };
+  private readonly cursorStyles: Map<number, CursorStyle>;
 
   constructor(readonly engine: Engine) {
     this.state = engine.construct("ghostty_render_state_new");
@@ -101,7 +105,9 @@ export class RenderState {
       tag: engine.bits("GhosttyCell", "content_tag"),
       codepoint: engine.bits("GhosttyCell", "content", "CODEPOINT", "codepoint"),
       wide: engine.bits("GhosttyCell", "wide"),
-    };
+    };    this.cursorStyles = new Map(
+      CURSOR_STYLES.map((style) => [engine.enumValue("GhosttyRenderStateCursorVisualStyle", style.toUpperCase()), style]),
+    );
   }
 
   /** Captures the terminal and returns the rows that changed since the last `clean`. */
@@ -149,7 +155,7 @@ export class RenderState {
             y: f("viewport_y"),
             visible: f("visible") !== 0,
             blinking: f("blinking") !== 0,
-            style: f("visual_style"),
+            style: this.cursorStyles.get(f("visual_style")) ?? "block",
             color: cursorColor,
           }
         : undefined;
@@ -226,9 +232,10 @@ export class RenderState {
   }
 
   private color(key: number, out: number): number {
-    const code = this.engine.call("ghostty_render_state_row_cells_get", this.cells, key, out);
-    if (code === RESULT.INVALID_VALUE) return NO_COLOR;
-    if (code !== RESULT.SUCCESS) throw new Error(`cell colour: ${code}`);
+    const e = this.engine;
+    const code = e.call("ghostty_render_state_row_cells_get", this.cells, key, out);
+    if (code === e.enumValue("GhosttyResult", "INVALID_VALUE")) return NO_COLOR;
+    if (code !== e.result.SUCCESS) throw new Error(`cell colour: ${code}`);
     return this.engine.readRgb(out);
   }
 
@@ -238,11 +245,11 @@ export class RenderState {
     e.view.setUint32(buffer + e.offsetOf("GhosttyBuffer", "cap"), cap, true);
     e.view.setUint32(buffer + e.offsetOf("GhosttyBuffer", "len"), 0, true);
     const code = e.call("ghostty_render_state_row_cells_get", this.cells, this.keys.cell["GRAPHEMES_UTF8"]!, buffer);
-    if (code === RESULT.SUCCESS) {
+    if (code === e.result.SUCCESS) {
       const len = e.field("GhosttyBuffer", buffer, "len");
       return new TextDecoder().decode(e.memory.slice(utf8, utf8 + len));
     }
-    if (code !== RESULT.OUT_OF_SPACE) throw new Error(`cell graphemes: ${code}`);
+    if (code !== e.result.OUT_OF_SPACE) throw new Error(`cell graphemes: ${code}`);
     // The buffer struct reports the needed length; retry through it.
     const needed = e.field("GhosttyBuffer", buffer, "len");
     return new TextDecoder().decode(
