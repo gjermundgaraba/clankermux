@@ -2,14 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use proto::{ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 
-use crate::session::{Effects, Session, new_input_queue, now};
+use crate::session::{Effects, InputQueue, Session, now};
 use crate::stream::Stream;
 use crate::{frame_json, pty};
 
@@ -46,10 +45,6 @@ impl Registry {
         })
     }
 
-    pub fn limits(&self) -> &Limits {
-        &self.config.limits
-    }
-
     pub fn get(&self, id: &str) -> Result<Shared, Fail> {
         self.state
             .lock()
@@ -61,7 +56,10 @@ impl Registry {
     }
 
     pub fn page(&self, after: Option<&str>) -> Page {
-        let state = self.state.lock().unwrap();
+        self.page_of(&self.state.lock().unwrap(), after)
+    }
+
+    fn page_of(&self, state: &State, after: Option<&str>) -> Page {
         let page = self.config.limits.page as usize;
         let mut sessions: Vec<proto::Session> = state
             .sessions
@@ -79,8 +77,11 @@ impl Registry {
         Page { sessions, next }
     }
 
-    pub fn subscribe(&self, tx: mpsc::UnboundedSender<Vec<u8>>) {
-        self.state.lock().unwrap().subscribers.push(tx);
+    /// Registers a subscriber and returns the first page as of that moment.
+    pub fn subscribe(&self, tx: mpsc::UnboundedSender<Vec<u8>>) -> Page {
+        let mut state = self.state.lock().unwrap();
+        state.subscribers.push(tx);
+        self.page_of(&state, None)
     }
 
     pub fn emit(&self, event: &Event) {
@@ -94,6 +95,7 @@ impl Registry {
 
     pub fn create(self: &Arc<Self>, params: proto::CreateParams) -> Result<proto::Session, Fail> {
         let limits = &self.config.limits;
+        let invalid = |message: &str| (ErrorCode::InvalidRequest, message.to_string());
         let label = params.label.unwrap_or_default();
         if label.len() > limits.label as usize {
             return Err((ErrorCode::LimitExceeded, "label too long".into()));
@@ -109,21 +111,13 @@ impl Registry {
         }
         let cols = params.cols.unwrap_or(80);
         let rows = params.rows.unwrap_or(24);
-        let mut env: Vec<(String, String)> = vec![("TERM".into(), "xterm-ghostty".into())];
-        for (k, v) in params.env.unwrap_or_default() {
-            env.retain(|(name, _)| *name != k);
-            env.push((k, v));
+        if cols == 0 || rows == 0 {
+            return Err(invalid("cols and rows must be at least 1"));
         }
-        let (pty, mut child) = pty::spawn(&argv, std::path::Path::new(&cwd), &env, cols, rows)
-            .map_err(|e| {
-                (
-                    ErrorCode::InvalidRequest,
-                    format!("cannot start session: {e}"),
-                )
-            })?;
-        let pid = child.id();
-        // SAFETY: the master is an owned, non-blocking fd registered once.
-        let master = Arc::new(unsafe { AsyncFd::register(pty.master) }.map_err(internal)?);
+        let mut env = BTreeMap::from([("TERM".to_string(), "xterm-ghostty".to_string())]);
+        env.extend(params.env.unwrap_or_default());
+
+        // Everything that can fail is tried before the child exists.
         let mut term = ghostty_vt::Terminal::new(cols, rows)
             .map_err(internal)?
             .with_handler(Effects::default());
@@ -138,7 +132,21 @@ impl Registry {
             cell_width: 0,
             cell_height: 0,
         };
-        let (input, input_rx, pending) = new_input_queue(limits.input_queue as usize);
+        let (pty, mut child) = pty::spawn(&argv, std::path::Path::new(&cwd), &env, cols, rows)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::PermissionDenied
+                | std::io::ErrorKind::NotADirectory => (
+                    ErrorCode::InvalidRequest,
+                    format!("cannot start {argv:?}: {e}"),
+                ),
+                _ => internal(e),
+            })?;
+        let pid = child.id().expect("a just spawned child has a pid");
+        // SAFETY: the master is an owned, non-blocking fd registered once.
+        // A failure drops the child, which tokio reaps when it exits.
+        let master = Arc::new(unsafe { AsyncFd::register(pty.master) }.map_err(internal)?);
+        let (input, input_rx) = InputQueue::new(limits.input_queue as usize);
         let session = Session {
             id: uuid::Uuid::new_v4().to_string(),
             label,
@@ -158,7 +166,7 @@ impl Registry {
             slave_path: pty.slave_path,
             input,
             pty_eof: false,
-            child_reaped: false,
+            text_limit: limits.text as usize,
         };
         let id = session.id.clone();
         let snapshot = session.to_proto(false);
@@ -205,29 +213,28 @@ impl Registry {
                 session.pty_eof = true;
                 session.maybe_end().map(|_| session.to_proto(false))
             };
-            registry.ended(ended, &reader_session);
+            registry.ended(ended);
         });
 
         let registry = self.clone();
         let wait_session = shared.clone();
         tokio::spawn(async move {
-            let status = tokio::task::spawn_blocking(move || child.wait()).await;
+            let status = child.wait().await;
             let ended = {
                 let mut session = wait_session.lock().unwrap();
-                session.child_reaped = true;
                 session.pid = None;
                 session.exit = Some(match status {
-                    Ok(Ok(status)) => exit_of(status),
-                    _ => Exit::Code { code: -1 },
+                    Ok(status) => exit_of(status),
+                    Err(_) => Exit::Code { code: -1 },
                 });
                 session.maybe_end().map(|_| session.to_proto(false))
             };
-            registry.ended(ended, &wait_session);
+            registry.ended(ended);
         });
 
         tokio::spawn(async move {
             let mut rx = input_rx;
-            while let Some((bytes, done)) = rx.recv().await {
+            while let Some((bytes, permit, done)) = rx.recv().await {
                 let mut written = 0;
                 while written < bytes.len() {
                     let Ok(mut guard) = master.writable().await else {
@@ -238,11 +245,12 @@ impl Registry {
                             .map_err(std::io::Error::from)
                     }) {
                         Ok(Ok(n)) => written += n,
-                        Ok(Err(_)) => break,
+                        // The waiter sees a dropped `done` as a failed write.
+                        Ok(Err(_)) => return,
                         Err(_would_block) => continue,
                     }
                 }
-                pending.fetch_sub(bytes.len(), Ordering::AcqRel);
+                drop(permit);
                 let _ = done.send(());
             }
         });
@@ -251,20 +259,18 @@ impl Registry {
     }
 
     /// Emits `session_exited` and schedules removal when a stream ended.
-    fn ended(self: &Arc<Self>, ended: Option<proto::Session>, session: &Shared) {
+    fn ended(self: &Arc<Self>, ended: Option<proto::Session>) {
         let Some(snapshot) = ended else { return };
-        self.emit(&Event::SessionExited {
-            session: snapshot.clone(),
-        });
-        if snapshot.on_exit == OnExit::Remove {
+        let remove = snapshot.on_exit == OnExit::Remove;
+        let id = snapshot.id.clone();
+        self.emit(&Event::SessionExited { session: snapshot });
+        if remove {
             let registry = self.clone();
-            let session = session.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(
                     registry.config.limits.remove_grace,
                 ))
                 .await;
-                let id = session.lock().unwrap().id.clone();
                 let _ = registry.remove(&id);
             });
         }

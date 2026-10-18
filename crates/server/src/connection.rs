@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use proto::{ErrorCode, ErrorMessage, FrameDecoder, FrameType, Header, Hello, Welcome};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::control::{self, Conn};
 use crate::frame_json;
@@ -17,15 +17,36 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Subscribers hold clones of `tx`, so the writer ends on this signal
+    // rather than on the channel closing.
+    let (close_tx, mut close_rx) = oneshot::channel::<()>();
     let write_task = tokio::spawn(async move {
-        while let Some(bytes) = rx.recv().await {
+        loop {
+            let bytes = tokio::select! {
+                bytes = rx.recv() => match bytes {
+                    Some(bytes) => bytes,
+                    None => break,
+                },
+                _ = &mut close_rx => {
+                    rx.close();
+                    while let Ok(bytes) = rx.try_recv() {
+                        if writer.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    break;
+                }
+            };
             if writer.write_all(&bytes).await.is_err() {
                 break;
             }
         }
         let _ = writer.shutdown().await;
     });
-    let conn = Conn { tx: tx.clone() };
+    let conn = Conn {
+        tx: tx.clone(),
+        subscribed: false,
+    };
     let mut state = Connection {
         registry,
         conn,
@@ -33,13 +54,14 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
         hello_done: false,
     };
     let mut buf = vec![0u8; 64 * 1024];
-    let hello_timeout = Duration::from_millis(state.registry.limits().hello_timeout);
+    let hello_deadline = tokio::time::Instant::now()
+        + Duration::from_millis(state.registry.config.limits.hello_timeout);
     loop {
         let read = reader.read(&mut buf);
         let n = if state.hello_done {
             read.await
         } else {
-            match tokio::time::timeout(hello_timeout, read).await {
+            match tokio::time::timeout_at(hello_deadline, read).await {
                 Ok(n) => n,
                 Err(_) => break,
             }
@@ -54,6 +76,7 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
     }
     drop(state);
     drop(tx);
+    let _ = close_tx.send(());
     let _ = write_task.await;
 }
 
@@ -83,7 +106,7 @@ impl Connection {
 
     /// Handles every buffered frame; false closes the connection.
     async fn drain(&mut self) -> bool {
-        let limits = *self.registry.limits();
+        let limits = self.registry.config.limits;
         loop {
             let (header, payload) = match self.decoder.next_frame(limits.max_frame) {
                 Ok(Some(frame)) => frame,
@@ -122,7 +145,10 @@ impl Connection {
                     self.fail(ErrorCode::ProtocolError, "second HELLO");
                     return false;
                 }
-                return self.hello(&payload);
+                if !self.hello(&payload) {
+                    return false;
+                }
+                continue;
             }
             if !self.hello_done {
                 self.fail(ErrorCode::ProtocolError, "frame before HELLO");
@@ -149,6 +175,7 @@ impl Connection {
         }
     }
 
+    /// Handles HELLO; false closes the connection.
     fn hello(&mut self, payload: &[u8]) -> bool {
         // The version is read before the typed parse so that another
         // version's shape still gets `version_mismatch`.
@@ -183,7 +210,7 @@ impl Connection {
                 engine: ghostty_vt::ENGINE.into(),
                 incarnation: self.registry.incarnation.clone(),
                 capabilities: Vec::new(),
-                limits: *self.registry.limits(),
+                limits: self.registry.config.limits,
             },
         );
         true
@@ -212,7 +239,7 @@ impl Connection {
             }
         };
         let id = request.id;
-        match control::handle(&self.registry, &self.conn, request).await {
+        match control::handle(&self.registry, &mut self.conn, request).await {
             Ok(result) => self.send(FrameType::Reply, 0, &proto::Reply { id, result }),
             Err((code, message)) => self.send(
                 FrameType::Error,

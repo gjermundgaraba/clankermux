@@ -292,14 +292,7 @@ async fn session_lifecycle() {
     let data = base64::engine::general_purpose::STANDARD.encode("hello\n");
     c.ok("write", json!({"session": session.id, "data": data}))
         .await;
-    let mut read = Read::default_read();
-    for _ in 0..50 {
-        read = serde_json::from_value(c.ok("read", json!({"session": session.id})).await).unwrap();
-        if read.text.contains("hello\nhello") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let read = wait_text(&mut c, &session.id, "hello\nhello").await;
     assert_eq!(read.text, "hello\nhello\n", "echo and cat's copy");
     assert_eq!(read.cursor, Some(Cursor { x: 0, y: 2 }));
     assert!(read.offset > 0);
@@ -404,20 +397,202 @@ async fn session_lifecycle() {
     );
 }
 
-trait DefaultRead {
-    fn default_read() -> Read;
-}
-impl DefaultRead for Read {
-    fn default_read() -> Read {
-        Read {
-            text: String::new(),
-            cols: 0,
-            rows: 0,
-            cursor: None,
-            offset: 0,
-            status: Status::Running,
+/// Polls `read` until `needle` appears on the screen.
+async fn wait_text(c: &mut Client, id: &str, needle: &str) -> Read {
+    for _ in 0..200 {
+        let read: Read =
+            serde_json::from_value(c.ok("read", json!({"session": id})).await).unwrap();
+        if read.text.contains(needle) {
+            return read;
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    panic!("{needle:?} never appeared");
+}
+
+#[tokio::test]
+async fn malformed_requests_pipelining_and_the_hello_deadline() {
+    let server = start(fast_limits()).await;
+
+    // HELLO and a request in one write are both handled.
+    let mut c = Client::connect(&server).await;
+    let mut both = encode_frame(
+        FrameType::Hello,
+        0,
+        br#"{"version":1,"client":{"name":"t","version":"0"}}"#,
+    );
+    both.extend(encode_frame(
+        FrameType::Request,
+        0,
+        br#"{"id":1,"method":"list","params":{}}"#,
+    ));
+    c.stream.write_all(&both).await.unwrap();
+    assert_eq!(c.recv_json().await.0.frame_type, FrameType::Welcome);
+    let (header, body) = c.recv_json().await;
+    assert_eq!(
+        (header.frame_type, body["id"].as_i64()),
+        (FrameType::Reply, Some(1))
+    );
+
+    // A request without an integer id gets an id-less error, then the
+    // connection closes.
+    c.send(
+        FrameType::Request,
+        0,
+        br#"{"id":"x","method":"list","params":{}}"#,
+    )
+    .await;
+    let (_, body) = c.recv_json().await;
+    assert_eq!(body["code"], "invalid_request");
+    assert!(body.get("id").is_none());
+    assert!(c.recv().await.is_none());
+
+    // A malformed request with an id is answered and the connection stays.
+    let mut c = client(&server).await;
+    c.send(FrameType::Request, 0, br#"{"id":-7,"method":"list"}"#)
+        .await;
+    let (_, body) = c.recv_json().await;
+    assert_eq!(
+        (body["code"].as_str(), body["id"].as_i64()),
+        (Some("invalid_request"), Some(-7))
+    );
+    assert!(c.request("list", json!({})).await.is_ok());
+
+    // Another version's shape still gets version_mismatch.
+    let mut c = Client::connect(&server).await;
+    c.send_json(FrameType::Hello, 0, &json!({"version": 2, "peer": "x"}))
+        .await;
+    assert_eq!(c.recv_json().await.1["code"], "version_mismatch");
+    assert!(c.recv().await.is_none());
+
+    // The HELLO deadline runs from connecting, not from the last byte.
+    let mut c = Client::connect(&server).await;
+    let hello = encode_frame(
+        FrameType::Hello,
+        0,
+        br#"{"version":1,"client":{"name":"t","version":"0"}}"#,
+    );
+    let started = std::time::Instant::now();
+    c.stream.write_all(&hello[..1]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    c.stream.write_all(&hello[1..2]).await.unwrap();
+    assert!(
+        c.recv().await.is_none(),
+        "closed although bytes kept arriving"
+    );
+    // A deadline reset by the second byte would close at 500 ms.
+    assert!(started.elapsed() < Duration::from_millis(450));
+}
+
+#[tokio::test]
+async fn subscribed_connections_close_on_errors_and_get_each_event_once() {
+    let server = start(fast_limits()).await;
+    let mut c = client(&server).await;
+    c.ok("subscribe", json!({})).await;
+    c.ok("subscribe", json!({})).await;
+    let mut other = client(&server).await;
+    let session = other.create(json!({"argv": ["/bin/sleep", "5"]})).await;
+    assert!(matches!(c.event().await, Event::SessionCreated { session: s } if s.id == session.id));
+    let big = vec![b' '; Limits::default().control_body as usize + 1];
+    c.send(FrameType::Request, 0, &big).await;
+    let (_, body) = c.recv_json().await;
+    assert_eq!(body["code"], "protocol_error");
+    assert!(c.recv().await.is_none(), "closed although subscribed");
+    other
+        .ok("signal", json!({"session": session.id, "signal": "KILL"}))
+        .await;
+}
+
+#[tokio::test]
+async fn signals_by_name_and_sizes_are_validated() {
+    let server = start(fast_limits()).await;
+    let mut c = client(&server).await;
+    c.ok("subscribe", json!({})).await;
+    let session = c
+        .create(json!({"argv": ["/bin/sh", "-c", "kill -SEGV $$"], "on_exit": "keep"}))
+        .await;
+    let exited = c.wait_exit(&session.id).await;
+    assert_eq!(
+        exited.exit,
+        Some(Exit::Signal {
+            signal: "SEGV".into()
+        })
+    );
+    let session = c.create(json!({"argv": ["/bin/sleep", "5"]})).await;
+    assert_eq!(
+        c.err(
+            "set_size",
+            json!({"session": session.id, "cols": 0, "rows": 1})
+        )
+        .await,
+        ErrorCode::InvalidRequest
+    );
+    c.ok(
+        "signal",
+        json!({"session": session.id, "signal": "SIGALRM"}),
+    )
+    .await;
+    let exited = c.wait_exit(&session.id).await;
+    assert_eq!(
+        exited.exit,
+        Some(Exit::Signal {
+            signal: "ALRM".into()
+        })
+    );
+    assert_eq!(
+        c.err("create", json!({"cols": 0})).await,
+        ErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        c.err(
+            "create",
+            json!({"argv": ["/bin/sh", "-c", "exit 0"], "cwd": "/nonexistent"})
+        )
+        .await,
+        ErrorCode::InvalidRequest
+    );
+    let term = c
+        .create(json!({"argv": ["/bin/sh", "-c", "printf '%s' \"$TERM\"; sleep 1"], "env": {"TERM": "dumb"}}))
+        .await;
+    assert_eq!(wait_text(&mut c, &term.id, "dumb").await.text, "dumb\n");
+    c.ok("signal", json!({"session": term.id, "signal": "KILL"}))
+        .await;
+}
+
+#[tokio::test]
+async fn read_screen_only_after_clear_and_bounded_replies() {
+    let server = start(Limits {
+        max_frame: 8192,
+        ..fast_limits()
+    })
+    .await;
+    let mut c = client(&server).await;
+    let session = c
+        .create(json!({"argv": ["/bin/sh", "-c", "i=1; while [ $i -le 1000 ]; do echo line$i; i=$((i+1)); done; printf '\\033[H\\033[2Jonly\\n'; sleep 5"], "cols": 20, "rows": 5}))
+        .await;
+    let read = wait_text(&mut c, &session.id, "only").await;
+    assert_eq!(read.text, "only\n", "no history without scrollback");
+    let read: Read = serde_json::from_value(
+        c.ok("read", json!({"session": session.id, "scrollback": 2}))
+            .await,
+    )
+    .unwrap();
+    // Before the clear the screen held line997 to line1000 and the cursor row.
+    assert_eq!(read.text, "line995\nline996\nonly\n");
+    let read: Read = serde_json::from_value(
+        c.ok("read", json!({"session": session.id, "scrollback": 100000}))
+            .await,
+    )
+    .unwrap();
+    assert!(read.text.len() <= 8192 - 4096);
+    assert!(
+        read.text.starts_with("line"),
+        "whole lines are dropped: {:?}",
+        &read.text[..10]
+    );
+    assert!(read.text.ends_with("line996\nonly\n"));
+    c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
+        .await;
 }
 
 #[tokio::test]
@@ -450,10 +625,10 @@ async fn end_sends_hangup() {
     c.ok("subscribe", json!({})).await;
     let session = c
         .create(
-            json!({"argv": ["/bin/sh", "-c", "trap 'exit 7' HUP; while :; do sleep 0.05; done"]}),
+            json!({"argv": ["/bin/sh", "-c", "trap 'exit 7' HUP; echo ready; while :; do sleep 0.05; done"]}),
         )
         .await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_text(&mut c, &session.id, "ready").await;
     c.ok("end", json!({"session": session.id})).await;
     let exited = c.wait_exit(&session.id).await;
     assert_eq!(exited.exit, Some(Exit::Code { code: 7 }));
@@ -540,7 +715,9 @@ async fn events_are_ordered_with_replies() {
     c.ok("subscribe", json!({})).await;
     let session = c.create(json!({"argv": ["/bin/sleep", "5"]})).await;
     // The server emits the event before it sends the reply, and this
-    // connection receives both in that order.
+    // connection receives both in that order: the event was queued while
+    // waiting for the reply.
+    assert_eq!(c.events.len(), 1, "event before reply");
     assert!(matches!(c.event().await, Event::SessionCreated { session: s } if s.id == session.id));
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
@@ -567,11 +744,12 @@ async fn read_returns_scrollback_then_screen() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(lines.len(), 8, "{lines:?}");
-    assert_eq!(lines[0], "line43");
+    // The screen holds line47 to line50 and the blank cursor row.
+    assert_eq!(lines.len(), 7, "{lines:?}");
+    assert_eq!(lines[0], "line44");
     let read: Read =
         serde_json::from_value(c.ok("read", json!({"session": session.id})).await).unwrap();
-    assert_eq!(read.text.lines().count(), 5);
+    assert_eq!(read.text.lines().count(), 4);
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
 }

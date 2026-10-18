@@ -25,19 +25,38 @@ pub fn frame_json<T: serde::Serialize>(frame_type: FrameType, channel: u32, body
     )
 }
 
-/// Binds the Unix socket (directory 0700, socket 0600) and serves
-/// connections from the server's own uid until the task is cancelled.
+/// Binds the Unix socket (directories it creates 0700, socket 0600) and
+/// serves connections from the server's own uid until the task is
+/// cancelled. Refuses to replace a socket another server is listening on.
 pub async fn serve_unix(socket: PathBuf, registry: Arc<Registry>) -> io::Result<()> {
-    if let Some(dir) = socket.parent() {
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if let Some(dir) = socket.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("another server is listening on {}", socket.display()),
+        ));
     }
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
-    std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    std::fs::set_permissions(&socket, PermissionsExt::from_mode(0o600))?;
     let uid = rustix::process::getuid().as_raw();
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                // Transient errors (EMFILE, ECONNABORTED) must not stop the
+                // server; back off briefly instead.
+                tracing::warn!(error = %err, "accept failed");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         match stream.peer_cred() {
             Ok(cred) if cred.uid() == uid => {
                 tokio::spawn(connection::serve_connection(stream, registry.clone()));
@@ -64,13 +83,51 @@ pub fn socket_path() -> PathBuf {
     }
 }
 
+/// The login shell and home directory of the server's user, from the
+/// password database.
+fn passwd_entry() -> Option<(String, String)> {
+    use std::ffi::CStr;
+    let mut buf = vec![0u8; 16 * 1024];
+    // SAFETY: zeroed passwd is a valid out parameter; getpwuid_r fills it
+    // with pointers into buf, which outlives the copies below.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut pw,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 || found.is_null() || pw.pw_shell.is_null() || pw.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: both are NUL-terminated strings inside buf.
+    let string = |p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+    Some((string(pw.pw_shell), string(pw.pw_dir)))
+}
+
+/// Defaults from the user's password entry, else the environment.
 pub fn default_config() -> Config {
+    let (shell, home) = passwd_entry().unwrap_or_default();
+    let shell = if shell.is_empty() {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+    } else {
+        shell
+    };
+    let home = if home.is_empty() {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"))
+    } else {
+        PathBuf::from(home)
+    };
     Config {
         limits: proto::Limits::default(),
-        shell: vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())],
-        home: std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/")),
+        shell: vec![shell],
+        home,
         version: env!("CARGO_PKG_VERSION").into(),
     }
 }

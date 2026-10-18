@@ -26,6 +26,34 @@ fn filled(rows: usize) -> Terminal {
 }
 
 #[test]
+fn formats_a_tail_of_rows() {
+    let mut term = Terminal::new(10, 3).unwrap();
+    for i in 1..=6 {
+        term.vt_write(format!("line{i}\r\n").as_bytes());
+    }
+    // Three rows of history, then the screen: line4, line5, line6 and a
+    // blank cursor row.
+    assert_eq!(term.scrollback_rows(), 4);
+    let tail = |start_row| {
+        String::from_utf8(
+            formatter::format(
+                &term,
+                Options {
+                    trim: true,
+                    start_row: Some(start_row),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(tail(4), "line5\nline6");
+    assert_eq!(tail(2), "line3\nline4\nline5\nline6");
+    assert_eq!(tail(0), "line1\nline2\nline3\nline4\nline5\nline6");
+}
+
+#[test]
 fn snapshot_round_trip() {
     let mut term = filled(10);
     term.vt_write(b"\x1b]2;title\x07");

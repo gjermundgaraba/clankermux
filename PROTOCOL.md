@@ -134,8 +134,9 @@ the order the server produced them.
   program status records; use `inspect` once per session.
 - `read`: `scrollback` is a line count, default 0. `text` is the last
   `scrollback` history lines followed by the screen, one logical line per
-  newline, with soft-wrapped rows joined and trailing blanks trimmed. Works
-  for every status.
+  newline, with soft-wrapped rows joined and trailing blanks trimmed. The
+  oldest lines are dropped to keep the reply under `limits.max_frame`.
+  Works for every status.
 - `write`: `data` is base64. Replies after the bytes are written to the PTY
   as one unit. Fails with `not_running` unless `status` is `running`.
 - `subscribe` starts `EVENT` frames on this connection and returns the

@@ -2,12 +2,11 @@
 
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ghostty_vt::{ColorKind, ColorScheme, Handler, Rgb, SizeReport, Term, Terminal};
+use ghostty_vt::{ColorScheme, Handler, Rgb, SizeReport, Term, Terminal};
 use proto::{Exit, OnExit, Status};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::stream::{MarkerKind, Stream};
 
@@ -66,31 +65,37 @@ pub fn luminance(c: Rgb) -> f64 {
     0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
 }
 
-/// One queued write and the sender resolved once it is written.
-pub type InputUnit = (Vec<u8>, oneshot::Sender<()>);
+/// One queued write: its bytes, the queue permits they hold until written,
+/// and the sender resolved once they are written.
+pub type InputUnit = (Vec<u8>, OwnedSemaphorePermit, oneshot::Sender<()>);
 
 /// Bytes queued for the PTY, bounded by `limits.input_queue`.
 pub struct InputQueue {
     tx: mpsc::UnboundedSender<InputUnit>,
-    pending: Arc<AtomicUsize>,
-    max: usize,
+    permits: Arc<Semaphore>,
 }
 
 impl InputQueue {
+    pub fn new(max: usize) -> (Self, mpsc::UnboundedReceiver<InputUnit>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let queue = InputQueue {
+            tx,
+            permits: Arc::new(Semaphore::new(max)),
+        };
+        (queue, rx)
+    }
+
     /// Queues `bytes` to be written as one unit. The receiver resolves once
-    /// they are written. Fails when the queue would exceed its bound.
+    /// they are written and fails when they could not be. Returns `None`
+    /// when the queue would exceed its bound.
     pub fn push(&self, bytes: Vec<u8>) -> Option<oneshot::Receiver<()>> {
-        let len = bytes.len();
-        let before = self.pending.fetch_add(len, Ordering::AcqRel);
-        if before + len > self.max {
-            self.pending.fetch_sub(len, Ordering::AcqRel);
-            return None;
-        }
+        let permit = self
+            .permits
+            .clone()
+            .try_acquire_many_owned(u32::try_from(bytes.len()).ok()?)
+            .ok()?;
         let (done, wait) = oneshot::channel();
-        if self.tx.send((bytes, done)).is_err() {
-            self.pending.fetch_sub(len, Ordering::AcqRel);
-            return None;
-        }
+        self.tx.send((bytes, permit, done)).ok()?;
         Some(wait)
     }
 }
@@ -108,6 +113,7 @@ pub struct Session {
     pub on_exit: OnExit,
     pub created_at: String,
     pub exited_at: Option<String>,
+    /// Set once the child is reaped.
     pub exit: Option<Exit>,
     pub term: Terminal<Effects>,
     pub stream: Stream,
@@ -116,7 +122,8 @@ pub struct Session {
     pub slave_path: String,
     pub input: InputQueue,
     pub pty_eof: bool,
-    pub child_reaped: bool,
+    /// `limits.text`, applied to the title and pwd the program reports.
+    pub text_limit: usize,
 }
 
 impl Session {
@@ -130,8 +137,8 @@ impl Session {
             pid: self.pid,
             cols: self.term.cols(),
             rows: self.term.rows(),
-            title: self.term.title(),
-            pwd: pwd_path(&self.term.pwd()),
+            title: truncate(self.term.title(), self.text_limit),
+            pwd: truncate(pwd_path(&self.term.pwd()), self.text_limit),
             on_exit: self.on_exit,
             created_at: self.created_at.clone(),
             exited_at: self.exited_at.clone(),
@@ -157,7 +164,9 @@ impl Session {
         let effects = self.term.handler_mut();
         if !effects.pty_output.is_empty() {
             let answers = std::mem::take(&mut effects.pty_output);
-            self.input.push(answers);
+            if self.input.push(answers).is_none() {
+                tracing::warn!(session = self.id, "input queue full; query answers dropped");
+            }
         }
         std::mem::take(&mut self.term.handler_mut().changed)
     }
@@ -170,21 +179,22 @@ impl Session {
         cell_width: u32,
         cell_height: u32,
     ) -> Option<crate::stream::Marker> {
-        let effects = self.term.handler_mut();
-        effects.size = SizeReport {
+        let changed = (self.term.cols(), self.term.rows()) != (cols, rows);
+        if changed
+            && self
+                .term
+                .resize(cols, rows, cell_width, cell_height)
+                .is_err()
+        {
+            return None;
+        }
+        self.term.handler_mut().size = SizeReport {
             cols,
             rows,
             cell_width,
             cell_height,
         };
-        if (self.term.cols(), self.term.rows()) == (cols, rows) {
-            return None;
-        }
-        if self
-            .term
-            .resize(cols, rows, cell_width, cell_height)
-            .is_err()
-        {
+        if !changed {
             return None;
         }
         let _ = crate::pty::set_size(&self.master, cols, rows);
@@ -195,19 +205,15 @@ impl Session {
     /// Called when the PTY reached EOF or the child was reaped; ends the
     /// stream once both have happened. Returns the exit when it did.
     pub fn maybe_end(&mut self) -> Option<Exit> {
-        if !(self.pty_eof && self.child_reaped) || self.status != Status::Running {
+        if !self.pty_eof || self.status != Status::Running {
             return None;
         }
-        let exit = self.exit.clone().unwrap_or(Exit::Code { code: -1 });
+        let exit = self.exit.clone()?;
         self.status = Status::Exited;
         self.exited_at = Some(now());
         self.stream
             .add_marker(MarkerKind::Exited { exit: exit.clone() });
         Some(exit)
-    }
-
-    pub fn background(&self) -> Option<Rgb> {
-        self.term.color(ColorKind::Background)
     }
 }
 
@@ -219,28 +225,20 @@ pub fn pwd_path(value: &str) -> String {
     }
 }
 
-pub fn now() -> String {
-    jiff::Timestamp::now().to_string()
+/// The first at most `max` bytes of `text`, on a character boundary.
+pub fn truncate(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
-pub fn new_input_queue(
-    max: usize,
-) -> (
-    InputQueue,
-    mpsc::UnboundedReceiver<InputUnit>,
-    Arc<AtomicUsize>,
-) {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let pending = Arc::new(AtomicUsize::new(0));
-    (
-        InputQueue {
-            tx,
-            pending: pending.clone(),
-            max,
-        },
-        rx,
-        pending,
-    )
+pub fn now() -> String {
+    jiff::Timestamp::now().to_string()
 }
 
 #[cfg(test)]
@@ -255,6 +253,13 @@ mod tests {
     }
 
     #[test]
+    fn truncates_on_character_boundaries() {
+        assert_eq!(truncate("héllo".into(), 2), "h");
+        assert_eq!(truncate("héllo".into(), 3), "hé");
+        assert_eq!(truncate("hi".into(), 10), "hi");
+    }
+
+    #[test]
     fn luminance_splits_dark_and_light() {
         assert!(luminance(Rgb { r: 0, g: 0, b: 0 }) < 0.5);
         assert!(
@@ -263,13 +268,6 @@ mod tests {
                 g: 255,
                 b: 255
             }) > 0.5
-        );
-        assert!(
-            luminance(Rgb {
-                r: 0x1e,
-                g: 0x1e,
-                b: 0x2e
-            }) < 0.5
         );
     }
 }

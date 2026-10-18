@@ -1,13 +1,15 @@
 //! PTY master plus child process.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::os::unix::process::CommandExt;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 
+use rustix::process::{Pid, Signal};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+use tokio::process::{Child, Command};
 
 pub struct Pty {
     pub master: OwnedFd,
@@ -20,12 +22,11 @@ pub struct Pty {
 pub fn spawn(
     argv: &[String],
     cwd: &Path,
-    env: &[(String, String)],
+    env: &BTreeMap<String, String>,
     cols: u16,
     rows: u16,
 ) -> io::Result<(Pty, Child)> {
-    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
-    rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC)?;
+    let master = open_master()?;
     grantpt(&master)?;
     unlockpt(&master)?;
     let slave_path = ptsname(&master, Vec::new())?
@@ -45,21 +46,15 @@ pub fn spawn(
     command
         .args(args)
         .current_dir(cwd)
+        .envs(env)
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave));
-    for (key, value) in env {
-        command.env(key, value);
-    }
-    // SAFETY: setsid and ioctl are async-signal-safe.
+    // SAFETY: setsid and the ioctl are async-signal-safe.
     unsafe {
         command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                return Err(io::Error::last_os_error());
-            }
+            rustix::process::setsid()?;
+            rustix::process::ioctl_tiocsctty(std::io::stdin())?;
             Ok(())
         });
     }
@@ -68,63 +63,98 @@ pub fn spawn(
     Ok((Pty { master, slave_path }, child))
 }
 
+#[cfg(target_os = "linux")]
+fn open_master() -> io::Result<OwnedFd> {
+    Ok(openpt(
+        OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC,
+    )?)
+}
+
+/// `posix_openpt` has no `O_CLOEXEC` here; the flag is set right after.
+#[cfg(not(target_os = "linux"))]
+fn open_master() -> io::Result<OwnedFd> {
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+    rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC)?;
+    Ok(master)
+}
+
 pub fn set_size(master: &impl AsFd, cols: u16, rows: u16) -> io::Result<()> {
-    let size = libc::winsize {
+    let size = rustix::termios::Winsize {
         ws_row: rows,
         ws_col: cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    // SAFETY: TIOCSWINSZ takes a pointer to a winsize.
-    if unsafe { libc::ioctl(master.as_fd().as_raw_fd(), libc::TIOCSWINSZ, &size) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    Ok(rustix::termios::tcsetwinsize(master, size)?)
 }
 
 /// Sends `signal` to the child's process group, else to every process that
 /// holds the slave open. Returns false when no process was signalled.
-pub fn signal(pgid: u32, slave_path: &str, signal: i32) -> bool {
-    // SAFETY: kill with a negative pid targets the process group.
-    if unsafe { libc::kill(-(pgid as i32), signal) } == 0 {
+pub fn signal(pgid: u32, slave_path: &str, signal: Signal) -> bool {
+    let kill = |pid: u32, group: bool| {
+        Pid::from_raw(pid as i32).is_some_and(|pid| {
+            if group {
+                rustix::process::kill_process_group(pid, signal).is_ok()
+            } else {
+                rustix::process::kill_process(pid, signal).is_ok()
+            }
+        })
+    };
+    if kill(pgid, true) {
         return true;
     }
     let mut any = false;
     for pid in holders::holders(slave_path) {
-        // SAFETY: kill is safe to call with any pid.
-        if unsafe { libc::kill(pid as i32, signal) } == 0 {
-            any = true;
-        }
+        any |= kill(pid, false);
     }
     any
 }
 
-pub fn signal_number(name: &str) -> Option<i32> {
-    Some(match name.trim_start_matches("SIG") {
-        "HUP" => libc::SIGHUP,
-        "INT" => libc::SIGINT,
-        "QUIT" => libc::SIGQUIT,
-        "KILL" => libc::SIGKILL,
-        "USR1" => libc::SIGUSR1,
-        "USR2" => libc::SIGUSR2,
-        "TERM" => libc::SIGTERM,
-        "CONT" => libc::SIGCONT,
-        "STOP" => libc::SIGSTOP,
-        "TSTP" => libc::SIGTSTP,
-        "WINCH" => libc::SIGWINCH,
-        _ => return None,
-    })
+/// Signal names without the `SIG` prefix and their numbers.
+const SIGNALS: &[(&str, i32)] = &[
+    ("HUP", libc::SIGHUP),
+    ("INT", libc::SIGINT),
+    ("QUIT", libc::SIGQUIT),
+    ("ILL", libc::SIGILL),
+    ("TRAP", libc::SIGTRAP),
+    ("ABRT", libc::SIGABRT),
+    ("BUS", libc::SIGBUS),
+    ("FPE", libc::SIGFPE),
+    ("KILL", libc::SIGKILL),
+    ("USR1", libc::SIGUSR1),
+    ("SEGV", libc::SIGSEGV),
+    ("USR2", libc::SIGUSR2),
+    ("PIPE", libc::SIGPIPE),
+    ("ALRM", libc::SIGALRM),
+    ("TERM", libc::SIGTERM),
+    ("CHLD", libc::SIGCHLD),
+    ("CONT", libc::SIGCONT),
+    ("STOP", libc::SIGSTOP),
+    ("TSTP", libc::SIGTSTP),
+    ("TTIN", libc::SIGTTIN),
+    ("TTOU", libc::SIGTTOU),
+    ("URG", libc::SIGURG),
+    ("XCPU", libc::SIGXCPU),
+    ("XFSZ", libc::SIGXFSZ),
+    ("VTALRM", libc::SIGVTALRM),
+    ("PROF", libc::SIGPROF),
+    ("WINCH", libc::SIGWINCH),
+    ("IO", libc::SIGIO),
+    ("SYS", libc::SIGSYS),
+];
+
+/// The signal named `name`, with or without the `SIG` prefix.
+pub fn signal_by_name(name: &str) -> Option<Signal> {
+    let name = name.strip_prefix("SIG").unwrap_or(name);
+    let (_, number) = SIGNALS.iter().find(|(n, _)| *n == name)?;
+    Signal::from_named_raw(*number)
 }
 
 pub fn signal_name(number: i32) -> String {
-    for name in [
-        "HUP", "INT", "QUIT", "KILL", "USR1", "USR2", "TERM", "CONT", "STOP", "TSTP", "WINCH",
-    ] {
-        if signal_number(name) == Some(number) {
-            return name.to_string();
-        }
-    }
-    number.to_string()
+    SIGNALS
+        .iter()
+        .find(|(_, n)| *n == number)
+        .map_or_else(|| number.to_string(), |(name, _)| name.to_string())
 }
 
 /// Processes holding a path open, by platform.
@@ -237,5 +267,25 @@ mod holders {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_names_round_trip() {
+        assert_eq!(
+            signal_by_name("SIGHUP"),
+            Signal::from_named_raw(libc::SIGHUP)
+        );
+        assert_eq!(
+            signal_by_name("SEGV"),
+            Signal::from_named_raw(libc::SIGSEGV)
+        );
+        assert_eq!(signal_by_name("SIGSIGHUP"), None);
+        assert_eq!(signal_name(libc::SIGSEGV), "SEGV");
+        assert_eq!(signal_name(200), "200");
     }
 }

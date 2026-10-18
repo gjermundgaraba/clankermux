@@ -9,10 +9,14 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::registry::{Fail, Registry};
+use crate::registry::{Fail, Registry, internal};
+
+/// JSON overhead allowed around `read`'s text within `max_frame`.
+const READ_REPLY_MARGIN: usize = 4096;
 
 pub struct Conn {
     pub tx: mpsc::UnboundedSender<Vec<u8>>,
+    pub subscribed: bool,
 }
 
 fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
@@ -30,7 +34,7 @@ fn running(status: Status) -> Result<(), Fail> {
 
 pub async fn handle(
     registry: &Arc<Registry>,
-    conn: &Conn,
+    conn: &mut Conn,
     request: Request,
 ) -> Result<Value, Fail> {
     let p = request.params;
@@ -56,7 +60,7 @@ pub async fn handle(
                 let p: proto::SignalParams = params(p)?;
                 (p.session, p.signal)
             };
-            let number = crate::pty::signal_number(&signal).ok_or((
+            let signal = crate::pty::signal_by_name(&signal).ok_or((
                 ErrorCode::InvalidRequest,
                 format!("unknown signal {signal}"),
             ))?;
@@ -66,7 +70,7 @@ pub async fn handle(
                 running(s.status)?;
                 (s.pgid, s.slave_path.clone())
             };
-            if crate::pty::signal(pgid, &slave, number) {
+            if crate::pty::signal(pgid, &slave, signal) {
                 Ok(json!({}))
             } else {
                 Err((ErrorCode::SignalFailed, "no process to signal".into()))
@@ -79,7 +83,7 @@ pub async fn handle(
         }
         "set_label" => {
             let p: proto::SetLabelParams = params(p)?;
-            if p.label.len() > registry.limits().label as usize {
+            if p.label.len() > registry.config.limits.label as usize {
                 return Err((ErrorCode::LimitExceeded, "label too long".into()));
             }
             let session = registry.get(&p.session)?;
@@ -95,6 +99,12 @@ pub async fn handle(
         }
         "set_size" => {
             let p: proto::SetSizeParams = params(p)?;
+            if p.cols == 0 || p.rows == 0 {
+                return Err((
+                    ErrorCode::InvalidRequest,
+                    "cols and rows must be at least 1".into(),
+                ));
+            }
             let session = registry.get(&p.session)?;
             let changed = {
                 let mut s = session.lock().unwrap();
@@ -110,19 +120,28 @@ pub async fn handle(
             let p: proto::ReadParams = params(p)?;
             let session = registry.get(&p.session)?;
             let s = session.lock().unwrap();
+            let rows = usize::from(s.term.rows());
+            let wanted = rows + p.scrollback.unwrap_or(0) as usize;
+            let start_row = (s.term.scrollback_rows() + rows).saturating_sub(wanted);
             let formatted = formatter::format(
                 &s.term,
                 formatter::Options {
                     unwrap: true,
                     trim: true,
+                    start_row: Some(start_row as u32),
                     ..Default::default()
                 },
             )
-            .map_err(crate::registry::internal)?;
-            let text = String::from_utf8_lossy(&formatted);
-            let lines: Vec<&str> = text.lines().collect();
-            let keep = s.term.rows() as usize + p.scrollback.unwrap_or(0) as usize;
-            let mut text = lines[lines.len().saturating_sub(keep)..].join("\n");
+            .map_err(internal)?;
+            let mut text = String::from_utf8_lossy(&formatted).into_owned();
+            let max = (registry.config.limits.max_frame as usize).saturating_sub(READ_REPLY_MARGIN);
+            if text.len() > max {
+                let excess = text.len() - max;
+                let cut = text[excess..]
+                    .find('\n')
+                    .map_or(text.len(), |i| excess + i + 1);
+                text.drain(..cut);
+            }
             if !text.is_empty() {
                 text.push('\n');
             }
@@ -154,12 +173,16 @@ pub async fn handle(
                     .push(data)
                     .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?
             };
-            let _ = wait.await;
+            wait.await
+                .map_err(|_| internal("the PTY refused the bytes"))?;
             Ok(json!({}))
         }
         "subscribe" => {
-            registry.subscribe(conn.tx.clone());
-            Ok(json!(registry.page(None)))
+            if conn.subscribed {
+                return Ok(json!(registry.page(None)));
+            }
+            conn.subscribed = true;
+            Ok(json!(registry.subscribe(conn.tx.clone())))
         }
         other => Err((ErrorCode::InvalidRequest, format!("unknown method {other}"))),
     }
