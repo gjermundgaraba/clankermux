@@ -24,3 +24,5 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true }

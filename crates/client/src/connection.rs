@@ -137,9 +137,11 @@ impl Connection {
     ) -> Result<Self, Error> {
         let (mut reader, mut writer) = tokio::io::split(stream);
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // A flush per frame: a message carrier (the WebSocket adapter)
+        // sends nothing before one.
         tokio::spawn(async move {
             while let Some(bytes) = rx.recv().await {
-                if writer.write_all(&bytes).await.is_err() {
+                if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
                     break;
                 }
             }

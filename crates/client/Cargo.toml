@@ -13,5 +13,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
 server = { workspace = true }
 tempfile = "3"

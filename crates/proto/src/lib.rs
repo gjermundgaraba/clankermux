@@ -12,4 +12,6 @@ pub use message::*;
 pub const VERSION: u32 = 1;
 
 #[cfg(test)]
+mod props;
+#[cfg(test)]
 mod tests;
