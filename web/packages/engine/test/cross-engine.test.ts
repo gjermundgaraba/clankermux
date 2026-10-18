@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 
@@ -6,16 +6,27 @@ import { ENGINE, Engine } from "../src/index.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const fixtures = `${here}fixtures/`;
+const names = readdirSync(fixtures)
+  .filter((f) => f.endsWith(".ghostsnp"))
+  .map((f) => f.slice(0, -".ghostsnp".length));
 
-test("wasm decoder accepts the native encoder's snapshot", async () => {
+test.each(names)("wasm decoder accepts the native encoder's %s snapshot", async (name) => {
   const engine = await Engine.load(readFileSync(`${here}../ghostty-vt.wasm`));
-  const term = engine.decodeSnapshot(readFileSync(`${fixtures}basic.ghostsnp`));
+  const term = engine.decodeSnapshot(readFileSync(`${fixtures}${name}.ghostsnp`));
   expect([term.cols, term.rows]).toEqual([20, 5]);
-  expect(term.title).toBe("fixture");
-  expect(term.formatPlain()).toBe(readFileSync(`${fixtures}basic.txt`, "utf8"));
+  expect(term.formatPlain()).toBe(readFileSync(`${fixtures}${name}.txt`, "utf8"));
+  if (name === "basic") expect(term.title).toBe("fixture");
   term.free();
 });
 
-test("engine id names the vendored build", () => {
-  expect(ENGINE).toMatch(/^ghostty-vt@/);
+test("a fresh terminal accepts input", async () => {
+  const engine = await Engine.load(readFileSync(`${here}../ghostty-vt.wasm`));
+  const term = engine.terminalNew(10, 2);
+  term.write(new TextEncoder().encode("hi"));
+  expect(term.formatPlain().startsWith("hi")).toBe(true);
+  term.free();
+});
+
+test("engine id equals the native engine id", () => {
+  expect(ENGINE).toBe(readFileSync(`${fixtures}engine.txt`, "utf8"));
 });

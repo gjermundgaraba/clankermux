@@ -8,38 +8,35 @@ use crate::error::{Result, check};
 use crate::io;
 use crate::terminal::Term;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Format {
+    #[default]
     Plain,
     Vt,
 }
 
 /// Formatting options. `Default` is plain text of the whole screen with
-/// nothing extra.
+/// nothing extra. The extras apply to VT output only.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Options {
-    pub format: Option<Format>,
+    pub format: Format,
+    /// Join soft-wrapped rows into one line.
     pub unwrap: bool,
+    /// Drop trailing blanks.
     pub trim: bool,
-    /// Styled output only: cursor position and state.
     pub cursor: bool,
-    /// Styled output only: text styles.
     pub style: bool,
     pub hyperlink: bool,
     pub palette: bool,
     pub modes: bool,
     pub scrolling_region: bool,
-    pub tabstops: bool,
-    pub pwd: bool,
     pub keyboard: bool,
-    pub kitty_keyboard: bool,
-    pub charsets: bool,
 }
 
 pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
     let raw_options = sys::GhosttyFormatterTerminalOptions {
         size: size_of::<sys::GhosttyFormatterTerminalOptions>(),
-        emit: match options.format.unwrap_or(Format::Plain) {
+        emit: match options.format {
             Format::Plain => sys::GHOSTTY_FORMATTER_FORMAT_PLAIN,
             Format::Vt => sys::GHOSTTY_FORMATTER_FORMAT_VT,
         },
@@ -50,8 +47,8 @@ pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
             palette: options.palette,
             modes: options.modes,
             scrolling_region: options.scrolling_region,
-            tabstops: options.tabstops,
-            pwd: options.pwd,
+            tabstops: false,
+            pwd: false,
             keyboard: options.keyboard,
             screen: sys::GhosttyFormatterScreenExtra {
                 size: size_of::<sys::GhosttyFormatterScreenExtra>(),
@@ -59,8 +56,8 @@ pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
                 style: options.style,
                 hyperlink: options.hyperlink,
                 protection: false,
-                kitty_keyboard: options.kitty_keyboard,
-                charsets: options.charsets,
+                kitty_keyboard: options.keyboard,
+                charsets: false,
             },
         },
         selection: ptr::null(),

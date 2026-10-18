@@ -18,12 +18,17 @@ fn writes_and_formats() {
     assert_eq!((term.cols(), term.rows()), (10, 3));
 }
 
-#[test]
-fn snapshot_round_trip() {
+fn filled(rows: usize) -> Terminal {
     let mut term = Terminal::new(20, 4).unwrap();
-    for i in 0..10 {
+    for i in 0..rows {
         term.vt_write(format!("row {i}\r\n").as_bytes());
     }
+    term
+}
+
+#[test]
+fn snapshot_round_trip() {
+    let mut term = filled(10);
     term.vt_write(b"\x1b]2;title\x07");
     let bytes = snapshot::encode(&term).unwrap();
     assert_eq!(&bytes[..8], b"GHOSTSNP");
@@ -34,40 +39,71 @@ fn snapshot_round_trip() {
     assert_eq!(restored.scrollback_rows(), term.scrollback_rows());
 }
 
-#[test]
-fn incremental_decode_by_steps() {
-    let mut term = Terminal::new(20, 4).unwrap();
-    for i in 0..5000 {
-        term.vt_write(format!("row {i}\r\n").as_bytes());
-    }
-    let bytes = snapshot::encode(&term).unwrap();
-    let ready = snapshot::ready_end(&bytes).unwrap();
-
+/// Decodes `bytes` by steps, pushing `chunk` bytes at a time, and returns
+/// the restored terminal and the number of history pages.
+fn decode_in_chunks(bytes: &[u8], chunk: usize) -> (Terminal, usize) {
     let mut decoder = snapshot::Decoder::new().unwrap();
-    decoder.push(&bytes[..ready - 1]);
-    assert!(!decoder.ready_available());
-    decoder.push(&bytes[ready - 1..ready]);
-    assert!(decoder.ready_available());
-    let restored = decoder.ready().unwrap();
-    assert_eq!(decoder.buffered(), 0);
-
-    let mut pos = ready;
+    let mut pos = 0;
     let mut pages = 0;
+    let mut ready = false;
+    let mut finished = false;
     while pos < bytes.len() {
-        let end = snapshot::step_end(&bytes, pos).unwrap();
+        let end = (pos + chunk).min(bytes.len());
         decoder.push(&bytes[pos..end]);
-        assert!(decoder.step_available());
-        if decoder.next_page().unwrap() {
-            pages += 1;
-        } else {
-            assert!(decoder.finished());
-        }
         pos = end;
+        if !ready {
+            if !decoder.ready_available() {
+                continue;
+            }
+            decoder.ready().unwrap();
+            ready = true;
+        }
+        while !finished && decoder.step_available() {
+            if decoder.next_page().unwrap() {
+                pages += 1;
+                // Live output between pages goes to the same terminal.
+                decoder.terminal().unwrap().vt_write(b"");
+            } else {
+                finished = true;
+            }
+        }
     }
-    assert!(pages >= 1);
-    assert!(decoder.finished());
-    assert_eq!(restored.scrollback_rows(), term.scrollback_rows());
-    assert_eq!(plain(&restored), plain(&term));
+    assert!(
+        ready && finished,
+        "chunk {chunk}: ready {ready}, finished {finished}"
+    );
+    assert_eq!(decoder.buffered(), 0);
+    (decoder.into_terminal().unwrap(), pages)
+}
+
+#[test]
+fn incremental_decode_at_arbitrary_splits() {
+    let term = filled(5000);
+    let bytes = snapshot::encode(&term).unwrap();
+    for chunk in [1, 7, 4096, bytes.len()] {
+        let (restored, pages) = decode_in_chunks(&bytes, chunk);
+        assert!(pages >= 1, "chunk {chunk}");
+        assert_eq!(
+            restored.scrollback_rows(),
+            term.scrollback_rows(),
+            "chunk {chunk}"
+        );
+        assert_eq!(plain(&restored), plain(&term), "chunk {chunk}");
+    }
+}
+
+#[test]
+fn decoder_keeps_its_terminal_until_released() {
+    let bytes = snapshot::encode(&filled(5000)).unwrap();
+    let mut decoder = snapshot::Decoder::new().unwrap();
+    decoder.push(&bytes);
+    assert!(decoder.terminal().is_none());
+    decoder.ready().unwrap();
+    assert_eq!(decoder.terminal().unwrap().rows(), 4);
+    // Dropping the decoder before FINISH must leave a usable terminal.
+    let mut term = decoder.into_terminal().unwrap();
+    term.vt_write(b"after");
+    assert!(plain(&term).contains("after"));
 }
 
 #[derive(Default)]
@@ -103,8 +139,13 @@ impl Handler for Shared {
             cell_height: 18,
         })
     }
-    fn clipboard_write(&mut self, _location: ClipboardLocation, contents: &[ClipboardContent]) {
+    fn clipboard_write(
+        &mut self,
+        _location: ClipboardLocation,
+        contents: &[ClipboardContent],
+    ) -> bool {
         self.0.borrow_mut().clipboard.extend_from_slice(contents);
+        true
     }
     fn resize_window(&mut self, cols: u16, rows: u16) {
         self.0.borrow_mut().resize = Some((cols, rows));
@@ -190,7 +231,7 @@ fn modes_and_colors() {
     let vt = formatter::format(
         &term,
         Options {
-            format: Some(Format::Vt),
+            format: Format::Vt,
             ..Options::default()
         },
     )

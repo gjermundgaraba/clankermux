@@ -101,8 +101,10 @@ pub struct ClipboardContent {
     pub data: Vec<u8>,
 }
 
-/// Effects raised by the engine while it parses. Every method has a no-op
-/// default.
+/// Effects raised by the engine while it parses. Every method has a
+/// default that ignores the effect, except that clipboard writes are
+/// denied. The engine calls these from `extern "C"` trampolines, so a panic
+/// in a handler aborts the process.
 pub trait Handler: 'static {
     /// Bytes the terminal wants written to the PTY: query answers and mode
     /// reports.
@@ -117,8 +119,15 @@ pub trait Handler: 'static {
     fn size(&mut self) -> Option<SizeReport> {
         None
     }
-    /// OSC 52 write. An empty `contents` clears the clipboard.
-    fn clipboard_write(&mut self, _location: ClipboardLocation, _contents: &[ClipboardContent]) {}
+    /// OSC 52 write; an empty `contents` clears the clipboard. Returns
+    /// whether the write was applied, which the program is told.
+    fn clipboard_write(
+        &mut self,
+        _location: ClipboardLocation,
+        _contents: &[ClipboardContent],
+    ) -> bool {
+        false
+    }
     /// CSI 8 t request to resize the grid.
     fn resize_window(&mut self, _cols: u16, _rows: u16) {}
     fn title_changed(&mut self, _term: &Term) {}
@@ -134,7 +143,6 @@ struct Slot {
 }
 
 /// A borrowed terminal handle with read access. [`Terminal`] derefs to it.
-#[repr(transparent)]
 pub struct Term(sys::GhosttyTerminal);
 
 impl Term {
@@ -233,7 +241,9 @@ impl Term {
 /// An owned terminal with its effect handler.
 pub struct Terminal {
     term: Term,
-    slot: Box<Slot>,
+    /// Heap slot the callbacks reach through userdata; a raw pointer so
+    /// that Rust-side access and the callbacks share one provenance.
+    slot: *mut Slot,
 }
 
 impl std::ops::Deref for Terminal {
@@ -254,15 +264,14 @@ impl Terminal {
 
     /// Wraps a caller-owned raw terminal and installs the effect callbacks.
     pub(crate) unsafe fn from_raw(raw: sys::GhosttyTerminal) -> Self {
-        let mut slot = Box::new(Slot {
+        let slot = Box::into_raw(Box::new(Slot {
             handler: Box::new(()),
             xtversion: Vec::new(),
-        });
-        let userdata = &mut *slot as *mut Slot as *mut c_void;
+        }));
         // SAFETY: the slot lives as long as the terminal, and each callback
         // pointer has the type the option documents.
         unsafe {
-            sys::ghostty_terminal_set(raw, sys::GHOSTTY_TERMINAL_OPT_USERDATA, userdata);
+            sys::ghostty_terminal_set(raw, sys::GHOSTTY_TERMINAL_OPT_USERDATA, slot as *mut c_void);
             set_fn(
                 raw,
                 sys::GHOSTTY_TERMINAL_OPT_WRITE_PTY,
@@ -312,17 +321,19 @@ impl Terminal {
         }
     }
 
-    pub fn set_handler(&mut self, handler: Box<dyn Handler>) {
-        self.slot.handler = handler;
+    fn slot(&mut self) -> &mut Slot {
+        // SAFETY: the slot is live until Drop, and the library only reaches
+        // it during calls that take `&mut self`.
+        unsafe { &mut *self.slot }
     }
 
-    pub fn handler_mut(&mut self) -> &mut dyn Handler {
-        &mut *self.slot.handler
+    pub fn set_handler(&mut self, handler: Box<dyn Handler>) {
+        self.slot().handler = handler;
     }
 
     /// Answer to XTVERSION.
     pub fn set_xtversion(&mut self, version: &str) {
-        self.slot.xtversion = version.as_bytes().to_vec();
+        self.slot().xtversion = version.as_bytes().to_vec();
         // SAFETY: the callback reads the slot's xtversion, which the slot owns.
         unsafe {
             set_fn(
@@ -400,8 +411,11 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         // SAFETY: the terminal was created by the library and is freed once,
-        // before the slot its callbacks point at.
-        unsafe { sys::ghostty_terminal_free(self.term.0) }
+        // before the slot its callbacks point at, which Box::into_raw made.
+        unsafe {
+            sys::ghostty_terminal_free(self.term.0);
+            drop(Box::from_raw(self.slot));
+        }
     }
 }
 

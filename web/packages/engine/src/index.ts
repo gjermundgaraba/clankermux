@@ -42,14 +42,14 @@ export class Engine {
     return new Uint8Array(this.exports.memory.buffer);
   }
 
-  private call(name: string, ...args: number[]): number {
+  call(name: string, ...args: number[]): number {
     const fn = this.exports[name];
     if (!fn) throw new Error(`wasm export ${name} missing`);
     return fn(...args) as number;
   }
 
   /** Calls a function returning GhosttyResult and throws on failure. */
-  private check(name: string, ...args: number[]): void {
+  check(name: string, ...args: number[]): void {
     const code = this.call(name, ...args);
     if (code !== RESULT_SUCCESS) throw new EngineError(name, code);
   }
@@ -84,7 +84,8 @@ export class Engine {
     if (!info || info.kind !== "struct") throw new Error(`unknown struct ${name}`);
     const out = new Uint8Array(info.size);
     const view = new DataView(out.buffer);
-    if (info.fields["size"]) view.setUint32(0, info.size, true);
+    const sizeField = info.fields["size"];
+    if (sizeField) view.setUint32(sizeField.offset, info.size, true);
     for (const [key, value] of Object.entries(values)) {
       const field = info.fields[key];
       if (!field) throw new Error(`${name} has no field ${key}`);
@@ -115,8 +116,28 @@ export class Engine {
 
   terminalNew(cols: number, rows: number): Terminal {
     const slot = this.call("ghostty_wasm_alloc_opaque");
-    this.check("ghostty_terminal_new", 0, slot, cols, rows);
-    return new Terminal(this, this.call("ghostty_wasm_take_opaque", slot));
+    try {
+      this.check("ghostty_terminal_new", 0, slot, cols, rows);
+      return new Terminal(this, this.call("ghostty_wasm_take_opaque", slot));
+    } finally {
+      this.call("ghostty_wasm_free_opaque", slot);
+    }
+  }
+
+  /** Reads a GhosttyString at `ptr` using the manifest's layout. */
+  readString(ptr: number): string {
+    const info = this.types["GhosttyString"];
+    if (!info || info.kind !== "struct") throw new Error("GhosttyString missing from manifest");
+    const view = new DataView(this.memory.buffer);
+    const data = view.getUint32(ptr + info.fields["ptr"]!.offset, true);
+    const len = view.getUint32(ptr + info.fields["len"]!.offset, true);
+    return new TextDecoder().decode(this.memory.subarray(data, data + len));
+  }
+
+  sizeOf(name: string): number {
+    const info = this.types[name];
+    if (!info) throw new Error(`unknown type ${name}`);
+    return info.size;
   }
 
   /** Decodes a complete snapshot held in memory. */
@@ -138,15 +159,6 @@ export class Engine {
     }
   }
 
-  /** @internal */
-  callRaw(name: string, ...args: number[]): number {
-    return this.call(name, ...args);
-  }
-
-  /** @internal */
-  checkRaw(name: string, ...args: number[]): void {
-    this.check(name, ...args);
-  }
 }
 
 export class Terminal {
@@ -158,7 +170,7 @@ export class Terminal {
   write(bytes: Uint8Array): void {
     const ptr = this.engine.copyIn(bytes);
     try {
-      this.engine.callRaw("ghostty_terminal_vt_write", this.handle, ptr, bytes.length);
+      this.engine.call("ghostty_terminal_vt_write", this.handle, ptr, bytes.length);
     } finally {
       this.engine.free(ptr, bytes.length);
     }
@@ -167,7 +179,7 @@ export class Terminal {
   private getU16(key: string): number {
     const out = this.engine.alloc(2);
     try {
-      this.engine.checkRaw(
+      this.engine.check(
         "ghostty_terminal_get",
         this.handle,
         this.engine.enumValue("GhosttyTerminalData", key),
@@ -188,9 +200,10 @@ export class Terminal {
   }
 
   get title(): string {
-    const out = this.engine.alloc(8);
+    const size = this.engine.sizeOf("GhosttyString");
+    const out = this.engine.alloc(size);
     try {
-      const code = this.engine.callRaw(
+      const code = this.engine.call(
         "ghostty_terminal_get",
         this.handle,
         this.engine.enumValue("GhosttyTerminalData", "TITLE"),
@@ -198,12 +211,9 @@ export class Terminal {
       );
       if (code === RESULT_NO_VALUE) return "";
       if (code !== RESULT_SUCCESS) throw new EngineError("ghostty_terminal_get", code);
-      const view = new DataView(this.engine.memory.buffer);
-      const ptr = view.getUint32(out, true);
-      const len = view.getUint32(out + 4, true);
-      return new TextDecoder().decode(this.engine.memory.subarray(ptr, ptr + len));
+      return this.engine.readString(out);
     } finally {
-      this.engine.free(out, 8);
+      this.engine.free(out, size);
     }
   }
 
@@ -214,34 +224,34 @@ export class Terminal {
       extra: { screen: {} },
     });
     const optionsPtr = this.engine.copyIn(options);
-    const slot = this.engine.callRaw("ghostty_wasm_alloc_opaque");
+    const slot = this.engine.call("ghostty_wasm_alloc_opaque");
     const outPtr = this.engine.alloc(4);
     const outLen = this.engine.alloc(4);
     try {
-      this.engine.checkRaw("ghostty_formatter_terminal_new", 0, slot, this.handle, optionsPtr);
-      const formatter = this.engine.callRaw("ghostty_wasm_take_opaque", slot);
+      this.engine.check("ghostty_formatter_terminal_new", 0, slot, this.handle, optionsPtr);
+      const formatter = this.engine.call("ghostty_wasm_take_opaque", slot);
       try {
-        this.engine.checkRaw("ghostty_formatter_format_alloc", formatter, 0, outPtr, outLen);
+        this.engine.check("ghostty_formatter_format_alloc", formatter, 0, outPtr, outLen);
         const view = new DataView(this.engine.memory.buffer);
         const ptr = view.getUint32(outPtr, true);
         const len = view.getUint32(outLen, true);
         try {
           return new TextDecoder().decode(this.engine.memory.slice(ptr, ptr + len));
         } finally {
-          this.engine.callRaw("ghostty_free", 0, ptr, len);
+          this.engine.call("ghostty_free", 0, ptr, len);
         }
       } finally {
-        this.engine.callRaw("ghostty_formatter_free", formatter);
+        this.engine.call("ghostty_formatter_free", formatter);
       }
     } finally {
       this.engine.free(outLen, 4);
       this.engine.free(outPtr, 4);
-      this.engine.callRaw("ghostty_wasm_free_opaque", slot);
+      this.engine.call("ghostty_wasm_free_opaque", slot);
       this.engine.free(optionsPtr, options.length);
     }
   }
 
   free(): void {
-    this.engine.callRaw("ghostty_terminal_free", this.handle);
+    this.engine.call("ghostty_terminal_free", this.handle);
   }
 }

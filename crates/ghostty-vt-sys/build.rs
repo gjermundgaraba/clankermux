@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -10,14 +10,6 @@ fn main() {
     println!("cargo:rerun-if-changed={}", vendored.display());
     println!("cargo:rerun-if-env-changed=ZIG");
 
-    let target = env::var("TARGET").unwrap();
-    let zig_target = match target.as_str() {
-        "aarch64-apple-darwin" => "aarch64-macos",
-        "x86_64-apple-darwin" => "x86_64-macos",
-        "aarch64-unknown-linux-gnu" => "aarch64-linux-gnu",
-        "x86_64-unknown-linux-gnu" => "x86_64-linux-gnu",
-        other => panic!("no zig target mapping for {other}"),
-    };
     let version = fs::read_to_string(vendored.join("VERSION")).unwrap();
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let zig = env::var("ZIG").unwrap_or_else(|_| "zig".into());
@@ -28,12 +20,17 @@ fn main() {
             "-Demit-xcframework=false",
             "-Doptimize=ReleaseFast",
         ])
-        .arg(format!("-Dtarget={zig_target}"))
+        .arg(format!(
+            "-Dtarget={}",
+            zig_target(&env::var("TARGET").unwrap())
+        ))
         .arg(format!("-Dversion-string={}", version.trim()))
         .arg("--prefix")
         .arg(out.join("zig-out"))
+        // Outside the vendored tree, which rerun-if-changed watches, and
+        // shared across build-script hashes so profiles reuse artifacts.
         .arg("--cache-dir")
-        .arg(out.join("zig-cache"))
+        .arg(zig_cache(&out))
         .current_dir(&vendored)
         .status()
         .unwrap_or_else(|err| panic!("cannot run {zig} (set ZIG to a zig 0.16.0 binary): {err}"));
@@ -53,9 +50,31 @@ fn main() {
     .unwrap();
     println!("cargo:rustc-link-search=native={}", lib.display());
     println!("cargo:rustc-link-lib=static=ghostty-vt");
-    if target.contains("apple") {
-        println!("cargo:rustc-link-lib=c++");
-    } else {
-        println!("cargo:rustc-link-lib=stdc++");
+}
+
+/// `aarch64-apple-darwin` -> `aarch64-macos`, `x86_64-unknown-linux-gnu` ->
+/// `x86_64-linux-gnu`: zig drops the vendor and calls Darwin macOS.
+fn zig_target(rust_target: &str) -> String {
+    let mut parts = rust_target.splitn(4, '-');
+    let arch = parts.next().unwrap();
+    let _vendor = parts.next();
+    let os = match parts.next() {
+        Some("darwin") => "macos",
+        Some(os) => os,
+        None => panic!("unexpected target triple {rust_target}"),
+    };
+    match parts.next() {
+        Some(abi) => format!("{arch}-{os}-{abi}"),
+        None => format!("{arch}-{os}"),
     }
+}
+
+/// `<target dir>/zig-cache`, found from `OUT_DIR`
+/// (`<target dir>/<profile>/build/<crate>-<hash>/out`).
+fn zig_cache(out: &Path) -> PathBuf {
+    out.ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == "build"))
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map_or_else(|| out.join("zig-cache"), |target| target.join("zig-cache"))
 }

@@ -14,13 +14,9 @@ pub const ENVELOPE_LEN: usize = 10;
 /// Bytes in a record header: tag u16, payload length u32, CRC32C u32.
 pub const RECORD_HEADER_LEN: usize = 10;
 
-pub const TAG_TERMINAL: u16 = 1;
-pub const TAG_SCREEN: u16 = 2;
 pub const TAG_PAGE: u16 = 3;
-pub const TAG_HISTORY: u16 = 4;
 pub const TAG_READY: u16 = 5;
 pub const TAG_FINISH: u16 = 6;
-pub const TAG_CONTINUATION: u16 = 7;
 
 /// Encodes the whole terminal, history included, into one buffer.
 pub fn encode(term: &Term) -> Result<Vec<u8>> {
@@ -47,7 +43,7 @@ pub fn ready_end(buf: &[u8]) -> Option<usize> {
 }
 
 /// Position just past the next `PAGE` or `FINISH` record at or after
-/// `pos`, which is what one decoder `next` call consumes.
+/// `pos`, which is what one decoder `next_page` call consumes.
 pub fn step_end(buf: &[u8], pos: usize) -> Option<usize> {
     end_of_step(buf, pos, |tag| tag == TAG_PAGE || tag == TAG_FINISH)
 }
@@ -73,8 +69,8 @@ unsafe extern "C" fn read_source(
     capacity: usize,
     out_read: *mut usize,
 ) -> bool {
-    // SAFETY: userdata is the boxed Source owned by the Decoder, and
-    // buffer has room for capacity bytes.
+    // SAFETY: userdata is the Source owned by the Decoder, and buffer has
+    // room for capacity bytes.
     unsafe {
         let source = &mut *(userdata as *mut Source);
         let n = capacity.min(source.data.len() - source.pos);
@@ -85,36 +81,57 @@ unsafe extern "C" fn read_source(
     true
 }
 
-/// A pull decoder fed from a buffer the caller fills incrementally.
+/// A pull decoder fed from a buffer the caller fills incrementally. It
+/// owns the terminal it restores until [`Decoder::into_terminal`], because
+/// the library writes history into that terminal on every page.
 ///
 /// The decoder reads whole steps and is unusable after a short read, so
-/// callers check [`Decoder::ready_available`] or [`Decoder::step_available`]
-/// before [`Decoder::ready`] or [`Decoder::next_page`].
+/// callers check [`Decoder::ready_available`] or
+/// [`Decoder::step_available`] before [`Decoder::ready`] or
+/// [`Decoder::next_page`].
 pub struct Decoder {
     raw: sys::GhosttySnapshotDecoder,
-    source: Box<Source>,
-    finished: bool,
+    source: *mut Source,
+    terminal: Option<Terminal>,
 }
 
 impl Decoder {
     pub fn new() -> Result<Self> {
-        let mut source = Box::new(Source {
+        let source = Box::into_raw(Box::new(Source {
             data: Vec::new(),
             pos: 0,
-        });
+        }));
         let reader = sys::GhosttyReader {
             read: Some(read_source),
-            userdata: &mut *source as *mut Source as *mut c_void,
+            userdata: source as *mut c_void,
         };
         let mut raw = ptr::null_mut();
-        // SAFETY: the reader's userdata outlives the decoder because both
-        // live in this struct and the decoder is freed first.
-        check(unsafe { sys::ghostty_snapshot_decoder_new(ptr::null(), &mut raw, reader) })?;
+        // SAFETY: the source outlives the decoder; Drop frees the decoder
+        // first.
+        if let Err(err) =
+            check(unsafe { sys::ghostty_snapshot_decoder_new(ptr::null(), &mut raw, reader) })
+        {
+            // SAFETY: source came from Box::into_raw above and was not
+            // handed to a decoder.
+            drop(unsafe { Box::from_raw(source) });
+            return Err(err);
+        }
         Ok(Decoder {
             raw,
             source,
-            finished: false,
+            terminal: None,
         })
+    }
+
+    fn source(&self) -> &Source {
+        // SAFETY: source is live until Drop and the library only touches it
+        // during decoder calls, which take `&mut self`.
+        unsafe { &*self.source }
+    }
+
+    fn source_mut(&mut self) -> &mut Source {
+        // SAFETY: as in `source`.
+        unsafe { &mut *self.source }
     }
 
     pub fn set_max_continuation_bytes(&mut self, max: usize) -> Result<()> {
@@ -129,44 +146,44 @@ impl Decoder {
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
-        self.source.data.extend_from_slice(bytes);
+        self.source_mut().data.extend_from_slice(bytes);
     }
 
     /// Bytes pushed but not yet consumed.
     pub fn buffered(&self) -> usize {
-        self.source.data.len() - self.source.pos
+        let source = self.source();
+        source.data.len() - source.pos
     }
 
+    /// Whether every byte through `READY` is buffered. Only meaningful
+    /// before [`Decoder::ready`].
     pub fn ready_available(&self) -> bool {
-        self.source.pos == 0 && ready_end(&self.source.data).is_some()
+        ready_end(&self.source().data).is_some()
     }
 
     pub fn step_available(&self) -> bool {
-        step_end(&self.source.data, self.source.pos).is_some()
+        let source = self.source();
+        step_end(&source.data, source.pos).is_some()
     }
 
-    pub fn finished(&self) -> bool {
-        self.finished
-    }
-
-    /// Decodes through `READY` and returns the renderable terminal.
-    pub fn ready(&mut self) -> Result<Terminal> {
+    /// Decodes through `READY`; the terminal is then renderable.
+    pub fn ready(&mut self) -> Result<&mut Terminal> {
         let mut raw = ptr::null_mut();
         // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_ready(self.raw, &mut raw) };
         self.compact();
         check(result)?;
         // SAFETY: on success raw is a caller-owned terminal.
-        Ok(unsafe { Terminal::from_raw(raw) })
+        Ok(self.terminal.insert(unsafe { Terminal::from_raw(raw) }))
     }
 
-    /// Decodes one history page. Returns `false` once `FINISH` is validated.
+    /// Decodes one history page into the terminal. Returns `false` once
+    /// `FINISH` is validated.
     pub fn next_page(&mut self) -> Result<bool> {
         // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_next(self.raw) };
         self.compact();
         if result == sys::GHOSTTY_NO_VALUE {
-            self.finished = true;
             return Ok(false);
         }
         check(result)?;
@@ -174,27 +191,42 @@ impl Decoder {
     }
 
     /// Decodes a complete snapshot in one call.
-    pub fn decode(&mut self) -> Result<Terminal> {
+    pub fn decode(&mut self) -> Result<&mut Terminal> {
         let mut raw = ptr::null_mut();
         // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_decode(self.raw, &mut raw) };
         self.compact();
         check(result)?;
-        self.finished = true;
         // SAFETY: on success raw is a caller-owned terminal.
-        Ok(unsafe { Terminal::from_raw(raw) })
+        Ok(self.terminal.insert(unsafe { Terminal::from_raw(raw) }))
+    }
+
+    /// The terminal restored so far, for rendering and live input between
+    /// pages.
+    pub fn terminal(&mut self) -> Option<&mut Terminal> {
+        self.terminal.as_mut()
+    }
+
+    /// Frees the decoder and releases the terminal, finished or not.
+    pub fn into_terminal(mut self) -> Option<Terminal> {
+        self.terminal.take()
     }
 
     fn compact(&mut self) {
-        self.source.data.drain(..self.source.pos);
-        self.source.pos = 0;
+        let source = self.source_mut();
+        source.data.drain(..source.pos);
+        source.pos = 0;
     }
 }
 
 impl Drop for Decoder {
     fn drop(&mut self) {
-        // SAFETY: raw was created by decoder_new and is freed once.
-        unsafe { sys::ghostty_snapshot_decoder_free(self.raw) }
+        // SAFETY: raw was created by decoder_new and is freed once, before
+        // the terminal it borrows (dropped after this) and the source.
+        unsafe {
+            sys::ghostty_snapshot_decoder_free(self.raw);
+            drop(Box::from_raw(self.source));
+        }
     }
 }
 
@@ -202,5 +234,6 @@ impl Drop for Decoder {
 pub fn decode(bytes: &[u8]) -> Result<Terminal> {
     let mut decoder = Decoder::new()?;
     decoder.push(bytes);
-    decoder.decode()
+    decoder.decode()?;
+    Ok(decoder.into_terminal().expect("decoded"))
 }
