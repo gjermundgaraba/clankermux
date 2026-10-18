@@ -55,9 +55,8 @@ export class Engine {
     };
   }
 
-  static async load(wasm: BufferSource | WebAssembly.Module): Promise<Engine> {
-    const module = wasm instanceof WebAssembly.Module ? wasm : await WebAssembly.compile(wasm);
-    const instance = await WebAssembly.instantiate(module, {});
+  static async load(wasm: BufferSource): Promise<Engine> {
+    const { instance } = await WebAssembly.instantiate(wasm, {});
     return new Engine(instance.exports as Engine["exports"]);
   }
 
