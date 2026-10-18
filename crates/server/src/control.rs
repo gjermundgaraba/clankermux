@@ -20,7 +20,7 @@ fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
         .map_err(|e| (ErrorCode::InvalidRequest, format!("bad params: {e}")))
 }
 
-fn running(status: Status) -> Result<(), Fail> {
+pub(crate) fn running(status: Status) -> Result<(), Fail> {
     if status == Status::Running {
         Ok(())
     } else {
@@ -98,23 +98,18 @@ pub async fn handle(
         }
         "set_size" => {
             let p: proto::SetSizeParams = params(p)?;
-            if p.cols == 0 || p.rows == 0 {
-                return Err((
-                    ErrorCode::InvalidRequest,
-                    "cols and rows must be at least 1".into(),
-                ));
-            }
+            let size = Size {
+                cols: p.cols,
+                rows: p.rows,
+                cell_width: None,
+                cell_height: None,
+            };
+            session::check_size(&size)?;
             let session = registry.get(&p.session)?;
             running(session.lock().unwrap().status)?;
             let report = Report {
-                source: None,
                 viewport: Viewport {
-                    size: Size {
-                        cols: p.cols,
-                        rows: p.rows,
-                        cell_width: None,
-                        cell_height: None,
-                    },
+                    size,
                     profile: None,
                 },
             };

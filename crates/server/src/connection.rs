@@ -14,13 +14,21 @@ use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::attach::{self, Handle};
 use crate::registry::Registry;
-use crate::session::{self, Report};
+use crate::session::{self, Report, Shared};
 use crate::{control, frame_json};
 
 /// Queued bytes above which attachments stop pulling from their streams
 /// until the socket drains, so a slow client falls behind in the ring
 /// instead of growing server memory.
 pub const HIGH_WATER: usize = 256 * 1024;
+
+/// Queued bytes above which the connection is closed: a client that stops
+/// reading altogether would otherwise grow its queue of events and
+/// replies without bound. Attachments may legitimately overshoot the
+/// high-water mark by a few frames.
+pub fn ceiling(max_frame: u64) -> usize {
+    HIGH_WATER + 4 * max_frame as usize
+}
 
 /// The connection's outgoing frame queue, shared by control, events and
 /// attachments.
@@ -29,13 +37,22 @@ pub struct Writer {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     queued: Arc<AtomicUsize>,
     drained: Arc<Notify>,
+    ceiling: usize,
+    overflow: Arc<Notify>,
 }
 
 impl Writer {
     /// Queues a frame. False once the connection is gone.
     pub fn send(&self, frame: Vec<u8>) -> bool {
-        self.queued.fetch_add(frame.len(), Ordering::AcqRel);
+        let queued = self.queued.fetch_add(frame.len(), Ordering::AcqRel) + frame.len();
+        if queued > self.ceiling {
+            self.overflow.notify_one();
+        }
         self.tx.send(frame).is_ok()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
     }
 
     pub fn send_json<T: serde::Serialize>(
@@ -75,12 +92,17 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
         tx,
         queued: Arc::new(AtomicUsize::new(0)),
         drained: Arc::new(Notify::new()),
+        ceiling: ceiling(registry.config.limits.max_frame),
+        overflow: Arc::new(Notify::new()),
     };
     let queued = writer.queued.clone();
     let drained = writer.drained.clone();
+    let overflow = writer.overflow.clone();
     // Subscribers hold clones of the sender, so the writer ends on this
-    // signal rather than on the channel closing.
-    let (close_tx, mut close_rx) = oneshot::channel::<()>();
+    // signal rather than on the channel closing. It says whether to flush
+    // the queue first; not after an overflow, when the client is not
+    // reading.
+    let (close_tx, mut close_rx) = oneshot::channel::<bool>();
     let write_task = tokio::spawn(async move {
         loop {
             let bytes = tokio::select! {
@@ -88,9 +110,11 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
                     Some(bytes) => bytes,
                     None => break,
                 },
-                _ = &mut close_rx => {
+                flush = &mut close_rx => {
                     rx.close();
-                    while let Ok(bytes) = rx.try_recv() {
+                    while flush == Ok(true)
+                        && let Ok(bytes) = rx.try_recv()
+                    {
                         if socket.write_all(&bytes).await.is_err() {
                             break;
                         }
@@ -118,14 +142,24 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
     let mut buf = vec![0u8; 64 * 1024];
     let hello_deadline = tokio::time::Instant::now()
         + Duration::from_millis(state.registry.config.limits.hello_timeout);
+    let mut flush = true;
     loop {
-        let read = reader.read(&mut buf);
-        let n = if state.hello.is_some() {
-            read.await
-        } else {
-            match tokio::time::timeout_at(hello_deadline, read).await {
-                Ok(n) => n,
-                Err(_) => break,
+        let read = async {
+            if state.hello.is_some() {
+                reader.read(&mut buf).await
+            } else {
+                match tokio::time::timeout_at(hello_deadline, reader.read(&mut buf)).await {
+                    Ok(n) => n,
+                    Err(_) => Ok(0),
+                }
+            }
+        };
+        let n = tokio::select! {
+            n = read => n,
+            _ = overflow.notified() => {
+                tracing::warn!("client stopped reading; closing");
+                flush = false;
+                break;
             }
         };
         match n {
@@ -138,7 +172,7 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
     }
     // Dropping the channel table ends every attachment silently.
     drop(state);
-    let _ = close_tx.send(());
+    let _ = close_tx.send(flush);
     let _ = write_task.await;
 }
 
@@ -229,7 +263,7 @@ impl Connection {
                 FrameType::Input => self.input(channel, &payload),
                 FrameType::Viewport => self.viewport(channel, &payload),
                 FrameType::Close => {
-                    if let Some(handle) = self.open_handle(channel) {
+                    if let Some(handle) = self.handle(channel) {
                         handle.close();
                     }
                 }
@@ -320,19 +354,24 @@ impl Connection {
         true
     }
 
-    /// The attachment on `channel`, if one is still open there.
-    fn open_handle(&mut self, channel: u32) -> Option<Handle> {
-        if self.channels.get(&channel).is_some_and(Handle::is_open) {
-            self.channels.remove(&channel)
-        } else {
-            None
-        }
+    /// The attachment on `channel`, if the channel is in use.
+    fn handle(&self, channel: u32) -> Option<&Handle> {
+        self.channels.get(&channel).filter(|h| h.is_open())
+    }
+
+    /// Sends an `ERROR` that ends the attachment on `channel`, if any.
+    fn end(&mut self, channel: u32, code: ErrorCode, message: String) {
+        // Dropping the handle ends the task; the ERROR goes out first.
+        self.channels.remove(&channel);
+        self.error(channel, code, message);
     }
 
     fn open(&mut self, channel: u32, payload: &[u8]) {
-        // An ERROR on the channel ends the attachment that was there.
-        if self.open_handle(channel).is_some() {
-            self.error(channel, ErrorCode::ChannelInUse, "channel in use");
+        // The channel stays in use until the task has queued CLOSED, so a
+        // pipelined CLOSE + OPEN is refused and, per the Errors rule, the
+        // attachment that was there ends.
+        if self.handle(channel).is_some() {
+            self.end(channel, ErrorCode::ChannelInUse, "channel in use".into());
             return;
         }
         let open: Open = match serde_json::from_slice(payload) {
@@ -346,6 +385,12 @@ impl Connection {
                 return;
             }
         };
+        if let Some(size) = &open.viewport
+            && let Err((code, message)) = session::check_size(size)
+        {
+            self.error(channel, code, message);
+            return;
+        }
         let session = match self.registry.get(&open.session) {
             Ok(session) => session,
             Err((code, message)) => {
@@ -366,56 +411,55 @@ impl Connection {
         self.channels.insert(channel, handle);
     }
 
-    /// The writable, running attachment on `channel`; an error keeps the
-    /// attachment and drops the frame. None when the channel is not in use.
-    fn writable(&self, channel: u32) -> Option<&Handle> {
-        let handle = self.channels.get(&channel).filter(|h| h.is_open())?;
+    /// The session of the writable, running attachment on `channel`; an
+    /// error keeps the attachment and drops the frame. None when the
+    /// channel is not in use.
+    fn writable(&self, channel: u32) -> Option<Shared> {
+        let handle = self.handle(channel)?;
         if handle.read_only {
             self.error(channel, ErrorCode::ReadOnly, "attachment is read-only");
             return None;
         }
-        if let Err((code, message)) = attach::running(&handle.session.lock().unwrap()) {
+        let session = handle.session()?;
+        if let Err((code, message)) = control::running(session.lock().unwrap().status) {
             self.error(channel, code, message);
             return None;
         }
-        Some(handle)
+        Some(session)
     }
 
     fn input(&mut self, channel: u32, payload: &[u8]) {
-        let Some(handle) = self.writable(channel) else {
+        let Some(session) = self.writable(channel) else {
             return;
         };
-        let pushed = handle.session.lock().unwrap().input.push(payload.to_vec());
+        let pushed = session.lock().unwrap().input.push(payload.to_vec());
         if pushed.is_none() {
             self.error(channel, ErrorCode::InputOverflow, "input queue full");
         }
     }
 
     fn viewport(&mut self, channel: u32, payload: &[u8]) {
+        if self.handle(channel).is_none() {
+            return;
+        }
         let viewport: Viewport = match serde_json::from_slice(payload) {
             Ok(viewport) => viewport,
             Err(err) => {
-                if self.open_handle(channel).is_some() {
-                    self.error(
-                        channel,
-                        ErrorCode::InvalidRequest,
-                        format!("malformed VIEWPORT: {err}"),
-                    );
-                }
+                self.end(
+                    channel,
+                    ErrorCode::InvalidRequest,
+                    format!("malformed VIEWPORT: {err}"),
+                );
                 return;
             }
         };
-        let Some(handle) = self.writable(channel) else {
+        if let Err((code, message)) = session::check_size(&viewport.size) {
+            self.end(channel, code, message);
+            return;
+        }
+        let Some(session) = self.writable(channel) else {
             return;
         };
-        session::report(
-            &self.registry,
-            &handle.session,
-            Report {
-                source: Some(handle.id),
-                viewport,
-            },
-            false,
-        );
+        session::report(&self.registry, &session, Report { viewport }, false);
     }
 }

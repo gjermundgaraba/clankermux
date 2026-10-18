@@ -565,3 +565,25 @@ async fn read_screen_only_after_clear_and_bounded_replies() {
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
 }
+
+#[tokio::test]
+async fn a_connection_that_stops_reading_is_closed() {
+    // The queue ceiling is 256 KiB plus four frames; small frames keep
+    // the test short.
+    let server = start(Limits {
+        max_frame: 16 * 1024,
+        ..fast_limits()
+    })
+    .await;
+    let mut c = client(&server).await;
+    let mut idle = client(&server).await;
+    idle.ok("subscribe", json!({})).await;
+    let session = c.create(json!({"argv": ["/bin/cat"]})).await;
+    let label = "x".repeat(200);
+    for _ in 0..2000 {
+        c.ok("set_label", json!({"session": session.id, "label": label}))
+            .await;
+    }
+    // The idle subscriber reads what the socket buffered, then end of file.
+    while idle.recv().await.is_some() {}
+}

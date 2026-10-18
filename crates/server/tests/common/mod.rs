@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use ghostty_vt::{formatter, snapshot};
 use proto::*;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -32,8 +33,9 @@ pub async fn start(limits: Limits) -> Server {
         version: "test".into(),
     });
     let task = tokio::spawn(server::serve_unix(socket.clone(), registry));
+    // The socket file exists before the server listens on it.
     for _ in 0..100 {
-        if socket.exists() {
+        if UnixStream::connect(&socket).await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -182,6 +184,147 @@ impl Client {
                 return session;
             }
         }
+    }
+
+    pub async fn open(&mut self, channel: u32, body: Value) {
+        self.send_json(FrameType::Open, channel, &body).await;
+    }
+
+    pub async fn recv_on(&mut self, channel: u32) -> (Header, Vec<u8>) {
+        let (header, payload) = self.recv().await.expect("a frame");
+        assert_eq!(header.channel, channel, "{header:?}");
+        (header, payload)
+    }
+
+    pub async fn attached(&mut self, channel: u32) -> Attached {
+        let (header, payload) = self.recv_on(channel).await;
+        assert_eq!(
+            header.frame_type,
+            FrameType::Attached,
+            "{}",
+            String::from_utf8_lossy(&payload)
+        );
+        serde_json::from_slice(&payload).unwrap()
+    }
+
+    /// Reads a `snapshot` bootstrap through `SNAPSHOT_READY`.
+    pub async fn bootstrap_ready(&mut self, channel: u32) -> Bootstrap {
+        let attached = self.attached(channel).await;
+        assert_eq!(attached.mode, AttachMode::Snapshot);
+        let mut ready = Vec::new();
+        loop {
+            let (header, payload) = self.recv_on(channel).await;
+            match header.frame_type {
+                FrameType::Snapshot => ready.extend_from_slice(&payload),
+                FrameType::SnapshotReady => break,
+                other => panic!("{other:?} before SNAPSHOT_READY"),
+            }
+        }
+        assert_eq!(snapshot::ready_end(&ready), Some(ready.len()));
+        Bootstrap {
+            attached,
+            ready,
+            rest: Vec::new(),
+            stream: Vec::new(),
+        }
+    }
+
+    /// Reads a whole `snapshot` bootstrap through `SNAPSHOT_END`.
+    pub async fn bootstrap(&mut self, channel: u32) -> Bootstrap {
+        let mut boot = self.bootstrap_ready(channel).await;
+        loop {
+            let (header, payload) = self.recv_on(channel).await;
+            match header.frame_type {
+                FrameType::Snapshot => boot.rest.extend_from_slice(&payload),
+                FrameType::SnapshotEnd => break,
+                _ => boot.stream.push((header, payload)),
+            }
+        }
+        boot
+    }
+
+    pub async fn expect_error(&mut self, channel: u32) -> ErrorCode {
+        let (header, payload) = self.recv_on(channel).await;
+        assert_eq!(header.frame_type, FrameType::Error);
+        let error: ErrorMessage = serde_json::from_slice(&payload).unwrap();
+        error.code
+    }
+
+    pub async fn expect_closed(&mut self, channel: u32) -> ClosedReason {
+        let (header, payload) = self.recv_on(channel).await;
+        assert_eq!(header.frame_type, FrameType::Closed);
+        let closed: Closed = serde_json::from_slice(&payload).unwrap();
+        closed.reason
+    }
+
+    pub async fn expect_resized(&mut self, channel: u32) -> Resized {
+        let (header, payload) = self.recv_on(channel).await;
+        assert_eq!(header.frame_type, FrameType::Resized);
+        serde_json::from_slice(&payload).unwrap()
+    }
+
+    /// Reads OUTPUT frames until `needle` appears; returns the offset of
+    /// the first frame and the bytes, asserting contiguous offsets.
+    pub async fn output_until(&mut self, channel: u32, needle: &[u8]) -> (u64, Vec<u8>) {
+        let mut bytes = Vec::new();
+        let mut first = None;
+        loop {
+            let (header, payload) = self.recv_on(channel).await;
+            assert_eq!(header.frame_type, FrameType::Output);
+            let (offset, data) = parse_output(&payload).unwrap();
+            let start = *first.get_or_insert(offset);
+            assert_eq!(offset, start + bytes.len() as u64, "contiguous offsets");
+            bytes.extend_from_slice(data);
+            if bytes.windows(needle.len()).any(|w| w == needle) {
+                return (start, bytes);
+            }
+        }
+    }
+
+    /// Polls `inspect` until the session reports `count` attachments.
+    pub async fn wait_attachments(&mut self, id: &str, count: u32) {
+        for _ in 0..200 {
+            let s: Session =
+                serde_json::from_value(self.ok("inspect", json!({"session": id})).await).unwrap();
+            if s.attachments == count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("attachments never reached {count}");
+    }
+}
+
+/// The bootstrap of a `snapshot` attachment: ATTACHED, snapshot frames
+/// and SNAPSHOT_READY / SNAPSHOT_END markers.
+pub struct Bootstrap {
+    pub attached: Attached,
+    /// Snapshot bytes through the READY record.
+    pub ready: Vec<u8>,
+    /// The remaining snapshot bytes.
+    pub rest: Vec<u8>,
+    /// Stream frames interleaved after SNAPSHOT_READY.
+    pub stream: Vec<(Header, Vec<u8>)>,
+}
+
+impl Bootstrap {
+    pub fn terminal(&self) -> ghostty_vt::Terminal {
+        let mut bytes = self.ready.clone();
+        bytes.extend_from_slice(&self.rest);
+        snapshot::decode(&bytes).unwrap()
+    }
+
+    pub fn text(&self) -> String {
+        let term = self.terminal();
+        let out = formatter::format(
+            &term,
+            formatter::Options {
+                trim: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
     }
 }
 

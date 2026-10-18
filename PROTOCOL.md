@@ -271,9 +271,11 @@ Checks, in order, each failing with `ERROR` on the channel:
    a session loaded from a park file, the engine recorded there equals the
    server's, else `engine_mismatch`.
 
-A writable `OPEN` with `viewport` on a running session is applied as a
-viewport report at once, before the snapshot is taken, bypassing
-coalescing. On any other session it is ignored.
+A writable `OPEN` with `viewport` or `profile` on a running session is
+applied as a viewport report at once (at the session's size when
+`viewport` is absent), before the snapshot is taken, bypassing coalescing.
+On any other session it is ignored. A `cols` or `rows` of 0, in `OPEN` or
+`VIEWPORT`, is `invalid_request`.
 
 ### ATTACHED
 
@@ -384,8 +386,12 @@ marker the cursor has not received is no longer retained, the server
 sends `GAP {from, to}`, meaning bytes from `from` up to `to` were not
 delivered, where `to` is the `offset` of the `ATTACHED` that follows, and
 begins a new bootstrap in mode `snapshot` on the same channel. The client
-discards its terminal. If a bootstrap is still in flight when this happens
-again, the server sends `ERROR too_slow`.
+discards its terminal. If the bootstrap that followed a gap is still in
+flight when this happens again, the server sends `ERROR too_slow`.
+
+A client that stops reading altogether is disconnected once the server
+holds more than 256 KiB plus four frames of `limits.max_frame` of
+undelivered frames for it.
 
 ### CLOSE and CLOSED
 
@@ -418,12 +424,13 @@ terminal, sets the PTY size, emits a mode 2048 report if enabled, and
 appends `RESIZED` to the stream. A report applied at once discards pending
 coalesced reports. Resize requests from the program (CSI 8 t) are ignored.
 
-The authoritative attachment is the one whose report was adopted last;
-`set_size` changes the size but not the authoritative attachment. Its
-`profile` and cell size answer the queries below, persist while no
-attachment is open, and are parked with the session. When the answer to
-the colour scheme query changes and mode 2031 is set, the server writes
-the colour scheme report to the PTY.
+A report carries a size and may carry a `profile` and a cell size; what
+it omits is unchanged (`set_size` carries neither). The session's profile
+and cell size are those of the latest reports that carried them. They
+answer the queries below, persist while no attachment is open, and are
+parked with the session. When the answer to the colour scheme query
+changes and mode 2031 is set, the server writes the colour scheme report
+to the PTY.
 
 ## Queries
 
@@ -435,9 +442,9 @@ The server's terminal answers every query from the PTY.
 | Kitty keyboard, kitty graphics     | From the server's terminal                         |
 | XTVERSION                          | `clankermux <version>`                             |
 | XTGETTCAP                          | Ghostty's terminfo for `xterm-ghostty`             |
-| OSC 10, 11, 12                     | The authoritative profile; defaults if unset       |
+| OSC 10, 11, 12                     | The session's profile; defaults if unset           |
 | CSI ? 996 n colour scheme          | `profile.scheme`; else from `bg` when set, dark below relative luminance 0.5; else no answer |
-| XTWINOPS size reports              | Session size; authoritative cell size, else 0      |
+| XTWINOPS size reports              | Session size; the session's cell size, else 0      |
 | OSC 7501 `?`                       | Supported; the effect is installed                 |
 | OSC 52 read                        | Not answered                                       |
 

@@ -8,7 +8,9 @@ use std::time::Duration;
 use ghostty_vt::{
     ColorKind, ColorScheme, Handler, Rgb, SizeReport, Term, Terminal, color_scheme_report,
 };
-use proto::{ClosedReason, Event, Exit, OnExit, Profile, Scheme, Size, Status, Viewport};
+use proto::{
+    ClosedReason, ErrorCode, Event, Exit, OnExit, Profile, Scheme, Size, Status, Viewport,
+};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
@@ -132,11 +134,20 @@ impl InputQueue {
     }
 }
 
-/// A viewport report from an attachment, or from `set_size` with no source.
-#[derive(Debug, Clone)]
+/// A viewport report from an attachment or from `set_size`.
 pub struct Report {
-    pub source: Option<u64>,
     pub viewport: Viewport,
+}
+
+/// `cols` and `rows` of a size are at least 1.
+pub fn check_size(size: &Size) -> Result<(), crate::registry::Fail> {
+    if size.cols == 0 || size.rows == 0 {
+        return Err((
+            ErrorCode::InvalidRequest,
+            "cols and rows must be at least 1".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// An open attachment as the session sees it.
@@ -176,9 +187,6 @@ pub struct Session {
     /// `limits.text`, applied to the title and pwd the program reports.
     pub text_limit: usize,
     pub attached: Vec<Attachment>,
-    /// The attachment whose report was adopted last.
-    pub authoritative: Option<u64>,
-    pub profile: Profile,
     /// The latest coalesced report, waiting for the timer.
     pub pending: Option<Report>,
     pub timer_running: bool,
@@ -246,9 +254,6 @@ impl Session {
         if self.status != Status::Running {
             return None;
         }
-        if let Some(source) = report.source {
-            self.authoritative = Some(source);
-        }
         let Viewport {
             size:
                 Size {
@@ -290,9 +295,9 @@ impl Session {
         Some(marker)
     }
 
-    /// Makes `profile` the authoritative one: default colours for OSC 10,
-    /// 11 and 12, the scheme for CSI ? 996 n, and a mode 2031 report when
-    /// the scheme answer changed.
+    /// Makes `profile` the session's: default colours for OSC 10, 11 and
+    /// 12, the scheme for CSI ? 996 n, and a mode 2031 report when the
+    /// scheme answer changed.
     pub fn set_profile(&mut self, profile: Profile) {
         let before = self.term.handler().scheme_answer();
         let effects = self.term.handler_mut();
@@ -310,7 +315,6 @@ impl Session {
                 .term
                 .set_color(kind, value.as_deref().and_then(parse_rgb));
         }
-        self.profile = profile;
         let after = self.term.handler().scheme_answer();
         if after != before
             && let Some(scheme) = after
@@ -343,13 +347,14 @@ impl Session {
             .all(|a| a.finished.load(Ordering::Acquire))
     }
 
-    /// Tells attachments to close: all of them, or only the finished ones.
-    pub fn close_attachments(&self, reason: ClosedReason, finished_only: bool) {
+    /// Sends `CLOSED removed` to every attachment, or only the finished
+    /// ones.
+    pub fn close_attachments(&self, finished_only: bool) {
         for a in &self.attached {
             if (!finished_only || a.finished.load(Ordering::Acquire))
                 && let Some(close) = a.close.upgrade()
             {
-                let _ = close.send(reason);
+                let _ = close.send(ClosedReason::Removed);
             }
         }
     }

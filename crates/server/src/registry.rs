@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use proto::{ClosedReason, ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status};
+use proto::{ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Notify;
 
@@ -95,7 +95,6 @@ impl Registry {
 
     pub fn create(self: &Arc<Self>, params: proto::CreateParams) -> Result<proto::Session, Fail> {
         let limits = &self.config.limits;
-        let invalid = |message: &str| (ErrorCode::InvalidRequest, message.to_string());
         let label = params.label.unwrap_or_default();
         if label.len() > limits.label as usize {
             return Err((ErrorCode::LimitExceeded, "label too long".into()));
@@ -111,9 +110,12 @@ impl Registry {
         }
         let cols = params.cols.unwrap_or(80);
         let rows = params.rows.unwrap_or(24);
-        if cols == 0 || rows == 0 {
-            return Err(invalid("cols and rows must be at least 1"));
-        }
+        crate::session::check_size(&proto::Size {
+            cols,
+            rows,
+            cell_width: None,
+            cell_height: None,
+        })?;
         let mut env = BTreeMap::from([("TERM".to_string(), "xterm-ghostty".to_string())]);
         env.extend(params.env.unwrap_or_default());
 
@@ -168,8 +170,6 @@ impl Registry {
             pty_eof: false,
             text_limit: limits.text as usize,
             attached: Vec::new(),
-            authoritative: None,
-            profile: proto::Profile::default(),
             pending: None,
             timer_running: false,
         };
@@ -294,8 +294,11 @@ impl Registry {
             if s.status == Status::Running {
                 return Err((ErrorCode::Running, "session is running".into()));
             }
-            s.close_attachments(ClosedReason::Removed, true);
-            s.attachments_finished()
+            let all_finished = s.attachments_finished();
+            if !all_finished {
+                s.close_attachments(true);
+            }
+            all_finished
         };
         if all_finished {
             self.remove_now(id);
@@ -310,10 +313,7 @@ impl Registry {
         let Some(session) = self.state.lock().unwrap().sessions.remove(id) else {
             return;
         };
-        session
-            .lock()
-            .unwrap()
-            .close_attachments(ClosedReason::Removed, false);
+        session.lock().unwrap().close_attachments(false);
         self.emit(&Event::SessionRemoved { id: id.to_string() });
     }
 }

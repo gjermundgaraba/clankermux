@@ -7,153 +7,13 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use common::*;
-use ghostty_vt::{formatter, snapshot};
+use ghostty_vt::snapshot;
 use proto::*;
-use serde_json::{Value, json};
-
-/// The bootstrap of a `snapshot` attachment: ATTACHED, snapshot frames
-/// and SNAPSHOT_READY / SNAPSHOT_END markers.
-struct Bootstrap {
-    attached: Attached,
-    /// Snapshot bytes through the READY record.
-    ready: Vec<u8>,
-    /// The remaining snapshot bytes.
-    rest: Vec<u8>,
-    /// Stream frames interleaved after SNAPSHOT_READY.
-    stream: Vec<(Header, Vec<u8>)>,
-}
-
-impl Bootstrap {
-    fn terminal(&self) -> ghostty_vt::Terminal {
-        let mut bytes = self.ready.clone();
-        bytes.extend_from_slice(&self.rest);
-        snapshot::decode(&bytes).unwrap()
-    }
-
-    fn text(&self) -> String {
-        let term = self.terminal();
-        let out = formatter::format(
-            &term,
-            formatter::Options {
-                trim: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        String::from_utf8(out).unwrap()
-    }
-}
-
-trait Attach {
-    async fn open(&mut self, channel: u32, body: Value);
-    async fn recv_on(&mut self, channel: u32) -> (Header, Vec<u8>);
-    async fn attached(&mut self, channel: u32) -> Attached;
-    async fn bootstrap(&mut self, channel: u32) -> Bootstrap;
-    async fn expect_error(&mut self, channel: u32) -> ErrorCode;
-    async fn expect_closed(&mut self, channel: u32) -> ClosedReason;
-    async fn output_until(&mut self, channel: u32, needle: &[u8]) -> (u64, Vec<u8>);
-}
-
-impl Attach for Client {
-    async fn open(&mut self, channel: u32, body: Value) {
-        self.send_json(FrameType::Open, channel, &body).await;
-    }
-
-    async fn recv_on(&mut self, channel: u32) -> (Header, Vec<u8>) {
-        let (header, payload) = self.recv().await.expect("a frame");
-        assert_eq!(header.channel, channel, "{header:?}");
-        (header, payload)
-    }
-
-    async fn attached(&mut self, channel: u32) -> Attached {
-        let (header, payload) = self.recv_on(channel).await;
-        assert_eq!(
-            header.frame_type,
-            FrameType::Attached,
-            "{}",
-            String::from_utf8_lossy(&payload)
-        );
-        serde_json::from_slice(&payload).unwrap()
-    }
-
-    async fn bootstrap(&mut self, channel: u32) -> Bootstrap {
-        let attached = self.attached(channel).await;
-        assert_eq!(attached.mode, AttachMode::Snapshot);
-        let mut ready = Vec::new();
-        loop {
-            let (header, payload) = self.recv_on(channel).await;
-            match header.frame_type {
-                FrameType::Snapshot => ready.extend_from_slice(&payload),
-                FrameType::SnapshotReady => break,
-                other => panic!("{other:?} before SNAPSHOT_READY"),
-            }
-        }
-        assert_eq!(snapshot::ready_end(&ready), Some(ready.len()));
-        let mut rest = Vec::new();
-        let mut stream = Vec::new();
-        loop {
-            let (header, payload) = self.recv_on(channel).await;
-            match header.frame_type {
-                FrameType::Snapshot => rest.extend_from_slice(&payload),
-                FrameType::SnapshotEnd => break,
-                _ => stream.push((header, payload)),
-            }
-        }
-        Bootstrap {
-            attached,
-            ready,
-            rest,
-            stream,
-        }
-    }
-
-    async fn expect_error(&mut self, channel: u32) -> ErrorCode {
-        let (header, payload) = self.recv_on(channel).await;
-        assert_eq!(header.frame_type, FrameType::Error);
-        let error: ErrorMessage = serde_json::from_slice(&payload).unwrap();
-        error.code
-    }
-
-    async fn expect_closed(&mut self, channel: u32) -> ClosedReason {
-        let (header, payload) = self.recv_on(channel).await;
-        assert_eq!(header.frame_type, FrameType::Closed);
-        let closed: Closed = serde_json::from_slice(&payload).unwrap();
-        closed.reason
-    }
-
-    /// Reads OUTPUT frames until `needle` appears; returns the offset of
-    /// the first frame and the bytes, asserting contiguous offsets.
-    async fn output_until(&mut self, channel: u32, needle: &[u8]) -> (u64, Vec<u8>) {
-        let mut bytes = Vec::new();
-        let mut first = None;
-        loop {
-            let (header, payload) = self.recv_on(channel).await;
-            assert_eq!(header.frame_type, FrameType::Output);
-            let (offset, data) = parse_output(&payload).unwrap();
-            let start = *first.get_or_insert(offset);
-            assert_eq!(offset, start + bytes.len() as u64, "contiguous offsets");
-            bytes.extend_from_slice(data);
-            if bytes.windows(needle.len()).any(|w| w == needle) {
-                return (start, bytes);
-            }
-        }
-    }
-}
+use serde_json::json;
+use tokio::io::AsyncWriteExt;
 
 fn b64(s: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(s)
-}
-
-async fn wait_attachments(c: &mut Client, id: &str, count: u32) {
-    for _ in 0..200 {
-        let s: Session =
-            serde_json::from_value(c.ok("inspect", json!({"session": id})).await).unwrap();
-        if s.attachments == count {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("attachments never reached {count}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -194,11 +54,10 @@ async fn snapshot_bootstrap_then_stream_then_close() {
 
     c.send(FrameType::Close, 1, b"").await;
     assert_eq!(c.expect_closed(1).await, ClosedReason::Closed);
+    // The attachment is gone and the channel free once CLOSED is read.
     let inspected: Session =
         serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
     assert_eq!(inspected.attachments, 0);
-
-    // The channel is free again.
     c.open(1, json!({"session": session.id})).await;
     let boot = c.bootstrap(1).await;
     assert_eq!(boot.attached.offset, offset + bytes.len() as u64);
@@ -226,9 +85,43 @@ async fn open_checks_in_order() {
         ErrorCode::ChannelInUse,
         "checked before the session"
     );
-    wait_attachments(&mut c, &session.id, 0).await;
+    c.wait_attachments(&session.id, 0).await;
+
+    // A channel is in use until CLOSED. A pipelined CLOSE + OPEN is
+    // either refused, when the OPEN is read before the task has queued
+    // CLOSED, or accepted after it; never accepted before it.
+    c.open(3, json!({"session": session.id})).await;
+    c.bootstrap(3).await;
+    let mut both = encode_frame(FrameType::Close, 3, b"");
+    both.extend(encode_frame(
+        FrameType::Open,
+        3,
+        &serde_json::to_vec(&json!({"session": session.id})).unwrap(),
+    ));
+    c.stream.write_all(&both).await.unwrap();
+    let (header, payload) = c.recv_on(3).await;
+    match header.frame_type {
+        FrameType::Error => {
+            let error: ErrorMessage = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(error.code, ErrorCode::ChannelInUse);
+            assert_eq!(c.expect_closed(3).await, ClosedReason::Closed);
+        }
+        FrameType::Closed => {
+            c.bootstrap(3).await;
+            c.send(FrameType::Close, 3, b"").await;
+            assert_eq!(c.expect_closed(3).await, ClosedReason::Closed);
+        }
+        other => panic!("{other:?} first"),
+    }
+    c.wait_attachments(&session.id, 0).await;
 
     c.send(FrameType::Open, 4, b"{bad").await;
+    assert_eq!(c.expect_error(4).await, ErrorCode::InvalidRequest);
+    c.open(
+        4,
+        json!({"session": session.id, "viewport": {"cols": 0, "rows": 5}}),
+    )
+    .await;
     assert_eq!(c.expect_error(4).await, ErrorCode::InvalidRequest);
 
     c.open(
@@ -240,6 +133,12 @@ async fn open_checks_in_order() {
 
     let mut no_engine = Client::connect(&server).await;
     no_engine.hello_with(None).await;
+    no_engine.open(1, json!({"session": "nope"})).await;
+    assert_eq!(
+        no_engine.expect_error(1).await,
+        ErrorCode::NoSuchSession,
+        "checked before the engine"
+    );
     no_engine.open(1, json!({"session": session.id})).await;
     assert_eq!(no_engine.expect_error(1).await, ErrorCode::EngineMismatch);
 
@@ -271,6 +170,12 @@ async fn resume_when_retained_else_snapshot() {
     c.send(FrameType::Close, 1, b"").await;
     c.expect_closed(1).await;
 
+    // A marker added while detached is delivered on resume.
+    c.ok(
+        "set_size",
+        json!({"session": session.id, "cols": 30, "rows": 8}),
+    )
+    .await;
     c.open(
         1,
         json!({"session": session.id, "resume": {"incarnation": incarnation, "offset": cursor, "marker": 0}}),
@@ -279,6 +184,16 @@ async fn resume_when_retained_else_snapshot() {
     let attached = c.attached(1).await;
     assert_eq!(attached.mode, AttachMode::Resume);
     assert_eq!((attached.offset, attached.marker), (cursor, 0));
+    assert_eq!((attached.cols, attached.rows), (30, 8));
+    assert_eq!(
+        c.expect_resized(1).await,
+        Resized {
+            seq: 1,
+            offset: cursor,
+            cols: 30,
+            rows: 8
+        }
+    );
     c.send(FrameType::Input, 1, b"b\n").await;
     let (offset, _) = c.output_until(1, b"b\r\nb\r\n").await;
     assert_eq!(offset, cursor, "the stream continues from the cursor");
@@ -287,7 +202,7 @@ async fn resume_when_retained_else_snapshot() {
 
     c.open(
         1,
-        json!({"session": session.id, "resume": {"incarnation": "other", "offset": cursor, "marker": 0}}),
+        json!({"session": session.id, "resume": {"incarnation": "other", "offset": cursor, "marker": 1}}),
     )
     .await;
     c.bootstrap(1).await;
@@ -303,7 +218,7 @@ async fn resume_when_retained_else_snapshot() {
     wait_text(&mut c, &session.id, &"x".repeat(100)).await;
     c.open(
         1,
-        json!({"session": session.id, "resume": {"incarnation": incarnation, "offset": 0, "marker": 0}}),
+        json!({"session": session.id, "resume": {"incarnation": incarnation, "offset": 0, "marker": 1}}),
     )
     .await;
     c.bootstrap(1).await;
@@ -345,11 +260,8 @@ async fn viewport_reports_coalesce_and_mark_the_stream() {
 
     c.send_json(FrameType::Viewport, 1, &json!({"cols": 50, "rows": 12}))
         .await;
-    let (header, payload) = c.recv_on(1).await;
-    assert_eq!(header.frame_type, FrameType::Resized);
-    let resized: Resized = serde_json::from_slice(&payload).unwrap();
     assert_eq!(
-        resized,
+        c.expect_resized(1).await,
         Resized {
             seq: 2,
             offset: boot.attached.offset,
@@ -358,14 +270,20 @@ async fn viewport_reports_coalesce_and_mark_the_stream() {
         }
     );
 
+    // A report applied at once discards the pending coalesced one.
+    c.send_json(FrameType::Viewport, 1, &json!({"cols": 45, "rows": 11}))
+        .await;
     c.ok(
         "set_size",
         json!({"session": session.id, "cols": 60, "rows": 15}),
     )
     .await;
-    let (_, payload) = c.recv_on(1).await;
-    let resized: Resized = serde_json::from_slice(&payload).unwrap();
+    let resized = c.expect_resized(1).await;
     assert_eq!((resized.seq, resized.cols), (3, 60));
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let inspected: Session =
+        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    assert_eq!((inspected.cols, inspected.marker), (60, 3));
 
     c.open(
         2,
@@ -379,12 +297,22 @@ async fn viewport_reports_coalesce_and_mark_the_stream() {
     c.send_json(FrameType::Viewport, 2, &json!({"cols": 1, "rows": 1}))
         .await;
     assert_eq!(c.expect_error(2).await, ErrorCode::ReadOnly);
-    c.send(FrameType::Close, 2, b"").await;
+    c.send(FrameType::Viewport, 2, b"{bad").await;
     assert_eq!(
-        c.expect_closed(2).await,
-        ClosedReason::Closed,
-        "the attachment survived"
+        c.expect_error(2).await,
+        ErrorCode::InvalidRequest,
+        "a malformed VIEWPORT ends the attachment"
     );
+    c.wait_attachments(&session.id, 1).await;
+    c.send(FrameType::Close, 2, b"").await;
+
+    c.send_json(FrameType::Viewport, 1, &json!({"cols": 0, "rows": 1}))
+        .await;
+    assert_eq!(c.expect_error(1).await, ErrorCode::InvalidRequest);
+    c.wait_attachments(&session.id, 0).await;
+    let inspected: Session =
+        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    assert_eq!(inspected.cols, 60);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -417,6 +345,16 @@ async fn exit_ends_the_stream_and_removal_closes() {
     events.wait_exit(&session.id).await;
     assert!(matches!(events.event().await, Event::SessionRemoved { id } if id == session.id));
 
+    // With a grace far beyond the receive timeout, only an immediate
+    // CLOSED can arrive.
+    let server = start(Limits {
+        remove_grace: 60_000,
+        ..fast_limits()
+    })
+    .await;
+    let mut c = client(&server).await;
+    let mut events = client(&server).await;
+    events.ok("subscribe", json!({})).await;
     let kept = c
         .create(json!({"argv": ["/bin/sh", "-c", "exit 0"], "on_exit": "keep"}))
         .await;
@@ -435,12 +373,20 @@ async fn exit_ends_the_stream_and_removal_closes() {
         ClosedReason::Removed,
         "finished attachments close at once"
     );
+    loop {
+        if let Event::SessionRemoved { id } = events.event().await {
+            assert_eq!(id, kept.id);
+            break;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gap_when_the_client_falls_behind() {
+    // The ring holds more than one PTY read, so the cursor is evicted by
+    // the unread bulk of the output, not by one burst.
     let server = start(Limits {
-        ring: 16 * 1024,
+        ring: 256 * 1024,
         ..fast_limits()
     })
     .await;
@@ -456,7 +402,7 @@ async fn gap_when_the_client_falls_behind() {
     // Read nothing until the session has produced everything and exited.
     let exited = events.wait_exit(&session.id).await;
     let mut delivered = 0u64;
-    loop {
+    let gap = loop {
         let (header, payload) = c.recv_on(1).await;
         match header.frame_type {
             FrameType::Output => {
@@ -464,26 +410,24 @@ async fn gap_when_the_client_falls_behind() {
                 assert_eq!(offset, boot.attached.offset + delivered);
                 delivered += data.len() as u64;
             }
-            FrameType::Gap => {
-                let gap: Gap = serde_json::from_slice(&payload).unwrap();
-                assert_eq!(gap.from, boot.attached.offset + delivered);
-                assert_eq!(gap.to, exited.offset);
-                break;
-            }
+            FrameType::Gap => break serde_json::from_slice::<Gap>(&payload).unwrap(),
             other => panic!("{other:?}"),
         }
-    }
+    };
     assert!(delivered < 1_500_000);
+    assert_eq!(gap.from, boot.attached.offset + delivered);
     let again = c.bootstrap(1).await;
+    assert_eq!(gap.to, again.attached.offset);
     assert_eq!(again.attached.offset, exited.offset);
     assert_eq!(again.attached.session.status, Status::Exited);
     assert!(again.stream.is_empty(), "the snapshot reflects the exit");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn too_slow_during_a_bootstrap() {
-    // Small frames and a history that does not compress, so the snapshot
-    // is far larger than the connection's queue allows in flight.
+async fn gap_during_a_bootstrap_retries_once_then_too_slow() {
+    // Small frames and a history that does not compress, so a snapshot is
+    // far larger than the connection's queue allows in flight; each burst
+    // is larger than the ring and waits for a line on stdin.
     let server = start(Limits {
         ring: 16 * 1024,
         max_frame: 16 * 1024,
@@ -491,32 +435,45 @@ async fn too_slow_during_a_bootstrap() {
     })
     .await;
     let mut c = client(&server).await;
-    let mut events = client(&server).await;
-    events.ok("subscribe", json!({})).await;
-    let script =
-        "head -c 600000 /dev/urandom | base64; echo FIRST-DONE; sleep 0.5; yes | head -c 100000";
-    let session = c
+    let mut ctl = client(&server).await;
+    ctl.ok("subscribe", json!({})).await;
+    let script = "head -c 600000 /dev/urandom | base64; echo FIRST-DONE; \
+                  read go; yes | head -c 100000; echo SECOND-DONE; \
+                  read go; yes | head -c 100000";
+    let session = ctl
         .create(
             json!({"argv": ["/bin/sh", "-c", script], "on_exit": "keep", "cols": 20, "rows": 5}),
         )
         .await;
-    wait_text(&mut c, &session.id, "FIRST-DONE").await;
+    wait_text(&mut ctl, &session.id, "FIRST-DONE").await;
+    let go = json!({"session": session.id, "data": b64("go\n")});
+
     c.open(1, json!({"session": session.id})).await;
-    let attached = c.attached(1).await;
-    assert_eq!(attached.mode, AttachMode::Snapshot);
-    loop {
-        let (header, _) = c.recv_on(1).await;
-        if header.frame_type == FrameType::SnapshotReady {
-            break;
+    let first = c.bootstrap_ready(1).await;
+    // Not reading: the remainder fills the queue to the high-water mark
+    // while the burst pushes the cursor out of the ring.
+    ctl.ok("write", go.clone()).await;
+    wait_text(&mut ctl, &session.id, "SECOND-DONE").await;
+    let gap = loop {
+        let (header, payload) = c.recv_on(1).await;
+        match header.frame_type {
+            FrameType::Snapshot => {}
+            FrameType::Gap => break serde_json::from_slice::<Gap>(&payload).unwrap(),
+            other => panic!("{other:?}"),
         }
-    }
-    // The history is far larger than the connection's queue; stop reading
-    // until the second burst has pushed the cursor out of the ring.
-    events.wait_exit(&session.id).await;
+    };
+    assert_eq!(gap.from, first.attached.offset);
+    let second = c.bootstrap_ready(1).await;
+    assert_eq!(gap.to, second.attached.offset);
+    assert!(second.attached.offset > first.attached.offset);
+
+    // The same during the bootstrap that followed the gap is too_slow.
+    ctl.ok("write", go).await;
+    ctl.wait_exit(&session.id).await;
     loop {
         let (header, payload) = c.recv_on(1).await;
         match header.frame_type {
-            FrameType::Snapshot | FrameType::Output => {}
+            FrameType::Snapshot => {}
             FrameType::Error => {
                 let error: ErrorMessage = serde_json::from_slice(&payload).unwrap();
                 assert_eq!(error.code, ErrorCode::TooSlow);
@@ -525,7 +482,7 @@ async fn too_slow_during_a_bootstrap() {
             other => panic!("{other:?}"),
         }
     }
-    wait_attachments(&mut c, &session.id, 0).await;
+    ctl.wait_attachments(&session.id, 0).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -546,17 +503,20 @@ async fn input_overflow_keeps_the_attachment() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn queries_are_answered_from_the_authoritative_profile() {
+async fn queries_are_answered_from_the_latest_profile_and_cell_size() {
     let server = start(fast_limits()).await;
     let mut c = client(&server).await;
     let session = c
-        .create(json!({"argv": ["/bin/sh", "-c", "stty raw -echo; exec cat"]}))
+        .create(json!({"argv": ["/bin/sh", "-c", "stty raw -echo; echo READY; exec cat"]}))
         .await;
-    // Give stty time to switch the line discipline.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_text(&mut c, &session.id, "READY").await;
     c.open(
         1,
-        json!({"session": session.id, "profile": {"scheme": "dark", "bg": "#102030"}}),
+        json!({
+            "session": session.id,
+            "viewport": {"cols": 80, "rows": 24, "cell_width": 8, "cell_height": 16},
+            "profile": {"scheme": "dark", "bg": "#102030", "fg": "#ffffff", "cursor": "#ff0000"},
+        }),
     )
     .await;
     c.bootstrap(1).await;
@@ -565,12 +525,19 @@ async fn queries_are_answered_from_the_authoritative_profile() {
     c.output_until(1, b"\x1bP>|clankermux test\x1b\\").await;
     c.send(FrameType::Input, 1, b"\x1b[?996n").await;
     c.output_until(1, b"\x1b[?997;1n").await;
+    c.send(FrameType::Input, 1, b"\x1b]10;?\x1b\\").await;
+    c.output_until(1, b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\").await;
     c.send(FrameType::Input, 1, b"\x1b]11;?\x1b\\").await;
     c.output_until(1, b"\x1b]11;rgb:1010/2020/3030\x1b\\").await;
+    c.send(FrameType::Input, 1, b"\x1b]12;?\x1b\\").await;
+    c.output_until(1, b"\x1b]12;rgb:ffff/0000/0000\x1b\\").await;
+    c.send(FrameType::Input, 1, b"\x1b[16t").await;
+    c.output_until(1, b"\x1b[6;16;8t").await;
     c.send(FrameType::Input, 1, b"\x1b[?2031h").await;
 
-    // A second writable attachment's profile becomes authoritative; with
-    // mode 2031 set the changed answer is reported unasked.
+    // A second writable attachment's profile replaces it; with mode 2031
+    // set the changed answer is reported unasked. Its report carries no
+    // cell size, which stays.
     let mut other = client(&server).await;
     other
         .open(
@@ -582,6 +549,8 @@ async fn queries_are_answered_from_the_authoritative_profile() {
     c.output_until(1, b"\x1b[?997;2n").await;
     c.send(FrameType::Input, 1, b"\x1b[?996n").await;
     c.output_until(1, b"\x1b[?997;2n").await;
+    c.send(FrameType::Input, 1, b"\x1b[16t").await;
+    c.output_until(1, b"\x1b[6;16;8t").await;
 
     // Without a scheme the background decides.
     other
