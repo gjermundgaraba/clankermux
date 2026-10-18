@@ -50,6 +50,21 @@ fn kitty_codepoint(byte: u8) -> u32 {
     })
 }
 
+/// The kitty keyboard protocol's `ctrl` modifier bit.
+const KITTY_CTRL: u32 = 4;
+
+/// The first screen row of a `clip_rows`-tall window into `rows`: the
+/// bottom rows, or when the cursor is above them the rows ending at the
+/// cursor.
+fn clip_window(rows: u16, clip_rows: u16, cursor_row: u16) -> u16 {
+    let bottom = rows - clip_rows;
+    if cursor_row >= bottom {
+        bottom
+    } else {
+        (cursor_row + 1).saturating_sub(clip_rows)
+    }
+}
+
 /// How long to wait for the rest of an escape sequence from stdin.
 const KEY_TIMEOUT: Duration = Duration::from_millis(25);
 /// Coalescing window for repaints while the sizes differ.
@@ -162,7 +177,7 @@ impl Shell {
         let (cols, rows) = (term.cols(), term.rows());
         let (cursor_col, cursor_row) = term.cursor();
         let clip = (outer.cols.min(cols), outer.rows.min(rows));
-        let from_row = (rows - clip.1).min((cursor_row + 1).saturating_sub(clip.1));
+        let from_row = clip_window(rows, clip.1, cursor_row);
         let painted = formatter::format(
             term,
             formatter::Options {
@@ -239,7 +254,7 @@ impl Shell {
 
     fn is_prefix(&self, unit: &[u8]) -> bool {
         unit == [self.opts.detach_key]
-            || vt::kitty_key(unit) == Some((kitty_codepoint(self.opts.detach_key), 2))
+            || vt::kitty_key(unit) == Some((kitty_codepoint(self.opts.detach_key), KITTY_CTRL))
     }
 
     /// Takes the whole keys from `pending` (all of it with `flush`), drops
@@ -479,4 +494,87 @@ pub async fn run(opts: Options) -> Result<ExitCode, Error> {
     };
     eprintln!("\r\n[clankermux: {message}]");
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shell(detach_key: u8) -> Shell {
+        Shell {
+            opts: Options {
+                socket: PathBuf::new(),
+                session: String::new(),
+                read_only: false,
+                detach_key,
+            },
+            attachment: Attachment::new(),
+            outer: Size {
+                cols: 80,
+                rows: 24,
+                cell_width: None,
+                cell_height: None,
+            },
+            repaint_at: None,
+            pending: Vec::new(),
+            keys_at: None,
+            armed: None,
+        }
+    }
+
+    fn feed(shell: &mut Shell, bytes: &[u8]) -> Option<Vec<u8>> {
+        shell.pending.extend_from_slice(bytes);
+        match shell.keys(false) {
+            Keys::Send(out) => Some(out),
+            Keys::Detach => None,
+        }
+    }
+
+    #[test]
+    fn the_prefix_is_recognised_raw_and_kitty_encoded() {
+        let mut s = shell(0x1c);
+        assert_eq!(feed(&mut s, b"a\x1c"), Some(b"a".to_vec()));
+        assert_eq!(
+            feed(&mut s, b"\x1c"),
+            Some(b"\x1c".to_vec()),
+            "twice sends once"
+        );
+        assert_eq!(
+            feed(&mut s, b"\x1cx"),
+            Some(b"\x1cx".to_vec()),
+            "other keys follow"
+        );
+        assert_eq!(
+            feed(&mut s, b"\x1b[92;5u"),
+            Some(vec![]),
+            "ctrl+\\ under kitty arms"
+        );
+        assert_eq!(feed(&mut s, b"\x1b[100u"), None, "kitty d detaches");
+        let mut s = shell(0x1c);
+        assert_eq!(
+            feed(&mut s, b"\x1b[92;3u"),
+            Some(b"\x1b[92;3u".to_vec()),
+            "alt+\\ is not the prefix"
+        );
+        assert_eq!(feed(&mut s, b"\x1cd"), None);
+    }
+
+    #[test]
+    fn the_clip_window_is_the_bottom_unless_the_cursor_is_above_it() {
+        assert_eq!(clip_window(40, 24, 39), 16);
+        assert_eq!(
+            clip_window(40, 24, 16),
+            16,
+            "cursor on the window's top row"
+        );
+        assert_eq!(
+            clip_window(40, 24, 15),
+            0,
+            "just above: the window ends at the cursor"
+        );
+        assert_eq!(clip_window(40, 24, 30), 16, "mid-window keeps the bottom");
+        assert_eq!(clip_window(24, 24, 5), 0);
+        assert_eq!(clip_window(60, 24, 40), 36);
+        assert_eq!(clip_window(60, 24, 30), 7);
+    }
 }
