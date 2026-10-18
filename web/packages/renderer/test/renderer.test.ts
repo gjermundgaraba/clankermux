@@ -1,0 +1,92 @@
+import { expect, test } from "vitest";
+
+import { type Cell, FLAG, type Frame, NO_COLOR } from "@clankermux/engine";
+
+import { CanvasRenderer, type Context2D, type Metrics, css } from "../src/index.ts";
+
+type Op = ["rect", string, number, number, number, number] | ["text", string, string, number, number];
+
+/** Records what is drawn. */
+class Recording implements Context2D {
+  fillStyle = "";
+  font = "";
+  globalAlpha = 1;
+  ops: Op[] = [];
+  fillRect(x: number, y: number, w: number, h: number): void {
+    this.ops.push(["rect", this.fillStyle, x, y, w, h]);
+  }
+  fillText(text: string, x: number, y: number): void {
+    this.ops.push(["text", this.font, text, x, y]);
+  }
+  texts(): string[] {
+    return this.ops.filter((op) => op[0] === "text").map((op) => op[2] as string);
+  }
+}
+
+const metrics: Metrics = {
+  cellWidth: 10,
+  cellHeight: 20,
+  baseline: 15,
+  font: "r",
+  boldFont: "b",
+  italicFont: "i",
+  boldItalicFont: "bi",
+};
+const palette = { foreground: "#fff", background: "#000", cursor: "#0f0" };
+
+const blank = (): Cell => ({ text: "", fg: NO_COLOR, bg: NO_COLOR, flags: 0, underline: 0 });
+const cell = (text: string, extra: Partial<Cell> = {}): Cell => ({ ...blank(), text, ...extra });
+const frame = (lines: Frame["lines"], cursor: Frame["cursor"], full = false): Frame => ({
+  cols: 3,
+  rows: 2,
+  full,
+  background: NO_COLOR,
+  foreground: NO_COLOR,
+  cursor,
+  lines,
+});
+
+test("colours convert", () => {
+  expect(css(0xff0000, "x")).toBe("#ff0000");
+  expect(css(0x000001, "x")).toBe("#000001");
+  expect(css(NO_COLOR, "x")).toBe("x");
+});
+
+test("a full frame clears, rows draw their cells, and the cursor moves between frames", () => {
+  const ctx = new Recording();
+  const r = new CanvasRenderer(ctx, metrics, palette);
+  r.draw(
+    frame(
+      [
+        { y: 0, cells: [cell("a", { flags: FLAG.BOLD, fg: 0xff0000 }), cell("漢", { flags: FLAG.WIDE }), cell("", { flags: FLAG.SPACER })] },
+        { y: 1, cells: [cell("b", { bg: 0x0000ff }), cell(" "), blank()] },
+      ],
+      { x: 0, y: 1, visible: true, blinking: false, style: 1, color: NO_COLOR },
+      true,
+    ),
+  );
+  expect(ctx.ops[0]).toEqual(["rect", "#000", 0, 0, 30, 40]);
+  expect(ctx.ops).toContainEqual(["text", "b", "a", 0, 15]);
+  expect(ctx.ops).toContainEqual(["text", "r", "漢", 10, 15]);
+  expect(ctx.ops).toContainEqual(["rect", "#0000ff", 0, 20, 10, 20]);
+  // The block cursor, then the cell's text over it in the background colour.
+  expect(ctx.ops.slice(-2)).toEqual([
+    ["rect", "#0f0", 0, 20, 10, 20],
+    ["text", "r", "b", 0, 35],
+  ]);
+  expect(ctx.texts().filter((t) => t === " ")).toEqual([]);
+
+  // Only row 0 changed, but the cursor left row 1: that row is redrawn
+  // from the cache without the cursor, and the cursor drawn on row 0.
+  ctx.ops = [];
+  r.draw(frame([{ y: 0, cells: [cell("c"), blank(), blank()] }], { x: 2, y: 0, visible: true, blinking: false, style: 0, color: 0x00ff00 }));
+  expect(ctx.ops[0]).toEqual(["rect", "#000", 0, 0, 30, 20]);
+  expect(ctx.texts()).toEqual(["c", "b"]);
+  expect(ctx.ops.at(-1)).toEqual(["rect", "#00ff00", 20, 0, 2, 20]);
+
+  // A hidden cursor draws nothing extra; inverse swaps the colours.
+  ctx.ops = [];
+  r.draw(frame([{ y: 1, cells: [cell("x", { flags: FLAG.INVERSE }), blank(), blank()] }], { x: 0, y: 0, visible: false, blinking: false, style: 1, color: NO_COLOR }));
+  expect(ctx.ops).toContainEqual(["rect", "#fff", 0, 20, 10, 20]);
+  expect(ctx.ops.filter((op) => op[1] === "#0f0")).toEqual([]);
+});

@@ -1,9 +1,9 @@
 import pin from "../../../../vendor/pin.json" with { type: "json" };
 
-export { Decoder } from "./decoder.ts";
+export { Decoder, readyEnd } from "./decoder.ts";
 export { KeyEncoder, keyName } from "./keys.ts";
 export type { KeyInput } from "./keys.ts";
-export { RenderState } from "./render.ts";
+export { FLAG, NO_COLOR, RenderState } from "./render.ts";
 export type { Cell, Frame, FrameRow } from "./render.ts";
 
 /** Engine id of the vendored libghostty-vt build, matched by the server. */
@@ -283,6 +283,8 @@ export class Terminal {
   ) {}
 
   write(bytes: Uint8Array): void {
+    // The allocator returns null for zero bytes.
+    if (bytes.length === 0) return;
     const ptr = this.engine.copyIn(bytes);
     try {
       this.engine.call("ghostty_terminal_vt_write", this.handle, ptr, bytes.length);

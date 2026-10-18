@@ -1,0 +1,22 @@
+{
+  "name": "@clankermux/web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/build.mjs --watch & node scripts/bridge.mjs",
+    "bridge": "node scripts/bridge.mjs"
+  },
+  "dependencies": {
+    "@clankermux/client": "workspace:*",
+    "@clankermux/engine": "workspace:*",
+    "@clankermux/proto": "workspace:*",
+    "@clankermux/renderer": "workspace:*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.0",
+    "ws": "^8.18.0"
+  }
+}

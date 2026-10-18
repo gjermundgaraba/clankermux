@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>clankermux</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #d8dee9;
+        --bg: #282c34;
+        --cursor: #ffffff;
+        --chrome: #1b1e24;
+        --font: 14px Menlo, "DejaVu Sans Mono", monospace;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --fg: #24292e;
+          --bg: #ffffff;
+          --cursor: #24292e;
+          --chrome: #eaeef2;
+        }
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        font: var(--font);
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+      }
+      #bar {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 4px 8px;
+        background: var(--chrome);
+        font-size: 13px;
+      }
+      #bar select,
+      #bar button {
+        font: inherit;
+      }
+      #status {
+        margin-left: auto;
+        opacity: 0.8;
+      }
+      #terminal {
+        flex: 1;
+        min-height: 0;
+        position: relative;
+        overflow: hidden;
+      }
+      #screen {
+        position: absolute;
+        inset: 0;
+        outline: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="bar">
+      <select id="sessions" aria-label="Session"></select>
+      <button id="new">New session</button>
+      <span id="status">loading</span>
+    </div>
+    <div id="terminal"><canvas id="screen" tabindex="0"></canvas></div>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

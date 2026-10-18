@@ -176,6 +176,28 @@ importers:
         specifier: ^3.2.0
         version: 3.2.7(@types/node@24.19.2)
 
+  apps/client:
+    dependencies:
+      '@clankermux/client':
+        specifier: workspace:*
+        version: link:../../packages/client
+      '@clankermux/engine':
+        specifier: workspace:*
+        version: link:../../packages/engine
+      '@clankermux/proto':
+        specifier: workspace:*
+        version: link:../../packages/proto
+      '@clankermux/renderer':
+        specifier: workspace:*
+        version: link:../../packages/renderer
+    devDependencies:
+      esbuild:
+        specifier: ^0.28.0
+        version: 0.28.2
+      ws:
+        specifier: ^8.18.0
+        version: 8.22.0
+
   packages/client:
     dependencies:
       '@clankermux/engine':
@@ -188,6 +210,12 @@ importers:
   packages/engine: {}
 
   packages/proto: {}
+
+  packages/renderer:
+    dependencies:
+      '@clankermux/engine':
+        specifier: workspace:*
+        version: link:../engine
 
 packages:
 
@@ -758,6 +786,18 @@ packages:
     engines: {node: '>=8'}
     hasBin: true
 
+  ws@8.22.0:
+    resolution: {integrity: sha512-Ydggc987+RO0AnWtZ/7Wq9FtNvcrL1b/RO0ud9mWjUPgDrsAAwQSF51sm2hm1XofbU/4jkpGEsLFsZZxU+1DOg==}
+    engines: {node: '>=10.0.0'}
+    peerDependencies:
+      bufferutil: ^4.0.1
+      utf-8-validate: '>=5.0.2'
+    peerDependenciesMeta:
+      bufferutil:
+        optional: true
+      utf-8-validate:
+        optional: true
+
 snapshots:
 
   '@esbuild/aix-ppc64@0.28.2':
@@ -1204,3 +1244,5 @@ snapshots:
     dependencies:
       siginfo: 2.0.0
       stackback: 0.0.2
+
+  ws@8.22.0: {}
