@@ -1,47 +1,80 @@
-[
-  {
-    "name": "hello",
-    "hex": "010000000000310000007b2276657273696f6e223a312c22636c69656e74223a7b226e616d65223a2274222c2276657273696f6e223a2230227d7d",
-    "type": 1,
-    "channel": 0,
-    "payload": "7b2276657273696f6e223a312c22636c69656e74223a7b226e616d65223a2274222c2276657273696f6e223a2230227d7d"
+{
+  "types": {
+    "hello": 1,
+    "request": 2,
+    "open": 16,
+    "input": 17,
+    "viewport": 18,
+    "close": 19,
+    "welcome": 129,
+    "reply": 130,
+    "event": 131,
+    "error": 143,
+    "attached": 144,
+    "snapshot": 145,
+    "snapshot_ready": 146,
+    "snapshot_end": 147,
+    "output": 148,
+    "resized": 149,
+    "exited": 150,
+    "gap": 151,
+    "closed": 153
   },
-  {
-    "name": "close empty payload",
-    "hex": "13000500000000000000",
-    "type": 19,
-    "channel": 5,
-    "payload": ""
-  },
-  {
-    "name": "output with offset",
-    "hex": "9400010000000b0000002a00000000000000616263",
-    "type": 148,
-    "channel": 1,
-    "payload": "2a00000000000000616263"
-  },
-  {
-    "name": "flags ignored",
-    "hex": "11ff070000000100000078",
-    "type": 17,
-    "channel": 7,
-    "payload": "78"
-  },
-  {
-    "name": "max channel",
-    "hex": "9000ffffffff020000007b7d",
-    "type": 144,
-    "channel": 4294967295,
-    "payload": "7b7d"
-  },
-  {
-    "name": "unknown type 0x98",
-    "hex": "98000100000000000000",
-    "error": "unknown frame type 0x98"
-  },
-  {
-    "name": "length above max_frame",
-    "hex": "11000100000001001000",
-    "error": "frame length 1048577 exceeds max_frame 1048576"
-  }
-]
+  "frames": [
+    {
+      "name": "hello",
+      "hex": "010000000000310000007b2276657273696f6e223a312c22636c69656e74223a7b226e616d65223a2274222c2276657273696f6e223a2230227d7d",
+      "type": 1,
+      "channel": 0,
+      "payload": "7b2276657273696f6e223a312c22636c69656e74223a7b226e616d65223a2274222c2276657273696f6e223a2230227d7d"
+    },
+    {
+      "name": "close empty payload",
+      "hex": "13000500000000000000",
+      "type": 19,
+      "channel": 5,
+      "payload": ""
+    },
+    {
+      "name": "output with offset",
+      "hex": "9400010000000b0000002a00000000000000616263",
+      "type": 148,
+      "channel": 1,
+      "payload": "2a00000000000000616263"
+    },
+    {
+      "name": "flags ignored",
+      "hex": "11ff070000000100000078",
+      "type": 17,
+      "channel": 7,
+      "payload": "78"
+    },
+    {
+      "name": "max channel",
+      "hex": "9000ffffffff020000007b7d",
+      "type": 144,
+      "channel": 4294967295,
+      "payload": "7b7d"
+    },
+    {
+      "name": "unknown type 0x98",
+      "hex": "98000100000000000000",
+      "error": "unknown_type"
+    },
+    {
+      "name": "length above max_frame",
+      "hex": "11000100000001001000",
+      "error": "too_long"
+    },
+    {
+      "name": "shorter than a header",
+      "hex": "110001000000010000",
+      "error": "short"
+    },
+    {
+      "name": "length below the payload",
+      "hex": "110001000000010000007879",
+      "error": "length_mismatch"
+    }
+  ]
+}

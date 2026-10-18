@@ -36,7 +36,16 @@ export interface Header {
   length: number;
 }
 
-export class HeaderError extends Error {}
+export type FrameErrorKind = "unknown_type" | "too_long" | "short" | "length_mismatch";
+
+export class FrameError extends Error {
+  constructor(
+    readonly kind: FrameErrorKind,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 export function encodeHeader(type: FrameType, channel: number, length: number): Uint8Array {
   const out = new Uint8Array(HEADER_LEN);
@@ -49,12 +58,15 @@ export function encodeHeader(type: FrameType, channel: number, length: number): 
 
 /** Parses a header, ignoring `flags`. */
 export function parseHeader(bytes: Uint8Array, maxFrame: number): Header {
+  if (bytes.length < HEADER_LEN) throw new FrameError("short", "message shorter than a frame header");
   const type = bytes[0]!;
-  if (!isFrameType(type)) throw new HeaderError(`unknown frame type 0x${type.toString(16).padStart(2, "0")}`);
+  if (!isFrameType(type)) {
+    throw new FrameError("unknown_type", `unknown frame type 0x${type.toString(16).padStart(2, "0")}`);
+  }
   const view = new DataView(bytes.buffer, bytes.byteOffset, HEADER_LEN);
   const channel = view.getUint32(2, true);
   const length = view.getUint32(6, true);
-  if (length > maxFrame) throw new HeaderError(`frame length ${length} exceeds max_frame ${maxFrame}`);
+  if (length > maxFrame) throw new FrameError("too_long", `frame length ${length} exceeds max_frame ${maxFrame}`);
   return { type, channel, length };
 }
 
@@ -70,42 +82,21 @@ export interface Frame {
   payload: Uint8Array;
 }
 
-/** Splits a byte stream into frames. */
-export class FrameDecoder {
-  private buf = new Uint8Array(0);
-  private pos = 0;
-
-  push(bytes: Uint8Array): void {
-    const pending = this.buf.subarray(this.pos);
-    const next = new Uint8Array(pending.length + bytes.length);
-    next.set(pending);
-    next.set(bytes, pending.length);
-    this.buf = next;
-    this.pos = 0;
+/** Parses one message that carries exactly one frame. */
+export function parseFrame(message: Uint8Array, maxFrame: number): Frame {
+  const header = parseHeader(message, maxFrame);
+  const payload = message.subarray(HEADER_LEN);
+  if (header.length !== payload.length) {
+    throw new FrameError("length_mismatch", `frame length ${header.length} with ${payload.length} payload bytes`);
   }
-
-  /** The next complete frame, if buffered. A HeaderError poisons the stream. */
-  next(maxFrame: number): Frame | undefined {
-    if (this.buf.length - this.pos < HEADER_LEN) return undefined;
-    const header = parseHeader(this.buf.subarray(this.pos, this.pos + HEADER_LEN), maxFrame);
-    const end = this.pos + HEADER_LEN + header.length;
-    if (end > this.buf.length) return undefined;
-    const payload = this.buf.slice(this.pos + HEADER_LEN, end);
-    this.pos = end;
-    return { header, payload };
-  }
+  return { header, payload };
 }
 
-/** `OUTPUT` payload: the stream offset of the first byte, then the bytes. */
-export function encodeOutput(offset: bigint, bytes: Uint8Array): Uint8Array {
-  const out = new Uint8Array(8 + bytes.length);
-  new DataView(out.buffer).setBigUint64(0, offset, true);
-  out.set(bytes, 8);
-  return out;
-}
-
-export function parseOutput(payload: Uint8Array): { offset: bigint; bytes: Uint8Array } | undefined {
+/** `OUTPUT` payload: the stream offset of the first byte (u64 LE), then the bytes. */
+export function parseOutput(payload: Uint8Array): { offset: number; bytes: Uint8Array } | undefined {
   if (payload.length < 8) return undefined;
-  const offset = new DataView(payload.buffer, payload.byteOffset, 8).getBigUint64(0, true);
+  const view = new DataView(payload.buffer, payload.byteOffset, 8);
+  const offset = view.getUint32(4, true) * 2 ** 32 + view.getUint32(0, true);
+  if (!Number.isSafeInteger(offset)) return undefined;
   return { offset, bytes: payload.subarray(8) };
 }

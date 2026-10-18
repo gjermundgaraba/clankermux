@@ -74,7 +74,8 @@ export type OnExit = "remove" | "keep";
 export type Status = "running" | "exited" | "restored";
 export type Exit = { code: number } | { signal: string };
 
-export interface Record {
+/** One program status record (OSC 7501). */
+export interface StatusRecord {
   id: string;
   state: string;
   kind?: string;
@@ -103,7 +104,7 @@ export interface Session {
   offset: number;
   marker: number;
   attachments: number;
-  program_status?: Record[];
+  program_status?: StatusRecord[];
 }
 
 export interface Page {
@@ -120,11 +121,46 @@ export interface Read {
   status: Status;
 }
 
+export interface ListParams {
+  after?: string;
+}
+
+export interface SessionParams {
+  session: string;
+}
+
+export interface SignalParams {
+  session: string;
+  signal: string;
+}
+
+export interface SetLabelParams {
+  session: string;
+  label: string;
+}
+
+export interface SetSizeParams {
+  session: string;
+  cols: number;
+  rows: number;
+}
+
+export interface ReadParams {
+  session: string;
+  scrollback?: number;
+}
+
+export interface WriteParams {
+  session: string;
+  /** Base64. */
+  data: string;
+}
+
 export interface CreateParams {
   label?: string;
   argv?: string[];
   cwd?: string;
-  env?: { [name: string]: string };
+  env?: Record<string, string>;
   cols?: number;
   rows?: number;
   on_exit?: OnExit;
@@ -135,7 +171,7 @@ export type Event =
   | { event: "session_changed"; session: Session }
   | { event: "session_exited"; session: Session }
   | { event: "session_removed"; id: string }
-  | { event: "program_status_changed"; id: string; record: Record }
+  | { event: "program_status_changed"; id: string; record: StatusRecord }
   | { event: "program_status_removed"; id: string; record_ids: string[] };
 
 export type Scheme = "light" | "dark";
@@ -147,11 +183,16 @@ export interface Profile {
   scheme?: Scheme;
 }
 
-export interface Viewport {
+/** `OPEN.viewport`: the terminal size in cells and, optionally, pixels. */
+export interface Size {
   cols: number;
   rows: number;
   cell_width?: number;
   cell_height?: number;
+}
+
+/** The `VIEWPORT` payload. */
+export interface Viewport extends Size {
   profile?: Profile;
 }
 
@@ -164,7 +205,7 @@ export interface Resume {
 export interface Open {
   session: string;
   read_only?: boolean;
-  viewport?: Viewport;
+  viewport?: Size;
   profile?: Profile;
   resume?: Resume;
 }

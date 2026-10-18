@@ -282,7 +282,6 @@
       "sync"
     ]
   },
-  "create/empty": {},
   "open/full": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001",
     "read_only": false,
@@ -361,5 +360,51 @@
   },
   "closed/removed": {
     "reason": "removed"
+  },
+  "params/create": {
+    "label": "build",
+    "argv": [
+      "/bin/zsh",
+      "-l"
+    ],
+    "cwd": "/Users/me",
+    "env": {
+      "FOO": "bar"
+    },
+    "cols": 120,
+    "rows": 40,
+    "on_exit": "keep"
+  },
+  "params/create-empty": {},
+  "params/list": {
+    "after": "0f1e2d3c-0000-4000-8000-000000000001"
+  },
+  "params/list-first": {},
+  "params/inspect": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001"
+  },
+  "params/signal": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "signal": "TERM"
+  },
+  "params/set_label": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "label": "deploy"
+  },
+  "params/set_size": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "cols": 100,
+    "rows": 30
+  },
+  "params/read": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "scrollback": 50
+  },
+  "params/read-screen": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001"
+  },
+  "params/write": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "data": "bHMK"
   }
 }

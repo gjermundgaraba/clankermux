@@ -36,19 +36,18 @@ pub struct Welcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
-    pub id: u64,
+    pub id: i64,
     pub method: String,
-    #[serde(default)]
     pub params: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reply {
-    pub id: u64,
+    pub id: i64,
     pub result: Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     ProtocolError,
@@ -70,7 +69,7 @@ pub enum ErrorCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<u64>,
+    pub id: Option<i64>,
     pub code: ErrorCode,
     pub message: String,
 }
@@ -98,7 +97,8 @@ pub enum Exit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Record {
+/// One program status record (OSC 7501).
+pub struct StatusRecord {
     pub id: String,
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,7 +137,7 @@ pub struct Session {
     pub marker: u64,
     pub attachments: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub program_status: Option<Vec<Record>>,
+    pub program_status: Option<Vec<StatusRecord>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,8 +215,8 @@ pub struct SetSizeParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadParams {
     pub session: String,
-    #[serde(default)]
-    pub scrollback: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrollback: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,7 +233,7 @@ pub enum Event {
     SessionChanged { session: Session },
     SessionExited { session: Session },
     SessionRemoved { id: String },
-    ProgramStatusChanged { id: String, record: Record },
+    ProgramStatusChanged { id: String, record: StatusRecord },
     ProgramStatusRemoved { id: String, record_ids: Vec<String> },
 }
 
@@ -256,15 +256,22 @@ pub enum Scheme {
     Dark,
 }
 
-/// `OPEN.viewport` and the `VIEWPORT` payload; `profile` only in the latter.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Viewport {
+/// `OPEN.viewport`: the terminal size in cells and, optionally, pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Size {
     pub cols: u16,
     pub rows: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell_width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell_height: Option<u32>,
+}
+
+/// The `VIEWPORT` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Viewport {
+    #[serde(flatten)]
+    pub size: Size,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
 }
@@ -282,7 +289,7 @@ pub struct Open {
     #[serde(default)]
     pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub viewport: Option<Viewport>,
+    pub viewport: Option<Size>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

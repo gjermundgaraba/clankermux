@@ -1,8 +1,11 @@
 //! The 10-byte frame header and the raw payload shapes.
 
+use serde::{Deserialize, Serialize};
+
 pub const HEADER_LEN: usize = 10;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum FrameType {
     Hello = 0x01,
@@ -27,30 +30,33 @@ pub enum FrameType {
 }
 
 impl FrameType {
-    pub fn from_u8(byte: u8) -> Option<Self> {
+    pub const ALL: [FrameType; 19] = {
         use FrameType::*;
-        Some(match byte {
-            0x01 => Hello,
-            0x02 => Request,
-            0x10 => Open,
-            0x11 => Input,
-            0x12 => Viewport,
-            0x13 => Close,
-            0x81 => Welcome,
-            0x82 => Reply,
-            0x83 => Event,
-            0x8F => Error,
-            0x90 => Attached,
-            0x91 => Snapshot,
-            0x92 => SnapshotReady,
-            0x93 => SnapshotEnd,
-            0x94 => Output,
-            0x95 => Resized,
-            0x96 => Exited,
-            0x97 => Gap,
-            0x99 => Closed,
-            _ => return None,
-        })
+        [
+            Hello,
+            Request,
+            Open,
+            Input,
+            Viewport,
+            Close,
+            Welcome,
+            Reply,
+            Event,
+            Error,
+            Attached,
+            Snapshot,
+            SnapshotReady,
+            SnapshotEnd,
+            Output,
+            Resized,
+            Exited,
+            Gap,
+            Closed,
+        ]
+    };
+
+    pub fn from_u8(byte: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| *t as u8 == byte)
     }
 
     /// Frames the server sends have the high bit set.
@@ -62,11 +68,6 @@ impl FrameType {
     pub fn is_control(self) -> bool {
         use FrameType::*;
         matches!(self, Hello | Request | Welcome | Reply | Event | Error)
-    }
-
-    /// Whether the type belongs on an attachment channel.
-    pub fn is_attachment(self) -> bool {
-        !self.is_control() || self == FrameType::Error
     }
 
     pub fn is_json(self) -> bool {
@@ -86,23 +87,37 @@ pub struct Header {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeaderError {
+pub enum FrameError {
     UnknownType(u8),
-    TooLong { length: u32, max_frame: u32 },
+    TooLong {
+        length: u32,
+        max_frame: u64,
+    },
+    /// A message shorter than a header.
+    Short,
+    /// A message whose header length is not its payload length.
+    LengthMismatch {
+        length: u32,
+        payload: usize,
+    },
 }
 
-impl std::fmt::Display for HeaderError {
+impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HeaderError::UnknownType(t) => write!(f, "unknown frame type 0x{t:02x}"),
-            HeaderError::TooLong { length, max_frame } => {
+            FrameError::UnknownType(t) => write!(f, "unknown frame type 0x{t:02x}"),
+            FrameError::TooLong { length, max_frame } => {
                 write!(f, "frame length {length} exceeds max_frame {max_frame}")
+            }
+            FrameError::Short => write!(f, "message shorter than a frame header"),
+            FrameError::LengthMismatch { length, payload } => {
+                write!(f, "frame length {length} with {payload} payload bytes")
             }
         }
     }
 }
 
-impl std::error::Error for HeaderError {}
+impl std::error::Error for FrameError {}
 
 pub fn encode_header(frame_type: FrameType, channel: u32, length: u32) -> [u8; HEADER_LEN] {
     let mut out = [0u8; HEADER_LEN];
@@ -113,12 +128,12 @@ pub fn encode_header(frame_type: FrameType, channel: u32, length: u32) -> [u8; H
 }
 
 /// Parses a header, ignoring `flags`.
-pub fn parse_header(bytes: &[u8; HEADER_LEN], max_frame: u32) -> Result<Header, HeaderError> {
-    let frame_type = FrameType::from_u8(bytes[0]).ok_or(HeaderError::UnknownType(bytes[0]))?;
+pub fn parse_header(bytes: &[u8; HEADER_LEN], max_frame: u64) -> Result<Header, FrameError> {
+    let frame_type = FrameType::from_u8(bytes[0]).ok_or(FrameError::UnknownType(bytes[0]))?;
     let channel = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
     let length = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
-    if length > max_frame {
-        return Err(HeaderError::TooLong { length, max_frame });
+    if u64::from(length) > max_frame {
+        return Err(FrameError::TooLong { length, max_frame });
     }
     Ok(Header {
         frame_type,
@@ -129,10 +144,26 @@ pub fn parse_header(bytes: &[u8; HEADER_LEN], max_frame: u32) -> Result<Header, 
 
 /// A complete frame: header followed by the payload.
 pub fn encode_frame(frame_type: FrameType, channel: u32, payload: &[u8]) -> Vec<u8> {
+    let length = u32::try_from(payload.len()).expect("frame payload longer than u32");
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
-    out.extend_from_slice(&encode_header(frame_type, channel, payload.len() as u32));
+    out.extend_from_slice(&encode_header(frame_type, channel, length));
     out.extend_from_slice(payload);
     out
+}
+
+/// Parses one message that carries exactly one frame.
+pub fn parse_frame(message: &[u8], max_frame: u64) -> Result<(Header, &[u8]), FrameError> {
+    let (head, payload) = message
+        .split_at_checked(HEADER_LEN)
+        .ok_or(FrameError::Short)?;
+    let header = parse_header(head.try_into().unwrap(), max_frame)?;
+    if header.length as usize != payload.len() {
+        return Err(FrameError::LengthMismatch {
+            length: header.length,
+            payload: payload.len(),
+        });
+    }
+    Ok((header, payload))
 }
 
 /// Splits a byte stream into frames.
@@ -149,7 +180,7 @@ impl FrameDecoder {
 
     /// The next complete frame, if buffered. A header error poisons the
     /// stream: the caller closes the connection.
-    pub fn next_frame(&mut self, max_frame: u32) -> Result<Option<(Header, Vec<u8>)>, HeaderError> {
+    pub fn next_frame(&mut self, max_frame: u64) -> Result<Option<(Header, Vec<u8>)>, FrameError> {
         let Some(head) = self.buf.get(self.pos..self.pos + HEADER_LEN) else {
             self.compact();
             return Ok(None);
