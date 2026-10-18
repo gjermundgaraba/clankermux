@@ -1,0 +1,7 @@
+/target
+node_modules
+.zig-cache
+zig-out
+zig-pkg
+web/packages/engine/ghostty-vt.wasm
+web/packages/engine/test/fixtures
