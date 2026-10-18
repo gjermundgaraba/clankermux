@@ -4,11 +4,13 @@ mod common;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::*;
 use futures_util::{SinkExt, StreamExt};
 use proto::*;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -158,25 +160,30 @@ async fn the_websocket_admits_allowed_origins_only() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn each_message_is_exactly_one_frame() {
-    let server = start(fast_limits()).await;
-    let ws = serve_ws(&server, vec!["http://allowed".into()]).await;
-    let mut raw = ws.connect(Some("http://allowed")).await.unwrap();
+/// The next message from the server, which must be one whole frame.
+async fn next(raw: &mut ClientWs) -> (Header, Vec<u8>) {
     let max_frame = Limits::default().max_frame;
-    let json = |frame_type, body: serde_json::Value| {
-        Message::Binary(encode_frame(frame_type, 0, &serde_json::to_vec(&body).unwrap()).into())
+    let message = tokio::time::timeout(Duration::from_secs(5), raw.next())
+        .await
+        .expect("a message in time")
+        .expect("a message")
+        .unwrap();
+    let bytes = match message {
+        Message::Binary(bytes) => bytes,
+        other => panic!("{other:?}"),
     };
-    // Every message from the server is one whole frame.
-    let next = async |raw: &mut ClientWs| -> (Header, Vec<u8>) {
-        let bytes = match raw.next().await.expect("a message").unwrap() {
-            Message::Binary(bytes) => bytes,
-            other => panic!("{other:?}"),
-        };
-        let (header, payload) = parse_frame(&bytes, max_frame).unwrap();
-        assert_eq!(HEADER_LEN + header.length as usize, bytes.len());
-        (header, payload.to_vec())
-    };
+    let (header, payload) = parse_frame(&bytes, max_frame).unwrap();
+    assert_eq!(HEADER_LEN + header.length as usize, bytes.len());
+    (header, payload.to_vec())
+}
+
+fn json(frame_type: FrameType, body: serde_json::Value) -> Message {
+    Message::Binary(encode_frame(frame_type, 0, &serde_json::to_vec(&body).unwrap()).into())
+}
+
+/// A raw connection past its handshake.
+async fn greeted(ws: &Ws) -> ClientWs {
+    let mut raw = ws.connect(Some("http://allowed")).await.unwrap();
     raw.send(json(
         FrameType::Hello,
         json!({"version": 1, "client": {"name": "raw", "version": "0"}, "capabilities": [],
@@ -185,6 +192,44 @@ async fn each_message_is_exactly_one_frame() {
     .await
     .unwrap();
     assert_eq!(next(&mut raw).await.0.frame_type, FrameType::Welcome);
+    raw
+}
+
+/// Reads to the close: an `ERROR protocol_error` on channel 0 must come,
+/// and no reply.
+async fn ends_with_protocol_error(raw: &mut ClientWs) -> String {
+    let max_frame = Limits::default().max_frame;
+    let mut error = None;
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(5), raw.next())
+            .await
+            .expect("the close in time");
+        match message {
+            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+            Some(Ok(Message::Binary(bytes))) => {
+                let (header, payload) = parse_frame(&bytes, max_frame).unwrap();
+                // Whatever was still queued for channel 1 may arrive first.
+                match header.frame_type {
+                    FrameType::Reply => panic!("a reply to a bad message"),
+                    FrameType::Error if header.channel == 0 => {
+                        let message: ErrorMessage = serde_json::from_slice(payload).unwrap();
+                        assert_eq!(message.code, ErrorCode::ProtocolError, "{message:?}");
+                        error = Some(message.message);
+                    }
+                    _ => {}
+                }
+            }
+            Some(Ok(_)) => {}
+        }
+    }
+    error.expect("ERROR protocol_error before the close")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_message_is_exactly_one_frame() {
+    let server = start(fast_limits()).await;
+    let ws = serve_ws(&server, vec!["http://allowed".into()]).await;
+    let mut raw = greeted(&ws).await;
     raw.send(json(
         FrameType::Request,
         json!({"id": 1, "method": "create", "params": {"argv": ["/bin/cat"]}}),
@@ -225,7 +270,7 @@ async fn each_message_is_exactly_one_frame() {
     assert_eq!(seen[0], FrameType::Attached);
     assert!(seen.contains(&FrameType::SnapshotReady));
 
-    // Two frames in one message end the connection.
+    // Two frames in one message are a protocol error.
     let mut two = encode_frame(
         FrameType::Request,
         0,
@@ -237,20 +282,47 @@ async fn each_message_is_exactly_one_frame() {
         br#"{"id":3,"method":"list","params":{}}"#,
     ));
     raw.send(Message::Binary(two.into())).await.unwrap();
-    let ended = loop {
-        match raw.next().await {
-            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break true,
-            Some(Ok(Message::Binary(bytes))) => {
-                let (header, _) = parse_frame(&bytes, max_frame).unwrap();
-                // Whatever was still queued for channel 1 may arrive first.
-                assert_ne!(
-                    header.frame_type,
-                    FrameType::Reply,
-                    "a reply to a bad message"
-                );
-            }
-            Some(Ok(_)) => {}
-        }
-    };
-    assert!(ended);
+    assert!(
+        ends_with_protocol_error(&mut raw)
+            .await
+            .contains("exactly one frame")
+    );
+
+    // A text message, too.
+    let mut raw = greeted(&ws).await;
+    raw.send(Message::Text("hello".into())).await.unwrap();
+    assert!(
+        ends_with_protocol_error(&mut raw)
+            .await
+            .contains("binary messages")
+    );
+
+    // A bad header is reported as on any carrier.
+    let mut raw = greeted(&ws).await;
+    let mut bad = encode_frame(FrameType::Request, 0, b"{}");
+    bad[0] = 0x7f;
+    raw.send(Message::Binary(bad.into())).await.unwrap();
+    assert_eq!(
+        ends_with_protocol_error(&mut raw).await,
+        "unknown frame type 0x7f"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_connection_closes_within_hello_timeout() {
+    let server = start(fast_limits()).await;
+    let ws = serve_ws(&server, vec!["http://allowed".into()]).await;
+    let started = std::time::Instant::now();
+    // Nothing sent: no TLS handshake, no upgrade.
+    let mut tcp = TcpStream::connect(ws.addr).await.unwrap();
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut byte))
+        .await
+        .expect("the server closes");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(2),
+        "{elapsed:?}"
+    );
 }

@@ -13,7 +13,9 @@ const newButton = document.getElementById("new") as HTMLButtonElement;
 const status = document.getElementById("status") as HTMLElement;
 
 const params = new URLSearchParams(location.search);
-const wsUrl = params.get("ws") ?? `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+// The server's default WebSocket port on the host the page came from;
+// `?ws=wss://<node>:<port>/` names any other.
+const wsUrl = params.get("ws") ?? `wss://${location.hostname}:7438/`;
 
 const style = getComputedStyle(document.documentElement);
 const font = style.getPropertyValue("--font").trim() || "14px monospace";

@@ -59,14 +59,14 @@ enum Command {
         ws: Option<String>,
         /// A page origin allowed on the WebSocket (repeatable); none
         /// refuses every page.
-        #[arg(long, value_name = "ORIGIN")]
+        #[arg(long, value_name = "ORIGIN", requires = "ws")]
         origin: Vec<String>,
         /// Certificate chain PEM; without it the node's Tailscale
         /// certificate is used.
-        #[arg(long, value_name = "PATH", requires = "tls_key")]
+        #[arg(long, value_name = "PATH", requires = "ws", requires = "tls_key")]
         tls_cert: Option<PathBuf>,
         /// Private key PEM.
-        #[arg(long, value_name = "PATH", requires = "tls_cert")]
+        #[arg(long, value_name = "PATH", requires = "ws", requires = "tls_cert")]
         tls_key: Option<PathBuf>,
     },
     /// Start a session; `argv` after `--`, the login shell by default.
@@ -251,7 +251,7 @@ fn session_line(s: &Session) {
 /// Binds the carriers `serve` was asked for and runs them with the Unix
 /// socket until a signal; then parks every running session.
 async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::SocketAddr;
     let Carriers {
         tcp,
         ws,
@@ -259,13 +259,39 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
         tls_cert,
         tls_key,
     } = carriers;
-    // The tailnet address and certificate domain, when a carrier needs them.
-    let api = server::tailscale::LocalApi::discover();
-    let tailnet = async |api: &std::io::Result<server::tailscale::LocalApi>| {
-        let api = api.as_ref().map_err(|e| usage(e.to_string()))?;
-        api.status().await.map_err(Error::Io)
+    let origins = origin
+        .iter()
+        .map(|o| server::ws::origin(o).map_err(usage))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ws_bind = ws
+        .as_deref()
+        .map(|bind| match bind.parse::<u16>() {
+            Ok(port) => Ok(WsBind::Port(port)),
+            Err(_) => match bind.parse::<SocketAddr>() {
+                Ok(addr) if addr.ip().is_loopback() => Ok(WsBind::Loopback(addr)),
+                _ => Err(usage(format!(
+                    "--ws takes a port on the tailnet address or a loopback address, not {bind:?}"
+                ))),
+            },
+        })
+        .transpose()?;
+    let tls_files = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => Some(server::tls::Source::Files { cert, key }),
+        _ => None,
     };
-    let tailnet_addr = async |status: &server::tailscale::Status, port: u16| {
+    // One status request serves every carrier that needs the tailnet.
+    let needs_tailnet = tcp.is_some()
+        || matches!(ws_bind, Some(WsBind::Port(_)))
+        || (ws_bind.is_some() && tls_files.is_none());
+    let tailnet = if needs_tailnet {
+        let api = server::tailscale::LocalApi::discover().map_err(|e| usage(e.to_string()))?;
+        let status = api.status().await.map_err(Error::Io)?;
+        Some((api, status))
+    } else {
+        None
+    };
+    let tailnet_addr = |port: u16| {
+        let (_, status) = tailnet.as_ref().expect("needed, so requested");
         let ip = status
             .this
             .tailscale_ips
@@ -277,38 +303,29 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
     };
     let mut tcp_listener = None;
     if let Some(port) = tcp {
-        let status = tailnet(&api).await?;
-        let addr = tailnet_addr(&status, port).await?;
         tcp_listener = Some(
-            tokio::net::TcpListener::bind(addr)
+            tokio::net::TcpListener::bind(tailnet_addr(port)?)
                 .await
                 .map_err(Error::Io)?,
         );
     }
     let mut ws_listener = None;
-    if let Some(bind) = ws {
-        let addr: SocketAddr = match bind.parse::<u16>() {
-            Ok(port) => tailnet_addr(&tailnet(&api).await?, port).await?,
-            Err(_) => match bind.parse::<SocketAddr>() {
-                Ok(addr) if addr.ip().is_loopback() => addr,
-                _ => {
-                    return Err(usage(format!(
-                        "--ws takes a port on the tailnet address or a loopback address, not {bind:?}"
-                    )));
-                }
-            },
+    if let Some(bind) = ws_bind {
+        let addr = match bind {
+            WsBind::Port(port) => tailnet_addr(port)?,
+            WsBind::Loopback(addr) => addr,
         };
-        let source = match (tls_cert, tls_key) {
-            (Some(cert), Some(key)) => server::tls::Source::Files { cert, key },
-            _ => {
-                let status = tailnet(&api).await?;
+        let source = match tls_files {
+            Some(files) => files,
+            None => {
+                let (api, status) = tailnet.as_ref().expect("needed, so requested");
                 let domain = status.cert_domains.first().cloned().ok_or_else(|| {
                     usage(
                         "this node has no certificate domain; pass --tls-cert and --tls-key".into(),
                     )
                 })?;
                 server::tls::Source::Tailscale {
-                    api: api.as_ref().unwrap().clone(),
+                    api: api.clone(),
                     domain,
                 }
             }
@@ -320,7 +337,6 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
             .map_err(Error::Io)?;
         ws_listener = Some((listener, tls));
     }
-    let _ = IpAddr::V4; // keep the import list honest on every platform
 
     let registry = server::Registry::new(server::default_config()).map_err(Error::Io)?;
     let mut tasks = tokio::task::JoinSet::new();
@@ -342,7 +358,7 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
             listener,
             registry.clone(),
             tls,
-            origin,
+            origins,
         ));
     }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -365,15 +381,38 @@ struct Carriers {
     tls_key: Option<PathBuf>,
 }
 
-/// `--stdio`: bytes both ways between stdio and the socket until either
-/// side ends.
+/// What `--ws` names: a port on the tailnet address, or a loopback address.
+enum WsBind {
+    Port(u16),
+    Loopback(std::net::SocketAddr),
+}
+
+/// `--stdio`: bytes both ways between stdio and the socket. The relay ends
+/// when the server side does; stdin's blocking read cannot be cancelled,
+/// so main exits the process rather than waiting for it.
 async fn relay(socket: PathBuf) -> Result<ExitCode, Error> {
-    let mut unix = tokio::net::UnixStream::connect(&socket)
+    use tokio::io::AsyncWriteExt as _;
+    let unix = tokio::net::UnixStream::connect(&socket)
         .await
         .map_err(|e| usage(format!("cannot connect to {}: {e}", socket.display())))?;
-    let mut stdio = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
-    let _ = tokio::io::copy_bidirectional(&mut unix, &mut stdio).await;
-    Ok(ExitCode::SUCCESS)
+    let (mut from_server, mut to_server) = unix.into_split();
+    let to_stdout = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        tokio::io::copy(&mut from_server, &mut stdout).await?;
+        stdout.flush().await
+    });
+    let to_server = async move {
+        let mut stdin = tokio::io::stdin();
+        let _ = tokio::io::copy(&mut stdin, &mut to_server).await;
+        // The server ends the connection at EOF; its last bytes follow.
+        let _ = to_server.shutdown().await;
+        std::future::pending::<()>().await
+    };
+    let copied = tokio::select! {
+        copied = to_stdout => copied.map_err(std::io::Error::other).and_then(|r| r),
+        () = to_server => unreachable!(),
+    };
+    copied.map(|_| ExitCode::SUCCESS).map_err(Error::Io)
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, Error> {
@@ -594,7 +633,10 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .with_writer(std::io::stderr)
         .init();
     let code = match run(Cli::parse()).await {

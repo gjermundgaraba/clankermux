@@ -18,7 +18,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use proto::FrameType;
-use tokio::net::UnixListener;
+use tokio::net::{TcpListener, TcpStream, UnixListener};
+use tokio::time::Instant;
 
 pub use registry::{Config, Registry};
 
@@ -56,40 +57,57 @@ pub async fn serve_unix(socket: PathBuf, registry: Arc<Registry>) -> io::Result<
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(err) => {
-                // Transient errors (EMFILE, ECONNABORTED) must not stop the
-                // server; back off briefly instead.
-                tracing::warn!(error = %err, "accept failed");
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                accept_failed(err).await;
                 continue;
             }
         };
         match stream.peer_cred() {
             Ok(cred) if cred.uid() == uid => {
-                tokio::spawn(connection::serve_connection(stream, registry.clone()));
+                tokio::spawn(connection::serve_connection(
+                    stream,
+                    registry.clone(),
+                    Instant::now(),
+                ));
             }
             _ => drop(stream),
         }
     }
 }
 
-/// Serves `listener` until cancelled: plaintext frames, `TCP_NODELAY`.
-/// Trust is the caller's: the binary binds the tailnet address only.
-pub async fn serve_tcp(
-    listener: tokio::net::TcpListener,
-    registry: Arc<Registry>,
-) -> io::Result<()> {
+/// Transient accept errors (EMFILE, ECONNABORTED) must not stop the
+/// server: they are logged and the listener backs off briefly.
+async fn accept_failed(err: io::Error) {
+    tracing::warn!(error = %err, "accept failed");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+}
+
+/// Serves `listener` until cancelled: `TCP_NODELAY` on every stream, then
+/// `handle` on its own task with the instant it was accepted.
+pub(crate) async fn serve_tcp_with<F, Fut>(listener: TcpListener, handle: F) -> io::Result<()>
+where
+    F: Fn(TcpStream, Instant) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let _ = stream.set_nodelay(true);
-                tokio::spawn(connection::serve_connection(stream, registry.clone()));
-            }
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
             Err(err) => {
-                tracing::warn!(error = %err, "accept failed");
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                accept_failed(err).await;
+                continue;
             }
-        }
+        };
+        let _ = stream.set_nodelay(true);
+        tokio::spawn(handle(stream, Instant::now()));
     }
+}
+
+/// Serves `listener` until cancelled: plaintext frames. Trust is the
+/// caller's: the binary binds the tailnet address only.
+pub async fn serve_tcp(listener: TcpListener, registry: Arc<Registry>) -> io::Result<()> {
+    serve_tcp_with(listener, move |stream, accepted| {
+        connection::serve_connection(stream, registry.clone(), accepted)
+    })
+    .await
 }
 
 /// `$XDG_STATE_HOME/clankermux`, else `~/.local/state/clankermux`.

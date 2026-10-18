@@ -1035,6 +1035,7 @@ dependencies = [
  "base64 0.22.1",
  "futures-util",
  "ghostty-vt",
+ "httparse",
  "jiff",
  "libc",
  "proto",

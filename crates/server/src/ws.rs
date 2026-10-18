@@ -5,6 +5,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use futures_util::{Sink, Stream};
 use proto::{HEADER_LEN, parse_header};
@@ -22,7 +23,8 @@ use crate::tls::Tls;
 
 /// Serves `listener` until cancelled. Every connection is TLS; the
 /// upgrade is refused with 403 unless its `Origin` is in `origins`, so an
-/// empty allowlist refuses them all.
+/// empty allowlist refuses them all. The TLS handshake and the upgrade
+/// count against `hello_timeout` like the bytes before `HELLO`.
 pub async fn serve_ws(
     listener: TcpListener,
     registry: Arc<Registry>,
@@ -31,61 +33,86 @@ pub async fn serve_ws(
 ) -> io::Result<()> {
     let origins = Arc::new(origins);
     let max_frame = registry.config.limits.max_frame;
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(err) => {
-                tracing::warn!(error = %err, "accept failed");
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                continue;
-            }
-        };
-        let _ = stream.set_nodelay(true);
+    let hello_timeout = Duration::from_millis(registry.config.limits.hello_timeout);
+    crate::serve_tcp_with(listener, move |stream, accepted| {
         let acceptor = tls.acceptor();
         let registry = registry.clone();
         let origins = origins.clone();
-        tokio::spawn(async move {
-            let stream = match acceptor.accept(stream).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    tracing::debug!(%error, "TLS handshake failed");
-                    return;
-                }
-            };
-            // The callback's error type is tungstenite's HTTP response.
-            #[allow(clippy::result_large_err)]
-            let check = |request: &Request,
-                         response: Response|
-             -> Result<Response, ErrorResponse> {
-                let origin = request
-                    .headers()
-                    .get("origin")
-                    .and_then(|v| v.to_str().ok());
-                match origin {
-                    Some(origin) if origins.iter().any(|allowed| allowed == origin) => Ok(response),
-                    _ => {
-                        let mut refused = ErrorResponse::new(Some("origin not allowed".into()));
-                        *refused.status_mut() = StatusCode::FORBIDDEN;
-                        Err(refused)
-                    }
-                }
-            };
-            let config = WebSocketConfig::default()
-                .max_message_size(Some(message_ceiling(max_frame)))
-                .max_frame_size(Some(message_ceiling(max_frame)));
-            let ws =
-                match tokio_tungstenite::accept_hdr_async_with_config(stream, check, Some(config))
+        async move {
+            let upgrade = async {
+                let stream = acceptor.accept(stream).await?;
+                // The callback's error type is tungstenite's HTTP response.
+                #[allow(clippy::result_large_err)]
+                let check =
+                    |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
+                        let allowed = request
+                            .headers()
+                            .get("origin")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| origin(v).ok())
+                            .is_some_and(|o| origins.contains(&o));
+                        if allowed {
+                            Ok(response)
+                        } else {
+                            let mut refused = ErrorResponse::new(Some("origin not allowed".into()));
+                            *refused.status_mut() = StatusCode::FORBIDDEN;
+                            Err(refused)
+                        }
+                    };
+                let config = WebSocketConfig::default()
+                    .max_message_size(Some(message_ceiling(max_frame)))
+                    .max_frame_size(Some(message_ceiling(max_frame)));
+                tokio_tungstenite::accept_hdr_async_with_config(stream, check, Some(config))
                     .await
-                {
-                    Ok(ws) => ws,
-                    Err(error) => {
-                        tracing::debug!(%error, "WebSocket upgrade failed");
-                        return;
-                    }
-                };
-            serve_connection(WsStream::new(ws, max_frame), registry).await;
-        });
+                    .map_err(other)
+            };
+            match tokio::time::timeout_at(accepted + hello_timeout, upgrade).await {
+                Ok(Ok(ws)) => {
+                    serve_connection(WsStream::new(ws, max_frame), registry, accepted).await
+                }
+                Ok(Err(error)) => tracing::debug!(%error, "WebSocket handshake failed"),
+                Err(_) => tracing::debug!("WebSocket handshake timed out"),
+            }
+        }
+    })
+    .await
+}
+
+/// An origin as browsers serialize it: lowercase scheme and host, no
+/// default port, no path; or `null`. Anything else is an error.
+pub fn origin(text: &str) -> Result<String, String> {
+    if text == "null" {
+        return Ok(text.into());
     }
+    let bad = || format!("{text:?} is not an origin (scheme://host[:port])");
+    let (scheme, rest) = text.split_once("://").ok_or_else(bad)?;
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    if scheme.is_empty()
+        || !scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+        || rest.is_empty()
+        || rest.contains(['/', '?', '#', '@'])
+    {
+        return Err(bad());
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) if !rest.ends_with(']') => {
+            (host, Some(port.parse::<u16>().map_err(|_| bad())?))
+        }
+        _ => (rest, None),
+    };
+    let default = match scheme.as_str() {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        _ => None,
+    };
+    let host = host.to_ascii_lowercase();
+    Ok(match port {
+        Some(port) if Some(port) != default => format!("{scheme}://{host}:{port}"),
+        _ => format!("{scheme}://{host}"),
+    })
 }
 
 /// The longest message that can hold one frame.
@@ -118,14 +145,12 @@ impl<S> WsStream<S> {
     }
 }
 
-/// The length of the frame `bytes` starts with, when its header is there.
-fn frame_len(bytes: &[u8], max_frame: u64) -> io::Result<Option<usize>> {
-    let Some(head) = bytes.get(..HEADER_LEN) else {
-        return Ok(None);
-    };
-    let header = parse_header(head.try_into().unwrap(), max_frame)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok(Some(HEADER_LEN + header.length as usize))
+/// The length of the frame `bytes` starts with, when its header is there
+/// and valid.
+fn frame_len(bytes: &[u8], max_frame: u64) -> Option<usize> {
+    let head = bytes.get(..HEADER_LEN)?;
+    let header = parse_header(head.try_into().unwrap(), max_frame).ok()?;
+    Some(HEADER_LEN + header.length as usize)
 }
 
 fn other(error: tokio_tungstenite::tungstenite::Error) -> io::Error {
@@ -133,6 +158,12 @@ fn other(error: tokio_tungstenite::tungstenite::Error) -> io::Error {
         tokio_tungstenite::tungstenite::Error::Io(e) => e,
         e => io::Error::other(e),
     }
+}
+
+/// A carrier-level protocol error: the connection reports it before
+/// closing.
+fn invalid(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what)
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
@@ -151,29 +182,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
             }
             match ready!(Pin::new(&mut this.ws).poll_next(cx)) {
                 Some(Ok(Message::Binary(bytes))) => {
-                    if frame_len(&bytes, this.max_frame)? != Some(bytes.len()) {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "a message must hold exactly one frame",
-                        )));
+                    // A bad header passes through: the frame decoder
+                    // reports it like on any other carrier.
+                    if frame_len(&bytes, this.max_frame).is_some_and(|len| len != bytes.len()) {
+                        return Poll::Ready(Err(invalid("a message must hold exactly one frame")));
                     }
                     this.incoming = bytes;
                     this.pos = 0;
                 }
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
-                    // The pong tungstenite queued leaves with this flush.
-                    let _ = Pin::new(&mut this.ws).poll_flush(cx);
-                }
+                // tungstenite answers a ping with the next read.
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None => return Poll::Ready(Ok(())),
-                Some(Ok(Message::Text(_) | Message::Frame(_))) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "frames travel as binary messages",
-                    )));
+                Some(Ok(_)) => {
+                    return Poll::Ready(Err(invalid("frames travel as binary messages")));
                 }
                 Some(Err(e)) => return Poll::Ready(Err(other(e))),
             }
         }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> WsStream<S> {
+    /// Sends the whole frames buffered so far, one message each, as far
+    /// as the sink is ready.
+    fn send_frames(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while let Some(len) = frame_len(&self.outgoing, self.max_frame)
+            && len <= self.outgoing.len()
+        {
+            ready!(Pin::new(&mut self.ws).poll_ready(cx)).map_err(other)?;
+            let frame: Vec<u8> = self.outgoing.drain(..len).collect();
+            Pin::new(&mut self.ws)
+                .start_send(Message::Binary(frame.into()))
+                .map_err(other)?;
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -184,28 +226,52 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        ready!(Pin::new(&mut this.ws).poll_ready(cx)).map_err(other)?;
+        ready!(this.send_frames(cx))?;
         this.outgoing.extend_from_slice(buf);
-        while let Some(len) = frame_len(&this.outgoing, this.max_frame)?
-            && len <= this.outgoing.len()
-        {
-            let frame: Vec<u8> = this.outgoing.drain(..len).collect();
-            Pin::new(&mut this.ws)
-                .start_send(Message::Binary(frame.into()))
-                .map_err(other)?;
+        if let Poll::Ready(Err(e)) = this.send_frames(cx) {
+            return Poll::Ready(Err(e));
         }
         Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().ws)
-            .poll_flush(cx)
-            .map_err(other)
+        let this = self.get_mut();
+        ready!(this.send_frames(cx))?;
+        Pin::new(&mut this.ws).poll_flush(cx).map_err(other)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().ws)
             .poll_close(cx)
             .map_err(other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin;
+
+    #[test]
+    fn origins_take_the_form_browsers_send() {
+        for (given, expected) in [
+            ("http://page.test", "http://page.test"),
+            ("HTTP://Page.Test/", "http://page.test"),
+            ("https://node.ts.net:443", "https://node.ts.net"),
+            ("http://127.0.0.1:8787/", "http://127.0.0.1:8787"),
+            ("http://[::1]:8787", "http://[::1]:8787"),
+            ("http://[::1]", "http://[::1]"),
+            ("null", "null"),
+        ] {
+            assert_eq!(origin(given).as_deref(), Ok(expected), "{given}");
+        }
+        for bad in [
+            "page.test",
+            "http://",
+            "http://page.test/app",
+            "http://page.test:port",
+            "http://user@page.test",
+        ] {
+            assert!(origin(bad).is_err(), "{bad}");
+        }
     }
 }

@@ -389,20 +389,43 @@ impl Endpoint {
                 Connection::handshake(stream, hello).await
             }
             Endpoint::Ssh(destination) => {
+                // The child outlives this handle: it ends when the pipes
+                // close, and tokio reaps it. Its stderr would otherwise
+                // print into an attached terminal in raw mode; it is read
+                // into the error when the handshake fails and dropped
+                // afterwards.
                 let mut child = tokio::process::Command::new("ssh")
                     .arg(destination)
                     .args(["clankermux", "--stdio"])
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
-                    .kill_on_drop(true)
+                    .stderr(std::process::Stdio::piped())
                     .spawn()?;
                 let stdin = child.stdin.take().expect("piped");
                 let stdout = child.stdout.take().expect("piped");
-                // The child outlives this handle; a closed stdin ends it.
-                tokio::spawn(async move {
-                    let _ = child.wait().await;
+                let mut stderr = child.stderr.take().expect("piped");
+                let drain = tokio::spawn(async move {
+                    let mut text = String::new();
+                    let _ = tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut text).await;
+                    text
                 });
-                Connection::handshake(tokio::io::join(stdout, stdin), hello).await
+                match Connection::handshake(tokio::io::join(stdout, stdin), hello).await {
+                    Ok(connection) => Ok(connection),
+                    Err(error) => {
+                        drop(child);
+                        let said = tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                            .unwrap_or_default();
+                        match said.trim() {
+                            "" => Err(error),
+                            said => {
+                                Err(Error::Io(io::Error::other(format!("{error}; ssh: {said}"))))
+                            }
+                        }
+                    }
+                }
             }
         }
     }

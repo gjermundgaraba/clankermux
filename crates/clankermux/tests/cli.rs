@@ -315,7 +315,8 @@ async fn ssh_relays_through_stdio() {
     std::fs::write(
         bin.join("ssh"),
         format!(
-            "#!/bin/sh\ntest \"$1\" = remote-host || exit 9\nexec {} --socket {} --stdio\n",
+            "#!/bin/sh\ntest \"$1 $2 $3\" = 'remote-host clankermux --stdio' || exit 9\n\
+             exec {} --socket {} --stdio\n",
             env!("CARGO_BIN_EXE_clankermux"),
             server.socket.display()
         ),
@@ -333,4 +334,46 @@ async fn ssh_relays_through_stdio() {
     );
     let listed = run(&["--ssh", "remote-host", "list"], &[("PATH", path)]).await;
     assert!(listed.contains("over-ssh"), "{listed}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_relay_ends_when_the_server_side_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("sock");
+    // A stand-in server that accepts one connection and drops it.
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
+        .args(["--socket", socket.to_str().unwrap(), "--stdio"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    drop(stream);
+    // stdin stays open: the relay must not wait for its EOF.
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("the relay exits")
+        .unwrap();
+    assert!(status.success(), "{status}");
+}
+
+#[tokio::test]
+async fn websocket_flags_need_the_websocket() {
+    for args in [
+        ["serve", "--origin", "http://page.test"],
+        ["serve", "--tls-cert", "c"],
+        ["serve", "--tls-key", "k"],
+    ] {
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
+            .args(args)
+            .output()
+            .await
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains("--ws"),
+            "{stderr}"
+        );
+    }
 }

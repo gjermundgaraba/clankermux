@@ -42,7 +42,7 @@ export class FrameError extends Error {
   readonly kind: FrameErrorKind;
 
   // Erasable syntax only: node runs this package's sources with type
-  // stripping (the dev bridge and the headless driver).
+  // stripping (the headless driver).
   constructor(kind: FrameErrorKind, message: string) {
     super(message);
     this.kind = kind;

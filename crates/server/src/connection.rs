@@ -2,6 +2,7 @@
 //! table.
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -82,9 +83,12 @@ impl Writer {
     }
 }
 
+/// Serves one connection from `accepted` on: `HELLO` is due within
+/// `hello_timeout` of that instant.
 pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
     stream: S,
     registry: Arc<Registry>,
+    accepted: tokio::time::Instant,
 ) {
     let (mut reader, mut socket) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -141,8 +145,8 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
         channels: HashMap::new(),
     };
     let mut buf = vec![0u8; 64 * 1024];
-    let hello_deadline = tokio::time::Instant::now()
-        + Duration::from_millis(state.registry.config.limits.hello_timeout);
+    let hello_deadline =
+        accepted + Duration::from_millis(state.registry.config.limits.hello_timeout);
     let mut flush = true;
     loop {
         let read = async {
@@ -164,7 +168,13 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
             }
         };
         match n {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            // A carrier found the bytes malformed (`ws::WsStream`).
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                state.error(0, ErrorCode::ProtocolError, e.to_string());
+                break;
+            }
+            Err(_) => break,
             Ok(n) => state.decoder.push(&buf[..n]),
         }
         if !state.drain().await {

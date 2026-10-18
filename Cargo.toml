@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 ghostty-vt-sys = { path = "crates/ghostty-vt-sys" }
 ghostty-vt = { path = "crates/ghostty-vt" }
+httparse = "1"
 client = { path = "crates/client" }
 proto = { path = "crates/proto" }
 server = { path = "crates/server" }

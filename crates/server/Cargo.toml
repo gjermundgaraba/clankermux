@@ -9,6 +9,7 @@ publish.workspace = true
 base64 = { workspace = true }
 futures-util = { workspace = true }
 ghostty-vt = { workspace = true }
+httparse = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
 proto = { workspace = true }

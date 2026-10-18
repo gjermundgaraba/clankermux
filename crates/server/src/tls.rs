@@ -41,7 +41,7 @@ impl Source {
 
 /// A server configuration from PEM holding the private key and the
 /// certificate chain, in any order.
-pub fn config(pem: &[u8]) -> io::Result<Arc<ServerConfig>> {
+fn config(pem: &[u8]) -> io::Result<Arc<ServerConfig>> {
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<_, _>>()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("certificate: {e}")))?;

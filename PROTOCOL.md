@@ -514,8 +514,12 @@ Frames are carried on any ordered reliable byte stream.
 | WebSocket   | TLS only; one frame per binary message, same header; bound to the tailnet address or loopback, default port 7438; the server refuses a connection whose `Origin` header is not in the configured allowlist, and every connection while the allowlist is empty |
 
 A WebSocket upgrade is accepted on any request path; a refused `Origin`
-gets HTTP 403. A binary message that is not exactly one frame, or a text
-message, is a protocol error that ends the connection.
+gets HTTP 403. The TLS handshake and the upgrade count against
+`limits.hello_timeout`. A binary message that is not exactly one frame, or
+a text message, is a protocol error: `ERROR protocol_error` on channel 0,
+then the close, as on any carrier. Configured origins are compared in the
+form browsers send them (lowercase scheme and host, no default port, no
+trailing slash).
 
 Over TCP and WebSocket, trust is the tailnet policy alone: any process on
 any node the policy admits, under any user on that node, can do everything

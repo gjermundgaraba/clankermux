@@ -1,6 +1,7 @@
 // Development only: serves dist/ over HTTP on loopback. The page then
-// reaches a server through `?ws=wss://<host>:<port>/`; the server must
-// list this origin in its allowlist (`--origin http://127.0.0.1:<port>`).
+// reaches a server through `?ws=wss://<node>:<port>/` (by default the
+// server's port 7438 on the page's own host); the server must list this
+// origin in its allowlist (`--origin http://127.0.0.1:<port>`).
 import { createReadStream, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { extname, join, normalize } from "node:path";

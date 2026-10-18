@@ -126,7 +126,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   // A graceful stop parks into the state directory; wait before removing it.
-  if (server) await new Promise((resolve) => (server.once("exit", resolve), server.kill()));
+  if (server && server.exitCode === null) await new Promise((resolve) => (server.once("exit", resolve), server.kill()));
   if (dir) rmSync(dir, { recursive: true, force: true });
 });
 

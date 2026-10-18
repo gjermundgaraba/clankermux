@@ -1,11 +1,12 @@
 //! The Tailscale local API: the node's tailnet address and its certificate.
 //!
 //! Two requests do not justify an HTTP client: this is a minimal HTTP/1.1
-//! GET with `Connection: close`, reading the response to its end.
+//! GET with `Connection: close`, reading the response to its end and
+//! parsing it with `httparse`.
 
 use std::io;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -14,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Where tailscaled listens for the local API.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Endpoint {
+enum Endpoint {
     /// tailscaled's Unix socket.
     Unix(PathBuf),
     /// The macOS app: loopback TCP with a token shared through a file.
@@ -23,15 +24,15 @@ pub enum Endpoint {
 
 #[derive(Debug, Clone)]
 pub struct LocalApi {
-    pub endpoint: Endpoint,
+    endpoint: Endpoint,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct Response {
-    pub status: u16,
+struct Response {
+    status: u16,
     /// `Retry-After` in seconds, when present.
-    pub retry_after: Option<Duration>,
-    pub body: Vec<u8>,
+    retry_after: Option<Duration>,
+    body: Vec<u8>,
 }
 
 /// The parts of `/localapi/v0/status` the server uses.
@@ -60,24 +61,32 @@ pub enum Cert {
 
 const SOCKET: &str = "/var/run/tailscaled.socket";
 const MACSYS: &str = "/Library/Tailscale";
+/// The App Store app's group container, `<team id>.io.tailscale.ipn.macos`.
+const MACOS_CONTAINER: &str = "io.tailscale.ipn.macos";
+/// The status request is answered from memory.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+/// A certificate request may wait on an ACME issuance.
+const CERT_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl LocalApi {
-    /// Finds tailscaled: its Unix socket, then the macOS system extension
-    /// (`/Library/Tailscale/ipnport` names the port, `sameuserproof-<port>`
-    /// holds the token), then the App Store app (`sameuserproof-<port>-<token>`
-    /// in its group container).
+    /// Finds tailscaled: its Unix socket, then the App Store app
+    /// (`sameuserproof-<port>-<token>` in its group container), then the
+    /// macOS system extension (`/Library/Tailscale/ipnport` names the
+    /// port, `sameuserproof-<port>` holds the token).
     pub fn discover() -> io::Result<Self> {
         let endpoint = Self::unix_socket()
-            .or_else(Self::macsys)
             .or_else(Self::group_container)
-            .ok_or_else(|| {
-                io::Error::new(
+            .map(Ok)
+            .or_else(|| Self::macsys().transpose())
+            .unwrap_or_else(|| {
+                Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "no Tailscale local API: looked for {SOCKET}, {MACSYS}/ipnport and \
-                         ~/Library/Group Containers/*.io.tailscale.ipn.macsys/sameuserproof-*"
+                        "no Tailscale local API: looked for {SOCKET}, \
+                         ~/Library/Group Containers/*.{MACOS_CONTAINER}/sameuserproof-* \
+                         and {MACSYS}/ipnport"
                     ),
-                )
+                ))
             })?;
         Ok(Self { endpoint })
     }
@@ -87,18 +96,24 @@ impl LocalApi {
         path.exists().then_some(Endpoint::Unix(path))
     }
 
-    fn macsys() -> Option<Endpoint> {
-        let dir = PathBuf::from(MACSYS);
-        let port: u16 = std::fs::read_link(dir.join("ipnport"))
-            .ok()?
-            .to_str()?
-            .parse()
-            .ok()?;
-        let token = std::fs::read_to_string(dir.join(format!("sameuserproof-{port}"))).ok()?;
-        Some(Endpoint::Tcp {
+    /// None without `ipnport`; an error when the proof beside it cannot be
+    /// read (it is readable by the `admin` group).
+    fn macsys() -> io::Result<Option<Endpoint>> {
+        let dir = Path::new(MACSYS);
+        let Ok(port) = std::fs::read_link(dir.join("ipnport")) else {
+            return Ok(None);
+        };
+        let port: u16 = port
+            .to_str()
+            .and_then(|p| p.parse().ok())
+            .ok_or_else(|| invalid(&format!("{MACSYS}/ipnport is not a port")))?;
+        let proof = dir.join(format!("sameuserproof-{port}"));
+        let token = std::fs::read_to_string(&proof)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", proof.display())))?;
+        Ok(Some(Endpoint::Tcp {
             port,
             token: token.trim().to_string(),
-        })
+        }))
     }
 
     fn group_container() -> Option<Endpoint> {
@@ -108,11 +123,14 @@ impl LocalApi {
             if !container
                 .file_name()
                 .to_string_lossy()
-                .ends_with("io.tailscale.ipn.macsys")
+                .ends_with(MACOS_CONTAINER)
             {
                 continue;
             }
-            for entry in std::fs::read_dir(container.path()).ok()?.flatten() {
+            let Ok(entries) = std::fs::read_dir(container.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 let Some(rest) = name.strip_prefix("sameuserproof-") else {
@@ -131,22 +149,34 @@ impl LocalApi {
         None
     }
 
-    pub async fn get(&self, path: &str) -> io::Result<Response> {
-        match &self.endpoint {
-            Endpoint::Unix(socket) => {
-                let stream = tokio::net::UnixStream::connect(socket).await?;
-                get(stream, path, "local-tailscaled.sock", None).await
+    async fn get(&self, path: &str, timeout: Duration) -> io::Result<Response> {
+        let request = async {
+            match &self.endpoint {
+                Endpoint::Unix(socket) => {
+                    let stream = tokio::net::UnixStream::connect(socket).await?;
+                    get(stream, path, "local-tailscaled.sock", None).await
+                }
+                Endpoint::Tcp { port, token } => {
+                    let stream = tokio::net::TcpStream::connect(("127.0.0.1", *port)).await?;
+                    let host = format!("127.0.0.1:{port}");
+                    get(stream, path, &host, Some(token)).await
+                }
             }
-            Endpoint::Tcp { port, token } => {
-                let stream = tokio::net::TcpStream::connect(("127.0.0.1", *port)).await?;
-                let host = format!("127.0.0.1:{port}");
-                get(stream, path, &host, Some(token)).await
-            }
-        }
+        };
+        tokio::time::timeout(timeout, request)
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("local API: no answer to {path} in {}s", timeout.as_secs()),
+                ))
+            })
     }
 
     pub async fn status(&self) -> io::Result<Status> {
-        let response = self.get("/localapi/v0/status?peers=false").await?;
+        let response = self
+            .get("/localapi/v0/status?peers=false", STATUS_TIMEOUT)
+            .await?;
         if response.status != 200 {
             return Err(io::Error::other(format!(
                 "status: HTTP {}: {}",
@@ -162,9 +192,10 @@ impl LocalApi {
     pub async fn cert(&self, domain: &str, min_validity: Duration) -> io::Result<Cert> {
         let hours = min_validity.as_secs().div_ceil(3600);
         let response = self
-            .get(&format!(
-                "/localapi/v0/cert/{domain}?type=pair&min_validity={hours}h"
-            ))
+            .get(
+                &format!("/localapi/v0/cert/{domain}?type=pair&min_validity={hours}h"),
+                CERT_TIMEOUT,
+            )
             .await?;
         match response.status {
             200 => Ok(Cert::Pem(response.body)),
@@ -180,7 +211,7 @@ impl LocalApi {
 }
 
 /// One GET over `stream`, response read to the end of the stream.
-pub async fn get<S: AsyncRead + AsyncWrite + Unpin>(
+async fn get<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     path: &str,
     host: &str,
@@ -202,46 +233,40 @@ fn invalid(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("local API: {what}"))
 }
 
-/// Parses a response: the status line, `Retry-After`, and the body, which
-/// is de-chunked when `Transfer-Encoding: chunked`.
-pub fn parse(raw: &[u8]) -> io::Result<Response> {
-    let head_end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| invalid("no header end"))?;
-    let head = std::str::from_utf8(&raw[..head_end]).map_err(|_| invalid("header not UTF-8"))?;
-    let mut lines = head.split("\r\n");
-    let status: u16 = lines
-        .next()
-        .and_then(|l| l.split(' ').nth(1))
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| invalid("bad status line"))?;
+/// Parses a complete response: the status, `Retry-After`, and the body,
+/// de-chunked when the transfer encoding ends with `chunked`.
+fn parse(raw: &[u8]) -> io::Result<Response> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut response = httparse::Response::new(&mut headers);
+    let head_len = match response.parse(raw) {
+        Ok(httparse::Status::Complete(n)) => n,
+        Ok(httparse::Status::Partial) => return Err(invalid("truncated response")),
+        Err(e) => return Err(invalid(&e.to_string())),
+    };
+    let status = response.code.ok_or_else(|| invalid("no status"))?;
     let mut retry_after = None;
     let mut chunked = false;
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("retry-after") {
-            retry_after = value.parse().ok().map(Duration::from_secs);
-        } else if name.eq_ignore_ascii_case("transfer-encoding") {
-            chunked = value.eq_ignore_ascii_case("chunked");
+    for header in response.headers.iter() {
+        let value = String::from_utf8_lossy(header.value);
+        if header.name.eq_ignore_ascii_case("retry-after") {
+            retry_after = value.trim().parse().ok().map(Duration::from_secs);
+        } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = value
+                .rsplit(',')
+                .next()
+                .is_some_and(|last| last.trim().eq_ignore_ascii_case("chunked"));
         }
     }
-    let mut body = &raw[head_end + 4..];
+    let mut body = &raw[head_len..];
     let body = if chunked {
         let mut out = Vec::new();
         loop {
-            let line_end = body
-                .windows(2)
-                .position(|w| w == b"\r\n")
-                .ok_or_else(|| invalid("bad chunk"))?;
-            let size = std::str::from_utf8(&body[..line_end])
-                .ok()
-                .and_then(|s| usize::from_str_radix(s.split(';').next().unwrap_or(""), 16).ok())
-                .ok_or_else(|| invalid("bad chunk size"))?;
-            body = &body[line_end + 2..];
+            let (skip, size) = match httparse::parse_chunk_size(body) {
+                Ok(httparse::Status::Complete(parsed)) => parsed,
+                _ => return Err(invalid("bad chunk size")),
+            };
+            let size = usize::try_from(size).map_err(|_| invalid("bad chunk size"))?;
+            body = &body[skip..];
             if size == 0 {
                 break;
             }
@@ -278,20 +303,26 @@ mod tests {
         (port, task)
     }
 
+    fn api(port: u16, token: &str) -> LocalApi {
+        LocalApi {
+            endpoint: Endpoint::Tcp {
+                port,
+                token: token.into(),
+            },
+        }
+    }
+
     #[tokio::test]
     async fn a_request_carries_the_token_and_reads_a_chunked_body() {
         let (port, task) = serve_once(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n\
-             3\r\nabc\r\n2;ext\r\nde\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: gzip, chunked\r\n\r\n\
+             3\r\nabc\r\n2 ;ext\r\nde\r\n0\r\n\r\n",
         )
         .await;
-        let api = LocalApi {
-            endpoint: Endpoint::Tcp {
-                port,
-                token: "tok".into(),
-            },
-        };
-        let response = api.get("/localapi/v0/x").await.unwrap();
+        let response = api(port, "tok")
+            .get("/localapi/v0/x", STATUS_TIMEOUT)
+            .await
+            .unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"abcde");
         let request = task.await.unwrap();
@@ -310,13 +341,7 @@ mod tests {
     async fn a_rate_limit_carries_its_delay() {
         let (port, _) =
             serve_once("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\n\r\nslow down").await;
-        let api = LocalApi {
-            endpoint: Endpoint::Tcp {
-                port,
-                token: String::new(),
-            },
-        };
-        match api
+        match api(port, "")
             .cert("x.ts.net", Duration::from_secs(3600))
             .await
             .unwrap()
@@ -324,6 +349,19 @@ mod tests {
             Cert::RetryAfter(delay) => assert_eq!(delay, Duration::from_secs(7)),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_silent_daemon_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hold = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let error = api(port, "")
+            .get("/localapi/v0/x", Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        hold.abort();
     }
 
     #[test]
