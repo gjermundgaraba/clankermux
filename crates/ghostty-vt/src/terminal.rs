@@ -229,11 +229,8 @@ impl<H: Handler> Drop for Owner<H> {
 
 // SAFETY: libghostty-vt keeps no thread-local state, so a terminal may be
 // used from any thread as long as calls are serialized, which `&mut`
-// access guarantees. The handler is `Send` by its trait bound. The owner
-// is only ever touched through a wrapper's calls.
+// access guarantees. The handler is `Send` by its trait bound.
 unsafe impl<H: Handler> Send for Terminal<H> {}
-unsafe impl<H: Handler> Send for Owner<H> {}
-unsafe impl<H: Handler> Sync for Owner<H> {}
 
 impl<H: Handler> std::ops::Deref for Terminal<H> {
     type Target = Term;

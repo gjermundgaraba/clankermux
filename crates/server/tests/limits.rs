@@ -394,9 +394,6 @@ async fn continuation_bounds_a_snapshot() {
     // No snapshot can be taken for the whole 5 s retry window, so the
     // bootstrap fails and the attachment ends.
     c.open(1, json!({"session": session.id})).await;
-    // The error comes after the 5 s window; the harness waits 5 s per
-    // frame, so start that wait a little later.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     assert_eq!(c.expect_error(1).await, ErrorCode::LimitExceeded);
     c.wait_attachments(&session.id, 0).await;
     // Closing the sequence and writing at ground again makes the session

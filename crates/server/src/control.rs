@@ -54,10 +54,35 @@ fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
         .map_err(|e| (ErrorCode::InvalidRequest, format!("bad params: {e}")))
 }
 
-/// `write`, which is answered once the PTY took the bytes; meanwhile the
-/// connection reads on. Replies to one session come in its queue's
-/// order; a failure is answered at once.
-pub fn write(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
+/// Answers `request` on `writer`: `write` from a task once the PTY took
+/// the bytes, `list` and `subscribe` from the registry under its lock,
+/// the rest at once.
+pub fn dispatch(
+    registry: &Arc<Registry>,
+    writer: &Writer,
+    subscribed: &mut bool,
+    request: Request,
+) {
+    let id = request.id;
+    match request.method.as_str() {
+        "write" => write(registry, writer, id, request.params),
+        "list" => match params::<proto::ListParams>(request.params) {
+            Ok(p) => registry.reply_page(writer, id, p.after.as_deref(), false),
+            Err(fail) => reply(writer, id, Err(fail)),
+        },
+        "subscribe" => {
+            let first = !std::mem::replace(subscribed, true);
+            registry.reply_page(writer, id, None, first);
+        }
+        _ => reply(writer, id, handle(registry, request)),
+    }
+}
+
+/// `write`: answered once the PTY took the bytes, meanwhile the
+/// connection reads on. The reply task is chained on the session's
+/// previous one under the session lock, as the bytes are queued, so the
+/// replies come in queue order; a failure is answered at once.
+fn write(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
     let started = (|| {
         let p: proto::WriteParams = params(p)?;
         let data = base64::engine::general_purpose::STANDARD
@@ -69,39 +94,36 @@ pub fn write(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
                 )
             })?;
         let session = registry.get(&p.session)?;
-        let s = session.lock().unwrap();
+        let mut s = session.lock().unwrap();
         let wait = s
             .running()?
             .input
             .push(data)
             .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?;
-        Ok((wait, s.write_order.clone()))
+        let previous = s.write_chain.take();
+        let writer = writer.clone();
+        s.write_chain = Some(tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let outcome = wait
+                .await
+                .map(|()| json!({}))
+                .map_err(|_| internal("the PTY refused the bytes"));
+            reply(&writer, id, outcome);
+        }));
+        Ok(())
     })();
-    match started {
-        Err(fail) => reply(writer, id, Err(fail)),
-        Ok((wait, order)) => {
-            let writer = writer.clone();
-            tokio::spawn(async move {
-                let _in_turn = order.lock().await;
-                let outcome = wait
-                    .await
-                    .map(|()| json!({}))
-                    .map_err(|_| internal("the PTY refused the bytes"));
-                reply(&writer, id, outcome);
-            });
-        }
+    if let Err(fail) = started {
+        reply(writer, id, Err(fail));
     }
 }
 
-/// Handles one request but `write`.
-pub fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
+/// Handles one request but `write`, `list` and `subscribe`.
+fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
     let p = request.params;
     match request.method.as_str() {
         "create" => Ok(json!(registry.create(params(p)?)?)),
-        "list" => {
-            let p: proto::ListParams = params(p)?;
-            Ok(json!(registry.page(p.after.as_deref())))
-        }
         "inspect" => {
             let p: proto::SessionParams = params(p)?;
             let session = registry.get(&p.session)?;
@@ -197,8 +219,6 @@ pub fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail>
                 status: s.status(),
             }))
         }
-        // A first `subscribe` is answered by the registry itself.
-        "subscribe" => Ok(json!(registry.page(None))),
         other => Err((ErrorCode::InvalidRequest, format!("unknown method {other}"))),
     }
 }

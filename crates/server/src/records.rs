@@ -256,8 +256,7 @@ mod tests {
             record("b", "error", "t2"),
             record("a", "working", "t3"),
         ]);
-        let mut ids: Vec<_> = loaded.all().into_iter().map(|x| x.id).collect();
-        ids.sort();
+        let ids: Vec<_> = loaded.all().into_iter().map(|x| x.id).collect();
         assert_eq!(ids, vec!["b".to_string(), "c".to_string()]);
     }
 }

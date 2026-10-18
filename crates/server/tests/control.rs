@@ -487,6 +487,38 @@ async fn malformed_requests_pipelining_and_the_hello_deadline() {
 }
 
 #[tokio::test]
+async fn write_replies_come_in_request_order() {
+    let server = start(fast_limits());
+    let mut c = client(&server).await;
+    let session = c
+        .create(json!({"argv": ["/bin/sh", "-c", "echo up; exec cat"]}))
+        .await;
+    wait_text(&mut c, &session.id, "up").await;
+    for _ in 0..20 {
+        let mut pipelined = Vec::new();
+        for id in 1..=4 {
+            let data = base64::engine::general_purpose::STANDARD.encode([b'0' + id as u8]);
+            let request = json!({"id": id, "method": "write",
+                "params": {"session": session.id, "data": data}});
+            pipelined.extend(encode_frame(
+                FrameType::Request,
+                0,
+                &serde_json::to_vec(&request).unwrap(),
+            ));
+        }
+        c.stream.write_all(&pipelined).await.unwrap();
+        let mut ids = Vec::new();
+        while ids.len() < 4 {
+            let (header, body) = c.recv_json().await;
+            if header.frame_type == FrameType::Reply {
+                ids.push(body["id"].as_i64().unwrap());
+            }
+        }
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+    }
+}
+
+#[tokio::test]
 async fn subscribed_connections_close_on_errors_and_get_each_event_once() {
     let server = start(fast_limits());
     let mut c = client(&server).await;

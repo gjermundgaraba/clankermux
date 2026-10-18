@@ -118,7 +118,8 @@ pub fn load(sessions: &Path) -> Vec<Loaded> {
 }
 
 /// The newest readable generation of one session, `None` when there is
-/// none left.
+/// none left. A file naming another session is an error: its id would
+/// be removed under a path of its choosing.
 fn load_session(session_dir: &Path) -> io::Result<Option<Loaded>> {
     let mut generations: Vec<(u64, PathBuf)> = Vec::new();
     for entry in fs::read_dir(session_dir)?.flatten() {
@@ -149,6 +150,14 @@ fn load_session(session_dir: &Path) -> io::Result<Option<Loaded>> {
     }
     for (_, older) in generations {
         let _ = fs::remove_dir_all(older);
+    }
+    if let Some(loaded) = &chosen
+        && Some(loaded.file.session.id.as_str()) != session_dir.file_name().and_then(|n| n.to_str())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("park names session {}", loaded.file.session.id),
+        ));
     }
     Ok(chosen)
 }

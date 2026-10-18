@@ -161,17 +161,6 @@ impl Registry {
             snapshot_path,
         } = loaded;
         let info = file.session;
-        if Some(info.id.as_str())
-            != snapshot_path
-                .parent()
-                .and_then(|g| g.parent()?.file_name()?.to_str())
-        {
-            tracing::warn!(
-                session = info.id,
-                "park file names another session; skipped"
-            );
-            return;
-        }
         let limits = &self.config.limits;
         let session = Session {
             id: info.id.clone(),
@@ -191,7 +180,7 @@ impl Registry {
             removed: false,
             announced: Default::default(),
             park_lock: Default::default(),
-            write_order: Default::default(),
+            write_chain: None,
             last_generation: 0,
             body: Body::Parked(Parked {
                 engine: file.engine,
@@ -315,8 +304,16 @@ impl Registry {
             .ok_or_else(|| (ErrorCode::NoSuchSession, format!("no session {id}")))
     }
 
-    pub fn page(&self, after: Option<&str>) -> Page {
-        self.page_of(&self.state.lock().unwrap(), after)
+    /// Answers a `list` or `subscribe` with a page under the state lock,
+    /// so no event raised after the page is queued before it; a
+    /// `subscribe` then registers the connection for events.
+    pub fn reply_page(&self, writer: &Writer, id: i64, after: Option<&str>, subscribe: bool) {
+        let mut state = self.state.lock().unwrap();
+        let page = self.page_of(&state, after);
+        crate::connection::reply(writer, id, Ok(serde_json::json!(page)));
+        if subscribe {
+            state.subscribers.push(writer.clone());
+        }
     }
 
     /// Up to `limits.page` sessions after `after`, fewer when the page
@@ -355,13 +352,6 @@ impl Registry {
     /// Registers a subscriber, answering request `id` with the first page
     /// before any event the subscriber gets: both under the lock, so an
     /// event produced after the page cannot precede it.
-    pub fn subscribe(&self, writer: Writer, id: i64) {
-        let mut state = self.state.lock().unwrap();
-        let page = self.page_of(&state, None);
-        crate::connection::reply(&writer, id, Ok(serde_json::json!(page)));
-        state.subscribers.push(writer);
-    }
-
     pub fn emit(&self, event: &Event) {
         let bytes = frame_json(FrameType::Event, 0, event);
         self.state
@@ -484,7 +474,7 @@ impl Registry {
             removed: false,
             announced: Default::default(),
             park_lock: Default::default(),
-            write_order: Default::default(),
+            write_chain: None,
             last_generation: 0,
             body: Body::Live(Box::new(Live {
                 pid: Some(pid),

@@ -31,8 +31,8 @@ export interface Cell {
 }
 
 /** `GhosttyRenderStateCursorVisualStyle` by name. */
-export type CursorStyle = "bar" | "block" | "underline" | "block_hollow";
-const CURSOR_STYLES: CursorStyle[] = ["bar", "block", "underline", "block_hollow"];
+const CURSOR_STYLES = ["bar", "block", "underline", "block_hollow"] as const;
+export type CursorStyle = (typeof CURSOR_STYLES)[number];
 
 export interface FrameRow {
   y: number;

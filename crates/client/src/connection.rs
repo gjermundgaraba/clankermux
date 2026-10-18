@@ -21,7 +21,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
-    /// The server broke the protocol or the connection ended unexpectedly.
+    /// The server broke the protocol.
     Protocol(String),
     /// A stream frame did not continue from the cursor: the attachment
     /// lost its place and a fresh `OPEN` recovers it.
@@ -90,9 +90,9 @@ enum Ended {
     /// The server sent an `ERROR` without id.
     Server(ErrorMessage),
     /// The server broke the protocol.
-    Lost(String),
+    Protocol(String),
     /// The stream broke.
-    Io(String),
+    Io(io::ErrorKind, String),
     /// The server closed the connection, as on a stop.
     Eof,
 }
@@ -101,8 +101,8 @@ impl From<&Ended> for Error {
     fn from(ended: &Ended) -> Self {
         match ended {
             Ended::Server(error) => Error::Server(error.clone()),
-            Ended::Lost(reason) => Error::Protocol(reason.clone()),
-            Ended::Io(reason) => Error::Io(io::Error::other(reason.clone())),
+            Ended::Protocol(reason) => Error::Protocol(reason.clone()),
+            Ended::Io(kind, reason) => Error::Io(io::Error::new(*kind, reason.clone())),
             Ended::Eof => Error::Closed,
         }
     }
@@ -317,12 +317,12 @@ async fn read_loop<R: AsyncRead + Unpin>(
                 continue;
             }
             Ok(None) => {}
-            Err(err) => break Ended::Lost(err.to_string()),
+            Err(err) => break Ended::Protocol(err.to_string()),
         }
         match reader.read(&mut buf).await {
             Ok(0) => break Ended::Eof,
             Ok(n) => decoder.push(&buf[..n]),
-            Err(err) => break Ended::Io(err.to_string()),
+            Err(err) => break Ended::Io(err.kind(), err.to_string()),
         }
     };
     let mut routes = routes.lock().unwrap();
@@ -335,7 +335,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
 
 /// Delivers one frame; an error ends the connection.
 fn route(routes: &Mutex<Routes>, frame: Frame) -> Result<(), Ended> {
-    let lost = |e: Error| Ended::Lost(e.to_string());
+    let lost = |e: Error| Ended::Protocol(e.to_string());
     let mut routes = routes.lock().unwrap();
     let channel = frame.header.channel;
     if channel != 0 {
@@ -374,7 +374,7 @@ fn route(routes: &Mutex<Routes>, frame: Frame) -> Result<(), Ended> {
                 routes.events = None;
             }
         }
-        other => return Err(Ended::Lost(format!("{other:?} on channel 0"))),
+        other => return Err(Ended::Protocol(format!("{other:?} on channel 0"))),
     }
     Ok(())
 }

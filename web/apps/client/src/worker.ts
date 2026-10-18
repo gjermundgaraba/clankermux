@@ -8,7 +8,6 @@ import {
   type ErrorMessage,
   type Event,
   FrameType,
-  HEADER_LEN,
   type Page,
   type Profile,
   type Session,
@@ -74,8 +73,9 @@ class Client {
   /** The session attached or being attached. */
   private session: string | undefined;
   private sessions = new Map<string, Session>();
-  /** Input in order: a paste goes as `write` requests, and keys typed
-   * meanwhile wait behind it. */
+  /** This attachment's input in order: a paste goes as `write` requests,
+   * and keys typed meanwhile wait behind it. A new attachment starts its
+   * own chain. */
   private writes: Promise<void> = Promise.resolve();
   private readonly clipboard = new Osc52Scanner();
   private paintTimer: ReturnType<typeof setTimeout> | undefined;
@@ -325,6 +325,7 @@ class Client {
 
   attach(session: string): void {
     this.detach();
+    this.writes = Promise.resolve();
     this.session = session;
     this.postSessions();
     this.open();
@@ -344,24 +345,28 @@ class Client {
   /** Input for the session, dropped unless attached on a live connection.
    * Keys go as INPUT; a paste goes as `write` requests, each answered
    * once the PTY took it, since INPUT frames are not acknowledged and a
-   * paste would overflow the input queue. Everything is sent in order, so
-   * nothing lands inside a paste. */
+   * paste would overflow the input queue. This tab's input is sent in
+   * order, so none of it lands inside a paste; a paste stops once the
+   * attachment is gone. */
   private input(bytes: Uint8Array, paste: boolean): void {
     const conn = this.conn;
     const attachment = this.attachment;
     const session = this.session;
     const channel = this.channel;
     if (bytes.length === 0 || !conn || !attachment || attachment.ended() || session === undefined) return;
-    // Each request's base64 fits the control body with room for the rest
-    // (the guard keeps the loop moving on an absurd limit).
-    const chunk = Math.max(3, Math.floor((conn.welcome.limits.control_body - 1024) / 4) * 3);
+    // Each request's base64 fits the control body with room for the rest,
+    // and its bytes fit the input queue (the guard keeps the loop moving
+    // on an absurd limit).
+    const { control_body, input_queue } = conn.welcome.limits;
+    const chunk = Math.max(3, Math.min(Math.floor((control_body - 1024) / 4) * 3, input_queue));
     this.writes = this.writes.then(async () => {
+      if (this.attachment !== attachment) return;
       try {
         if (!paste) {
           conn.send(FrameType.Input, channel, bytes);
           return;
         }
-        for (let at = 0; at < bytes.length; at += chunk) {
+        for (let at = 0; at < bytes.length && this.attachment === attachment; at += chunk) {
           await conn.call("write", { session, data: base64(bytes.subarray(at, at + chunk)) });
         }
       } catch (err) {

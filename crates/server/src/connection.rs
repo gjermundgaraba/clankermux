@@ -409,18 +409,7 @@ impl Connection {
                 }
             }
         };
-        let id = request.id;
-        if request.method == "write" {
-            control::write(&self.registry, &self.writer, id, request.params);
-            return true;
-        }
-        if request.method == "subscribe" && !self.subscribed {
-            self.subscribed = true;
-            self.registry.subscribe(self.writer.clone(), id);
-            return true;
-        }
-        let outcome = control::handle(&self.registry, request);
-        reply(&self.writer, id, outcome);
+        control::dispatch(&self.registry, &self.writer, &mut self.subscribed, request);
         true
     }
 

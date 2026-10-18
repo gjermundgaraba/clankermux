@@ -353,6 +353,34 @@ async fn websocket_flags_need_the_websocket() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn write_chunks_to_the_input_queue() {
+    let server = Server::start(Limits {
+        input_queue: 16,
+        ..Limits::default()
+    });
+    let conn = connect(&server).await;
+    let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
+    let text = "0123456789abcdefghijklmnopqrstuvwxyz\n";
+    run(
+        &[
+            "--socket",
+            server.socket.to_str().unwrap(),
+            "write",
+            &session.id,
+            text,
+        ],
+        &[],
+    )
+    .await;
+    wait_session(&conn, &session.id, |s| s.offset >= 2 * text.len() as u64).await;
+    let read: Read = conn
+        .call("read", json!({"session": session.id}))
+        .await
+        .unwrap();
+    assert!(read.text.contains(text), "{}", read.text);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn write_sends_one_request_even_for_empty_text() {
     let server = start().await;
     let conn = connect(&server).await;

@@ -337,17 +337,20 @@ impl Shell {
     }
 }
 
-type Connecting = Pin<Box<dyn Future<Output = Connection> + Send>>;
+type Connecting = Pin<Box<dyn Future<Output = Result<Connection, Error>> + Send>>;
 
-/// Retries with backoff until the server answers.
+/// Retries with backoff while the server is unreachable; a server that
+/// answers and refuses the handshake ends the attachment.
 fn reconnect(endpoint: Endpoint) -> Connecting {
     Box::pin(async move {
         let mut backoff = Duration::from_millis(250);
         loop {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(5));
-            if let Ok(conn) = connect(&endpoint).await {
-                return conn;
+            match connect(&endpoint).await {
+                Ok(conn) => return Ok(conn),
+                Err(err @ (Error::Server(_) | Error::Protocol(_))) => return Err(err),
+                Err(_) => {}
             }
         }
     })
@@ -373,6 +376,8 @@ enum LinkEvent {
     /// The connection ended, for this reason.
     Lost(Option<Error>),
     Connected(Box<Connection>),
+    /// The server answered a reconnect and refused the handshake.
+    Refused(Error),
 }
 
 impl Link {
@@ -382,7 +387,10 @@ impl Link {
                 Some(frame) => LinkEvent::Frame(frame),
                 None => LinkEvent::Lost(conn.ended()),
             },
-            Link::Down(connecting) => LinkEvent::Connected(Box::new(connecting.await)),
+            Link::Down(connecting) => match connecting.await {
+                Ok(conn) => LinkEvent::Connected(Box::new(conn)),
+                Err(err) => LinkEvent::Refused(err),
+            },
         }
     }
 }
@@ -414,12 +422,10 @@ pub async fn run(opts: Options) -> Result<ExitCode, Error> {
         armed: None,
         reopen: false,
     };
-    let mut link = match open(&mut shell, &conn) {
-        Ok(frames) => Link::Up {
-            conn: Box::new(conn),
-            frames,
-        },
-        Err(err) => return Err(err),
+    let frames = open(&mut shell, &conn)?;
+    let mut link = Link::Up {
+        conn: Box::new(conn),
+        frames,
     };
     let mut stdin = tokio::io::stdin();
     let mut buf = vec![0u8; 4096];
@@ -467,6 +473,7 @@ pub async fn run(opts: Options) -> Result<ExitCode, Error> {
                     link = Link::Down(reconnect(shell.opts.endpoint.clone()));
                     continue;
                 }
+                LinkEvent::Refused(err) => break Outcome::Failed(err.to_string()),
                 LinkEvent::Connected(conn) => {
                     // A `snapshot` answer repaints; `resume` continues.
                     link = match open(&mut shell, &conn) {

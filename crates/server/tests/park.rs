@@ -544,6 +544,51 @@ async fn loading_keeps_the_newest_complete_generation_only() {
 const OTHER: &str = "99999999-2222-3333-4444-555555555555";
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_park_naming_another_session_is_skipped() {
+    // A `remove` of the restored session would delete `sessions/<id>`
+    // for the id the file claims, so a file under the wrong directory is
+    // left alone and not restored.
+    let state = tempfile::tempdir().unwrap().keep();
+    let dir = sessions_dir(&state).join("mislabeled").join("1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = server::park::ParkFile {
+        protocol: server::park::PROTOCOL,
+        engine: ghostty_vt::ENGINE.into(),
+        parked_at: "2026-10-18T00:00:00Z".into(),
+        history_lines: 0,
+        session: Session {
+            id: OTHER.into(),
+            label: String::new(),
+            status: Status::Running,
+            argv: vec!["cat".into()],
+            cwd: "/".into(),
+            pid: None,
+            cols: 20,
+            rows: 5,
+            title: String::new(),
+            pwd: String::new(),
+            on_exit: OnExit::Keep,
+            created_at: "2026-10-18T00:00:00Z".into(),
+            exited_at: None,
+            exit: None,
+            offset: 0,
+            marker: 0,
+            attachments: 0,
+            program_status: None,
+        },
+    };
+    std::fs::write(dir.join("session.json"), serde_json::to_vec(&file).unwrap()).unwrap();
+    std::fs::write(dir.join("snapshot.ghostsnp"), b"GHOSTSNP").unwrap();
+    std::fs::write(dir.join("screen.txt"), "x\n").unwrap();
+
+    let server = start_with(fast_limits(), state.clone());
+    let mut c = client(&server).await;
+    let page: Page = serde_json::from_value(c.ok("list", json!({})).await).unwrap();
+    assert!(page.sessions.is_empty());
+    assert!(dir.join("session.json").is_file(), "the directory is kept");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_server_leaves_the_directory_to_its_successor() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");

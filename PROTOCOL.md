@@ -498,7 +498,8 @@ pending); a stop deletes the files of sessions being removed, then sends
 SIGHUP to each running session's process group. While the server stops,
 `create`, `remove` and `OPEN` fail with `internal`.
 The whole `sessions/<id>/` directory is deleted whenever the session is
-removed.
+removed. On start, a `session.json` whose `session.id` is not its
+directory's name is skipped with a warning.
 
 On start, each session directory becomes a session: `status` is `exited`
 if `session.json` says so, `restored` otherwise. `read` serves

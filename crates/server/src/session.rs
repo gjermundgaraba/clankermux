@@ -291,15 +291,16 @@ pub struct Session {
     pub records: Records,
     /// Events raised under the lock, emitted by whoever releases it.
     pub events: Vec<Event>,
-    /// Set by removal before the files go, so a park in flight deletes
-    /// what it wrote.
+    /// Being removed: at once, or after the grace while attachments
+    /// finish. A park in flight deletes what it wrote; a stop deletes the
+    /// files rather than parking.
     pub removed: bool,
     /// The title and pwd last announced by `session_changed`.
     pub announced: (String, String),
     /// Parks of this session run one at a time.
     pub park_lock: Arc<tokio::sync::Mutex<()>>,
-    /// `write` replies of this session come in queue order.
-    pub write_order: Arc<tokio::sync::Mutex<()>>,
+    /// The latest `write` reply task; the next replies after it.
+    pub write_chain: Option<tokio::task::JoinHandle<()>>,
     /// The last generation written, so the next is larger whatever the
     /// clock says.
     pub last_generation: u64,
@@ -430,10 +431,10 @@ impl Session {
         for event in status {
             let change = match event {
                 StatusEvent::Report(report) => self.records.apply(report, self.records_limit, &now),
-                StatusEvent::PromptStart => crate::records::Change {
-                    set: None,
-                    removed: self.records.drop_transient(),
-                },
+                StatusEvent::PromptStart => {
+                    self.drop_transient_records();
+                    continue;
+                }
             };
             if let Some(record) = change.set {
                 self.events.push(Event::ProgramStatusChanged {
