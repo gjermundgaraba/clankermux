@@ -28,8 +28,8 @@ pub struct Server {
     /// another was given.
     pub dir: tempfile::TempDir,
     handle: tokio::runtime::Handle,
-    stop: Option<oneshot::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// The runtime's stop signal and thread, until `shutdown`.
+    running: Option<(oneshot::Sender<()>, std::thread::JoinHandle<()>)>,
 }
 
 impl Server {
@@ -80,8 +80,7 @@ impl Server {
             registry,
             dir,
             handle,
-            stop: Some(stop),
-            thread: Some(thread),
+            running: Some((stop, thread)),
         }
     }
 
@@ -124,10 +123,8 @@ impl Server {
     /// Ends the server's runtime: its listeners and connections die at
     /// once, as when a server process is gone.
     pub fn shutdown(&mut self) {
-        if let Some(stop) = self.stop.take() {
+        if let Some((stop, thread)) = self.running.take() {
             let _ = stop.send(());
-        }
-        if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }

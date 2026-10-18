@@ -135,9 +135,7 @@ async fn label_and_text_are_bounded_everywhere() {
     // back raw, so "titled" appears twice once the title is set.
     let mut echoed = false;
     for _ in 0..1000 {
-        let read: Read =
-            serde_json::from_value(c.ok("read", json!({"session": session.id})).await).unwrap();
-        if read.text.matches("titled").count() == 2 {
+        if c.read(&session.id, 0).await.text.matches("titled").count() == 2 {
             echoed = true;
             break;
         }

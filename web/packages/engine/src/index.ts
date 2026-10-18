@@ -37,7 +37,7 @@ export class EngineError extends Error {
 
 /** A loaded ghostty-vt.wasm instance. */
 export class Engine {
-  readonly types: Record<string, TypeInfo>;
+  private readonly types: Record<string, TypeInfo>;
   /** The `GhosttyResult` members the wrapper branches on. */
   readonly result: { SUCCESS: number; OUT_OF_SPACE: number; NO_VALUE: number; INVALID_VALUE: number };
 
@@ -116,7 +116,7 @@ export class Engine {
   }
 
   /** Runs `f` with an opaque-handle slot; the handle is taken out before the slot is freed. */
-  withSlot<T>(f: (slot: number) => T): T {
+  private withSlot<T>(f: (slot: number) => T): T {
     const slot = this.call("ghostty_wasm_alloc_opaque");
     try {
       return f(slot);
@@ -148,7 +148,7 @@ export class Engine {
     return new TextDecoder().decode(mem.subarray(ptr, end));
   }
 
-  struct(name: string): Extract<TypeInfo, { kind: "struct" }> {
+  private struct(name: string): Extract<TypeInfo, { kind: "struct" }> {
     const info = this.types[name];
     if (!info || info.kind !== "struct") throw new Error(`unknown struct ${name}`);
     return info;
@@ -386,8 +386,9 @@ export class Terminal {
     });
   }
 
-  resize(cols: number, rows: number, cellWidth = 0, cellHeight = 0): void {
-    this.engine.check("ghostty_terminal_resize", this.handle, cols, rows, cellWidth, cellHeight);
+  /** No cell size in pixels: `RESIZED` carries none. */
+  resize(cols: number, rows: number): void {
+    this.engine.check("ghostty_terminal_resize", this.handle, cols, rows, 0, 0);
   }
 
   /** Sets a default colour (0xRRGGBB), as OSC 10, 11 and 12 report it. */

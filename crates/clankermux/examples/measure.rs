@@ -78,6 +78,12 @@ async fn create(conn: &Connection, script: &str) -> Session {
     .unwrap()
 }
 
+async fn kill(conn: &Connection, id: &str) {
+    conn.call::<_, serde_json::Value>("signal", json!({"session": id, "signal": "KILL"}))
+        .await
+        .unwrap();
+}
+
 async fn wait_text(conn: &Connection, id: &str, needle: &str) {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -175,23 +181,29 @@ async fn throughput(lab: &Lab, carrier: &str, bytes: u64) -> (f64, usize) {
         }
     }
     let elapsed = started.unwrap().elapsed();
-    conn.call::<_, serde_json::Value>("signal", json!({"session": session.id, "signal": "KILL"}))
-        .await
-        .unwrap();
+    kill(&conn, &session.id).await;
     (received as f64 / elapsed.as_secs_f64() / MIB as f64, gaps)
 }
 
+/// A command's trimmed stdout.
+fn stdout(program: &str, args: &[&str]) -> std::io::Result<String> {
+    std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
 fn ps(field: &str) -> String {
-    let out = std::process::Command::new("ps")
-        .args([
+    stdout(
+        "ps",
+        &[
             "-o",
             &format!("{field}="),
             "-p",
             &std::process::id().to_string(),
-        ])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+        ],
+    )
+    .unwrap()
 }
 
 fn rss_mib() -> f64 {
@@ -225,32 +237,20 @@ fn dir_size(path: &Path) -> u64 {
 
 /// macOS only; empty elsewhere.
 fn sysctl(name: &str) -> String {
-    std::process::Command::new("sysctl")
-        .args(["-n", name])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+    stdout("sysctl", &["-n", name]).unwrap_or_default()
 }
 
 #[tokio::main]
 async fn main() {
     let lab = lab().await;
-    let commit = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let commit = stdout("git", &["rev-parse", "--short", "HEAD"]).unwrap_or_default();
     println!("# Measurements\n");
     println!(
         "Commit `{commit}`, {} ({}, {} GiB), {}, `cargo run --release -p clankermux --example measure`.\n",
         sysctl("machdep.cpu.brand_string"),
         sysctl("hw.machine"),
         sysctl("hw.memsize").parse::<u64>().unwrap_or(0) / (1024 * MIB),
-        std::process::Command::new("date")
-            .arg("+%Y-%m-%d")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default()
+        stdout("date", &["+%Y-%m-%d"]).unwrap_or_default()
     );
     println!("Default limits; the server in-process; clients in the same process over loopback.\n");
 
@@ -278,10 +278,7 @@ async fn main() {
         println!("| {target} | {:.1} MiB | {cpu:.1}% |", rss_mib());
     }
     for id in ids {
-        control
-            .call::<_, serde_json::Value>("signal", json!({"session": id, "signal": "KILL"}))
-            .await
-            .unwrap();
+        kill(&control, &id).await;
     }
 
     println!("\n## Bootstrap\n");
@@ -317,13 +314,7 @@ async fn main() {
         if mib == 10 {
             big = Some(session.id);
         } else {
-            control
-                .call::<_, serde_json::Value>(
-                    "signal",
-                    json!({"session": session.id, "signal": "KILL"}),
-                )
-                .await
-                .unwrap();
+            kill(&control, &session.id).await;
         }
     }
 
@@ -339,10 +330,7 @@ async fn main() {
         elapsed.as_secs_f64() * 1000.0,
         size as f64 / MIB as f64
     );
-    control
-        .call::<_, serde_json::Value>("signal", json!({"session": big, "signal": "KILL"}))
-        .await
-        .unwrap();
+    kill(&control, &big).await;
 
     println!("## Stream throughput\n");
     println!("64 MiB of 80-column lines from the PTY to one attached client.\n");

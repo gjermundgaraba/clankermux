@@ -4,6 +4,7 @@ mod attach;
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -235,7 +236,6 @@ fn session_line(s: &Session) {
 /// Binds the carriers `serve` was asked for and runs them with the Unix
 /// socket until a signal; then parks every running session.
 async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
-    use std::net::SocketAddr;
     let Carriers {
         tcp,
         ws,
@@ -378,7 +378,7 @@ struct Carriers {
 /// What `--ws` names: a port on the tailnet address, or a loopback address.
 enum WsBind {
     Port(u16),
-    Loopback(std::net::SocketAddr),
+    Loopback(SocketAddr),
 }
 
 /// `--stdio`: bytes both ways between stdio and the socket. The relay ends

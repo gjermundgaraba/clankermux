@@ -26,7 +26,7 @@ export type FrameType = (typeof FrameType)[keyof typeof FrameType];
 
 const KNOWN_TYPES = new Set<number>(Object.values(FrameType));
 
-export function isFrameType(byte: number): byte is FrameType {
+function isFrameType(byte: number): byte is FrameType {
   return KNOWN_TYPES.has(byte);
 }
 

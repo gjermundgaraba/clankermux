@@ -8,22 +8,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use proto::{ClosedReason, ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status};
+use proto::{
+    ClosedReason, ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status,
+    encode_json_frame,
+};
 use rustix::process::Signal;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::connection::Writer;
+use crate::connection::{Writer, reply};
 use crate::park;
+use crate::pty;
 use crate::records::Records;
 use crate::session::{
-    Body, Effects, InputQueue, Live, Parked, SNAPSHOT_RETRY, Session, Shared, now,
-    snapshot_with_retry,
+    Body, Effects, InputQueue, Live, Parked, SNAPSHOT_RETRY, Session, Shared, check_size,
+    default_color, now, snapshot_with_retry,
 };
 use crate::stream::Stream;
-use crate::{frame_json, pty};
 
 pub type Fail = (ErrorCode, String);
 
@@ -96,7 +99,6 @@ impl Registry {
                 err => io::Error::from(err),
             },
         )?;
-        let loaded = park::load(&config.state_dir.join("sessions"));
         let registry = Arc::new(Registry {
             config,
             incarnation: uuid::Uuid::new_v4().to_string(),
@@ -107,7 +109,7 @@ impl Registry {
             connections: TaskTracker::new(),
             lock,
         });
-        for loaded in loaded {
+        for loaded in park::load(&registry.sessions_dir()) {
             registry.restore(loaded);
         }
         // The timer does not keep the registry alive and ends with `stop`.
@@ -310,7 +312,7 @@ impl Registry {
     pub fn reply_page(&self, writer: &Writer, id: i64, after: Option<&str>, subscribe: bool) {
         let mut state = self.state.lock().unwrap();
         let page = self.page_of(&state, after);
-        crate::connection::reply(writer, id, Ok(serde_json::json!(page)));
+        reply(writer, id, Ok(serde_json::json!(page)));
         if subscribe {
             state.subscribers.push(writer.clone());
         }
@@ -352,7 +354,7 @@ impl Registry {
     /// Queues `event` for every subscriber under the state lock, so it
     /// follows any page replied before it.
     pub fn emit(&self, event: &Event) {
-        let bytes = frame_json(FrameType::Event, 0, event);
+        let bytes = encode_json_frame(FrameType::Event, 0, event);
         self.state
             .lock()
             .unwrap()
@@ -408,7 +410,7 @@ impl Registry {
         }
         let cols = params.cols.unwrap_or(80);
         let rows = params.rows.unwrap_or(24);
-        crate::session::check_size(&proto::Size {
+        check_size(&proto::Size {
             cols,
             rows,
             cell_width: None,
@@ -427,7 +429,7 @@ impl Registry {
             ghostty_vt::ColorKind::Background,
             ghostty_vt::ColorKind::Cursor,
         ] {
-            term.set_color(kind, Some(crate::session::default_color(kind)))
+            term.set_color(kind, Some(default_color(kind)))
                 .map_err(internal)?;
         }
         term.set_scrollback_max_bytes(limits.scrollback as usize)

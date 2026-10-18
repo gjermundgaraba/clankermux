@@ -136,6 +136,19 @@ pub fn encode_frame(frame_type: FrameType, channel: u32, payload: &[u8]) -> Vec<
     out
 }
 
+/// A complete frame with a JSON payload.
+pub fn encode_json_frame<T: serde::Serialize>(
+    frame_type: FrameType,
+    channel: u32,
+    body: &T,
+) -> Vec<u8> {
+    encode_frame(
+        frame_type,
+        channel,
+        &serde_json::to_vec(body).expect("serializable"),
+    )
+}
+
 /// Parses one message that carries exactly one frame.
 pub fn parse_frame(message: &[u8], max_frame: u64) -> Result<(Header, &[u8]), FrameError> {
     let (head, payload) = message

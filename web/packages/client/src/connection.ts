@@ -114,7 +114,6 @@ export class Connection {
 
   /** A request; the reply's `result`, or a rejection with the server's error. */
   call<R>(method: string, params: unknown): Promise<R> {
-    if (this.ended) return Promise.reject(this.ended);
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });

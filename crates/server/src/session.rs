@@ -20,7 +20,7 @@ use crate::attach::Ending;
 use crate::park::ParkFile;
 use crate::records::Records;
 use crate::registry::{Fail, Registry};
-use crate::stream::{Marker, MarkerKind, Stream};
+use crate::stream::{MarkerKind, Stream};
 
 pub type Shared = Arc<Mutex<Session>>;
 
@@ -483,14 +483,14 @@ impl Session {
     }
 
     /// Applies a viewport report at once, discarding any pending coalesced
-    /// report. Returns the marker when the size changed.
-    pub fn apply_report(&mut self, report: Viewport) -> Option<Marker> {
+    /// report. Returns whether the size changed.
+    pub fn apply_report(&mut self, report: Viewport) -> bool {
         let Body::Live(live) = &mut self.body else {
-            return None;
+            return false;
         };
         live.pending = None;
         if self.exited_at.is_some() {
-            return None;
+            return false;
         }
         let Viewport {
             size:
@@ -506,7 +506,7 @@ impl Session {
             self.set_profile(profile);
         }
         let Body::Live(live) = &mut self.body else {
-            return None;
+            return false;
         };
         let current = live.term.handler().size;
         let cell_width = cell_width.unwrap_or(current.cell_width);
@@ -518,7 +518,7 @@ impl Session {
                 .resize(cols, rows, cell_width, cell_height)
                 .is_err()
         {
-            return None;
+            return false;
         }
         live.term.handler_mut().size = SizeReport {
             cols,
@@ -527,13 +527,13 @@ impl Session {
             cell_height,
         };
         if !changed {
-            return None;
+            return false;
         }
         let _ = crate::pty::set_size(&live.master, cols, rows);
-        let marker = live.stream.add_marker(MarkerKind::Resized { cols, rows });
+        live.stream.add_marker(MarkerKind::Resized { cols, rows });
         self.flush_effects();
         self.wake.notify_waiters();
-        Some(marker)
+        true
     }
 
     /// Makes `profile` the session's: default colours for OSC 10, 11 and
@@ -647,17 +647,21 @@ impl Session {
     }
 }
 
-/// Applies a viewport report, at once or after the coalescing window, and
-/// emits `session_changed` when the size changed.
-pub fn report(registry: &Arc<Registry>, session: &Shared, report: Viewport, immediate: bool) {
+/// Applies a viewport report at once and emits `session_changed` when the
+/// size changed.
+pub fn report_now(registry: &Registry, session: &Shared, report: Viewport) {
     let mut s = session.lock().unwrap();
-    if immediate {
-        let changed = s.apply_report(report).map(|_| s.to_proto(false));
-        let events = s.take_events();
-        drop(s);
-        registry.emit_session(events, changed);
-        return;
-    }
+    let changed = s.apply_report(report).then(|| s.to_proto(false));
+    let events = s.take_events();
+    drop(s);
+    registry.emit_session(events, changed);
+}
+
+/// Applies a viewport report after the coalescing window, merged with the
+/// reports that arrive within it, and emits `session_changed` when the
+/// size changed.
+pub fn report_coalesced(registry: &Arc<Registry>, session: &Shared, report: Viewport) {
+    let mut s = session.lock().unwrap();
     let Some(live) = s.live_mut() else {
         return;
     };
@@ -690,8 +694,8 @@ pub fn report(registry: &Arc<Registry>, session: &Shared, report: Viewport, imme
                 live.pending.take()
             });
             let changed = pending
-                .and_then(|r| s.apply_report(r))
-                .map(|_| s.to_proto(false));
+                .is_some_and(|r| s.apply_report(r))
+                .then(|| s.to_proto(false));
             (changed, s.take_events())
         };
         registry.emit_session(events, changed);

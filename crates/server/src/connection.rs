@@ -9,14 +9,15 @@ use std::time::Duration;
 
 use proto::{
     ErrorCode, ErrorMessage, FrameDecoder, FrameType, Header, Hello, Open, Viewport, Welcome,
+    encode_json_frame,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::attach::{self, Handle};
+use crate::control;
 use crate::registry::{Fail, Registry};
 use crate::session::{self, Shared};
-use crate::{control, frame_json};
 
 /// Queued bytes above which attachments stop pulling from their streams
 /// until the socket drains, so a slow client falls behind in the ring
@@ -79,7 +80,7 @@ impl Writer {
         channel: u32,
         body: &T,
     ) -> bool {
-        self.send(frame_json(frame_type, channel, body))
+        self.send(encode_json_frame(frame_type, channel, body))
     }
 
     pub fn over_high_water(&self) -> bool {
@@ -218,7 +219,7 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
 
 /// An id-less `ERROR` on `channel`.
 pub fn error_frame(channel: u32, code: ErrorCode, message: String) -> Vec<u8> {
-    frame_json(
+    encode_json_frame(
         FrameType::Error,
         channel,
         &ErrorMessage {
@@ -543,6 +544,6 @@ impl Connection {
             self.error(channel, code, message);
             return;
         }
-        session::report(&self.registry, &session, viewport, false);
+        session::report_coalesced(&self.registry, &session, viewport);
     }
 }

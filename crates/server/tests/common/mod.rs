@@ -165,6 +165,10 @@ impl Client {
         serde_json::from_value(self.ok("inspect", json!({"session": id})).await).unwrap()
     }
 
+    pub async fn list(&mut self) -> Page {
+        serde_json::from_value(self.ok("list", json!({})).await).unwrap()
+    }
+
     pub async fn read(&mut self, id: &str, scrollback: u32) -> Read {
         serde_json::from_value(
             self.ok("read", json!({"session": id, "scrollback": scrollback}))

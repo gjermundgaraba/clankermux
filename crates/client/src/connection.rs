@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use proto::{
     ErrorMessage, Event, FrameDecoder, FrameType, Header, Hello, Limits, Open, Peer, Welcome,
-    encode_frame,
+    encode_frame, encode_json_frame,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -85,7 +85,6 @@ struct Routes {
 }
 
 /// Why a connection ended.
-#[derive(Debug, Clone)]
 enum Ended {
     /// The server sent an `ERROR` without id.
     Server(ErrorMessage),
@@ -154,11 +153,7 @@ impl Connection {
             }
             let _ = writer.shutdown().await;
         });
-        let _ = tx.send(encode_frame(
-            FrameType::Hello,
-            0,
-            &serde_json::to_vec(&hello).expect("serializable"),
-        ));
+        let _ = tx.send(encode_json_frame(FrameType::Hello, 0, &hello));
         let mut decoder = FrameDecoder::default();
         let mut buf = vec![0u8; 64 * 1024];
         let welcome = loop {
@@ -419,9 +414,7 @@ impl Endpoint {
                     const KEPT: usize = 4096;
                     let mut tail = Vec::new();
                     let mut buf = [0u8; 1024];
-                    while let Ok(n @ 1..) =
-                        tokio::io::AsyncReadExt::read(&mut stderr, &mut buf).await
-                    {
+                    while let Ok(n @ 1..) = stderr.read(&mut buf).await {
                         tail.extend_from_slice(&buf[..n]);
                         if tail.len() > KEPT {
                             tail.drain(..tail.len() - KEPT);
@@ -456,8 +449,8 @@ impl Endpoint {
     }
 }
 
-impl std::fmt::Display for Endpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Endpoint::Unix(path) => write!(f, "{}", path.display()),
             Endpoint::Tcp(addr) => write!(f, "{addr}"),

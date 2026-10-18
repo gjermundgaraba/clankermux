@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::*;
@@ -19,13 +20,13 @@ async fn event_where<T>(c: &mut Client, mut pick: impl FnMut(&Event) -> Option<T
     panic!("no matching event within 50 events");
 }
 
-fn sessions_dir(state: &std::path::Path) -> std::path::PathBuf {
+fn sessions_dir(state: &Path) -> PathBuf {
     state.join("sessions")
 }
 
 /// The complete generation directories of `id`, oldest first.
-fn generations(state: &std::path::Path, id: &str) -> Vec<std::path::PathBuf> {
-    let mut found: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(sessions_dir(state).join(id))
+fn generations(state: &Path, id: &str) -> Vec<PathBuf> {
+    let mut found: Vec<(u64, PathBuf)> = std::fs::read_dir(sessions_dir(state).join(id))
         .map(|entries| {
             entries
                 .flatten()
@@ -45,7 +46,7 @@ fn generations(state: &std::path::Path, id: &str) -> Vec<std::path::PathBuf> {
 }
 
 /// Waits until a complete generation exists for `id`.
-async fn wait_parked(state: &std::path::Path, id: &str) -> std::path::PathBuf {
+async fn wait_parked(state: &Path, id: &str) -> PathBuf {
     for _ in 0..500 {
         if let Some(path) = generations(state, id).pop() {
             return path;
@@ -85,7 +86,7 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
         .pop()
         .expect("parked by the stop");
     // Private to the user: directories 0700, files 0600, as the socket.
-    let mode = |path: &std::path::Path| {
+    let mode = |path: &Path| {
         std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions())
             & 0o777
     };
@@ -100,7 +101,7 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
 
     let b = start_with(fast_limits(), state.clone());
     let mut c = client(&b).await;
-    let page: Page = serde_json::from_value(c.ok("list", json!({})).await).unwrap();
+    let page = c.list().await;
     assert_eq!(page.sessions.len(), 1);
     let restored = &page.sessions[0];
     assert_eq!(restored.id, session.id);
@@ -205,9 +206,7 @@ async fn keep_parks_at_exit_and_restores_as_exited() {
             .collect::<Vec<_>>(),
         vec![("last", "error")]
     );
-    let read: Read =
-        serde_json::from_value(c.ok("read", json!({"session": session.id})).await).unwrap();
-    assert!(read.text.contains("done-keep"));
+    assert!(c.read(&session.id, 0).await.text.contains("done-keep"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -457,7 +456,7 @@ async fn loading_keeps_the_newest_complete_generation_only() {
 
     let server = start_with(fast_limits(), state.clone());
     let mut c = client(&server).await;
-    let page: Page = serde_json::from_value(c.ok("list", json!({})).await).unwrap();
+    let page = c.list().await;
     assert_eq!(page.sessions.len(), 2);
     let s = page.sessions.iter().find(|s| s.id == id).unwrap();
     assert_eq!(
@@ -557,7 +556,7 @@ async fn a_park_naming_another_session_is_skipped() {
 
     let server = start_with(fast_limits(), state.clone());
     let mut c = client(&server).await;
-    let page: Page = serde_json::from_value(c.ok("list", json!({})).await).unwrap();
+    let page = c.list().await;
     assert!(page.sessions.is_empty());
     assert!(dir.join("session.json").is_file(), "the directory is kept");
 }
@@ -586,7 +585,7 @@ async fn a_stopped_server_leaves_the_directory_to_its_successor() {
     let b = start_with(fast_limits(), state.clone());
     let mut c = client(&b).await;
     tokio::time::sleep(Duration::from_millis(600)).await;
-    let page: Page = serde_json::from_value(c.ok("list", json!({})).await).unwrap();
+    let page = c.list().await;
     assert_eq!(page.sessions.len(), 1);
     assert!(c.read(&session.id, 0).await.text.contains("left-behind"));
     assert_eq!(generations(&state, &session.id).len(), 1);

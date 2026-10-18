@@ -14,7 +14,7 @@ pub struct Records {
 }
 
 /// What a report changed: a record set, and the ids of records dropped.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub struct Change {
     pub set: Option<StatusRecord>,
     pub removed: Vec<String>,

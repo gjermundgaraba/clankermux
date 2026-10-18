@@ -125,7 +125,7 @@ async fn session_lifecycle() {
     assert_eq!(read.cursor, Some(Cursor { x: 0, y: 2 }));
     assert!(read.offset > 0);
 
-    let listed: Page = serde_json::from_value(c.ok("list", json!({})).await).unwrap();
+    let listed = c.list().await;
     assert_eq!(listed.sessions[0].offset, read.offset);
     assert!(listed.sessions[0].program_status.is_none());
     let inspected = c.inspect(&session.id).await;
@@ -245,8 +245,7 @@ async fn exit_code_and_removal_on_exit() {
     let exited = c.wait_exit(&session.id).await;
     assert_eq!(exited.exit, Some(Exit::Code { code: 3 }));
     assert!(exited.exited_at.is_some());
-    let read: Read =
-        serde_json::from_value(c.ok("read", json!({"session": session.id})).await).unwrap();
+    let read = c.read(&session.id, 0).await;
     assert_eq!(read.status, Status::Exited);
     assert!(
         matches!(c.event().await, Event::SessionRemoved { id } if id == session.id),
@@ -316,9 +315,7 @@ async fn create_defaults_and_limits() {
     let env = c.create(json!({"argv": ["/bin/sh", "-c", "printf '%s|%s' \"$TERM\" \"$FOO\"; sleep 10"], "env": {"FOO": "bar"}})).await;
     let mut text = String::new();
     for _ in 0..500 {
-        let read: Read =
-            serde_json::from_value(c.ok("read", json!({"session": env.id})).await).unwrap();
-        text = read.text;
+        text = c.read(&env.id, 0).await.text;
         if text.contains('|') {
             break;
         }

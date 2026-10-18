@@ -17,20 +17,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use proto::FrameType;
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::time::Instant;
 
 pub use registry::{Config, Registry};
-
-/// A frame with a JSON payload.
-pub fn frame_json<T: serde::Serialize>(frame_type: FrameType, channel: u32, body: &T) -> Vec<u8> {
-    proto::encode_frame(
-        frame_type,
-        channel,
-        &serde_json::to_vec(body).expect("serializable"),
-    )
-}
 
 /// Binds the Unix socket: directories it creates are 0700, the socket
 /// 0600. Refuses to replace a socket another server is listening on.

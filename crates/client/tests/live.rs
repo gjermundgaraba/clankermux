@@ -19,6 +19,12 @@ fn start() -> Server {
     })
 }
 
+async fn connect(server: &Server) -> Connection {
+    Connection::connect_unix(&server.socket, hello("test", Some(ghostty_vt::ENGINE)))
+        .await
+        .unwrap()
+}
+
 fn text(a: &mut Attachment) -> String {
     let out = ghostty_vt::formatter::format(
         a.term().unwrap(),
@@ -54,9 +60,7 @@ async fn drive(
 #[tokio::test(flavor = "multi_thread")]
 async fn bootstrap_stream_and_resume() {
     let server = start();
-    let conn = Connection::connect_unix(&server.socket, hello("test", Some(ghostty_vt::ENGINE)))
-        .await
-        .unwrap();
+    let conn = connect(&server).await;
     assert_eq!(conn.welcome.engine, ghostty_vt::ENGINE);
     let session: Session = conn
         .call(
@@ -111,9 +115,7 @@ async fn bootstrap_stream_and_resume() {
     // The connection drops; a new one resumes from the cursor and the
     // terminal is kept.
     drop(conn);
-    let conn = Connection::connect_unix(&server.socket, hello("test", Some(ghostty_vt::ENGINE)))
-        .await
-        .unwrap();
+    let conn = connect(&server).await;
     a.open_on(&conn.welcome);
     let mut rx = conn
         .open(

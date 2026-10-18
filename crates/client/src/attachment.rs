@@ -34,7 +34,7 @@ pub enum Action {
     Error(ErrorMessage),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 struct Cursor {
     offset: u64,
     marker: u64,

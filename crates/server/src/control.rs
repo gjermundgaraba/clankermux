@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::connection::{Writer, reply};
 use crate::registry::{Fail, Registry, internal};
-use crate::session;
+use crate::{pty, session};
 
 /// JSON overhead allowed around `read`'s text within `max_frame`.
 const READ_REPLY_MARGIN: usize = 4096;
@@ -135,7 +135,7 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
                 (params::<proto::SessionParams>(p)?.session, Signal::HUP)
             } else {
                 let p: proto::SignalParams = params(p)?;
-                let signal = crate::pty::signal_by_name(&p.signal).ok_or((
+                let signal = pty::signal_by_name(&p.signal).ok_or((
                     ErrorCode::InvalidRequest,
                     format!("unknown signal {}", p.signal),
                 ))?;
@@ -147,7 +147,7 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
                 let live = s.running()?;
                 (live.pgid, live.slave_path.clone())
             };
-            if crate::pty::signal(pgid, &slave, signal) {
+            if pty::signal(pgid, &slave, signal) {
                 Ok(json!({}))
             } else {
                 Err((ErrorCode::SignalFailed, "no process to signal".into()))
@@ -189,7 +189,7 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
                 size,
                 profile: None,
             };
-            session::report(registry, &session, report, true);
+            session::report_now(registry, &session, report);
             Ok(json!({}))
         }
         "read" => {

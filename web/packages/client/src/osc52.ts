@@ -23,24 +23,17 @@ export interface ClipboardWrite {
   text: string;
 }
 
-type State = "text" | "esc" | "osc";
+/** `osc`: inside an OSC that may still be a 52, collecting its payload;
+ * `skip`: inside any other OSC, skipped to its end. */
+type State = "text" | "esc" | "osc" | "skip";
 
 export class Osc52Scanner {
   private state: State = "text";
-  /** Inside an OSC that may still be a 52; otherwise its bytes are skipped. */
-  private collecting = false;
   private payload: number[] = [];
 
   /** Forgets a sequence in progress: the stream it came from is gone. */
   reset(): void {
     this.state = "text";
-    this.collecting = false;
-    this.payload = [];
-  }
-
-  private startOsc(): void {
-    this.state = "osc";
-    this.collecting = true;
     this.payload = [];
   }
 
@@ -53,10 +46,12 @@ export class Osc52Scanner {
           if (b === ESC) this.state = "esc";
           break;
         case "esc":
-          if (b === 0x5d) this.startOsc();
+          // The payload is empty: every way out of an OSC clears it.
+          if (b === 0x5d) this.state = "osc";
           else this.state = b === ESC ? "esc" : "text";
           break;
         case "osc":
+        case "skip":
           if (b === BEL) {
             this.finish(writes);
           } else if (b === ESC) {
@@ -64,12 +59,11 @@ export class Osc52Scanner {
             this.state = "esc";
           } else if (b === CAN || b === SUB) {
             this.reset();
-          } else if (this.collecting) {
+          } else if (this.state === "osc") {
             this.payload.push(b);
-            // Only a 52 is collected; anything else is skipped to its end.
             const head = String.fromCharCode(...this.payload.slice(0, PREFIX.length));
             if (!PREFIX.startsWith(head) || this.payload.length > MAX_OSC) {
-              this.collecting = false;
+              this.state = "skip";
               this.payload = [];
             }
           }
@@ -80,7 +74,7 @@ export class Osc52Scanner {
   }
 
   private finish(writes: ClipboardWrite[]): void {
-    const collected = this.collecting;
+    const collected = this.state === "osc";
     const payload = new TextDecoder().decode(Uint8Array.from(this.payload));
     this.reset();
     if (!collected) return;
