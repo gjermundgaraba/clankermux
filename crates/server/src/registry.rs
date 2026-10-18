@@ -442,9 +442,9 @@ impl Registry {
         };
         let (pty, mut child) = pty::spawn(&argv, std::path::Path::new(&cwd), &env, cols, rows)
             .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound
-                | std::io::ErrorKind::PermissionDenied
-                | std::io::ErrorKind::NotADirectory => (
+                io::ErrorKind::NotFound
+                | io::ErrorKind::PermissionDenied
+                | io::ErrorKind::NotADirectory => (
                     ErrorCode::InvalidRequest,
                     format!("cannot start {argv:?}: {e}"),
                 ),
@@ -608,10 +608,7 @@ impl Registry {
     fn remove_after_grace(self: &Arc<Self>, id: String) {
         let registry = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(
-                registry.config.limits.remove_grace,
-            ))
-            .await;
+            tokio::time::sleep(Duration::from_millis(registry.config.limits.remove_grace)).await;
             if !registry.is_stopping() {
                 registry.remove_now(&id);
             }

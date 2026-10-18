@@ -74,11 +74,7 @@ async fn scrollback_bounds_the_history() {
         .create(json!({"rows": 4, "argv": ["/bin/sh", "-c", "seq 1 2000 | sed 's/^/line-/'; echo END; exec cat"]}))
         .await;
     wait_text(&mut c, &session.id, "END").await;
-    let read: Read = serde_json::from_value(
-        c.ok("read", json!({"session": session.id, "scrollback": 100000}))
-            .await,
-    )
-    .unwrap();
+    let read = c.read(&session.id, 100000).await;
     let lines = read.text.lines().count();
     assert!(lines < 2000, "{lines} lines retained");
     assert!(
@@ -148,8 +144,7 @@ async fn label_and_text_are_bounded_everywhere() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(echoed, "cat never wrote the line back");
-    let inspected: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    let inspected = c.inspect(&session.id).await;
     assert_eq!(inspected.title, title[..48], "title truncated to text");
     assert_eq!(inspected.pwd, pwd[..48], "pwd truncated to text");
 }
@@ -181,8 +176,7 @@ async fn markers_bound_what_a_resume_can_find() {
     }
     c.send(FrameType::Close, 1, &[]).await;
     assert_eq!(c.expect_closed(1).await, ClosedReason::Closed);
-    let inspected: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    let inspected = c.inspect(&session.id).await;
     assert_eq!(inspected.marker, first + 3);
     // A cursor at `first` has not received `first + 1`, which is gone: the
     // spec requires at least `markers` retained; this server keeps exactly
@@ -380,8 +374,7 @@ async fn continuation_bounds_a_snapshot() {
         .await;
     let mut filled = false;
     for _ in 0..1000 {
-        let inspected: Session =
-            serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+        let inspected = c.inspect(&session.id).await;
         if inspected.offset >= 6000 {
             filled = true;
             break;

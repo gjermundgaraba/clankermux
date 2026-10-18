@@ -5,6 +5,7 @@ import {
   FrameError,
   FrameType,
   type Hello,
+  type Reply,
   type Welcome,
   encodeFrame,
   parseFrame,
@@ -165,7 +166,7 @@ export class Connection {
     switch (frame.header.type) {
       case FrameType.Reply: {
         // A reply or error for a request no longer waited for is dropped.
-        const reply = body as { id: number; result: unknown };
+        const reply = body as Reply;
         this.pending.get(reply.id)?.resolve(reply.result);
         this.pending.delete(reply.id);
         break;

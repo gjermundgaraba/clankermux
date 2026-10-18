@@ -31,6 +31,13 @@ fn frames() -> impl Strategy<Value = Vec<(FrameType, u32, Vec<u8>)>> {
     )
 }
 
+fn encode_all(frames: &[(FrameType, u32, Vec<u8>)]) -> Vec<u8> {
+    frames
+        .iter()
+        .flat_map(|(frame_type, channel, payload)| encode_frame(*frame_type, *channel, payload))
+        .collect()
+}
+
 /// Random bytes, or a valid stream with up to four bytes replaced, so
 /// the decoder meets frames as well as garbage.
 fn bytes() -> impl Strategy<Value = Vec<u8>> {
@@ -38,10 +45,7 @@ fn bytes() -> impl Strategy<Value = Vec<u8>> {
         1 => prop::collection::vec(any::<u8>(), 0..2048),
         2 => (frames(), prop::collection::vec((any::<usize>(), any::<u8>()), 0..4)).prop_map(
             |(frames, edits)| {
-                let mut stream = Vec::new();
-                for (frame_type, channel, payload) in &frames {
-                    stream.extend(encode_frame(*frame_type, *channel, payload));
-                }
+                let mut stream = encode_all(&frames);
                 for (at, byte) in edits {
                     if !stream.is_empty() {
                         let at = at % stream.len();
@@ -123,10 +127,7 @@ proptest! {
         frames in frames(),
         cuts in prop::collection::vec(any::<usize>(), 0..16),
     ) {
-        let mut stream = Vec::new();
-        for (frame_type, channel, payload) in &frames {
-            stream.extend(encode_frame(*frame_type, *channel, payload));
-        }
+        let stream = encode_all(&frames);
         let (decoded, error) = decode_all(&chunks(&stream, &cuts));
         prop_assert_eq!(error, None);
         prop_assert_eq!(decoded.len(), frames.len());

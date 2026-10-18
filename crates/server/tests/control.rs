@@ -128,8 +128,7 @@ async fn session_lifecycle() {
     let listed: Page = serde_json::from_value(c.ok("list", json!({})).await).unwrap();
     assert_eq!(listed.sessions[0].offset, read.offset);
     assert!(listed.sessions[0].program_status.is_none());
-    let inspected: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    let inspected = c.inspect(&session.id).await;
     assert_eq!(inspected.program_status, Some(vec![]));
 
     c.ok(
@@ -218,11 +217,7 @@ async fn session_lifecycle() {
         .await,
         ErrorCode::NotRunning
     );
-    let read: Read = serde_json::from_value(
-        c.ok("read", json!({"session": session.id, "scrollback": 5}))
-            .await,
-    )
-    .unwrap();
+    let read = c.read(&session.id, 5).await;
     assert_eq!(read.status, Status::Exited);
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(
@@ -390,11 +385,7 @@ async fn read_returns_scrollback_then_screen() {
         .await;
     let mut lines = Vec::new();
     for _ in 0..500 {
-        let read: Read = serde_json::from_value(
-            c.ok("read", json!({"session": session.id, "scrollback": 3}))
-                .await,
-        )
-        .unwrap();
+        let read = c.read(&session.id, 3).await;
         lines = read.text.lines().map(str::to_string).collect();
         if lines.last().is_some_and(|l| l == "line50") {
             break;
@@ -604,18 +595,10 @@ async fn read_screen_only_after_clear_and_bounded_replies() {
         .await;
     let read = wait_text(&mut c, &session.id, "only").await;
     assert_eq!(read.text, "only\n", "no history without scrollback");
-    let read: Read = serde_json::from_value(
-        c.ok("read", json!({"session": session.id, "scrollback": 2}))
-            .await,
-    )
-    .unwrap();
+    let read = c.read(&session.id, 2).await;
     // Before the clear the screen held line997 to line1000 and the cursor row.
     assert_eq!(read.text, "line995\nline996\nonly\n");
-    let read: Read = serde_json::from_value(
-        c.ok("read", json!({"session": session.id, "scrollback": 100000}))
-            .await,
-    )
-    .unwrap();
+    let read = c.read(&session.id, 100000).await;
     assert!(read.text.len() <= TEXT_BUDGET);
     assert!(
         read.text.starts_with("line"),

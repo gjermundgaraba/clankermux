@@ -96,8 +96,8 @@ pub enum Exit {
     Signal { signal: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// One program status record (OSC 7501).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusRecord {
     pub id: String,
     pub state: String,

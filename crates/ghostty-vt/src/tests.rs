@@ -34,13 +34,13 @@ fn formats_a_tail_of_rows() {
     // Three rows of history, then the screen: line4, line5, line6 and a
     // blank cursor row.
     assert_eq!(term.scrollback_rows(), 4);
-    let tail = |start_row| {
+    let trimmed = |region| {
         String::from_utf8(
             formatter::format(
                 &term,
                 Options {
                     trim: true,
-                    region: Region::FromRow(start_row),
+                    region,
                     ..Default::default()
                 },
             )
@@ -48,27 +48,17 @@ fn formats_a_tail_of_rows() {
         )
         .unwrap()
     };
+    let tail = |start_row| trimmed(Region::FromRow(start_row));
     assert_eq!(tail(4), "line5\nline6");
     assert_eq!(tail(2), "line3\nline4\nline5\nline6");
     assert_eq!(tail(0), "line1\nline2\nline3\nline4\nline5\nline6");
 
     let clip = |from_row, cols, rows| {
-        String::from_utf8(
-            formatter::format(
-                &term,
-                Options {
-                    trim: true,
-                    region: Region::Clip {
-                        from_row,
-                        cols,
-                        rows,
-                    },
-                    ..Default::default()
-                },
-            )
-            .unwrap(),
-        )
-        .unwrap()
+        trimmed(Region::Clip {
+            from_row,
+            cols,
+            rows,
+        })
     };
     assert_eq!(clip(0, 3, 2), "lin\nlin");
     assert_eq!(clip(1, 10, 2), "line6");
@@ -120,7 +110,6 @@ fn decode_in_chunks(bytes: &[u8], chunk: usize) -> (Terminal, usize) {
     let mut pos = 0;
     let mut pages = 0;
     let mut ready = false;
-    let mut finished = false;
     while pos < bytes.len() {
         let end = (pos + chunk).min(bytes.len());
         decoder.push(&bytes[pos..end]);
@@ -132,19 +121,18 @@ fn decode_in_chunks(bytes: &[u8], chunk: usize) -> (Terminal, usize) {
             decoder.ready().unwrap();
             ready = true;
         }
-        while !finished && decoder.step_available() {
+        while decoder.step_available() {
             if decoder.next_page().unwrap() {
                 pages += 1;
                 // Live output between pages goes to the same terminal.
                 decoder.terminal().unwrap().vt_write(b"\x1b]2;between\x07");
-            } else {
-                finished = true;
             }
         }
     }
     assert!(
-        ready && finished,
-        "chunk {chunk}: ready {ready}, finished {finished}"
+        ready && decoder.finished(),
+        "chunk {chunk}: ready {ready}, finished {}",
+        decoder.finished()
     );
     assert_eq!(decoder.buffered(), 0);
     (decoder.into_terminal().unwrap(), pages)

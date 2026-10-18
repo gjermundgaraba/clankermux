@@ -216,6 +216,19 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
     write_task.abort();
 }
 
+/// An id-less `ERROR` on `channel`.
+pub fn error_frame(channel: u32, code: ErrorCode, message: String) -> Vec<u8> {
+    frame_json(
+        FrameType::Error,
+        channel,
+        &ErrorMessage {
+            id: None,
+            code,
+            message,
+        },
+    )
+}
+
 /// Sends the reply or error that answers request `id`.
 pub fn reply(writer: &Writer, id: i64, outcome: Result<serde_json::Value, Fail>) {
     match outcome {
@@ -243,29 +256,13 @@ struct Connection {
 
 impl Connection {
     fn error(&self, channel: u32, code: ErrorCode, message: impl Into<String>) {
-        self.writer.send_json(
-            FrameType::Error,
-            channel,
-            &ErrorMessage {
-                id: None,
-                code,
-                message: message.into(),
-            },
-        );
+        self.writer.send(error_frame(channel, code, message.into()));
     }
 
     /// Sends the `ERROR` that precedes closing the connection; nothing is
     /// queued after it.
     fn fatal(&self, code: ErrorCode, message: impl Into<String>) {
-        self.writer.send_last(frame_json(
-            FrameType::Error,
-            0,
-            &ErrorMessage {
-                id: None,
-                code,
-                message: message.into(),
-            },
-        ));
+        self.writer.send_last(error_frame(0, code, message.into()));
     }
 
     /// Handles every buffered frame; false closes the connection.

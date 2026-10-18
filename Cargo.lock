@@ -293,7 +293,6 @@ dependencies = [
  "testkit",
  "tokio",
  "tokio-rustls",
- "tokio-tungstenite",
  "tracing-subscriber",
 ]
 
@@ -346,8 +345,6 @@ dependencies = [
  "proto",
  "serde",
  "serde_json",
- "server",
- "tempfile",
  "testkit",
  "tokio",
 ]

@@ -49,15 +49,6 @@ export class FrameError extends Error {
   }
 }
 
-export function encodeHeader(type: FrameType, channel: number, length: number): Uint8Array {
-  const out = new Uint8Array(HEADER_LEN);
-  const view = new DataView(out.buffer);
-  out[0] = type;
-  view.setUint32(2, channel, true);
-  view.setUint32(6, length, true);
-  return out;
-}
-
 /** Parses a header, ignoring `flags`. */
 export function parseHeader(bytes: Uint8Array, maxFrame: number): Header {
   if (bytes.length < HEADER_LEN) throw new FrameError("short", "message shorter than a frame header");
@@ -74,7 +65,10 @@ export function parseHeader(bytes: Uint8Array, maxFrame: number): Header {
 
 export function encodeFrame(type: FrameType, channel: number, payload: Uint8Array): Uint8Array {
   const out = new Uint8Array(HEADER_LEN + payload.length);
-  out.set(encodeHeader(type, channel, payload.length));
+  const view = new DataView(out.buffer);
+  out[0] = type;
+  view.setUint32(2, channel, true);
+  view.setUint32(6, payload.length, true);
   out.set(payload, HEADER_LEN);
   return out;
 }

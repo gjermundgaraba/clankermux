@@ -161,6 +161,18 @@ impl Client {
         serde_json::from_value(self.request("create", params).await.unwrap()).unwrap()
     }
 
+    pub async fn inspect(&mut self, id: &str) -> Session {
+        serde_json::from_value(self.ok("inspect", json!({"session": id})).await).unwrap()
+    }
+
+    pub async fn read(&mut self, id: &str, scrollback: u32) -> Read {
+        serde_json::from_value(
+            self.ok("read", json!({"session": id, "scrollback": scrollback}))
+                .await,
+        )
+        .unwrap()
+    }
+
     pub async fn ok(&mut self, method: &str, params: Value) -> Value {
         self.request(method, params)
             .await
@@ -294,9 +306,7 @@ impl Client {
     /// Polls `inspect` until the session reports `count` attachments.
     pub async fn wait_attachments(&mut self, id: &str, count: u32) {
         for _ in 0..1000 {
-            let s: Session =
-                serde_json::from_value(self.ok("inspect", json!({"session": id})).await).unwrap();
-            if s.attachments == count {
+            if self.inspect(id).await.attachments == count {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

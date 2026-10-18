@@ -76,17 +76,14 @@ export class KeyEncoder {
     e.call("ghostty_key_event_set_composing", this.event, input.composing ? 1 : 0);
     const text = isText(input.key) ? input.key : "";
     const utf8 = new TextEncoder().encode(text);
-    const textPtr = utf8.length ? e.copyIn(utf8) : 0;
-    try {
+    return e.withBytes(utf8, (textPtr) => {
       e.call("ghostty_key_event_set_utf8", this.event, textPtr, utf8.length);
       const base = input.unshifted ?? (text ? text.toLowerCase() : "");
       e.call("ghostty_key_event_set_unshifted_codepoint", this.event, base ? base.codePointAt(0)! : 0);
       return e.growing("ghostty_key_encoder_encode", 64, (buf, cap, len) =>
         e.call("ghostty_key_encoder_encode", this.encoder, this.event, buf, cap, len),
       );
-    } finally {
-      if (textPtr) e.free(textPtr, utf8.length);
-    }
+    });
   }
 
   free(): void {

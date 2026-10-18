@@ -128,29 +128,20 @@ export class RenderState {
     });
     const full = dirty === e.enumValue("GhosttyRenderStateDirty", "FULL");
 
-    const colors = e.pack("GhosttyRenderStateColors", {});
-    const colorsPtr = e.copyIn(colors);
-    let background: number;
-    let foreground: number;
-    let cursorColor: number;
-    try {
-      e.check("ghostty_render_state_get", this.state, this.keys.data["COLORS"]!, colorsPtr);
-      background = e.readRgb(colorsPtr + e.offsetOf("GhosttyRenderStateColors", "background"));
-      foreground = e.readRgb(colorsPtr + e.offsetOf("GhosttyRenderStateColors", "foreground"));
-      cursorColor = e.field("GhosttyRenderStateColors", colorsPtr, "cursor_has_value")
-        ? e.readRgb(colorsPtr + e.offsetOf("GhosttyRenderStateColors", "cursor"))
-        : NO_COLOR;
-    } finally {
-      e.free(colorsPtr, colors.length);
-    }
+    const { background, foreground, cursorColor } = e.withBytes(e.pack("GhosttyRenderStateColors", {}), (colors) => {
+      e.check("ghostty_render_state_get", this.state, this.keys.data["COLORS"]!, colors);
+      const rgb = (key: string) => e.readRgb(colors + e.offsetOf("GhosttyRenderStateColors", key));
+      return {
+        background: rgb("background"),
+        foreground: rgb("foreground"),
+        cursorColor: e.field("GhosttyRenderStateColors", colors, "cursor_has_value") ? rgb("cursor") : NO_COLOR,
+      };
+    });
 
-    const cursorBytes = e.pack("GhosttyRenderStateCursor", {});
-    const cursorPtr = e.copyIn(cursorBytes);
-    let cursor: Frame["cursor"];
-    try {
-      e.check("ghostty_render_state_get", this.state, this.keys.data["CURSOR"]!, cursorPtr);
-      const f = (key: string) => e.field("GhosttyRenderStateCursor", cursorPtr, key);
-      cursor = f("viewport_has_value")
+    const cursor = e.withBytes(e.pack("GhosttyRenderStateCursor", {}), (ptr): Frame["cursor"] => {
+      e.check("ghostty_render_state_get", this.state, this.keys.data["CURSOR"]!, ptr);
+      const f = (key: string) => e.field("GhosttyRenderStateCursor", ptr, key);
+      return f("viewport_has_value")
         ? {
             x: f("viewport_x"),
             y: f("viewport_y"),
@@ -160,9 +151,7 @@ export class RenderState {
             color: cursorColor,
           }
         : undefined;
-    } finally {
-      e.free(cursorPtr, cursorBytes.length);
-    }
+    });
 
     const lines: FrameRow[] = [];
     // Iterator and cells containers are passed by address of their handle.

@@ -92,11 +92,17 @@ export class Engine {
     this.call("ghostty_wasm_free", ptr, len);
   }
 
-  /** Copies bytes into wasm memory; the caller frees them. */
-  copyIn(bytes: Uint8Array): number {
+  /** Runs `f` with `bytes` copied into wasm memory, or with a null
+   * pointer for no bytes (which the allocator cannot serve). */
+  withBytes<T>(bytes: Uint8Array, f: (ptr: number) => T): T {
+    if (bytes.length === 0) return f(0);
     const ptr = this.alloc(bytes.length);
     this.memory.set(bytes, ptr);
-    return ptr;
+    try {
+      return f(ptr);
+    } finally {
+      this.free(ptr, bytes.length);
+    }
   }
 
   /** Runs `f` with a scratch allocation of `len` bytes. */
@@ -290,17 +296,14 @@ export class Engine {
 
   /** Decodes a complete snapshot held in memory. */
   decodeSnapshot(bytes: Uint8Array): Terminal {
-    const src = this.copyIn(bytes);
-    try {
+    return this.withBytes(bytes, (src) => {
       const decoder = this.construct("ghostty_snapshot_decoder_new_buf", src, bytes.length);
       try {
         return new Terminal(this, this.take("ghostty_snapshot_decoder_decode", decoder));
       } finally {
         this.call("ghostty_snapshot_decoder_free", decoder);
       }
-    } finally {
-      this.free(src, bytes.length);
-    }
+    });
   }
 
   /**
@@ -310,14 +313,11 @@ export class Engine {
   encodePaste(text: string, bracketed: boolean): Uint8Array {
     const data = new TextEncoder().encode(text);
     if (data.length === 0) return data;
-    const src = this.copyIn(data);
-    try {
-      return this.growing("ghostty_paste_encode", data.length + 16, (buf, cap, len) =>
+    return this.withBytes(data, (src) =>
+      this.growing("ghostty_paste_encode", data.length + 16, (buf, cap, len) =>
         this.call("ghostty_paste_encode", src, data.length, bracketed ? 1 : 0, buf, cap, len),
-      );
-    } finally {
-      this.free(src, data.length);
-    }
+      ),
+    );
   }
 }
 
@@ -329,14 +329,8 @@ export class Terminal {
   ) {}
 
   write(bytes: Uint8Array): void {
-    // The allocator returns null for zero bytes.
     if (bytes.length === 0) return;
-    const ptr = this.engine.copyIn(bytes);
-    try {
-      this.engine.call("ghostty_terminal_vt_write", this.handle, ptr, bytes.length);
-    } finally {
-      this.engine.free(ptr, bytes.length);
-    }
+    this.engine.withBytes(bytes, (ptr) => this.engine.call("ghostty_terminal_vt_write", this.handle, ptr, bytes.length));
   }
 
   private get(key: string, size: number): number {
@@ -381,8 +375,7 @@ export class Terminal {
   /** Whether DEC private mode `number` is set. */
   mode(number: number): boolean {
     const config = this.engine.pack("GhosttyTerminalModeConfig", { mode: number });
-    const ptr = this.engine.copyIn(config);
-    try {
+    return this.engine.withBytes(config, (ptr) => {
       this.engine.check(
         "ghostty_terminal_get",
         this.handle,
@@ -390,9 +383,7 @@ export class Terminal {
         ptr,
       );
       return this.engine.field("GhosttyTerminalModeConfig", ptr, "value") !== 0;
-    } finally {
-      this.engine.free(ptr, config.length);
-    }
+    });
   }
 
   resize(cols: number, rows: number, cellWidth = 0, cellHeight = 0): void {
@@ -403,12 +394,7 @@ export class Terminal {
   setColor(kind: "foreground" | "background" | "cursor", color: number): void {
     const option = this.engine.enumValue("GhosttyTerminalOption", `COLOR_${kind.toUpperCase()}`);
     const rgb = this.engine.pack("GhosttyColorRgb", { r: (color >> 16) & 0xff, g: (color >> 8) & 0xff, b: color & 0xff });
-    const ptr = this.engine.copyIn(rgb);
-    try {
-      this.engine.check("ghostty_terminal_set", this.handle, option, ptr);
-    } finally {
-      this.engine.free(ptr, rgb.length);
-    }
+    this.engine.withBytes(rgb, (ptr) => this.engine.check("ghostty_terminal_set", this.handle, option, ptr));
   }
 
   /** The whole terminal, history included, as a snapshot. */
@@ -424,8 +410,7 @@ export class Terminal {
       emit: this.engine.enumValue("GhosttyFormatterFormat", "PLAIN"),
       extra: { screen: {} },
     });
-    const optionsPtr = this.engine.copyIn(options);
-    try {
+    return this.engine.withBytes(options, (optionsPtr) => {
       const formatter = this.engine.construct("ghostty_formatter_terminal_new", this.handle, optionsPtr);
       try {
         return new TextDecoder().decode(
@@ -436,9 +421,7 @@ export class Terminal {
       } finally {
         this.engine.call("ghostty_formatter_free", formatter);
       }
-    } finally {
-      this.engine.free(optionsPtr, options.length);
-    }
+    });
   }
 
   free(): void {

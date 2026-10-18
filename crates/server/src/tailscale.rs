@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Where tailscaled listens for the local API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum Endpoint {
     /// tailscaled's Unix socket.
     Unix(PathBuf),
@@ -27,7 +27,7 @@ pub struct LocalApi {
     endpoint: Endpoint,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct Response {
     status: u16,
     /// `Retry-After` in seconds, when present.

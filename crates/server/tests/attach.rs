@@ -50,8 +50,7 @@ async fn snapshot_bootstrap_then_stream_then_close() {
     c.send(FrameType::Close, 1, b"").await;
     assert_eq!(c.expect_closed(1).await, ClosedReason::Closed);
     // The attachment is gone and the channel free once CLOSED is read.
-    let inspected: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    let inspected = c.inspect(&session.id).await;
     assert_eq!(inspected.attachments, 0);
     c.open(1, json!({"session": session.id})).await;
     let boot = c.bootstrap(1).await;
@@ -251,8 +250,7 @@ async fn viewport_reports_coalesce_and_mark_the_stream() {
     c.send_json(FrameType::Viewport, 1, &json!({"cols": 30, "rows": 8}))
         .await;
     tokio::time::sleep(Duration::from_millis(80)).await;
-    let inspected: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    let inspected = c.inspect(&session.id).await;
     assert_eq!(
         (inspected.cols, inspected.marker),
         (30, 1),
@@ -282,8 +280,7 @@ async fn viewport_reports_coalesce_and_mark_the_stream() {
     let resized = c.expect_resized(1).await;
     assert_eq!((resized.seq, resized.cols), (3, 60));
     tokio::time::sleep(Duration::from_millis(80)).await;
-    let inspected: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    let inspected = c.inspect(&session.id).await;
     assert_eq!((inspected.cols, inspected.marker), (60, 3));
 
     c.open(
@@ -311,8 +308,7 @@ async fn viewport_reports_coalesce_and_mark_the_stream() {
         .await;
     assert_eq!(c.expect_error(1).await, ErrorCode::InvalidRequest);
     c.wait_attachments(&session.id, 0).await;
-    let inspected: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    let inspected = c.inspect(&session.id).await;
     assert_eq!(inspected.cols, 60);
 }
 

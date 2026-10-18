@@ -3,7 +3,7 @@
 //! native formatter produces for it.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ghostty_vt::formatter::{self, Options};
 use ghostty_vt::{Terminal, snapshot};
@@ -43,11 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn write(
-    dir: &std::path::Path,
-    name: &str,
-    term: &Terminal,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn write(dir: &Path, name: &str, term: &Terminal) -> Result<(), Box<dyn std::error::Error>> {
     fs::write(
         dir.join(format!("{name}.ghostsnp")),
         snapshot::encode(term)?,

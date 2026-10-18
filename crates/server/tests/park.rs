@@ -55,15 +55,6 @@ async fn wait_parked(state: &std::path::Path, id: &str) -> std::path::PathBuf {
     panic!("session {id} was not parked");
 }
 
-/// The `read` text of a session.
-async fn read(c: &mut Client, id: &str, scrollback: u32) -> Read {
-    serde_json::from_value(
-        c.ok("read", json!({"session": id, "scrollback": scrollback}))
-            .await,
-    )
-    .unwrap()
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn a_graceful_stop_parks_and_a_restart_restores() {
     let dir = tempfile::tempdir().unwrap();
@@ -120,7 +111,7 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
     assert_eq!(restored.attachments, 0);
     assert!(restored.exit.is_none());
 
-    let read = read(&mut c, &session.id, 100).await;
+    let read = c.read(&session.id, 100).await;
     assert!(read.text.contains("hello-park"), "{:?}", read.text);
     assert_eq!(read.status, Status::Restored);
     assert!(read.cursor.is_none(), "no cursor from a park file");
@@ -201,8 +192,7 @@ async fn keep_parks_at_exit_and_restores_as_exited() {
 
     let b = start_with(fast_limits(), state.clone());
     let mut c = client(&b).await;
-    let loaded: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    let loaded = c.inspect(&session.id).await;
     assert_eq!(loaded.status, Status::Exited);
     assert_eq!(loaded.exit, Some(Exit::Code { code: 3 }));
     assert_eq!(loaded.on_exit, OnExit::Keep);
@@ -257,13 +247,12 @@ async fn a_stop_parks_an_exited_session_whose_final_park_is_waiting() {
 
     let b = start_with(fast_limits(), state.clone());
     let mut c = client(&b).await;
-    let loaded: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    let loaded = c.inspect(&session.id).await;
     assert_eq!(
         (loaded.status, loaded.exit),
         (Status::Exited, Some(Exit::Code { code: 4 }))
     );
-    assert!(read(&mut c, &session.id, 0).await.text.contains("held"));
+    assert!(c.read(&session.id, 0).await.text.contains("held"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -309,8 +298,7 @@ async fn program_status_records_follow_the_protocol() {
     assert_eq!(record.kind.as_deref(), Some("permission"));
     assert_eq!(record.msg.as_deref(), Some("Apply?"));
     assert!(record.app.is_none(), "stored as reported");
-    let inspected: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    let inspected = c.inspect(&session.id).await;
     let records = inspected.program_status.unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(
@@ -354,8 +342,7 @@ async fn program_status_records_follow_the_protocol() {
     })
     .await;
     assert_eq!(removed, vec!["third".to_string()]);
-    let inspected: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    let inspected = c.inspect(&session.id).await;
     assert_eq!(inspected.program_status, Some(vec![]));
 }
 
@@ -484,11 +471,10 @@ async fn loading_keeps_the_newest_complete_generation_only() {
     assert_eq!(names, vec!["100"]);
     assert!(!sessions_dir(&state).join("empty").exists());
     // One history line before the screen.
-    assert_eq!(read(&mut c, id, 1).await.text, "line one\nline two 100\n");
-    assert_eq!(read(&mut c, id, 0).await.text, "line two 100\n");
-    assert_eq!(read(&mut c, id, 5).await.text, "line one\nline two 100\n");
-    let inspected: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": id})).await).unwrap();
+    assert_eq!(c.read(id, 1).await.text, "line one\nline two 100\n");
+    assert_eq!(c.read(id, 0).await.text, "line two 100\n");
+    assert_eq!(c.read(id, 5).await.text, "line one\nline two 100\n");
+    let inspected = c.inspect(id).await;
     assert_eq!(
         inspected
             .program_status
@@ -524,7 +510,7 @@ async fn loading_keeps_the_newest_complete_generation_only() {
     )
     .await;
     assert_eq!(c.expect_error(1).await, ErrorCode::EngineMismatch);
-    assert_eq!(read(&mut c, OTHER, 0).await.text, "elsewhere\n");
+    assert_eq!(c.read(OTHER, 0).await.text, "elsewhere\n");
     c.ok("remove", json!({"session": OTHER})).await;
 }
 
@@ -602,12 +588,7 @@ async fn a_stopped_server_leaves_the_directory_to_its_successor() {
     tokio::time::sleep(Duration::from_millis(600)).await;
     let page: Page = serde_json::from_value(c.ok("list", json!({})).await).unwrap();
     assert_eq!(page.sessions.len(), 1);
-    assert!(
-        read(&mut c, &session.id, 0)
-            .await
-            .text
-            .contains("left-behind")
-    );
+    assert!(c.read(&session.id, 0).await.text.contains("left-behind"));
     assert_eq!(generations(&state, &session.id).len(), 1);
     drop(a);
 }
@@ -621,8 +602,7 @@ async fn a_prompt_start_in_the_same_read_still_drops_the_working_record() {
             "printf '\\033]7501;state=working:id=w\\033\\\\\\033]133;A\\033\\\\'; echo same-chunk; exec cat"]}))
         .await;
     wait_text(&mut c, &session.id, "same-chunk").await;
-    let inspected: Session =
-        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    let inspected = c.inspect(&session.id).await;
     assert_eq!(inspected.program_status, Some(vec![]));
 }
 
@@ -637,8 +617,8 @@ async fn a_parked_read_takes_scrollback_from_the_history_only() {
             "seq 1 40; printf '\\033[H\\033[2J'; echo TOP; exec cat"]}))
         .await;
     wait_text(&mut c, &session.id, "TOP").await;
-    let live_screen = read(&mut c, &session.id, 0).await.text;
-    let live_two = read(&mut c, &session.id, 2).await.text;
+    let live_screen = c.read(&session.id, 0).await.text;
+    let live_two = c.read(&session.id, 2).await.text;
     // Ten rows: the last scroll before the clear left 1 to 31 in history.
     assert_eq!(live_screen, "TOP\n");
     assert_eq!(live_two, "30\n31\nTOP\n");
@@ -648,8 +628,8 @@ async fn a_parked_read_takes_scrollback_from_the_history_only() {
 
     let b = start_with(fast_limits(), state.clone());
     let mut c = client(&b).await;
-    assert_eq!(read(&mut c, &session.id, 0).await.text, live_screen);
-    assert_eq!(read(&mut c, &session.id, 2).await.text, live_two);
+    assert_eq!(c.read(&session.id, 0).await.text, live_screen);
+    assert_eq!(c.read(&session.id, 2).await.text, live_two);
 }
 
 #[tokio::test(flavor = "multi_thread")]

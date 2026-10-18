@@ -349,14 +349,11 @@ impl<H: Handler> Terminal<H> {
             ptr: name.as_ptr(),
             len: name.len(),
         };
-        // SAFETY: the option copies the string during the call.
-        check(unsafe {
-            sys::ghostty_terminal_set(
-                self.term.0,
-                sys::GHOSTTY_TERMINAL_OPT_TERMINFO_NAME,
-                &value as *const sys::GhosttyString as *const c_void,
-            )
-        })
+        // The option copies the string during the call.
+        self.set(
+            sys::GHOSTTY_TERMINAL_OPT_TERMINFO_NAME,
+            &value as *const sys::GhosttyString as *const c_void,
+        )
     }
 
     pub fn vt_write(&mut self, data: &[u8]) {

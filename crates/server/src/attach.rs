@@ -5,12 +5,13 @@ use std::sync::{Arc, Weak};
 
 use ghostty_vt::snapshot;
 use proto::{
-    AttachMode, Attached, Closed, ClosedReason, ErrorCode, ErrorMessage, Event, Exited, FrameType,
-    Gap, Open, Resized, Resume, Status, Viewport, encode_frame, encode_output,
+    AttachMode, Attached, Closed, ClosedReason, ErrorCode, Event, Exited, FrameType, Gap, Open,
+    Resized, Resume, Status, Viewport, encode_frame, encode_output,
 };
 use tokio::sync::mpsc;
 
-use crate::connection::Writer;
+use crate::connection::{Writer, error_frame};
+use crate::frame_json;
 use crate::registry::Registry;
 use crate::session::{Attachment, Body, SNAPSHOT_RETRY, Session, Shared, snapshot_with_retry};
 use crate::stream::MarkerKind;
@@ -206,14 +207,9 @@ impl Task {
     fn send_ending(&self, ending: Ending) {
         match ending {
             Ending::Closed(reason) => self.send_json(FrameType::Closed, &Closed { reason }),
-            Ending::Error(code, message) => self.send_json(
-                FrameType::Error,
-                &ErrorMessage {
-                    id: None,
-                    code,
-                    message,
-                },
-            ),
+            Ending::Error(code, message) => {
+                self.writer.send(error_frame(self.channel, code, message));
+            }
         }
     }
 
@@ -485,7 +481,7 @@ impl Task {
             loop {
                 while let Some(m) = markers.next_if(|m| m.offset <= self.cursor.offset) {
                     let frame = match &m.kind {
-                        MarkerKind::Resized { cols, rows } => crate::frame_json(
+                        MarkerKind::Resized { cols, rows } => frame_json(
                             FrameType::Resized,
                             self.channel,
                             &Resized {
@@ -495,7 +491,7 @@ impl Task {
                                 rows: *rows,
                             },
                         ),
-                        MarkerKind::Exited { exit } => crate::frame_json(
+                        MarkerKind::Exited { exit } => frame_json(
                             FrameType::Exited,
                             self.channel,
                             &Exited {

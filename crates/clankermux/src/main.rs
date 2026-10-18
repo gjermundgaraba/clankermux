@@ -349,7 +349,8 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
     // A graceful stop parks every running session and delivers `CLOSED
     // stopping` before the process ends.
     registry.stop().await;
-    result.map(|()| ExitCode::SUCCESS).map_err(Error::Io)
+    result?;
+    Ok(ExitCode::SUCCESS)
 }
 
 #[derive(Args)]
@@ -396,13 +397,10 @@ async fn relay(socket: PathBuf) -> Result<ExitCode, Error> {
         let _ = tokio::io::copy(&mut stdin, &mut to_server).await;
         let _ = to_server.shutdown().await;
     });
-    let copied = async {
-        let mut stdout = tokio::io::stdout();
-        tokio::io::copy(&mut from_server, &mut stdout).await?;
-        stdout.flush().await
-    }
-    .await;
-    copied.map(|_| ExitCode::SUCCESS).map_err(Error::Io)
+    let mut stdout = tokio::io::stdout();
+    tokio::io::copy(&mut from_server, &mut stdout).await?;
+    stdout.flush().await?;
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, Error> {
