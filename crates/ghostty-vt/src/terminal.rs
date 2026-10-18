@@ -137,6 +137,27 @@ pub trait Handler: Send + 'static {
 
 impl Handler for () {}
 
+/// The mode 2031 report announcing `scheme`.
+pub fn color_scheme_report(scheme: ColorScheme) -> Vec<u8> {
+    let raw = match scheme {
+        ColorScheme::Light => sys::GHOSTTY_COLOR_SCHEME_LIGHT,
+        ColorScheme::Dark => sys::GHOSTTY_COLOR_SCHEME_DARK,
+    };
+    let mut buf = [0u8; 32];
+    let mut written = 0;
+    // SAFETY: buf holds buf.len() writable bytes; the report is short.
+    let result = unsafe {
+        sys::ghostty_color_scheme_report_encode(
+            raw,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut written,
+        )
+    };
+    debug_assert_eq!(check(result), Ok::<(), Error>(()));
+    buf[..written].to_vec()
+}
+
 struct Slot<H> {
     handler: H,
     xtversion: Vec<u8>,

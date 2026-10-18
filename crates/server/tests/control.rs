@@ -1,190 +1,15 @@
 //! Conformance tests for the Control section of PROTOCOL.md, driven over
 //! a Unix socket against an in-process server.
 
-use std::path::PathBuf;
+mod common;
+
 use std::time::Duration;
 
 use base64::Engine as _;
+use common::*;
 use proto::*;
-use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-
-struct Server {
-    socket: PathBuf,
-    _dir: tempfile::TempDir,
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn start(limits: Limits) -> Server {
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("sock");
-    let registry = server::Registry::new(server::Config {
-        limits,
-        shell: vec!["/bin/sh".into()],
-        home: dir.path().to_path_buf(),
-        version: "test".into(),
-    });
-    let task = tokio::spawn(server::serve_unix(socket.clone(), registry));
-    for _ in 0..100 {
-        if socket.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Server {
-        socket,
-        _dir: dir,
-        task,
-    }
-}
-
-fn fast_limits() -> Limits {
-    Limits {
-        hello_timeout: 300,
-        remove_grace: 200,
-        page: 2,
-        ..Limits::default()
-    }
-}
-
-struct Client {
-    stream: UnixStream,
-    decoder: FrameDecoder,
-    next_id: u64,
-    /// Events that arrived while waiting for a reply.
-    events: std::collections::VecDeque<Event>,
-}
-
-impl Client {
-    async fn connect(server: &Server) -> Self {
-        Client {
-            stream: UnixStream::connect(&server.socket).await.unwrap(),
-            decoder: FrameDecoder::default(),
-            next_id: 1,
-            events: Default::default(),
-        }
-    }
-
-    async fn send(&mut self, frame_type: FrameType, channel: u32, payload: &[u8]) {
-        self.stream
-            .write_all(&encode_frame(frame_type, channel, payload))
-            .await
-            .unwrap();
-    }
-
-    async fn send_json(&mut self, frame_type: FrameType, channel: u32, body: &Value) {
-        self.send(frame_type, channel, &serde_json::to_vec(body).unwrap())
-            .await;
-    }
-
-    /// The next frame, or `None` when the server closed the connection.
-    async fn recv(&mut self) -> Option<(Header, Vec<u8>)> {
-        let mut buf = [0u8; 4096];
-        loop {
-            if let Some(frame) = self.decoder.next_frame(u64::MAX).unwrap() {
-                return Some(frame);
-            }
-            match tokio::time::timeout(Duration::from_secs(5), self.stream.read(&mut buf))
-                .await
-                .expect("frame within 5 s")
-            {
-                Ok(0) | Err(_) => return None,
-                Ok(n) => self.decoder.push(&buf[..n]),
-            }
-        }
-    }
-
-    async fn recv_json(&mut self) -> (Header, Value) {
-        let (header, payload) = self.recv().await.expect("a frame");
-        (header, serde_json::from_slice(&payload).unwrap())
-    }
-
-    async fn hello(&mut self) -> Welcome {
-        self.send_json(
-            FrameType::Hello,
-            0,
-            &json!({"version": 1, "client": {"name": "test", "version": "0"}, "capabilities": []}),
-        )
-        .await;
-        let (header, body) = self.recv_json().await;
-        assert_eq!(header.frame_type, FrameType::Welcome);
-        serde_json::from_value(body).unwrap()
-    }
-
-    /// Sends a request and returns its reply or error, queuing events that
-    /// arrive first.
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value, ErrorMessage> {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.send_json(
-            FrameType::Request,
-            0,
-            &json!({"id": id, "method": method, "params": params}),
-        )
-        .await;
-        loop {
-            let (header, body) = self.recv_json().await;
-            match header.frame_type {
-                FrameType::Reply => {
-                    assert_eq!(body["id"], id);
-                    return Ok(body["result"].clone());
-                }
-                FrameType::Error => {
-                    assert_eq!(body["id"], id, "error for another request: {body}");
-                    return Err(serde_json::from_value(body).unwrap());
-                }
-                FrameType::Event => self.events.push_back(serde_json::from_value(body).unwrap()),
-                other => panic!("unexpected {other:?}"),
-            }
-        }
-    }
-
-    async fn event(&mut self) -> Event {
-        if let Some(event) = self.events.pop_front() {
-            return event;
-        }
-        let (header, body) = self.recv_json().await;
-        assert_eq!(header.frame_type, FrameType::Event, "{body}");
-        serde_json::from_value(body).unwrap()
-    }
-
-    async fn create(&mut self, params: Value) -> Session {
-        serde_json::from_value(self.request("create", params).await.unwrap()).unwrap()
-    }
-
-    async fn ok(&mut self, method: &str, params: Value) -> Value {
-        self.request(method, params)
-            .await
-            .unwrap_or_else(|e| panic!("{method}: {e:?}"))
-    }
-
-    async fn err(&mut self, method: &str, params: Value) -> ErrorCode {
-        self.request(method, params).await.expect_err(method).code
-    }
-
-    async fn wait_exit(&mut self, id: &str) -> Session {
-        loop {
-            if let Event::SessionExited { session } = self.event().await
-                && session.id == id
-            {
-                return session;
-            }
-        }
-    }
-}
-
-async fn client(server: &Server) -> Client {
-    let mut c = Client::connect(server).await;
-    c.hello().await;
-    c
-}
+use serde_json::json;
+use tokio::io::AsyncWriteExt;
 
 #[tokio::test]
 async fn handshake_and_protocol_errors() {
@@ -397,17 +222,163 @@ async fn session_lifecycle() {
     );
 }
 
-/// Polls `read` until `needle` appears on the screen.
-async fn wait_text(c: &mut Client, id: &str, needle: &str) -> Read {
-    for _ in 0..200 {
+#[tokio::test]
+async fn exit_code_and_removal_on_exit() {
+    let server = start(fast_limits()).await;
+    let mut c = client(&server).await;
+    c.ok("subscribe", json!({})).await;
+    let session = c.create(json!({"argv": ["/bin/sh", "-c", "exit 3"]})).await;
+    assert!(matches!(c.event().await, Event::SessionCreated { .. }));
+    let exited = c.wait_exit(&session.id).await;
+    assert_eq!(exited.exit, Some(Exit::Code { code: 3 }));
+    assert!(exited.exited_at.is_some());
+    let read: Read =
+        serde_json::from_value(c.ok("read", json!({"session": session.id})).await).unwrap();
+    assert_eq!(read.status, Status::Exited);
+    assert!(
+        matches!(c.event().await, Event::SessionRemoved { id } if id == session.id),
+        "removed after remove_grace"
+    );
+    assert_eq!(
+        c.err("read", json!({"session": session.id})).await,
+        ErrorCode::NoSuchSession
+    );
+}
+
+#[tokio::test]
+async fn end_sends_hangup() {
+    let server = start(fast_limits()).await;
+    let mut c = client(&server).await;
+    c.ok("subscribe", json!({})).await;
+    let session = c
+        .create(
+            json!({"argv": ["/bin/sh", "-c", "trap 'exit 7' HUP; echo ready; while :; do sleep 0.05; done"]}),
+        )
+        .await;
+    wait_text(&mut c, &session.id, "ready").await;
+    c.ok("end", json!({"session": session.id})).await;
+    let exited = c.wait_exit(&session.id).await;
+    assert_eq!(exited.exit, Some(Exit::Code { code: 7 }));
+}
+
+#[tokio::test]
+async fn create_defaults_and_limits() {
+    let server = start(fast_limits()).await;
+    let mut c = client(&server).await;
+    let session = c.create(json!({})).await;
+    assert_eq!(session.argv, ["/bin/sh"]);
+    assert_eq!((session.cols, session.rows), (80, 24));
+    assert_eq!(session.on_exit, OnExit::Remove);
+    assert_eq!(session.label, "");
+    assert_eq!(
+        c.err("create", json!({"label": "x".repeat(300)})).await,
+        ErrorCode::LimitExceeded
+    );
+    assert_eq!(
+        c.err("create", json!({"cwd": "x".repeat(3000)})).await,
+        ErrorCode::LimitExceeded
+    );
+    assert_eq!(
+        c.err("create", json!({"argv": ["/nonexistent/program"]}))
+            .await,
+        ErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        c.err("create", json!({"cols": "wide"})).await,
+        ErrorCode::InvalidRequest
+    );
+
+    let env = c.create(json!({"argv": ["/bin/sh", "-c", "printf '%s|%s' \"$TERM\" \"$FOO\"; sleep 1"], "env": {"FOO": "bar"}})).await;
+    let mut text = String::new();
+    for _ in 0..50 {
         let read: Read =
-            serde_json::from_value(c.ok("read", json!({"session": id})).await).unwrap();
-        if read.text.contains(needle) {
-            return read;
+            serde_json::from_value(c.ok("read", json!({"session": env.id})).await).unwrap();
+        text = read.text;
+        if text.contains('|') {
+            break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("{needle:?} never appeared");
+    assert_eq!(text.trim_end(), "xterm-ghostty|bar");
+    c.ok("signal", json!({"session": env.id, "signal": "KILL"}))
+        .await;
+}
+
+#[tokio::test]
+async fn list_pages_by_id() {
+    let server = start(fast_limits()).await;
+    let mut c = client(&server).await;
+    let mut ids: Vec<String> = Vec::new();
+    for _ in 0..5 {
+        ids.push(c.create(json!({"argv": ["/bin/sleep", "5"]})).await.id);
+    }
+    ids.sort();
+    let mut seen = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page: Page =
+            serde_json::from_value(c.ok("list", json!({"after": after})).await).unwrap();
+        assert!(page.sessions.len() <= 2);
+        seen.extend(page.sessions.iter().map(|s| s.id.clone()));
+        match page.next {
+            Some(next) => {
+                assert_eq!(&next, seen.last().unwrap());
+                after = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(seen, ids);
+    for id in ids {
+        c.ok("signal", json!({"session": id, "signal": "KILL"}))
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn events_are_ordered_with_replies() {
+    let server = start(fast_limits()).await;
+    let mut c = client(&server).await;
+    c.ok("subscribe", json!({})).await;
+    let session = c.create(json!({"argv": ["/bin/sleep", "5"]})).await;
+    // The server emits the event before it sends the reply, and this
+    // connection receives both in that order: the event was queued while
+    // waiting for the reply.
+    assert_eq!(c.events.len(), 1, "event before reply");
+    assert!(matches!(c.event().await, Event::SessionCreated { session: s } if s.id == session.id));
+    c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
+        .await;
+    c.wait_exit(&session.id).await;
+}
+
+#[tokio::test]
+async fn read_returns_scrollback_then_screen() {
+    let server = start(fast_limits()).await;
+    let mut c = client(&server).await;
+    let session = c
+        .create(json!({"argv": ["/bin/sh", "-c", "i=1; while [ $i -le 50 ]; do echo line$i; i=$((i+1)); done; sleep 5"], "cols": 20, "rows": 5}))
+        .await;
+    let mut lines = Vec::new();
+    for _ in 0..100 {
+        let read: Read = serde_json::from_value(
+            c.ok("read", json!({"session": session.id, "scrollback": 3}))
+                .await,
+        )
+        .unwrap();
+        lines = read.text.lines().map(str::to_string).collect();
+        if lines.last().is_some_and(|l| l == "line50") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The screen holds line47 to line50 and the blank cursor row.
+    assert_eq!(lines.len(), 7, "{lines:?}");
+    assert_eq!(lines[0], "line44");
+    let read: Read =
+        serde_json::from_value(c.ok("read", json!({"session": session.id})).await).unwrap();
+    assert_eq!(read.text.lines().count(), 4);
+    c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
+        .await;
 }
 
 #[tokio::test]
@@ -591,165 +562,6 @@ async fn read_screen_only_after_clear_and_bounded_replies() {
         &read.text[..10]
     );
     assert!(read.text.ends_with("line996\nonly\n"));
-    c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
-        .await;
-}
-
-#[tokio::test]
-async fn exit_code_and_removal_on_exit() {
-    let server = start(fast_limits()).await;
-    let mut c = client(&server).await;
-    c.ok("subscribe", json!({})).await;
-    let session = c.create(json!({"argv": ["/bin/sh", "-c", "exit 3"]})).await;
-    assert!(matches!(c.event().await, Event::SessionCreated { .. }));
-    let exited = c.wait_exit(&session.id).await;
-    assert_eq!(exited.exit, Some(Exit::Code { code: 3 }));
-    assert!(exited.exited_at.is_some());
-    let read: Read =
-        serde_json::from_value(c.ok("read", json!({"session": session.id})).await).unwrap();
-    assert_eq!(read.status, Status::Exited);
-    assert!(
-        matches!(c.event().await, Event::SessionRemoved { id } if id == session.id),
-        "removed after remove_grace"
-    );
-    assert_eq!(
-        c.err("read", json!({"session": session.id})).await,
-        ErrorCode::NoSuchSession
-    );
-}
-
-#[tokio::test]
-async fn end_sends_hangup() {
-    let server = start(fast_limits()).await;
-    let mut c = client(&server).await;
-    c.ok("subscribe", json!({})).await;
-    let session = c
-        .create(
-            json!({"argv": ["/bin/sh", "-c", "trap 'exit 7' HUP; echo ready; while :; do sleep 0.05; done"]}),
-        )
-        .await;
-    wait_text(&mut c, &session.id, "ready").await;
-    c.ok("end", json!({"session": session.id})).await;
-    let exited = c.wait_exit(&session.id).await;
-    assert_eq!(exited.exit, Some(Exit::Code { code: 7 }));
-}
-
-#[tokio::test]
-async fn create_defaults_and_limits() {
-    let server = start(fast_limits()).await;
-    let mut c = client(&server).await;
-    let session = c.create(json!({})).await;
-    assert_eq!(session.argv, ["/bin/sh"]);
-    assert_eq!((session.cols, session.rows), (80, 24));
-    assert_eq!(session.on_exit, OnExit::Remove);
-    assert_eq!(session.label, "");
-    assert_eq!(
-        c.err("create", json!({"label": "x".repeat(300)})).await,
-        ErrorCode::LimitExceeded
-    );
-    assert_eq!(
-        c.err("create", json!({"cwd": "x".repeat(3000)})).await,
-        ErrorCode::LimitExceeded
-    );
-    assert_eq!(
-        c.err("create", json!({"argv": ["/nonexistent/program"]}))
-            .await,
-        ErrorCode::InvalidRequest
-    );
-    assert_eq!(
-        c.err("create", json!({"cols": "wide"})).await,
-        ErrorCode::InvalidRequest
-    );
-
-    let env = c.create(json!({"argv": ["/bin/sh", "-c", "printf '%s|%s' \"$TERM\" \"$FOO\"; sleep 1"], "env": {"FOO": "bar"}})).await;
-    let mut text = String::new();
-    for _ in 0..50 {
-        let read: Read =
-            serde_json::from_value(c.ok("read", json!({"session": env.id})).await).unwrap();
-        text = read.text;
-        if text.contains('|') {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(text.trim_end(), "xterm-ghostty|bar");
-    c.ok("signal", json!({"session": env.id, "signal": "KILL"}))
-        .await;
-}
-
-#[tokio::test]
-async fn list_pages_by_id() {
-    let server = start(fast_limits()).await;
-    let mut c = client(&server).await;
-    let mut ids: Vec<String> = Vec::new();
-    for _ in 0..5 {
-        ids.push(c.create(json!({"argv": ["/bin/sleep", "5"]})).await.id);
-    }
-    ids.sort();
-    let mut seen = Vec::new();
-    let mut after: Option<String> = None;
-    loop {
-        let page: Page =
-            serde_json::from_value(c.ok("list", json!({"after": after})).await).unwrap();
-        assert!(page.sessions.len() <= 2);
-        seen.extend(page.sessions.iter().map(|s| s.id.clone()));
-        match page.next {
-            Some(next) => {
-                assert_eq!(&next, seen.last().unwrap());
-                after = Some(next);
-            }
-            None => break,
-        }
-    }
-    assert_eq!(seen, ids);
-    for id in ids {
-        c.ok("signal", json!({"session": id, "signal": "KILL"}))
-            .await;
-    }
-}
-
-#[tokio::test]
-async fn events_are_ordered_with_replies() {
-    let server = start(fast_limits()).await;
-    let mut c = client(&server).await;
-    c.ok("subscribe", json!({})).await;
-    let session = c.create(json!({"argv": ["/bin/sleep", "5"]})).await;
-    // The server emits the event before it sends the reply, and this
-    // connection receives both in that order: the event was queued while
-    // waiting for the reply.
-    assert_eq!(c.events.len(), 1, "event before reply");
-    assert!(matches!(c.event().await, Event::SessionCreated { session: s } if s.id == session.id));
-    c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
-        .await;
-    c.wait_exit(&session.id).await;
-}
-
-#[tokio::test]
-async fn read_returns_scrollback_then_screen() {
-    let server = start(fast_limits()).await;
-    let mut c = client(&server).await;
-    let session = c
-        .create(json!({"argv": ["/bin/sh", "-c", "i=1; while [ $i -le 50 ]; do echo line$i; i=$((i+1)); done; sleep 5"], "cols": 20, "rows": 5}))
-        .await;
-    let mut lines = Vec::new();
-    for _ in 0..100 {
-        let read: Read = serde_json::from_value(
-            c.ok("read", json!({"session": session.id, "scrollback": 3}))
-                .await,
-        )
-        .unwrap();
-        lines = read.text.lines().map(str::to_string).collect();
-        if lines.last().is_some_and(|l| l == "line50") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    // The screen holds line47 to line50 and the blank cursor row.
-    assert_eq!(lines.len(), 7, "{lines:?}");
-    assert_eq!(lines[0], "line44");
-    let read: Read =
-        serde_json::from_value(c.ok("read", json!({"session": session.id})).await).unwrap();
-    assert_eq!(read.text.lines().count(), 4);
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
 }

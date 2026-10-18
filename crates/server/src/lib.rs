@@ -1,5 +1,6 @@
 //! The clankermux server.
 
+pub mod attach;
 pub mod connection;
 pub mod control;
 pub mod pty;

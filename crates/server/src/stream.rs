@@ -79,10 +79,15 @@ impl Stream {
         marker
     }
 
-    /// Retained bytes from `offset`, or `None` when they were dropped.
-    pub fn bytes_from(&self, offset: u64) -> Option<impl Iterator<Item = u8> + '_> {
-        let skip = offset.checked_sub(self.start)? as usize;
-        (skip <= self.ring.len()).then(|| self.ring.iter().skip(skip).copied())
+    /// Up to `max` retained bytes from `offset`, or `None` when the
+    /// stream no longer retains `offset`.
+    pub fn read(&self, offset: u64, max: usize) -> Option<Vec<u8>> {
+        let skip = usize::try_from(offset.checked_sub(self.start)?).ok()?;
+        if skip > self.ring.len() {
+            return None;
+        }
+        let end = skip.saturating_add(max).min(self.ring.len());
+        Some(self.ring.range(skip..end).copied().collect())
     }
 
     /// Whether every marker with `seq` above `after` is still retained.
@@ -108,9 +113,11 @@ mod tests {
         s.append(b"defg");
         assert_eq!(s.offset(), 7);
         assert_eq!(s.retained_start(), 3);
-        assert_eq!(s.bytes_from(3).unwrap().collect::<Vec<_>>(), b"defg");
-        assert!(s.bytes_from(2).is_none());
-        assert_eq!(s.bytes_from(7).unwrap().count(), 0);
+        assert_eq!(s.read(3, 100).unwrap(), b"defg");
+        assert_eq!(s.read(4, 2).unwrap(), b"ef");
+        assert!(s.read(2, 1).is_none());
+        assert!(s.read(8, 1).is_none());
+        assert_eq!(s.read(7, 1).unwrap(), b"");
         assert!(
             s.markers_retained_after(0),
             "marker at offset 3 is at the ring start"

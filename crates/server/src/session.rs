@@ -1,14 +1,24 @@
 //! One session: the child, its PTY, the engine and the stream.
 
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use ghostty_vt::{ColorScheme, Handler, Rgb, SizeReport, Term, Terminal};
-use proto::{Exit, OnExit, Status};
+use ghostty_vt::{
+    ColorKind, ColorScheme, Handler, Rgb, SizeReport, Term, Terminal, color_scheme_report,
+};
+use proto::{ClosedReason, Event, Exit, OnExit, Profile, Scheme, Size, Status, Viewport};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
-use crate::stream::{MarkerKind, Stream};
+use crate::registry::Registry;
+use crate::stream::{Marker, MarkerKind, Stream};
+
+pub type Shared = Arc<Mutex<Session>>;
+
+/// Coalescing window for `VIEWPORT` reports.
+pub const COALESCE: Duration = Duration::from_millis(25);
 
 /// Effects the engine raises while parsing, collected under the session
 /// lock and drained by the caller of `vt_write`.
@@ -22,12 +32,10 @@ pub struct Effects {
     pub size: SizeReport,
 }
 
-impl Handler for Effects {
-    fn write_pty(&mut self, data: &[u8]) {
-        self.pty_output.extend_from_slice(data);
-    }
-
-    fn color_scheme(&mut self) -> Option<ColorScheme> {
+impl Effects {
+    /// Answer to the colour scheme query: the profile's scheme, else from
+    /// its background, else none.
+    pub fn scheme_answer(&self) -> Option<ColorScheme> {
         self.scheme.or_else(|| {
             self.bg.map(|c| {
                 if luminance(c) < 0.5 {
@@ -37,6 +45,16 @@ impl Handler for Effects {
                 }
             })
         })
+    }
+}
+
+impl Handler for Effects {
+    fn write_pty(&mut self, data: &[u8]) {
+        self.pty_output.extend_from_slice(data);
+    }
+
+    fn color_scheme(&mut self) -> Option<ColorScheme> {
+        self.scheme_answer()
     }
 
     fn size(&mut self) -> Option<SizeReport> {
@@ -63,6 +81,20 @@ pub fn luminance(c: Rgb) -> f64 {
         }
     }
     0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+}
+
+/// `#rrggbb`.
+pub fn parse_rgb(value: &str) -> Option<Rgb> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some(Rgb {
+        r: channel(0)?,
+        g: channel(2)?,
+        b: channel(4)?,
+    })
 }
 
 /// One queued write: its bytes, the queue permits they hold until written,
@@ -100,6 +132,24 @@ impl InputQueue {
     }
 }
 
+/// A viewport report from an attachment, or from `set_size` with no source.
+#[derive(Debug, Clone)]
+pub struct Report {
+    pub source: Option<u64>,
+    pub viewport: Viewport,
+}
+
+/// An open attachment as the session sees it.
+pub struct Attachment {
+    pub id: u64,
+    /// Tells the attachment to send `CLOSED` and end. Weak, so that the
+    /// connection dropping its handle ends the attachment.
+    pub close: mpsc::WeakUnboundedSender<ClosedReason>,
+    /// Set once it has sent the final marker and, if bootstrapping,
+    /// `SNAPSHOT_END`.
+    pub finished: Arc<AtomicBool>,
+}
+
 pub struct Session {
     pub id: String,
     pub label: String,
@@ -117,13 +167,21 @@ pub struct Session {
     pub exit: Option<Exit>,
     pub term: Terminal<Effects>,
     pub stream: Stream,
-    pub attachments: u32,
+    /// Notified after every stream change.
+    pub wake: Arc<Notify>,
     pub master: Arc<AsyncFd<OwnedFd>>,
     pub slave_path: String,
     pub input: InputQueue,
     pub pty_eof: bool,
     /// `limits.text`, applied to the title and pwd the program reports.
     pub text_limit: usize,
+    pub attached: Vec<Attachment>,
+    /// The attachment whose report was adopted last.
+    pub authoritative: Option<u64>,
+    pub profile: Profile,
+    /// The latest coalesced report, waiting for the timer.
+    pub pending: Option<Report>,
+    pub timer_running: bool,
 }
 
 impl Session {
@@ -145,7 +203,7 @@ impl Session {
             exit: self.exit.clone(),
             offset: self.stream.offset(),
             marker: self.stream.latest_seq(),
-            attachments: self.attachments,
+            attachments: self.attached.len() as u32,
             program_status: with_records.then(Vec::new),
         }
     }
@@ -155,6 +213,7 @@ impl Session {
     pub fn output(&mut self, bytes: &[u8]) -> bool {
         self.term.vt_write(bytes);
         self.stream.append(bytes);
+        self.wake.notify_waiters();
         self.flush_effects()
     }
 
@@ -171,14 +230,41 @@ impl Session {
         std::mem::take(&mut self.term.handler_mut().changed)
     }
 
-    /// Applies a size, returning the marker when it changed the size.
-    pub fn resize(
-        &mut self,
-        cols: u16,
-        rows: u16,
-        cell_width: u32,
-        cell_height: u32,
-    ) -> Option<crate::stream::Marker> {
+    pub fn size(&self) -> Size {
+        Size {
+            cols: self.term.cols(),
+            rows: self.term.rows(),
+            cell_width: None,
+            cell_height: None,
+        }
+    }
+
+    /// Applies a viewport report at once, discarding any pending coalesced
+    /// report. Returns the marker when the size changed.
+    pub fn apply_report(&mut self, report: Report) -> Option<Marker> {
+        self.pending = None;
+        if self.status != Status::Running {
+            return None;
+        }
+        if let Some(source) = report.source {
+            self.authoritative = Some(source);
+        }
+        let Viewport {
+            size:
+                Size {
+                    cols,
+                    rows,
+                    cell_width,
+                    cell_height,
+                },
+            profile,
+        } = report.viewport;
+        if let Some(profile) = profile {
+            self.set_profile(profile);
+        }
+        let current = self.term.handler().size;
+        let cell_width = cell_width.unwrap_or(current.cell_width);
+        let cell_height = cell_height.unwrap_or(current.cell_height);
         let changed = (self.term.cols(), self.term.rows()) != (cols, rows);
         if changed
             && self
@@ -199,7 +285,40 @@ impl Session {
         }
         let _ = crate::pty::set_size(&self.master, cols, rows);
         self.flush_effects();
-        Some(self.stream.add_marker(MarkerKind::Resized { cols, rows }))
+        let marker = self.stream.add_marker(MarkerKind::Resized { cols, rows });
+        self.wake.notify_waiters();
+        Some(marker)
+    }
+
+    /// Makes `profile` the authoritative one: default colours for OSC 10,
+    /// 11 and 12, the scheme for CSI ? 996 n, and a mode 2031 report when
+    /// the scheme answer changed.
+    pub fn set_profile(&mut self, profile: Profile) {
+        let before = self.term.handler().scheme_answer();
+        let effects = self.term.handler_mut();
+        effects.scheme = profile.scheme.map(|s| match s {
+            Scheme::Light => ColorScheme::Light,
+            Scheme::Dark => ColorScheme::Dark,
+        });
+        effects.bg = profile.bg.as_deref().and_then(parse_rgb);
+        for (kind, value) in [
+            (ColorKind::Foreground, &profile.fg),
+            (ColorKind::Background, &profile.bg),
+            (ColorKind::Cursor, &profile.cursor),
+        ] {
+            let _ = self
+                .term
+                .set_color(kind, value.as_deref().and_then(parse_rgb));
+        }
+        self.profile = profile;
+        let after = self.term.handler().scheme_answer();
+        if after != before
+            && let Some(scheme) = after
+            && self.term.mode(2031).unwrap_or(false)
+            && self.input.push(color_scheme_report(scheme)).is_none()
+        {
+            tracing::warn!(session = self.id, "input queue full; scheme report dropped");
+        }
     }
 
     /// Called when the PTY reached EOF or the child was reaped; ends the
@@ -213,8 +332,63 @@ impl Session {
         self.exited_at = Some(now());
         self.stream
             .add_marker(MarkerKind::Exited { exit: exit.clone() });
+        self.wake.notify_waiters();
         Some(exit)
     }
+
+    /// Whether every open attachment has finished.
+    pub fn attachments_finished(&self) -> bool {
+        self.attached
+            .iter()
+            .all(|a| a.finished.load(Ordering::Acquire))
+    }
+
+    /// Tells attachments to close: all of them, or only the finished ones.
+    pub fn close_attachments(&self, reason: ClosedReason, finished_only: bool) {
+        for a in &self.attached {
+            if (!finished_only || a.finished.load(Ordering::Acquire))
+                && let Some(close) = a.close.upgrade()
+            {
+                let _ = close.send(reason);
+            }
+        }
+    }
+}
+
+/// Applies a viewport report, at once or after the coalescing window, and
+/// emits `session_changed` when the size changed.
+pub fn report(registry: &Arc<Registry>, session: &Shared, report: Report, immediate: bool) {
+    let mut s = session.lock().unwrap();
+    if immediate {
+        let changed = s.apply_report(report).map(|_| s.to_proto(false));
+        drop(s);
+        if let Some(session) = changed {
+            registry.emit(&Event::SessionChanged { session });
+        }
+        return;
+    }
+    s.pending = Some(report);
+    if s.timer_running {
+        return;
+    }
+    s.timer_running = true;
+    drop(s);
+    let registry = registry.clone();
+    let session = session.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(COALESCE).await;
+        let changed = {
+            let mut s = session.lock().unwrap();
+            s.timer_running = false;
+            s.pending
+                .take()
+                .and_then(|r| s.apply_report(r))
+                .map(|_| s.to_proto(false))
+        };
+        if let Some(session) = changed {
+            registry.emit(&Event::SessionChanged { session });
+        }
+    });
 }
 
 /// The path of an OSC 7 `file://host/path` value; other values unchanged.
@@ -269,5 +443,14 @@ mod tests {
                 b: 255
             }) > 0.5
         );
+        assert_eq!(
+            parse_rgb("#1e1e2e"),
+            Some(Rgb {
+                r: 0x1e,
+                g: 0x1e,
+                b: 0x2e
+            })
+        );
+        assert_eq!(parse_rgb("1e1e2e"), None);
     }
 }

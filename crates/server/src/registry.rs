@@ -4,16 +4,16 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use proto::{ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status};
+use proto::{ClosedReason, ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status};
 use tokio::io::unix::AsyncFd;
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
-use crate::session::{Effects, InputQueue, Session, now};
+use crate::connection::Writer;
+use crate::session::{Effects, InputQueue, Session, Shared, now};
 use crate::stream::Stream;
 use crate::{frame_json, pty};
 
 pub type Fail = (ErrorCode, String);
-pub type Shared = Arc<Mutex<Session>>;
 
 pub struct Config {
     pub limits: Limits,
@@ -33,7 +33,7 @@ pub struct Registry {
 #[derive(Default)]
 struct State {
     sessions: BTreeMap<String, Shared>,
-    subscribers: Vec<mpsc::UnboundedSender<Vec<u8>>>,
+    subscribers: Vec<Writer>,
 }
 
 impl Registry {
@@ -78,9 +78,9 @@ impl Registry {
     }
 
     /// Registers a subscriber and returns the first page as of that moment.
-    pub fn subscribe(&self, tx: mpsc::UnboundedSender<Vec<u8>>) -> Page {
+    pub fn subscribe(&self, writer: Writer) -> Page {
         let mut state = self.state.lock().unwrap();
-        state.subscribers.push(tx);
+        state.subscribers.push(writer);
         self.page_of(&state, None)
     }
 
@@ -90,7 +90,7 @@ impl Registry {
             .lock()
             .unwrap()
             .subscribers
-            .retain(|tx| tx.send(bytes.clone()).is_ok());
+            .retain(|w| w.send(bytes.clone()));
     }
 
     pub fn create(self: &Arc<Self>, params: proto::CreateParams) -> Result<proto::Session, Fail> {
@@ -161,12 +161,17 @@ impl Registry {
             exit: None,
             term,
             stream: Stream::new(limits.ring as usize, limits.markers as usize),
-            attachments: 0,
+            wake: Arc::new(Notify::new()),
             master: master.clone(),
             slave_path: pty.slave_path,
             input,
             pty_eof: false,
             text_limit: limits.text as usize,
+            attached: Vec::new(),
+            authoritative: None,
+            profile: proto::Profile::default(),
+            pending: None,
+            timer_running: false,
         };
         let id = session.id.clone();
         let snapshot = session.to_proto(false);
@@ -265,30 +270,51 @@ impl Registry {
         let id = snapshot.id.clone();
         self.emit(&Event::SessionExited { session: snapshot });
         if remove {
-            let registry = self.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    registry.config.limits.remove_grace,
-                ))
-                .await;
-                let _ = registry.remove(&id);
-            });
+            self.remove_after_grace(id);
         }
     }
 
-    pub fn remove(&self, id: &str) -> Result<(), Fail> {
-        let mut state = self.state.lock().unwrap();
-        let session = state
-            .sessions
-            .get(id)
-            .ok_or_else(|| (ErrorCode::NoSuchSession, format!("no session {id}")))?;
-        if session.lock().unwrap().status == Status::Running {
-            return Err((ErrorCode::Running, "session is running".into()));
+    fn remove_after_grace(self: &Arc<Self>, id: String) {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                registry.config.limits.remove_grace,
+            ))
+            .await;
+            registry.remove_now(&id);
+        });
+    }
+
+    /// An explicit `remove`: finished attachments close at once; when
+    /// others are open the session stays until `remove_grace` has passed.
+    pub fn remove(self: &Arc<Self>, id: &str) -> Result<(), Fail> {
+        let session = self.get(id)?;
+        let all_finished = {
+            let s = session.lock().unwrap();
+            if s.status == Status::Running {
+                return Err((ErrorCode::Running, "session is running".into()));
+            }
+            s.close_attachments(ClosedReason::Removed, true);
+            s.attachments_finished()
+        };
+        if all_finished {
+            self.remove_now(id);
+        } else {
+            self.remove_after_grace(id.to_string());
         }
-        state.sessions.remove(id);
-        drop(state);
-        self.emit(&Event::SessionRemoved { id: id.to_string() });
         Ok(())
+    }
+
+    /// Drops the session, closing every attachment.
+    fn remove_now(&self, id: &str) {
+        let Some(session) = self.state.lock().unwrap().sessions.remove(id) else {
+            return;
+        };
+        session
+            .lock()
+            .unwrap()
+            .close_attachments(ClosedReason::Removed, false);
+        self.emit(&Event::SessionRemoved { id: id.to_string() });
     }
 }
 

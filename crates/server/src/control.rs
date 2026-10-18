@@ -4,20 +4,16 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use ghostty_vt::formatter;
-use proto::{ErrorCode, Event, Request, Status};
+use proto::{ErrorCode, Event, Request, Size, Status, Viewport};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 
+use crate::connection::Writer;
 use crate::registry::{Fail, Registry, internal};
+use crate::session::{self, Report};
 
 /// JSON overhead allowed around `read`'s text within `max_frame`.
 const READ_REPLY_MARGIN: usize = 4096;
-
-pub struct Conn {
-    pub tx: mpsc::UnboundedSender<Vec<u8>>,
-    pub subscribed: bool,
-}
 
 fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
     serde_json::from_value(value)
@@ -32,9 +28,12 @@ fn running(status: Status) -> Result<(), Fail> {
     }
 }
 
+/// Handles one request on a connection whose `subscribed` flag records
+/// whether it already receives events.
 pub async fn handle(
     registry: &Arc<Registry>,
-    conn: &mut Conn,
+    writer: &Writer,
+    subscribed: &mut bool,
     request: Request,
 ) -> Result<Value, Fail> {
     let p = request.params;
@@ -106,14 +105,20 @@ pub async fn handle(
                 ));
             }
             let session = registry.get(&p.session)?;
-            let changed = {
-                let mut s = session.lock().unwrap();
-                running(s.status)?;
-                s.resize(p.cols, p.rows, 0, 0).map(|_| s.to_proto(false))
+            running(session.lock().unwrap().status)?;
+            let report = Report {
+                source: None,
+                viewport: Viewport {
+                    size: Size {
+                        cols: p.cols,
+                        rows: p.rows,
+                        cell_width: None,
+                        cell_height: None,
+                    },
+                    profile: None,
+                },
             };
-            if let Some(out) = changed {
-                registry.emit(&Event::SessionChanged { session: out });
-            }
+            session::report(registry, &session, report, true);
             Ok(json!({}))
         }
         "read" => {
@@ -178,11 +183,11 @@ pub async fn handle(
             Ok(json!({}))
         }
         "subscribe" => {
-            if conn.subscribed {
+            if *subscribed {
                 return Ok(json!(registry.page(None)));
             }
-            conn.subscribed = true;
-            Ok(json!(registry.subscribe(conn.tx.clone())))
+            *subscribed = true;
+            Ok(json!(registry.subscribe(writer.clone())))
         }
         other => Err((ErrorCode::InvalidRequest, format!("unknown method {other}"))),
     }

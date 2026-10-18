@@ -269,4 +269,5 @@ fn modes_and_colors() {
     .unwrap();
     assert!(!vt.is_empty());
     assert!(ENGINE.starts_with("ghostty-vt@"));
+    assert_eq!(color_scheme_report(ColorScheme::Dark), b"\x1b[?997;1n");
 }
