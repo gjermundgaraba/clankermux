@@ -139,6 +139,8 @@ struct Shell {
 enum Outcome {
     Detached,
     Exited(Exit),
+    /// The session was restored from a previous server: a screen, no process.
+    Restored,
     Closed(ClosedReason),
     Failed(String),
 }
@@ -219,13 +221,16 @@ impl Shell {
                 self.passthrough();
                 self.paint();
                 // A session whose stream ended sends no EXITED.
-                if let Some(exit) = self
-                    .attachment
-                    .session
-                    .as_ref()
-                    .and_then(|s| s.exit.clone())
-                {
-                    return Some(Outcome::Exited(exit));
+                match self.attachment.session.as_ref() {
+                    Some(s) if s.status == proto::Status::Restored => {
+                        return Some(Outcome::Restored);
+                    }
+                    Some(s) => {
+                        if let Some(exit) = s.exit.clone() {
+                            return Some(Outcome::Exited(exit));
+                        }
+                    }
+                    None => {}
                 }
             }
             Action::Output(bytes) => {
@@ -483,6 +488,10 @@ pub async fn run(opts: Options) -> Result<ExitCode, Error> {
         Outcome::Exited(Exit::Signal { signal }) => {
             (format!("session killed by SIG{signal}"), ExitCode::FAILURE)
         }
+        Outcome::Restored => (
+            "session restored from a previous server; no process".to_string(),
+            ExitCode::SUCCESS,
+        ),
         Outcome::Closed(ClosedReason::Removed) => {
             ("session removed".to_string(), ExitCode::SUCCESS)
         }

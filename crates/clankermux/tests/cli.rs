@@ -31,7 +31,9 @@ async fn start() -> Server {
         shell: vec!["/bin/sh".into()],
         home: dir.path().to_path_buf(),
         version: "test".into(),
-    });
+        state_dir: dir.path().join("state"),
+    })
+    .unwrap();
     let task = tokio::spawn(server::serve_unix(socket.clone(), registry));
     // The socket file exists before the server listens on it.
     while tokio::net::UnixStream::connect(&socket).await.is_err() {

@@ -13,6 +13,7 @@ use tokio::net::UnixStream;
 
 pub struct Server {
     pub socket: PathBuf,
+    pub registry: std::sync::Arc<server::Registry>,
     _dir: tempfile::TempDir,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
@@ -25,14 +26,23 @@ impl Drop for Server {
 
 pub async fn start(limits: Limits) -> Server {
     let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    start_with(limits, state_dir).await
+}
+
+/// A server on `state_dir`, which may hold a previous server's parks.
+pub async fn start_with(limits: Limits, state_dir: PathBuf) -> Server {
+    let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("sock");
     let registry = server::Registry::new(server::Config {
         limits,
         shell: vec!["/bin/sh".into()],
         home: dir.path().to_path_buf(),
         version: "test".into(),
-    });
-    let task = tokio::spawn(server::serve_unix(socket.clone(), registry));
+        state_dir,
+    })
+    .unwrap();
+    let task = tokio::spawn(server::serve_unix(socket.clone(), registry.clone()));
     // The socket file exists before the server listens on it.
     for _ in 0..100 {
         if UnixStream::connect(&socket).await.is_ok() {
@@ -42,6 +52,7 @@ pub async fn start(limits: Limits) -> Server {
     }
     Server {
         socket,
+        registry,
         _dir: dir,
         task,
     }

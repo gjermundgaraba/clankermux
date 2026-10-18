@@ -3,7 +3,9 @@
 pub mod attach;
 pub mod connection;
 pub mod control;
+pub mod park;
 pub mod pty;
+pub mod records;
 pub mod registry;
 pub mod session;
 pub mod stream;
@@ -130,5 +132,6 @@ pub fn default_config() -> Config {
         shell: vec![shell],
         home,
         version: env!("CARGO_PKG_VERSION").into(),
+        state_dir: state_dir(),
     }
 }

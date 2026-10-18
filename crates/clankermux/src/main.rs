@@ -219,11 +219,17 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
     let socket = cli.socket.unwrap_or_else(server::socket_path);
     let json = cli.json;
     if let Command::Serve = cli.command {
-        let registry = server::Registry::new(server::default_config());
+        let registry = server::Registry::new(server::default_config()).map_err(Error::Io)?;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(Error::Io)?;
         let result = tokio::select! {
-            result = server::serve_unix(socket, registry) => result,
+            result = server::serve_unix(socket, registry.clone()) => result,
             _ = tokio::signal::ctrl_c() => Ok(()),
+            _ = terminate.recv() => Ok(()),
         };
+        // A graceful stop parks every running session first.
+        registry.stop().await;
         return result.map(|()| ExitCode::SUCCESS).map_err(Error::Io);
     }
     let conn = Connection::connect_unix(&socket, hello("clankermux", None))

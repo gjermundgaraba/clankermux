@@ -1,19 +1,31 @@
 //! All sessions and the subscribers to their events.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use proto::{ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status};
+use ghostty_vt::snapshot;
+use proto::{ClosedReason, ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Notify;
 
 use crate::connection::Writer;
-use crate::session::{Effects, InputQueue, Session, Shared, now};
+use crate::park;
+use crate::records::Records;
+use crate::session::{Body, Effects, InputQueue, Live, Parked, Session, Shared, now};
 use crate::stream::Stream;
 use crate::{frame_json, pty};
 
 pub type Fail = (ErrorCode, String);
+
+/// Running sessions are parked this often.
+const PARK_INTERVAL: Duration = Duration::from_secs(300);
+/// How long a park retries while the continuation limit is exceeded.
+const PARK_RETRY: Duration = Duration::from_secs(5);
 
 pub struct Config {
     pub limits: Limits,
@@ -22,12 +34,18 @@ pub struct Config {
     /// Default `cwd`.
     pub home: PathBuf,
     pub version: String,
+    /// Holds `lock` and `sessions/`.
+    pub state_dir: PathBuf,
 }
 
 pub struct Registry {
     pub config: Config,
     pub incarnation: String,
     state: Mutex<State>,
+    /// Set by `stop`: no more parks from the timer.
+    stopping: AtomicBool,
+    /// The exclusive lock on the state directory, for the server's life.
+    _lock: File,
 }
 
 #[derive(Default)]
@@ -37,12 +55,196 @@ struct State {
 }
 
 impl Registry {
-    pub fn new(config: Config) -> Arc<Self> {
-        Arc::new(Registry {
+    /// Locks the state directory (another server holding it is an error),
+    /// loads the parked sessions and starts the park timer. Needs a tokio
+    /// runtime.
+    pub fn new(config: Config) -> io::Result<Arc<Self>> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&config.state_dir)?;
+        let lock = File::create(config.state_dir.join("lock"))?;
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).map_err(
+            |_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "another server holds {}",
+                        config.state_dir.join("lock").display()
+                    ),
+                )
+            },
+        )?;
+        let loaded = park::load(&config.state_dir.join("sessions"))?;
+        let registry = Arc::new(Registry {
             config,
             incarnation: uuid::Uuid::new_v4().to_string(),
             state: Mutex::default(),
-        })
+            stopping: AtomicBool::new(false),
+            _lock: lock,
+        });
+        for loaded in loaded {
+            registry.restore(loaded);
+        }
+        let timer = registry.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(PARK_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if timer.stopping.load(Ordering::Acquire) {
+                    return;
+                }
+                timer.park_running().await;
+            }
+        });
+        Ok(registry)
+    }
+
+    fn sessions_dir(&self) -> PathBuf {
+        self.config.state_dir.join("sessions")
+    }
+
+    /// A session from its park file: `exited` if it was, `restored` else.
+    fn restore(&self, loaded: park::Loaded) {
+        let park::Loaded {
+            file,
+            screen,
+            snapshot_path,
+        } = loaded;
+        let info = file.session;
+        let limits = &self.config.limits;
+        let exited = info.status == Status::Exited;
+        let session = Session {
+            id: info.id.clone(),
+            label: info.label,
+            status: if exited {
+                Status::Exited
+            } else {
+                Status::Restored
+            },
+            argv: info.argv,
+            cwd: info.cwd,
+            on_exit: info.on_exit,
+            created_at: info.created_at,
+            exited_at: info.exited_at,
+            exit: info.exit.filter(|_| exited),
+            wake: Arc::new(Notify::new()),
+            text_limit: limits.text as usize,
+            records_limit: limits.records as usize,
+            attached: Vec::new(),
+            records: Records::load(info.program_status.unwrap_or_default()),
+            events: Vec::new(),
+            body: Body::Parked(Parked {
+                engine: file.engine,
+                cols: info.cols,
+                rows: info.rows,
+                title: info.title,
+                pwd: info.pwd,
+                offset: info.offset,
+                marker: info.marker,
+                profile: file.profile,
+                cell: file.cell,
+                screen,
+                snapshot_path,
+            }),
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .sessions
+            .insert(info.id, Arc::new(Mutex::new(session)));
+    }
+
+    /// Parks every running session.
+    async fn park_running(self: &Arc<Self>) {
+        let running: Vec<Shared> = self
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .filter(|s| s.lock().unwrap().status == Status::Running)
+            .cloned()
+            .collect();
+        for session in running {
+            self.park(&session).await;
+        }
+    }
+
+    /// Writes a generation for a live session, retrying the snapshot while
+    /// the continuation limit is exceeded. A failure keeps the previous
+    /// generation and is logged.
+    pub async fn park(self: &Arc<Self>, session: &Shared) {
+        let deadline = Instant::now() + PARK_RETRY;
+        let result = loop {
+            let wake = session.lock().unwrap().wake.clone();
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let taken = {
+                let s = session.lock().unwrap();
+                let Some(live) = s.live() else {
+                    return;
+                };
+                let encode = || snapshot::encode(&live.term);
+                let encoded = match tokio::runtime::Handle::current().runtime_flavor() {
+                    tokio::runtime::RuntimeFlavor::CurrentThread => encode(),
+                    _ => tokio::task::block_in_place(encode),
+                };
+                encoded.and_then(|bytes| s.park_file().map(|(file, screen)| (bytes, file, screen)))
+            };
+            match taken {
+                Ok((bytes, file, screen)) => {
+                    let generation = jiff::Timestamp::now().as_millisecond() as u64;
+                    break park::write(&self.sessions_dir(), &file, generation, &bytes, &screen)
+                        .map_err(|e| e.to_string());
+                }
+                Err(ghostty_vt::Error::LimitExceeded) if Instant::now() < deadline => {
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = tokio::time::sleep_until(deadline.into()) => {}
+                    }
+                }
+                Err(err) => break Err(err.to_string()),
+            }
+        };
+        if let Err(error) = result {
+            let id = session.lock().unwrap().id.clone();
+            tracing::warn!(session = id, error, "park failed; previous files kept");
+        }
+    }
+
+    /// Graceful stop: parks every running session, closes every
+    /// attachment with `stopping`, and hangs up each running session's
+    /// process group.
+    pub async fn stop(self: &Arc<Self>) {
+        self.stopping.store(true, Ordering::Release);
+        self.park_running().await;
+        let sessions: Vec<Shared> = self
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .cloned()
+            .collect();
+        for session in sessions {
+            let s = session.lock().unwrap();
+            s.close_attachments(ClosedReason::Stopping, false);
+            if s.status == Status::Running
+                && let Some(live) = s.live()
+            {
+                pty::signal(
+                    live.pgid,
+                    &live.slave_path,
+                    pty::signal_by_name("HUP").unwrap(),
+                );
+            }
+        }
+        // The server's lifetime is over; the next one may take the directory.
+        let _ = rustix::fs::flock(&self._lock, rustix::fs::FlockOperation::Unlock);
     }
 
     pub fn get(&self, id: &str) -> Result<Shared, Fail> {
@@ -91,6 +293,12 @@ impl Registry {
             .unwrap()
             .subscribers
             .retain(|w| w.send(bytes.clone()));
+    }
+
+    pub fn emit_all(&self, events: Vec<Event>) {
+        for event in &events {
+            self.emit(event);
+        }
     }
 
     pub fn create(self: &Arc<Self>, params: proto::CreateParams) -> Result<proto::Session, Fail> {
@@ -163,23 +371,29 @@ impl Registry {
             status: Status::Running,
             argv,
             cwd,
-            pid: Some(pid),
-            pgid: pid,
             on_exit: params.on_exit.unwrap_or(OnExit::Remove),
             created_at: now(),
             exited_at: None,
             exit: None,
-            term,
-            stream: Stream::new(limits.ring as usize, limits.markers as usize),
             wake: Arc::new(Notify::new()),
-            master: master.clone(),
-            slave_path: pty.slave_path,
-            input,
-            pty_eof: false,
             text_limit: limits.text as usize,
+            records_limit: limits.records as usize,
             attached: Vec::new(),
-            pending: None,
-            timer_running: false,
+            records: Records::default(),
+            events: Vec::new(),
+            body: Body::Live(Live {
+                pid: Some(pid),
+                pgid: pid,
+                term,
+                stream: Stream::new(limits.ring as usize, limits.markers as usize),
+                master: master.clone(),
+                slave_path: pty.slave_path,
+                input,
+                pty_eof: false,
+                pending: None,
+                timer_running: false,
+                profile: proto::Profile::default(),
+            }),
         };
         let id = session.id.clone();
         let snapshot = session.to_proto(false);
@@ -208,13 +422,12 @@ impl Registry {
                 }) {
                     Ok(Ok(0)) => break,
                     Ok(Ok(n)) => {
-                        let changed = {
+                        let events = {
                             let mut session = reader_session.lock().unwrap();
-                            session.output(&buf[..n]).then(|| session.to_proto(false))
+                            session.output(&buf[..n]);
+                            session.take_events()
                         };
-                        if let Some(session) = changed {
-                            registry.emit(&Event::SessionChanged { session });
-                        }
+                        registry.emit_all(events);
                     }
                     // EIO is how Linux reports the slave side closing.
                     Ok(Err(_)) => break,
@@ -223,10 +436,12 @@ impl Registry {
             }
             let ended = {
                 let mut session = reader_session.lock().unwrap();
-                session.pty_eof = true;
+                if let Some(live) = session.live_mut() {
+                    live.pty_eof = true;
+                }
                 session.maybe_end().map(|_| session.to_proto(false))
             };
-            registry.ended(ended);
+            registry.ended(&reader_session, ended);
         });
 
         let registry = self.clone();
@@ -235,14 +450,16 @@ impl Registry {
             let status = child.wait().await;
             let ended = {
                 let mut session = wait_session.lock().unwrap();
-                session.pid = None;
+                if let Some(live) = session.live_mut() {
+                    live.pid = None;
+                }
                 session.exit = Some(match status {
                     Ok(status) => exit_of(status),
                     Err(_) => Exit::Code { code: -1 },
                 });
                 session.maybe_end().map(|_| session.to_proto(false))
             };
-            registry.ended(ended);
+            registry.ended(&wait_session, ended);
         });
 
         tokio::spawn(async move {
@@ -271,14 +488,21 @@ impl Registry {
         Ok(snapshot)
     }
 
-    /// Emits `session_exited` and schedules removal when a stream ended.
-    fn ended(self: &Arc<Self>, ended: Option<proto::Session>) {
+    /// Emits `session_exited` when a stream ended, then schedules removal
+    /// or parks the session once for `on_exit: keep`.
+    fn ended(self: &Arc<Self>, session: &Shared, ended: Option<proto::Session>) {
         let Some(snapshot) = ended else { return };
+        let events = session.lock().unwrap().take_events();
+        self.emit_all(events);
         let remove = snapshot.on_exit == OnExit::Remove;
         let id = snapshot.id.clone();
         self.emit(&Event::SessionExited { session: snapshot });
         if remove {
             self.remove_after_grace(id);
+        } else {
+            let registry = self.clone();
+            let session = session.clone();
+            tokio::spawn(async move { registry.park(&session).await });
         }
     }
 
@@ -304,7 +528,7 @@ impl Registry {
             }
             let all_finished = s.attachments_finished();
             if !all_finished {
-                s.close_attachments(true);
+                s.close_attachments(ClosedReason::Removed, true);
             }
             all_finished
         };
@@ -316,12 +540,16 @@ impl Registry {
         Ok(())
     }
 
-    /// Drops the session, closing every attachment.
+    /// Drops the session and its files, closing every attachment.
     fn remove_now(&self, id: &str) {
         let Some(session) = self.state.lock().unwrap().sessions.remove(id) else {
             return;
         };
-        session.lock().unwrap().close_attachments(false);
+        session
+            .lock()
+            .unwrap()
+            .close_attachments(ClosedReason::Removed, false);
+        park::remove(&self.sessions_dir(), id);
         self.emit(&Event::SessionRemoved { id: id.to_string() });
     }
 }

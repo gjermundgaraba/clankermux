@@ -202,8 +202,14 @@ class Client {
         this.clipboard.reset();
         this.applyProfile(this.attachment?.term());
         this.paint();
-        const exit = this.attachment?.session?.exit;
-        post({ type: "status", text: exit ? `exited: ${describe(exit)}` : "attached" });
+        const session = this.attachment?.session;
+        const text =
+          session?.status === "restored"
+            ? "restored from a previous server; no process"
+            : session?.exit
+              ? `exited: ${describe(session.exit)}`
+              : "attached";
+        post({ type: "status", text });
         break;
       }
       case "output":

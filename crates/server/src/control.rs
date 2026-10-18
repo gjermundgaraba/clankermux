@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use base64::Engine as _;
-use ghostty_vt::formatter;
 use proto::{ErrorCode, Event, Request, Size, Status, Viewport};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -67,7 +66,8 @@ pub async fn handle(
             let (pgid, slave) = {
                 let s = session.lock().unwrap();
                 running(s.status)?;
-                (s.pgid, s.slave_path.clone())
+                let live = s.live().expect("a running session is live");
+                (live.pgid, live.slave_path.clone())
             };
             if crate::pty::signal(pgid, &slave, signal) {
                 Ok(json!({}))
@@ -120,20 +120,9 @@ pub async fn handle(
             let p: proto::ReadParams = params(p)?;
             let session = registry.get(&p.session)?;
             let s = session.lock().unwrap();
-            let rows = usize::from(s.term.rows());
-            let wanted = rows + p.scrollback.unwrap_or(0) as usize;
-            let start_row = (s.term.scrollback_rows() + rows).saturating_sub(wanted);
-            let formatted = formatter::format(
-                &s.term,
-                formatter::Options {
-                    unwrap: true,
-                    trim: true,
-                    region: formatter::Region::FromRow(start_row as u32),
-                    ..Default::default()
-                },
-            )
-            .map_err(internal)?;
-            let mut text = String::from_utf8_lossy(&formatted).into_owned();
+            let mut text = s
+                .read_text(p.scrollback.unwrap_or(0) as usize)
+                .map_err(internal)?;
             let max = (registry.config.limits.max_frame as usize).saturating_sub(READ_REPLY_MARGIN);
             if text.len() > max {
                 let excess = text.len() - max;
@@ -145,13 +134,16 @@ pub async fn handle(
             if !text.is_empty() {
                 text.push('\n');
             }
-            let (x, y) = s.term.cursor();
+            let info = s.to_proto(false);
             Ok(json!(proto::Read {
                 text,
-                cols: s.term.cols(),
-                rows: s.term.rows(),
-                cursor: (s.status != Status::Restored).then_some(proto::Cursor { x, y }),
-                offset: s.stream.offset(),
+                cols: info.cols,
+                rows: info.rows,
+                cursor: s.live().map(|live| {
+                    let (x, y) = live.term.cursor();
+                    proto::Cursor { x, y }
+                }),
+                offset: info.offset,
                 status: s.status,
             }))
         }
@@ -169,7 +161,9 @@ pub async fn handle(
             let wait = {
                 let s = session.lock().unwrap();
                 running(s.status)?;
-                s.input
+                s.live()
+                    .expect("a running session is live")
+                    .input
                     .push(data)
                     .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?
             };

@@ -407,6 +407,20 @@ impl Connection {
             );
             return;
         }
+        let parked_engine = session
+            .lock()
+            .unwrap()
+            .parked()
+            .map(|p| p.engine.clone())
+            .filter(|e| e != ghostty_vt::ENGINE);
+        if let Some(parked_engine) = parked_engine {
+            self.error(
+                channel,
+                ErrorCode::EngineMismatch,
+                format!("the session was parked by engine {parked_engine}"),
+            );
+            return;
+        }
         let handle = attach::open(&self.registry, &self.writer, channel, open, session);
         self.channels.insert(channel, handle);
     }
@@ -432,7 +446,13 @@ impl Connection {
         let Some(session) = self.writable(channel) else {
             return;
         };
-        let pushed = session.lock().unwrap().input.push(payload.to_vec());
+        let pushed = session
+            .lock()
+            .unwrap()
+            .live()
+            .expect("a running session is live")
+            .input
+            .push(payload.to_vec());
         if pushed.is_none() {
             self.error(channel, ErrorCode::InputOverflow, "input queue full");
         }

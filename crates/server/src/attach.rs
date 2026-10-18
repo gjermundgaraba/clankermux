@@ -210,10 +210,8 @@ impl Task {
         match self.resume_cursor(resume) {
             Err(end) => return end,
             Ok(Some(cursor)) => {
-                let (cols, rows, session) = {
-                    let s = self.session.lock().unwrap();
-                    (s.term.cols(), s.term.rows(), s.to_proto(false))
-                };
+                let session = self.session.lock().unwrap().to_proto(false);
+                let (cols, rows) = (session.cols, session.rows);
                 self.cursor = cursor;
                 self.send_json(
                     FrameType::Attached,
@@ -288,15 +286,19 @@ impl Task {
             return Ok(None);
         };
         let s = self.session.lock().unwrap();
-        if resume.marker > s.stream.latest_seq() {
+        // A parked session has no stream to resume on.
+        let Some(live) = s.live() else {
+            return Ok(None);
+        };
+        if resume.marker > live.stream.latest_seq() {
             return Err(End::Error(
                 ErrorCode::InvalidRequest,
                 "resume marker above the latest".into(),
             ));
         }
-        let retained = s.stream.retained_start() <= resume.offset
-            && resume.offset <= s.stream.offset()
-            && s.stream.markers_retained_after(resume.marker);
+        let retained = live.stream.retained_start() <= resume.offset
+            && resume.offset <= live.stream.offset()
+            && live.stream.markers_retained_after(resume.marker);
         Ok(retained.then_some(Cursor {
             offset: resume.offset,
             marker: resume.marker,
@@ -314,25 +316,54 @@ impl Task {
             let notified = wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            self.done = false;
             let taken = {
                 let s = self.session.lock().unwrap();
-                // Encoding holds the session still (PLAN.md's choice); on a
-                // multi-thread runtime the worker is released meanwhile.
-                let encode = || snapshot::encode(&s.term);
-                let encoded = match tokio::runtime::Handle::current().runtime_flavor() {
-                    tokio::runtime::RuntimeFlavor::CurrentThread => encode(),
-                    _ => tokio::task::block_in_place(encode),
-                };
-                encoded.map(|bytes| {
-                    (
-                        bytes,
-                        Cursor {
-                            offset: s.stream.offset(),
-                            marker: s.stream.latest_seq(),
-                        },
-                        s.to_proto(false),
-                    )
-                })
+                match s.live() {
+                    Some(live) => {
+                        // Encoding holds the session still (PLAN.md's choice);
+                        // on a multi-thread runtime the worker is released
+                        // meanwhile.
+                        let encode = || snapshot::encode(&live.term);
+                        let encoded = match tokio::runtime::Handle::current().runtime_flavor() {
+                            tokio::runtime::RuntimeFlavor::CurrentThread => encode(),
+                            _ => tokio::task::block_in_place(encode),
+                        };
+                        encoded.map(|bytes| {
+                            (
+                                bytes,
+                                Cursor {
+                                    offset: live.stream.offset(),
+                                    marker: live.stream.latest_seq(),
+                                },
+                                s.to_proto(false),
+                            )
+                        })
+                    }
+                    // A parked session streams its park file, nothing after.
+                    None => {
+                        let parked = s.parked().expect("not live");
+                        match std::fs::read(&parked.snapshot_path) {
+                            Ok(bytes) => {
+                                self.done = true;
+                                Ok((
+                                    bytes,
+                                    Cursor {
+                                        offset: parked.offset,
+                                        marker: parked.marker,
+                                    },
+                                    s.to_proto(false),
+                                ))
+                            }
+                            Err(err) => {
+                                return Err(End::Error(
+                                    ErrorCode::Internal,
+                                    format!("park file unreadable: {err}"),
+                                ));
+                            }
+                        }
+                    }
+                }
             };
             match taken {
                 Ok((bytes, cursor, session)) => {
@@ -346,7 +377,6 @@ impl Task {
                         );
                     }
                     self.cursor = cursor;
-                    self.done = false;
                     self.send_json(
                         FrameType::Attached,
                         &Attached {
@@ -422,7 +452,10 @@ impl Task {
         let mut frames = Vec::new();
         {
             let s = self.session.lock().unwrap();
-            let stream = &s.stream;
+            let Some(live) = s.live() else {
+                return Pull::Idle;
+            };
+            let stream = &live.stream;
             if stream.retained_start() > self.cursor.offset
                 || !stream.markers_retained_after(self.cursor.marker)
             {

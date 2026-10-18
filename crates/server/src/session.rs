@@ -1,12 +1,14 @@
 //! One session: the child, its PTY, the engine and the stream.
 
 use std::os::fd::OwnedFd;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ghostty_vt::{
-    ColorKind, ColorScheme, Handler, Rgb, SizeReport, Term, Terminal, color_scheme_report,
+    ColorKind, ColorScheme, Handler, ProgramStatus, Rgb, SemanticPrompt, SemanticPromptKind,
+    SizeReport, Term, Terminal, color_scheme_report, formatter,
 };
 use proto::{
     ClosedReason, ErrorCode, Event, Exit, OnExit, Profile, Scheme, Size, Status, Viewport,
@@ -14,6 +16,8 @@ use proto::{
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
+use crate::park::{Cell, ParkFile};
+use crate::records::Records;
 use crate::registry::Registry;
 use crate::stream::{Marker, MarkerKind, Stream};
 
@@ -32,6 +36,10 @@ pub struct Effects {
     pub scheme: Option<ColorScheme>,
     pub bg: Option<Rgb>,
     pub size: SizeReport,
+    /// OSC 7501 reports, in order.
+    pub reports: Vec<ProgramStatus>,
+    /// An OSC 133 `A` arrived: transient records are dropped.
+    pub prompt_started: bool,
 }
 
 impl Effects {
@@ -69,6 +77,16 @@ impl Handler for Effects {
 
     fn pwd_changed(&mut self, _term: &Term) {
         self.changed = true;
+    }
+
+    fn program_status(&mut self, report: ProgramStatus) {
+        self.reports.push(report);
+    }
+
+    fn semantic_prompt(&mut self, event: SemanticPrompt) {
+        if event.kind == SemanticPromptKind::PromptStart {
+            self.prompt_started = true;
+        }
     }
 }
 
@@ -179,87 +197,209 @@ pub struct Attachment {
     pub finished: Arc<AtomicBool>,
 }
 
+/// What only a session with a process behind it has.
+pub struct Live {
+    /// The child's pid while it is alive.
+    pub pid: Option<u32>,
+    /// The child's process group, which may outlive the child.
+    pub pgid: u32,
+    pub term: Terminal<Effects>,
+    pub stream: Stream,
+    pub master: Arc<AsyncFd<OwnedFd>>,
+    pub slave_path: String,
+    pub input: InputQueue,
+    pub pty_eof: bool,
+    /// The latest coalesced report, waiting for the timer.
+    pub pending: Option<Report>,
+    pub timer_running: bool,
+    /// The latest profile a report carried, for the park file.
+    pub profile: Profile,
+}
+
+/// A session loaded from a park file: a screen, no process.
+pub struct Parked {
+    /// The engine that wrote the snapshot; `OPEN` needs the server's.
+    pub engine: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub title: String,
+    pub pwd: String,
+    pub offset: u64,
+    pub marker: u64,
+    pub profile: Profile,
+    pub cell: Cell,
+    /// `screen.txt`: history and screen at the park.
+    pub screen: String,
+    pub snapshot_path: PathBuf,
+}
+
+pub enum Body {
+    Live(Live),
+    Parked(Parked),
+}
+
 pub struct Session {
     pub id: String,
     pub label: String,
     pub status: Status,
     pub argv: Vec<String>,
     pub cwd: String,
-    /// The child's pid while it is alive.
-    pub pid: Option<u32>,
-    /// The child's process group, which may outlive the child.
-    pub pgid: u32,
     pub on_exit: OnExit,
     pub created_at: String,
     pub exited_at: Option<String>,
-    /// Set once the child is reaped.
+    /// Set once the child is reaped, or from the park file.
     pub exit: Option<Exit>,
-    pub term: Terminal<Effects>,
-    pub stream: Stream,
     /// Notified after every stream change.
     pub wake: Arc<Notify>,
-    pub master: Arc<AsyncFd<OwnedFd>>,
-    pub slave_path: String,
-    pub input: InputQueue,
-    pub pty_eof: bool,
     /// `limits.text`, applied to the title and pwd the program reports.
     pub text_limit: usize,
+    /// `limits.records`.
+    pub records_limit: usize,
     pub attached: Vec<Attachment>,
-    /// The latest coalesced report, waiting for the timer.
-    pub pending: Option<Report>,
-    pub timer_running: bool,
+    pub records: Records,
+    /// Events raised under the lock, emitted by whoever releases it.
+    pub events: Vec<Event>,
+    pub body: Body,
 }
 
 impl Session {
+    pub fn live(&self) -> Option<&Live> {
+        match &self.body {
+            Body::Live(live) => Some(live),
+            Body::Parked(_) => None,
+        }
+    }
+
+    pub fn live_mut(&mut self) -> Option<&mut Live> {
+        match &mut self.body {
+            Body::Live(live) => Some(live),
+            Body::Parked(_) => None,
+        }
+    }
+
+    pub fn parked(&self) -> Option<&Parked> {
+        match &self.body {
+            Body::Parked(parked) => Some(parked),
+            Body::Live(_) => None,
+        }
+    }
+
     pub fn to_proto(&self, with_records: bool) -> proto::Session {
+        let (pid, cols, rows, title, pwd, offset, marker) = match &self.body {
+            Body::Live(live) => (
+                live.pid,
+                live.term.cols(),
+                live.term.rows(),
+                live.term.title(),
+                pwd_path(&live.term.pwd()),
+                live.stream.offset(),
+                live.stream.latest_seq(),
+            ),
+            Body::Parked(parked) => (
+                None,
+                parked.cols,
+                parked.rows,
+                parked.title.clone(),
+                parked.pwd.clone(),
+                parked.offset,
+                parked.marker,
+            ),
+        };
         proto::Session {
             id: self.id.clone(),
             label: self.label.clone(),
             status: self.status,
             argv: self.argv.clone(),
             cwd: self.cwd.clone(),
-            pid: self.pid,
-            cols: self.term.cols(),
-            rows: self.term.rows(),
-            title: truncate(self.term.title(), self.text_limit),
-            pwd: truncate(pwd_path(&self.term.pwd()), self.text_limit),
+            pid,
+            cols,
+            rows,
+            title: truncate(title, self.text_limit),
+            pwd: truncate(pwd, self.text_limit),
             on_exit: self.on_exit,
             created_at: self.created_at.clone(),
             exited_at: self.exited_at.clone(),
             exit: self.exit.clone(),
-            offset: self.stream.offset(),
-            marker: self.stream.latest_seq(),
+            offset,
+            marker,
             attachments: self.attached.len() as u32,
-            program_status: with_records.then(Vec::new),
+            program_status: with_records.then(|| self.records.resolved()),
         }
     }
 
-    /// Feeds PTY bytes to the engine and the stream. Returns whether the
-    /// session's reported fields changed.
-    pub fn output(&mut self, bytes: &[u8]) -> bool {
-        self.term.vt_write(bytes);
-        self.stream.append(bytes);
-        self.wake.notify_waiters();
-        self.flush_effects()
+    /// The events raised since the last take.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
     }
 
-    /// Writes the engine's pending answers to the PTY and reports whether
-    /// title or pwd changed.
-    pub fn flush_effects(&mut self) -> bool {
-        let effects = self.term.handler_mut();
-        if !effects.pty_output.is_empty() {
-            let answers = std::mem::take(&mut effects.pty_output);
-            if self.input.push(answers).is_none() {
-                tracing::warn!(session = self.id, "input queue full; query answers dropped");
+    /// Feeds PTY bytes to the engine and the stream; the events this
+    /// raises wait in `events`.
+    pub fn output(&mut self, bytes: &[u8]) {
+        let Body::Live(live) = &mut self.body else {
+            return;
+        };
+        live.term.vt_write(bytes);
+        live.stream.append(bytes);
+        self.wake.notify_waiters();
+        self.flush_effects();
+    }
+
+    /// Writes the engine's pending answers to the PTY, applies the
+    /// program status reports, and queues `session_changed` when title or
+    /// pwd changed.
+    pub fn flush_effects(&mut self) {
+        let Body::Live(live) = &mut self.body else {
+            return;
+        };
+        let effects = live.term.handler_mut();
+        let answers = std::mem::take(&mut effects.pty_output);
+        let reports = std::mem::take(&mut effects.reports);
+        let prompt_started = std::mem::take(&mut effects.prompt_started);
+        let changed = std::mem::take(&mut effects.changed);
+        if !answers.is_empty() && live.input.push(answers).is_none() {
+            tracing::warn!(session = self.id, "input queue full; query answers dropped");
+        }
+        if prompt_started {
+            self.drop_transient_records();
+        }
+        let now = now();
+        for report in reports {
+            let change = self.records.apply(report, self.records_limit, &now);
+            if let Some(record) = change.set {
+                self.events.push(Event::ProgramStatusChanged {
+                    id: self.id.clone(),
+                    record,
+                });
+            }
+            if !change.removed.is_empty() {
+                self.events.push(Event::ProgramStatusRemoved {
+                    id: self.id.clone(),
+                    record_ids: change.removed,
+                });
             }
         }
-        std::mem::take(&mut self.term.handler_mut().changed)
+        if changed {
+            self.events.push(Event::SessionChanged {
+                session: self.to_proto(false),
+            });
+        }
+    }
+
+    fn drop_transient_records(&mut self) {
+        let removed = self.records.drop_transient();
+        if !removed.is_empty() {
+            self.events.push(Event::ProgramStatusRemoved {
+                id: self.id.clone(),
+                record_ids: removed,
+            });
+        }
     }
 
     pub fn size(&self) -> Size {
+        let proto = self.to_proto(false);
         Size {
-            cols: self.term.cols(),
-            rows: self.term.rows(),
+            cols: proto.cols,
+            rows: proto.rows,
             cell_width: None,
             cell_height: None,
         }
@@ -268,8 +408,12 @@ impl Session {
     /// Applies a viewport report at once, discarding any pending coalesced
     /// report. Returns the marker when the size changed.
     pub fn apply_report(&mut self, report: Report) -> Option<Marker> {
-        self.pending = None;
-        if self.status != Status::Running {
+        let running = self.status == Status::Running;
+        let Body::Live(live) = &mut self.body else {
+            return None;
+        };
+        live.pending = None;
+        if !running {
             return None;
         }
         let Viewport {
@@ -285,19 +429,20 @@ impl Session {
         if let Some(profile) = profile {
             self.set_profile(profile);
         }
-        let current = self.term.handler().size;
+        let live = self.live_mut().expect("checked above");
+        let current = live.term.handler().size;
         let cell_width = cell_width.unwrap_or(current.cell_width);
         let cell_height = cell_height.unwrap_or(current.cell_height);
-        let changed = (self.term.cols(), self.term.rows()) != (cols, rows);
+        let changed = (live.term.cols(), live.term.rows()) != (cols, rows);
         if changed
-            && self
+            && live
                 .term
                 .resize(cols, rows, cell_width, cell_height)
                 .is_err()
         {
             return None;
         }
-        self.term.handler_mut().size = SizeReport {
+        live.term.handler_mut().size = SizeReport {
             cols,
             rows,
             cell_width,
@@ -306,19 +451,23 @@ impl Session {
         if !changed {
             return None;
         }
-        let _ = crate::pty::set_size(&self.master, cols, rows);
+        let _ = crate::pty::set_size(&live.master, cols, rows);
+        let marker = live.stream.add_marker(MarkerKind::Resized { cols, rows });
         self.flush_effects();
-        let marker = self.stream.add_marker(MarkerKind::Resized { cols, rows });
         self.wake.notify_waiters();
         Some(marker)
     }
 
     /// Makes `profile` the session's: default colours for OSC 10, 11 and
-    /// 12 (falling back to [`DEFAULT_COLORS`]), the scheme for CSI ? 996
+    /// 12 (falling back to [`default_color`]), the scheme for CSI ? 996
     /// n, and a mode 2031 report when the scheme answer changed.
     pub fn set_profile(&mut self, profile: Profile) {
-        let before = self.term.handler().scheme_answer();
-        let effects = self.term.handler_mut();
+        let id = self.id.clone();
+        let Body::Live(live) = &mut self.body else {
+            return;
+        };
+        let before = live.term.handler().scheme_answer();
+        let effects = live.term.handler_mut();
         effects.scheme = profile.scheme.map(|s| match s {
             Scheme::Light => ColorScheme::Light,
             Scheme::Dark => ColorScheme::Dark,
@@ -333,31 +482,98 @@ impl Session {
                 .as_deref()
                 .and_then(parse_rgb)
                 .unwrap_or(default_color(kind));
-            let _ = self.term.set_color(kind, Some(color));
+            let _ = live.term.set_color(kind, Some(color));
         }
-        let after = self.term.handler().scheme_answer();
+        let after = live.term.handler().scheme_answer();
         if after != before
             && let Some(scheme) = after
-            && self.term.mode(2031).unwrap_or(false)
-            && self.input.push(color_scheme_report(scheme)).is_none()
+            && live.term.mode(2031).unwrap_or(false)
+            && live.input.push(color_scheme_report(scheme)).is_none()
         {
-            tracing::warn!(session = self.id, "input queue full; scheme report dropped");
+            tracing::warn!(session = id, "input queue full; scheme report dropped");
         }
+        live.profile = profile;
     }
 
     /// Called when the PTY reached EOF or the child was reaped; ends the
     /// stream once both have happened. Returns the exit when it did.
     pub fn maybe_end(&mut self) -> Option<Exit> {
-        if !self.pty_eof || self.status != Status::Running {
+        if self.status != Status::Running {
             return None;
         }
         let exit = self.exit.clone()?;
+        let Body::Live(live) = &mut self.body else {
+            return None;
+        };
+        if !live.pty_eof {
+            return None;
+        }
         self.status = Status::Exited;
         self.exited_at = Some(now());
-        self.stream
+        live.stream
             .add_marker(MarkerKind::Exited { exit: exit.clone() });
+        self.drop_transient_records();
         self.wake.notify_waiters();
         Some(exit)
+    }
+
+    /// The text `read` serves: the last `wanted` lines of the history and
+    /// screen, one logical line each.
+    pub fn read_text(&self, scrollback: usize) -> Result<String, ghostty_vt::Error> {
+        match &self.body {
+            Body::Live(live) => {
+                let rows = usize::from(live.term.rows());
+                let wanted = rows + scrollback;
+                let start_row = (live.term.scrollback_rows() + rows).saturating_sub(wanted);
+                let formatted = formatter::format(
+                    &live.term,
+                    formatter::Options {
+                        unwrap: true,
+                        trim: true,
+                        region: formatter::Region::FromRow(start_row as u32),
+                        ..Default::default()
+                    },
+                )?;
+                Ok(String::from_utf8_lossy(&formatted).into_owned())
+            }
+            Body::Parked(parked) => {
+                let lines: Vec<&str> = parked.screen.lines().collect();
+                let wanted = usize::from(parked.rows) + scrollback;
+                let start = lines.len().saturating_sub(wanted);
+                Ok(lines[start..].join("\n"))
+            }
+        }
+    }
+
+    /// The park file and `screen.txt` of a live session.
+    pub fn park_file(&self) -> Result<(ParkFile, String), ghostty_vt::Error> {
+        let live = self.live().expect("only live sessions are parked");
+        let formatted = formatter::format(
+            &live.term,
+            formatter::Options {
+                unwrap: true,
+                trim: true,
+                ..Default::default()
+            },
+        )?;
+        let size = live.term.handler().size;
+        let file = ParkFile {
+            protocol: crate::park::PROTOCOL,
+            engine: ghostty_vt::ENGINE.into(),
+            parked_at: now(),
+            session: proto::Session {
+                attachments: 0,
+                pid: None,
+                program_status: Some(self.records.all()),
+                ..self.to_proto(false)
+            },
+            profile: live.profile.clone(),
+            cell: Cell {
+                width: size.cell_width,
+                height: size.cell_height,
+            },
+        };
+        Ok((file, String::from_utf8_lossy(&formatted).into_owned()))
     }
 
     /// Whether every open attachment has finished.
@@ -367,14 +583,14 @@ impl Session {
             .all(|a| a.finished.load(Ordering::Acquire))
     }
 
-    /// Sends `CLOSED removed` to every attachment, or only the finished
+    /// Sends `CLOSED reason` to every attachment, or only the finished
     /// ones.
-    pub fn close_attachments(&self, finished_only: bool) {
+    pub fn close_attachments(&self, reason: ClosedReason, finished_only: bool) {
         for a in &self.attached {
             if (!finished_only || a.finished.load(Ordering::Acquire))
                 && let Some(close) = a.close.upgrade()
             {
-                let _ = close.send(ClosedReason::Removed);
+                let _ = close.send(reason);
             }
         }
     }
@@ -386,30 +602,39 @@ pub fn report(registry: &Arc<Registry>, session: &Shared, report: Report, immedi
     let mut s = session.lock().unwrap();
     if immediate {
         let changed = s.apply_report(report).map(|_| s.to_proto(false));
+        let events = s.take_events();
         drop(s);
+        registry.emit_all(events);
         if let Some(session) = changed {
             registry.emit(&Event::SessionChanged { session });
         }
         return;
     }
-    s.pending = Some(report);
-    if s.timer_running {
+    let Some(live) = s.live_mut() else {
+        return;
+    };
+    live.pending = Some(report);
+    if live.timer_running {
         return;
     }
-    s.timer_running = true;
+    live.timer_running = true;
     drop(s);
     let registry = registry.clone();
     let session = session.clone();
     tokio::spawn(async move {
         tokio::time::sleep(COALESCE).await;
-        let changed = {
+        let (changed, events) = {
             let mut s = session.lock().unwrap();
-            s.timer_running = false;
-            s.pending
-                .take()
+            let pending = s.live_mut().and_then(|live| {
+                live.timer_running = false;
+                live.pending.take()
+            });
+            let changed = pending
                 .and_then(|r| s.apply_report(r))
-                .map(|_| s.to_proto(false))
+                .map(|_| s.to_proto(false));
+            (changed, s.take_events())
         };
+        registry.emit_all(events);
         if let Some(session) = changed {
             registry.emit(&Event::SessionChanged { session });
         }
