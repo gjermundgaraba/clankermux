@@ -130,12 +130,12 @@ struct Shell {
     /// stop waiting for the rest.
     pending: Vec<u8>,
     keys_at: Option<Instant>,
-    /// The detach prefix was pressed: its encoding, sent on if what
-    /// follows is not `d`.
+    /// The detach prefix was pressed: its encoding and any releases
+    /// reported since, sent on if what follows is not `d`.
     armed: Option<Vec<u8>>,
-    /// The attachment is to be made afresh: a client-side protocol
-    /// error or `too_slow`, which the protocol has the client recover
-    /// from by attaching again.
+    /// The attachment is to be made afresh after this loop pass: a lost
+    /// place in the stream or `too_slow`, which the protocol has the
+    /// client recover from by attaching again.
     reopen: bool,
 }
 
@@ -313,10 +313,11 @@ impl Shell {
             let unit = &bytes[pos..pos + len];
             pos += len;
             match self.armed.take() {
-                Some(prefix) => {
-                    // The prefix's own release, when the program asked for
-                    // release events, is not the next key.
+                Some(mut prefix) => {
+                    // A release (the prefix's own, or a modifier's, when the
+                    // program asked for them) is not the next key.
                     if vt::kitty_release(unit) {
+                        prefix.extend_from_slice(unit);
                         self.armed = Some(prefix);
                         continue;
                     }
@@ -418,10 +419,7 @@ pub async fn run(opts: Options) -> Result<ExitCode, Error> {
             conn: Box::new(conn),
             frames,
         },
-        Err(err) => {
-            drop(raw);
-            return Err(err);
-        }
+        Err(err) => return Err(err),
     };
     let mut stdin = tokio::io::stdin();
     let mut buf = vec![0u8; 4096];
@@ -460,8 +458,10 @@ pub async fn run(opts: Options) -> Result<ExitCode, Error> {
                     }
                     continue;
                 }
-                LinkEvent::Lost(Some(Error::Server(error))) => {
-                    break Outcome::Failed(Error::Server(error).to_string());
+                // A server fault would only repeat; a broken stream is
+                // reconnected.
+                LinkEvent::Lost(Some(err @ (Error::Server(_) | Error::Protocol(_)))) => {
+                    break Outcome::Failed(err.to_string());
                 }
                 LinkEvent::Lost(_) => {
                     link = Link::Down(reconnect(shell.opts.endpoint.clone()));
@@ -605,6 +605,17 @@ mod tests {
         assert_eq!(feed(&mut s, b"\x1b[92;5u"), Some(vec![]));
         assert_eq!(feed(&mut s, b"\x1b[92;5:3u"), Some(vec![]), "still armed");
         assert_eq!(feed(&mut s, b"\x1b[100u"), None);
+        // Not `d`: the prefix, its release and the key all go through.
+        let mut s = shell(0x1c);
+        assert_eq!(feed(&mut s, b"\x1b[92;5u\x1b[92;5:3u"), Some(vec![]));
+        assert_eq!(
+            feed(&mut s, b"\x1b[120u"),
+            Some(b"\x1b[92;5u\x1b[92;5:3u\x1b[120u".to_vec())
+        );
+        // Caps lock set, and `d` with an empty modifier field.
+        let mut s = shell(0x1c);
+        assert_eq!(feed(&mut s, b"\x1b[92;69u"), Some(vec![]));
+        assert_eq!(feed(&mut s, b"\x1b[100;;100u"), None);
         let mut s = shell(0x1c);
         assert_eq!(
             feed(&mut s, b"\x1b[97;1:3u"),

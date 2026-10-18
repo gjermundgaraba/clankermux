@@ -207,6 +207,19 @@ fn decoder_refuses_a_replaced_terminal() {
     }
     assert_eq!(decoder.next_page(), Err(Error::InvalidValue));
     assert!(decoder.into_terminal().is_none());
+    // What was moved out stays a terminal of its own after the decoder
+    // is gone and its address could have been reused.
+    let mut decoder = snapshot::Decoder::new().unwrap();
+    decoder.push(&bytes);
+    decoder.ready().unwrap();
+    let mut stale = std::mem::replace(decoder.terminal().unwrap(), Terminal::new(5, 5).unwrap());
+    let (cols, rows) = (stale.cols(), stale.rows());
+    assert!(decoder.into_terminal().is_none());
+    let fresh: Vec<Terminal> = (0..8).map(|_| Terminal::new(30, 3).unwrap()).collect();
+    stale.vt_write(b"still mine");
+    assert_eq!((stale.cols(), stale.rows()), (cols, rows));
+    assert!(plain(&stale).contains("still mine"));
+    assert!(fresh.iter().all(|t| !plain(t).contains("still mine")));
 }
 
 #[test]
@@ -218,6 +231,10 @@ fn decoder_reports_finish_and_releases_an_unfinished_terminal() {
     decoder.ready().unwrap();
     assert!(!decoder.step_available());
     assert!(!decoder.finished());
+    // An unfinished terminal is released all the same (an attachment
+    // that ends mid-bootstrap keeps what it has).
+    let partial = decoder.into_terminal().unwrap();
+    assert_eq!((partial.cols(), partial.rows()), (20, 4));
     let mut decoder = snapshot::Decoder::new().unwrap();
     decoder.push(&bytes);
     decoder.ready().unwrap();

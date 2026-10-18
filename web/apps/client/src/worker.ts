@@ -74,7 +74,8 @@ class Client {
   /** The session attached or being attached. */
   private session: string | undefined;
   private sessions = new Map<string, Session>();
-  /** Pastes too long for one frame, as `write` requests in order. */
+  /** Input in order: a paste goes as `write` requests, and keys typed
+   * meanwhile wait behind it. */
   private writes: Promise<void> = Promise.resolve();
   private readonly clipboard = new Osc52Scanner();
   private paintTimer: ReturnType<typeof setTimeout> | undefined;
@@ -341,31 +342,32 @@ class Client {
   }
 
   /** Input for the session, dropped unless attached on a live connection.
-   * What fits one frame goes as INPUT; a longer paste goes as `write`
-   * requests, each answered once the PTY took it, since INPUT frames are
-   * not acknowledged and would overflow the input queue. */
-  private input(bytes: Uint8Array): void {
+   * Keys go as INPUT; a paste goes as `write` requests, each answered
+   * once the PTY took it, since INPUT frames are not acknowledged and a
+   * paste would overflow the input queue. Everything is sent in order, so
+   * nothing lands inside a paste. */
+  private input(bytes: Uint8Array, paste: boolean): void {
     const conn = this.conn;
     const attachment = this.attachment;
     const session = this.session;
+    const channel = this.channel;
     if (bytes.length === 0 || !conn || !attachment || attachment.ended() || session === undefined) return;
-    if (bytes.length <= conn.welcome.limits.max_frame - HEADER_LEN) {
-      try {
-        conn.send(FrameType.Input, this.channel, bytes);
-      } catch {
-        // Reported through onEnd.
-      }
-      return;
-    }
-    // Each request's base64 fits the control body with room for the rest.
+    // Each request's base64 fits the control body with room for the rest
+    // (the guard keeps the loop moving on an absurd limit).
     const chunk = Math.max(3, Math.floor((conn.welcome.limits.control_body - 1024) / 4) * 3);
     this.writes = this.writes.then(async () => {
       try {
+        if (!paste) {
+          conn.send(FrameType.Input, channel, bytes);
+          return;
+        }
         for (let at = 0; at < bytes.length; at += chunk) {
           await conn.call("write", { session, data: base64(bytes.subarray(at, at + chunk)) });
         }
       } catch (err) {
-        post({ type: "status", text: String(err) });
+        // A connection loss is reported through onEnd; a refused chunk
+        // ends the paste there.
+        if (conn === this.conn) post({ type: "status", text: String(err) });
       }
     });
   }
@@ -373,13 +375,13 @@ class Client {
   key(input: Extract<ToWorker, { type: "key" }>["input"]): void {
     const term = this.attachment?.term();
     if (!term) return;
-    this.input(this.keys.encode(term, input));
+    this.input(this.keys.encode(term, input), false);
   }
 
   paste(text: string): void {
     const term = this.attachment?.term();
     if (!term) return;
-    this.input(this.engine.encodePaste(text, term.mode(2004)));
+    this.input(this.engine.encodePaste(text, term.mode(2004)), true);
   }
 
   setViewport(size: Size, profile: Profile): void {

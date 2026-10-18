@@ -161,6 +161,17 @@ impl Registry {
             snapshot_path,
         } = loaded;
         let info = file.session;
+        if Some(info.id.as_str())
+            != snapshot_path
+                .parent()
+                .and_then(|g| g.parent()?.file_name()?.to_str())
+        {
+            tracing::warn!(
+                session = info.id,
+                "park file names another session; skipped"
+            );
+            return;
+        }
         let limits = &self.config.limits;
         let session = Session {
             id: info.id.clone(),
@@ -180,6 +191,7 @@ impl Registry {
             removed: false,
             announced: Default::default(),
             park_lock: Default::default(),
+            write_order: Default::default(),
             last_generation: 0,
             body: Body::Parked(Parked {
                 engine: file.engine,
@@ -237,11 +249,7 @@ impl Registry {
             }
             Ok(Some(Err(err))) | Err(err) => Err(err.to_string()),
         };
-        let gone = {
-            let s = session.lock().unwrap();
-            s.removed || (s.on_exit == OnExit::Remove && s.exited_at.is_some())
-        };
-        if gone {
+        if session.lock().unwrap().gone() {
             park::remove(&self.sessions_dir(), &id);
         }
         if let Err(error) = result {
@@ -249,29 +257,32 @@ impl Registry {
         }
     }
 
-    /// Graceful stop: parks every running session, closes every
-    /// attachment with `stopping` and hangs up each running session's
-    /// process group, then closes the connections once the attachments
-    /// have queued their `CLOSED`, and releases the state directory once
-    /// the connections have flushed (each wait bounded by `STOP_GRACE`).
+    /// Graceful stop: parks every session that is live and not going
+    /// (running, or exited and kept) and deletes the files of those
+    /// going, closes every attachment with `stopping` and hangs up each
+    /// running session's process group, then closes the connections once
+    /// the attachments have queued their `CLOSED`, and releases the state
+    /// directory once the connections have flushed (the attachment and
+    /// connection waits bounded by `STOP_GRACE`).
     pub async fn stop(self: &Arc<Self>) {
         self.stopping.store(true, Ordering::Release);
         // Taking a park lock joins a park in flight; a later one does
-        // nothing, so every live session is parked here (a kept session
-        // that exited may still be waiting for its final park), all at
-        // once so the phase lasts one snapshot retry at most.
+        // nothing, so every session is parked here (a kept session that
+        // exited may still be waiting for its final park), all at once so
+        // the phase lasts one snapshot retry past any park in flight.
         let mut parks = tokio::task::JoinSet::new();
         for session in self.sessions() {
             let registry = self.clone();
             parks.spawn(async move {
                 let park_lock = session.lock().unwrap().park_lock.clone();
                 let _one_at_a_time = park_lock.lock().await;
-                let live = {
+                let (id, gone) = {
                     let s = session.lock().unwrap();
-                    let gone = s.removed || (s.on_exit == OnExit::Remove && s.exited_at.is_some());
-                    s.live().is_some() && !gone
+                    (s.id.clone(), s.gone())
                 };
-                if live {
+                if gone {
+                    park::remove(&registry.sessions_dir(), &id);
+                } else {
                     registry.park_locked(&session).await;
                 }
             });
@@ -341,11 +352,14 @@ impl Registry {
         Page { sessions, next }
     }
 
-    /// Registers a subscriber and returns the first page as of that moment.
-    pub fn subscribe(&self, writer: Writer) -> Page {
+    /// Registers a subscriber, answering request `id` with the first page
+    /// before any event the subscriber gets: both under the lock, so an
+    /// event produced after the page cannot precede it.
+    pub fn subscribe(&self, writer: Writer, id: i64) {
         let mut state = self.state.lock().unwrap();
+        let page = self.page_of(&state, None);
+        crate::connection::reply(&writer, id, Ok(serde_json::json!(page)));
         state.subscribers.push(writer);
-        self.page_of(&state, None)
     }
 
     pub fn emit(&self, event: &Event) {
@@ -470,6 +484,7 @@ impl Registry {
             removed: false,
             announced: Default::default(),
             park_lock: Default::default(),
+            write_order: Default::default(),
             last_generation: 0,
             body: Body::Live(Box::new(Live {
                 pid: Some(pid),
@@ -636,10 +651,9 @@ impl Registry {
         if all_finished {
             self.remove_now(id);
         } else {
-            // The files go now, as at the end of an `on_exit: remove`
-            // stream: a stop within the grace must not bring it back.
+            // The files stay for the grace (a parked session serves its
+            // snapshot from them); a stop within it deletes them.
             session.lock().unwrap().removed = true;
-            park::remove(&self.sessions_dir(), id);
             self.remove_after_grace(id.to_string());
         }
         Ok(())

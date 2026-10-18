@@ -99,10 +99,10 @@ unsafe extern "C" fn read_source(
 pub struct Decoder<H: Handler = ()> {
     raw: sys::GhosttySnapshotDecoder,
     source: *mut Source,
-    /// The terminal the library retains between steps, owned here until
-    /// released so that nothing done through `terminal` can free it.
+    /// The terminal the library retains between steps, kept alive here
+    /// whatever is done through `terminal`.
     owner: Option<Terminal<H>>,
-    /// The view handed out; it must still be the owner's terminal.
+    /// The wrapper handed out; it must still be the owner's terminal.
     terminal: Option<Terminal<H>>,
     /// Installed on the terminal once it exists.
     handler: Option<H>,
@@ -154,18 +154,19 @@ impl<H: Handler> Decoder<H> {
         let handler = self.handler.take().expect("one terminal per decoder");
         // SAFETY: raw is a caller-owned terminal from the decoder.
         let owner = unsafe { Terminal::install(raw, handler) };
-        let view = owner.view();
+        let shared = owner.share();
         self.owner = Some(owner);
-        self.terminal.insert(view)
+        self.terminal.insert(shared)
     }
 
     /// Refuses to go on when the terminal handed out was replaced (safe
     /// code can `mem::replace` through the `&mut`), since the library
     /// still holds the one it returned. The owner keeps that one alive,
-    /// so another terminal cannot take its address.
+    /// so another terminal cannot take its address, and whatever was
+    /// moved out stays a valid terminal of its own.
     fn intact(&self) -> Result<()> {
         match (&self.terminal, &self.owner) {
-            (Some(view), Some(owner)) if view.raw() != owner.raw() => Err(Error::InvalidValue),
+            (Some(shared), Some(owner)) if shared.raw() != owner.raw() => Err(Error::InvalidValue),
             _ => Ok(()),
         }
     }
@@ -264,11 +265,10 @@ impl<H: Handler> Decoder<H> {
     }
 
     /// Frees the decoder and releases the terminal, finished or not;
-    /// `None` before `READY` or when the view was replaced.
+    /// `None` before `READY` or when the wrapper handed out was replaced.
     pub fn into_terminal(mut self) -> Option<Terminal<H>> {
         self.intact().ok()?;
-        self.terminal.take();
-        self.owner.take()
+        self.terminal.take()
     }
 
     fn compact(&mut self) {

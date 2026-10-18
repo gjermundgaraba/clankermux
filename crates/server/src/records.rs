@@ -31,8 +31,9 @@ fn text(value: String) -> Option<String> {
 }
 
 impl Records {
-    /// Records loaded from a park file, minus the transient ones; the file
-    /// holds them in the order of their last updates ([`Records::all`]).
+    /// Records loaded from a park file, minus the transient ones. A
+    /// restored session is never live again, so their order (which only
+    /// eviction reads) does not matter.
     pub fn load(records: Vec<StatusRecord>) -> Self {
         let mut out = Records::default();
         for record in records.into_iter().filter(|r| !transient(r)) {
@@ -125,12 +126,9 @@ impl Records {
         ids
     }
 
-    /// The records as reported (every key of their last report), least
-    /// recently updated first.
+    /// The records as reported: every key of their last report.
     pub fn all(&self) -> Vec<StatusRecord> {
-        let mut records: Vec<_> = self.by_id.values().collect();
-        records.sort_by_key(|(_, tick)| *tick);
-        records.into_iter().map(|(r, _)| r.clone()).collect()
+        self.by_id.values().map(|(r, _)| r.clone()).collect()
     }
 
     /// The records for `inspect`: `app` taken from the nearest ancestor
@@ -252,29 +250,14 @@ mod tests {
     }
 
     #[test]
-    fn loading_drops_transient_records_and_keeps_the_update_order() {
-        let mut loaded = Records::load(vec![
+    fn loading_drops_transient_records() {
+        let loaded = Records::load(vec![
             record("c", "done", "t1"),
             record("b", "error", "t2"),
             record("a", "working", "t3"),
         ]);
-        assert_eq!(loaded.all().len(), 2);
-        // `c` was updated before `b`, so it is evicted first.
-        let c = loaded.apply(report(ProgramStatusState::Done, "d", ""), 2, "t4");
-        assert_eq!(c.removed, vec!["c".to_string()]);
-    }
-
-    #[test]
-    fn all_lists_the_least_recently_updated_first() {
-        let mut r = Records::default();
-        r.apply(report(ProgramStatusState::Done, "b", ""), 10, "t1");
-        r.apply(report(ProgramStatusState::Done, "a", ""), 10, "t2");
-        r.apply(report(ProgramStatusState::Done, "b", ""), 10, "t3");
-        let ids: Vec<_> = r.all().into_iter().map(|x| x.id).collect();
-        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
-        // Loaded in that order, `a` is evicted first.
-        let mut loaded = Records::load(r.all());
-        let c = loaded.apply(report(ProgramStatusState::Done, "c", ""), 2, "t4");
-        assert_eq!(c.removed, vec!["a".to_string()]);
+        let mut ids: Vec<_> = loaded.all().into_iter().map(|x| x.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["b".to_string(), "c".to_string()]);
     }
 }

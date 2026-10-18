@@ -1,5 +1,6 @@
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::Arc;
 
 use ghostty_vt_sys as sys;
 
@@ -198,22 +199,41 @@ impl Term {
     }
 }
 
-/// A terminal with its effect handler. Owned, except for the view a
-/// [`snapshot::Decoder`](crate::snapshot::Decoder) hands out while it
-/// decodes: that one frees nothing, so replacing it cannot free the
-/// terminal the library still holds.
+/// A terminal with its effect handler. A [`snapshot::Decoder`](crate::snapshot::Decoder)
+/// holds a second wrapper on the terminal it decodes into while it hands
+/// one out; the terminal is freed with the last wrapper, so neither can
+/// free it under the other.
 pub struct Terminal<H: Handler = ()> {
     term: Term,
-    /// Heap slot the callbacks reach through userdata; a raw pointer so
-    /// that Rust-side access and the callbacks share one provenance.
+    owner: Arc<Owner<H>>,
+}
+
+/// What frees the terminal and the slot its callbacks reach through
+/// userdata (a raw pointer so that Rust-side access and the callbacks
+/// share one provenance).
+struct Owner<H: Handler> {
+    raw: sys::GhosttyTerminal,
     slot: *mut Slot<H>,
-    owned: bool,
+}
+
+impl<H: Handler> Drop for Owner<H> {
+    fn drop(&mut self) {
+        // SAFETY: the terminal was created by the library and is freed once,
+        // before the slot its callbacks point at, which Box::into_raw made.
+        unsafe {
+            sys::ghostty_terminal_free(self.raw);
+            drop(Box::from_raw(self.slot));
+        }
+    }
 }
 
 // SAFETY: libghostty-vt keeps no thread-local state, so a terminal may be
 // used from any thread as long as calls are serialized, which `&mut`
-// access guarantees. The handler is `Send` by its trait bound.
+// access guarantees. The handler is `Send` by its trait bound. The owner
+// is only ever touched through a wrapper's calls.
 unsafe impl<H: Handler> Send for Terminal<H> {}
+unsafe impl<H: Handler> Send for Owner<H> {}
+unsafe impl<H: Handler> Sync for Owner<H> {}
 
 impl<H: Handler> std::ops::Deref for Terminal<H> {
     type Target = Term;
@@ -298,30 +318,28 @@ impl<H: Handler> Terminal<H> {
         }
         Terminal {
             term: Term(raw),
-            slot,
-            owned: true,
+            owner: Arc::new(Owner { raw, slot }),
         }
     }
 
-    /// A second handle on this terminal that frees nothing; the owner
-    /// must outlive its use.
-    pub(crate) fn view(&self) -> Self {
+    /// A second wrapper on this terminal; the terminal lives as long as
+    /// either.
+    pub(crate) fn share(&self) -> Self {
         Terminal {
             term: Term(self.term.0),
-            slot: self.slot,
-            owned: false,
+            owner: self.owner.clone(),
         }
     }
 
     fn slot(&self) -> &Slot<H> {
-        // SAFETY: the slot is live until Drop, and the library only reaches
-        // it during calls that take `&mut self`.
-        unsafe { &*self.slot }
+        // SAFETY: the slot lives as long as the owner, and the library only
+        // reaches it during calls that take `&mut self`.
+        unsafe { &*self.owner.slot }
     }
 
     fn slot_mut(&mut self) -> &mut Slot<H> {
         // SAFETY: as in `slot`.
-        unsafe { &mut *self.slot }
+        unsafe { &mut *self.owner.slot }
     }
 
     pub fn handler(&self) -> &H {
@@ -406,20 +424,6 @@ impl<H: Handler> Terminal<H> {
             sys::GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES,
             &bytes as *const usize as *const c_void,
         )
-    }
-}
-
-impl<H: Handler> Drop for Terminal<H> {
-    fn drop(&mut self) {
-        if !self.owned {
-            return;
-        }
-        // SAFETY: the terminal was created by the library and is freed once,
-        // before the slot its callbacks point at, which Box::into_raw made.
-        unsafe {
-            sys::ghostty_terminal_free(self.term.0);
-            drop(Box::from_raw(self.slot));
-        }
     }
 }
 

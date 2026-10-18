@@ -1,12 +1,12 @@
 //! Writes snapshot fixtures for the cross-engine test: each `<name>.ghostsnp`
 //! is a native-encoded snapshot and `<name>.txt` the plain-text screen the
-//! native formatter produces for it. `engine.txt` holds the native engine id.
+//! native formatter produces for it.
 
 use std::fs;
 use std::path::PathBuf;
 
 use ghostty_vt::formatter::{self, Options};
-use ghostty_vt::{ENGINE, Terminal, snapshot};
+use ghostty_vt::{Terminal, snapshot};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = PathBuf::from(
@@ -15,7 +15,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("usage: encode-fixture <dir>")?,
     );
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join("engine.txt"), ENGINE)?;
 
     let mut basic = Terminal::new(20, 5)?;
     for i in 1..=12 {

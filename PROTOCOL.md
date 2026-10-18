@@ -166,7 +166,7 @@ Read
 | `pid`            | int?     | While the child is alive                                |
 | `cols`, `rows`   | int      | Current size                                            |
 | `title`          | string   | From the program, OSC 0 or 2                            |
-| `pwd`            | string   | From the program, OSC 7; the path only, host dropped    |
+| `pwd`            | string   | From the program, OSC 7; the path only, host dropped, percent-decoded |
 | `on_exit`        | string   | `remove` or `keep`                                      |
 | `created_at`     | string   | RFC 3339                                                |
 | `exited_at`      | string?  |                                                         |
@@ -481,7 +481,7 @@ the park time as Unix epoch milliseconds, mode 0700, files 0600:
 
 | File                | Contents                                                     |
 | ------------------- | ------------------------------------------------------------ |
-| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines}`: the `inspect` object (`attachments: 0`, no `pid`, `program_status` as reported with no inherited `app`, least recently updated first) and how many leading lines of `screen.txt` are history |
+| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines}`: the `inspect` object (`attachments: 0`, no `pid`, `program_status` as reported with no inherited `app`) and how many leading lines of `screen.txt` are history |
 | `snapshot.ghostsnp` | The snapshot bytes                                           |
 | `screen.txt`        | The `read` text with all retained history, at `parked_at`   |
 
@@ -491,9 +491,12 @@ its generation name, syncs `sessions/<id>/`, then deletes older
 generations. On start, the newest directory holding all three files is the
 session's state; the others, and any dot-named directory, are deleted.
 
-Parks happen for every running session every 5 minutes and on graceful
-stop, after which the server sends SIGHUP to each running session's process
-group, and once at the end of the stream for sessions with `on_exit: keep`.
+Parks happen for every running session every 5 minutes, once at the end
+of the stream for sessions with `on_exit: keep`, and on graceful stop for
+every session not being removed (a kept session's final park may still be
+pending); a stop deletes the files of sessions being removed, then sends
+SIGHUP to each running session's process group. While the server stops,
+`create`, `remove` and `OPEN` fail with `internal`.
 The whole `sessions/<id>/` directory is deleted whenever the session is
 removed.
 

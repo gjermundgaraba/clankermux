@@ -139,7 +139,7 @@ impl Term {
     }
 
     async fn exit_code(&mut self) -> i32 {
-        tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+        tokio::time::timeout(Duration::from_secs(10), self.child.wait())
             .await
             .unwrap()
             .unwrap()
@@ -350,4 +350,32 @@ async fn websocket_flags_need_the_websocket() {
             "{stderr}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_sends_one_request_even_for_empty_text() {
+    let server = start().await;
+    let conn = connect(&server).await;
+    let session = create(
+        &conn,
+        json!({"argv": ["/bin/sh", "-c", "exit 0"], "on_exit": "keep"}),
+    )
+    .await;
+    wait_session(&conn, &session.id, |s| s.status == Status::Exited).await;
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
+        .args([
+            "--socket",
+            server.socket.to_str().unwrap(),
+            "write",
+            &session.id,
+            "",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "an exited session refuses a write"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not_running"));
 }

@@ -298,6 +298,8 @@ pub struct Session {
     pub announced: (String, String),
     /// Parks of this session run one at a time.
     pub park_lock: Arc<tokio::sync::Mutex<()>>,
+    /// `write` replies of this session come in queue order.
+    pub write_order: Arc<tokio::sync::Mutex<()>>,
     /// The last generation written, so the next is larger whatever the
     /// clock says.
     pub last_generation: u64,
@@ -321,6 +323,12 @@ impl Session {
             (Body::Live(live), None) => Ok(live),
             _ => Err((ErrorCode::NotRunning, "session is not running".into())),
         }
+    }
+
+    /// Whether the session is going: removed, or ended with
+    /// `on_exit: remove`. Its files are not worth writing.
+    pub fn gone(&self) -> bool {
+        self.removed || (self.on_exit == OnExit::Remove && self.exited_at.is_some())
     }
 
     pub fn live(&self) -> Option<&Live> {
@@ -689,7 +697,9 @@ pub fn report(registry: &Arc<Registry>, session: &Shared, report: Viewport, imme
     });
 }
 
-/// The path of an OSC 7 `file://host/path` value; other values unchanged.
+/// The path of an OSC 7 value: what follows the host of any
+/// `scheme://host/path` (`file://` from most shells, `kitty-shell-cwd://`
+/// from Ghostty's integration), percent-decoded; a bare path as is.
 pub fn pwd_path(value: &str) -> String {
     let path = match value.split_once("://") {
         // `file://host/path`, or `kitty-shell-cwd://host/path` from

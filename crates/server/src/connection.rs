@@ -163,7 +163,6 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
         hello: None,
         subscribed: false,
         channels: HashMap::new(),
-        last_write: None,
     };
     let mut buf = vec![0u8; 64 * 1024];
     let hello_deadline =
@@ -244,8 +243,6 @@ struct Connection {
     hello: Option<Hello>,
     subscribed: bool,
     channels: HashMap<u32, Handle>,
-    /// The latest `write` reply task; the next replies after it.
-    last_write: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Connection {
@@ -414,16 +411,15 @@ impl Connection {
         };
         let id = request.id;
         if request.method == "write" {
-            control::write(
-                &self.registry,
-                &self.writer,
-                &mut self.last_write,
-                id,
-                request.params,
-            );
+            control::write(&self.registry, &self.writer, id, request.params);
             return true;
         }
-        let outcome = control::handle(&self.registry, &self.writer, &mut self.subscribed, request);
+        if request.method == "subscribe" && !self.subscribed {
+            self.subscribed = true;
+            self.registry.subscribe(self.writer.clone(), id);
+            return true;
+        }
+        let outcome = control::handle(&self.registry, request);
         reply(&self.writer, id, outcome);
         true
     }
@@ -450,7 +446,7 @@ impl Connection {
         // attachment that was there ends. A task that is ending is waited
         // for, so its last frame precedes the new attachment's first.
         if let Some(previous) = self.channels.remove(&channel) {
-            if previous.is_open() && !previous.done() {
+            if previous.is_open() && !previous.finished() {
                 if previous.end(ErrorCode::ChannelInUse, "channel in use".into()) {
                     self.channels.insert(channel, previous);
                 } else {
@@ -458,9 +454,9 @@ impl Connection {
                 }
                 return;
             }
-            previous.finished().await;
+            previous.join().await;
         }
-        self.channels.retain(|_, h| !h.done());
+        self.channels.retain(|_, h| !h.finished());
         if self.registry.is_stopping() {
             self.error(channel, ErrorCode::Internal, "server stopping");
             return;

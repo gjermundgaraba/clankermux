@@ -33,6 +33,6 @@ mv "$tmp/tree/$top" "$root/vendor/libghostty-vt"
 jq -n --arg sha "$sha" --arg sha256 "$sum" \
     --arg version "$(tr -d '\n' < "$root/vendor/libghostty-vt/VERSION")" \
     --arg date "$(date -u +%Y-%m-%d)" \
-    '{sha: $sha, sha256: $sha256, version: $version, date: $date, engine: ("ghostty-vt@" + $version)}' \
+    '{sha: $sha, sha256: $sha256, date: $date, engine: ("ghostty-vt@" + $version)}' \
     > "$pin"
 cat "$pin"

@@ -203,13 +203,16 @@ impl<H: Handler + Default> Attachment<H> {
                 else {
                     unreachable!()
                 };
+                if decoder.terminal().is_none() {
+                    return Err(Error::Protocol("SNAPSHOT_END before READY".into()));
+                }
                 while decoder.step_available() && decoder.next_page().map_err(engine)? {}
                 if !decoder.finished() {
                     return Err(Error::Protocol("SNAPSHOT_END before FINISH".into()));
                 }
                 let term = decoder
                     .into_terminal()
-                    .ok_or_else(|| Error::Protocol("SNAPSHOT_END before READY".into()))?;
+                    .ok_or_else(|| Error::Protocol("the decoder's terminal was replaced".into()))?;
                 self.state = State::Streaming(term);
                 for frame in held {
                     self.step(frame, actions)?;
@@ -478,11 +481,22 @@ mod tests {
             })
         );
 
-        // A wrong offset is a client-side error.
-        assert!(
-            a.handle(frame(FrameType::Output, proto::encode_output(5, b"z")))
-                .is_err()
-        );
+        // A wrong offset is a lost place in the stream, which a fresh OPEN
+        // recovers; so is a wrong marker.
+        assert!(matches!(
+            a.handle(frame(FrameType::Output, proto::encode_output(5, b"z"))),
+            Err(Error::Desync(_))
+        ));
+        let stale = Resized {
+            seq: 9,
+            offset: 102,
+            cols: 1,
+            rows: 1,
+        };
+        assert!(matches!(
+            a.handle(json(FrameType::Resized, &stale)),
+            Err(Error::Desync(_))
+        ));
 
         let exited = Exited {
             seq: 4,

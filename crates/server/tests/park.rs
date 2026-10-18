@@ -618,3 +618,54 @@ async fn a_parked_read_takes_scrollback_from_the_history_only() {
     assert_eq!(read(&mut c, &session.id, 0).await.text, live_screen);
     assert_eq!(read(&mut c, &session.id, 2).await.text, live_two);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deferred_remove_keeps_a_parked_session_until_the_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let limits = Limits {
+        remove_grace: 60_000,
+        ..fast_limits()
+    };
+    let a = start_with(limits, state.clone());
+    let mut c = client(&a).await;
+    // Enough history that a bootstrap pauses for a client that stops
+    // reading, which keeps its attachment unfinished.
+    let session = c
+        .create(json!({
+            "on_exit": "keep",
+            "argv": ["/bin/sh", "-c",
+                "awk 'BEGIN { s = sprintf(\"%1000s\", \"\"); gsub(/ /, \"a\", s); for (i = 0; i < 3000; i++) print s; print \"filled\" }'; exec cat"],
+            "cols": 200, "rows": 5,
+        }))
+        .await;
+    wait_text(&mut c, &session.id, "filled").await;
+    drop(c);
+    a.registry.stop().await;
+    drop(a);
+    assert!(
+        !generations(&state, &session.id).is_empty(),
+        "parked by the stop"
+    );
+
+    let b = start_with(limits, state.clone());
+    let mut c = client(&b).await;
+    let mut idle = client(&b).await;
+    idle.open(1, json!({"session": session.id})).await;
+    idle.attached(1).await;
+    c.wait_attachments(&session.id, 1).await;
+    c.ok("remove", json!({"session": session.id})).await;
+    // Within the grace the session is listed and its files serve a
+    // bootstrap.
+    c.open(2, json!({"session": session.id})).await;
+    assert!(c.bootstrap(2).await.text().contains("filled"));
+    // A stop within the grace does not bring it back.
+    b.registry.stop().await;
+    drop(b);
+    let d = start_with(limits, state);
+    let mut c = client(&d).await;
+    assert_eq!(
+        c.err("inspect", json!({"session": session.id})).await,
+        ErrorCode::NoSuchSession
+    );
+}

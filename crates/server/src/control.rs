@@ -55,15 +55,9 @@ fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
 }
 
 /// `write`, which is answered once the PTY took the bytes; meanwhile the
-/// connection reads on. Replies follow the previous `write`'s, so they
-/// come in request order.
-pub fn write(
-    registry: &Arc<Registry>,
-    writer: &Writer,
-    previous: &mut Option<tokio::task::JoinHandle<()>>,
-    id: i64,
-    p: Value,
-) {
+/// connection reads on. Replies to one session come in its queue's
+/// order; a failure is answered at once.
+pub fn write(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
     let started = (|| {
         let p: proto::WriteParams = params(p)?;
         let data = base64::engine::general_purpose::STANDARD
@@ -75,38 +69,32 @@ pub fn write(
                 )
             })?;
         let session = registry.get(&p.session)?;
-        session
-            .lock()
-            .unwrap()
+        let s = session.lock().unwrap();
+        let wait = s
             .running()?
             .input
             .push(data)
-            .ok_or((ErrorCode::InputOverflow, "input queue full".into()))
+            .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?;
+        Ok((wait, s.write_order.clone()))
     })();
-    let writer = writer.clone();
-    let before = previous.take();
-    *previous = Some(tokio::spawn(async move {
-        if let Some(before) = before {
-            let _ = before.await;
+    match started {
+        Err(fail) => reply(writer, id, Err(fail)),
+        Ok((wait, order)) => {
+            let writer = writer.clone();
+            tokio::spawn(async move {
+                let _in_turn = order.lock().await;
+                let outcome = wait
+                    .await
+                    .map(|()| json!({}))
+                    .map_err(|_| internal("the PTY refused the bytes"));
+                reply(&writer, id, outcome);
+            });
         }
-        let outcome = match started {
-            Err(fail) => Err(fail),
-            Ok(wait) => wait
-                .await
-                .map(|()| json!({}))
-                .map_err(|_| internal("the PTY refused the bytes")),
-        };
-        reply(&writer, id, outcome);
-    }));
+    }
 }
 
 /// Handles one request but `write`.
-pub fn handle(
-    registry: &Arc<Registry>,
-    writer: &Writer,
-    subscribed: &mut bool,
-    request: Request,
-) -> Result<Value, Fail> {
+pub fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
     let p = request.params;
     match request.method.as_str() {
         "create" => Ok(json!(registry.create(params(p)?)?)),
@@ -209,13 +197,8 @@ pub fn handle(
                 status: s.status(),
             }))
         }
-        "subscribe" => {
-            if *subscribed {
-                return Ok(json!(registry.page(None)));
-            }
-            *subscribed = true;
-            Ok(json!(registry.subscribe(writer.clone())))
-        }
+        // A first `subscribe` is answered by the registry itself.
+        "subscribe" => Ok(json!(registry.page(None))),
         other => Err((ErrorCode::InvalidRequest, format!("unknown method {other}"))),
     }
 }

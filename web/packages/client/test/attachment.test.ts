@@ -110,7 +110,10 @@ test("bootstraps, holds after a resize, and resumes", () => {
   expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo\nxy");
   expect(a.term()!.cols).toBe(20);
   expect(a.resume()).toEqual({ incarnation: "inc", offset: 102, marker: 3 });
-  expect(() => a.handle(output(5, "z"))).toThrow(/OUTPUT at 5/);
+  expect(() => a.handle(output(5, "z"))).toThrow(expect.objectContaining({ kind: "desync", message: expect.stringMatching(/OUTPUT at 5/) }));
+  expect(() => a.handle(json(FrameType.Resized, { seq: 9, offset: 102, cols: 1, rows: 1 }))).toThrow(
+    expect.objectContaining({ kind: "desync" }),
+  );
   expect(a.handle(json(FrameType.Exited, { seq: 4, offset: 102, exit: { code: 0 } }))).toEqual([
     { type: "exited", exit: { code: 0 } },
   ]);
@@ -151,7 +154,9 @@ test("a snapshot cut before FINISH is a protocol error", () => {
   a.handle(frame(FrameType.Snapshot, bytes.subarray(0, ready)));
   a.handle(frame(FrameType.SnapshotReady, new Uint8Array()));
   a.handle(frame(FrameType.Snapshot, bytes.subarray(ready, bytes.length - 1)));
-  expect(() => a.handle(frame(FrameType.SnapshotEnd, new Uint8Array()))).toThrow(/FINISH/);
+  expect(() => a.handle(frame(FrameType.SnapshotEnd, new Uint8Array()))).toThrow(
+    expect.objectContaining({ kind: "protocol", message: expect.stringMatching(/FINISH/) }),
+  );
   a.free();
 });
 

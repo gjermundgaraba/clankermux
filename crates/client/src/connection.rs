@@ -89,8 +89,10 @@ struct Routes {
 enum Ended {
     /// The server sent an `ERROR` without id.
     Server(ErrorMessage),
-    /// The stream ended or broke.
+    /// The server broke the protocol.
     Lost(String),
+    /// The stream broke.
+    Io(String),
     /// The server closed the connection, as on a stop.
     Eof,
 }
@@ -100,6 +102,7 @@ impl From<&Ended> for Error {
         match ended {
             Ended::Server(error) => Error::Server(error.clone()),
             Ended::Lost(reason) => Error::Protocol(reason.clone()),
+            Ended::Io(reason) => Error::Io(io::Error::other(reason.clone())),
             Ended::Eof => Error::Closed,
         }
     }
@@ -319,7 +322,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
         match reader.read(&mut buf).await {
             Ok(0) => break Ended::Eof,
             Ok(n) => decoder.push(&buf[..n]),
-            Err(err) => break Ended::Lost(err.to_string()),
+            Err(err) => break Ended::Io(err.to_string()),
         }
     };
     let mut routes = routes.lock().unwrap();

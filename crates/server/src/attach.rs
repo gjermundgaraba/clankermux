@@ -41,13 +41,13 @@ pub struct Handle {
 
 impl Handle {
     /// Whether the attachment still takes frames; a channel is free again
-    /// only once the task is [`Handle::done`].
+    /// only once the task has [`Handle::finished`].
     pub fn is_open(&self) -> bool {
         !self.ended.load(Ordering::Acquire)
     }
 
-    /// Whether the task has queued its last frame.
-    pub fn done(&self) -> bool {
+    /// Whether the task has queued its last frame and returned.
+    pub fn finished(&self) -> bool {
         self.task.is_finished()
     }
 
@@ -69,7 +69,7 @@ impl Handle {
 
     /// Waits for the task, which has queued every frame of the
     /// attachment by then.
-    pub async fn finished(self) {
+    pub async fn join(self) {
         let _ = self.task.await;
     }
 }

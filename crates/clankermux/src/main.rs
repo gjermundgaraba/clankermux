@@ -235,7 +235,7 @@ fn session_line(s: &Session) {
     };
     emit(&format!(
         "{:<8} {:<12} {:<8}{:<9} {:>3}x{:<3} {} {}\n",
-        &s.id[..8],
+        s.id.get(..8).unwrap_or(&s.id),
         s.label,
         s.status.to_string(),
         exit,

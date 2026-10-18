@@ -164,10 +164,10 @@ export class Attachment {
       case FrameType.SnapshotEnd: {
         if (this.state.kind !== "bootstrapping") throw ClientError.protocol("SNAPSHOT_END outside a bootstrap");
         const { decoder, held } = this.state;
+        if (!decoder.terminal()) throw ClientError.protocol("SNAPSHOT_END before READY");
         while (decoder.stepAvailable() && decoder.nextPage()) {}
         if (!decoder.finished()) throw ClientError.protocol("SNAPSHOT_END before FINISH");
-        const term = decoder.release();
-        if (!term) throw ClientError.protocol("SNAPSHOT_END before READY");
+        const term = decoder.release()!;
         this.state = { kind: "streaming", term };
         for (const f of held) this.step(f, actions);
         break;

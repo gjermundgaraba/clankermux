@@ -185,7 +185,8 @@ pub fn shape(seq: &[u8]) -> Option<Shape> {
 /// A kitty keyboard protocol key press or repeat `CSI code ; mods [:
 /// event] u`: the Unicode key code and the modifier bits (shift 1, alt
 /// 2, ctrl 4, super 8), as the terminal sends them when a program
-/// enabled the protocol. A release (event 3) is `None`.
+/// enabled the protocol; the lock bits (caps 64, num 128) are dropped. A
+/// release (event 3) is `None`.
 pub fn kitty_key(seq: &[u8]) -> Option<(u32, u32)> {
     let (code, mods, event) = kitty_event(seq)?;
     (event != 3).then_some((code, mods))
@@ -204,11 +205,15 @@ fn kitty_event(seq: &[u8]) -> Option<(u32, u32, u32)> {
     let mut fields = body.split(';');
     let code = fields.next()?.split(':').next()?.parse().ok()?;
     let (mods, event) = match fields.next() {
+        // The modifier field is empty when only later fields are sent.
         Some(mods) => {
             let mut parts = mods.split(':');
-            let mods = parts.next()?.parse::<u32>().ok()?.saturating_sub(1);
+            let mods = match parts.next()? {
+                "" => 0,
+                mods => mods.parse::<u32>().ok()?.saturating_sub(1),
+            };
             let event = parts.next().map_or(Some(1), |e| e.parse().ok())?;
-            (mods, event)
+            (mods & !(64 | 128), event)
         }
         None => (0, 1),
     };
