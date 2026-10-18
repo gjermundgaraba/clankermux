@@ -39,11 +39,13 @@ export interface Header {
 export type FrameErrorKind = "unknown_type" | "too_long" | "short" | "length_mismatch";
 
 export class FrameError extends Error {
-  constructor(
-    readonly kind: FrameErrorKind,
-    message: string,
-  ) {
+  readonly kind: FrameErrorKind;
+
+  // Erasable syntax only: node runs this package's sources with type
+  // stripping (the dev bridge and the headless driver).
+  constructor(kind: FrameErrorKind, message: string) {
     super(message);
+    this.kind = kind;
   }
 }
 

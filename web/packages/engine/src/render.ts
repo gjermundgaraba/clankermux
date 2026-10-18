@@ -1,4 +1,4 @@
-import { type Engine, RESULT, type Terminal } from "./index.ts";
+import { type BitField, type Engine, RESULT, type Terminal } from "./index.ts";
 
 /** Style flag bits of a [`Cell`]. */
 export const FLAG = {
@@ -68,6 +68,8 @@ export class RenderState {
   private readonly keys: { data: Record<string, number>; row: Record<string, number>; cell: Record<string, number> };
   private readonly tags: { codepoint: number; grapheme: number };
   private readonly wide: { wide: number; tail: number };
+  /** `GhosttyCell` bit fields, from the manifest. */
+  private readonly cell: { tag: BitField; codepoint: BitField; wide: BitField };
 
   constructor(readonly engine: Engine) {
     this.state = engine.construct("ghostty_render_state_new");
@@ -94,6 +96,11 @@ export class RenderState {
     this.wide = {
       wide: engine.enumValue("GhosttyCellWide", "WIDE"),
       tail: engine.enumValue("GhosttyCellWide", "SPACER_TAIL"),
+    };
+    this.cell = {
+      tag: engine.bits("GhosttyCell", "content_tag"),
+      codepoint: engine.bits("GhosttyCell", "content", "CODEPOINT", "codepoint"),
+      wide: engine.bits("GhosttyCell", "wide"),
     };
   }
 
@@ -182,13 +189,11 @@ export class RenderState {
       const utf8 = buffer + e.sizeOf("GhosttyBuffer");
       while (e.call("ghostty_render_state_row_cells_next", this.cells) && cells.length < cols) {
         e.check("ghostty_render_state_row_cells_get", this.cells, this.keys.cell["RAW"]!, raw);
-        const lo = e.view.getUint32(raw, true);
-        const hi = e.view.getUint32(raw + 4, true);
-        const tag = lo & 0x3;
-        const wide = (hi >>> 10) & 0x3;
+        const tag = e.readBits(raw, this.cell.tag);
+        const wide = e.readBits(raw, this.cell.wide);
         let text = "";
         if (tag === this.tags.codepoint) {
-          const cp = (lo >>> 2) & 0x1fffff;
+          const cp = e.readBits(raw, this.cell.codepoint);
           if (cp !== 0) text = String.fromCodePoint(cp);
         } else if (tag === this.tags.grapheme) {
           text = this.graphemes(buffer, utf8, utf8Cap);
@@ -233,19 +238,22 @@ export class RenderState {
     e.view.setUint32(buffer + e.offsetOf("GhosttyBuffer", "cap"), cap, true);
     e.view.setUint32(buffer + e.offsetOf("GhosttyBuffer", "len"), 0, true);
     const code = e.call("ghostty_render_state_row_cells_get", this.cells, this.keys.cell["GRAPHEMES_UTF8"]!, buffer);
-    if (code === RESULT.OUT_OF_SPACE) {
-      const needed = e.field("GhosttyBuffer", buffer, "len");
-      return e.scratch(needed, (big) => {
-        e.view.setUint32(buffer + e.offsetOf("GhosttyBuffer", "ptr"), big, true);
-        e.view.setUint32(buffer + e.offsetOf("GhosttyBuffer", "cap"), needed, true);
-        e.check("ghostty_render_state_row_cells_get", this.cells, this.keys.cell["GRAPHEMES_UTF8"]!, buffer);
-        const len = e.field("GhosttyBuffer", buffer, "len");
-        return new TextDecoder().decode(e.memory.slice(big, big + len));
-      });
+    if (code === RESULT.SUCCESS) {
+      const len = e.field("GhosttyBuffer", buffer, "len");
+      return new TextDecoder().decode(e.memory.slice(utf8, utf8 + len));
     }
-    if (code !== RESULT.SUCCESS) throw new Error(`cell graphemes: ${code}`);
-    const len = e.field("GhosttyBuffer", buffer, "len");
-    return new TextDecoder().decode(e.memory.slice(utf8, utf8 + len));
+    if (code !== RESULT.OUT_OF_SPACE) throw new Error(`cell graphemes: ${code}`);
+    // The buffer struct reports the needed length; retry through it.
+    const needed = e.field("GhosttyBuffer", buffer, "len");
+    return new TextDecoder().decode(
+      e.growing("ghostty_render_state_row_cells_get", needed, (big, bigCap, len) => {
+        e.view.setUint32(buffer + e.offsetOf("GhosttyBuffer", "ptr"), big, true);
+        e.view.setUint32(buffer + e.offsetOf("GhosttyBuffer", "cap"), bigCap, true);
+        const again = e.call("ghostty_render_state_row_cells_get", this.cells, this.keys.cell["GRAPHEMES_UTF8"]!, buffer);
+        e.view.setUint32(len, e.field("GhosttyBuffer", buffer, "len"), true);
+        return again;
+      }),
+    );
   }
 
   /** Marks the frame as drawn. */

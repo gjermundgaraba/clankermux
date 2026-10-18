@@ -12,10 +12,9 @@ export interface Metrics {
   boldItalicFont: string;
 }
 
-/** CSS colours used where the frame has none. */
+/** CSS colours used where the frame has none: only the cursor, since the
+ * frame always carries default foreground and background colours. */
 export interface Palette {
-  foreground: string;
-  background: string;
   cursor: string;
 }
 
@@ -50,8 +49,8 @@ export class CanvasRenderer {
   ) {}
 
   draw(frame: Frame): void {
-    this.background = css(frame.background, this.palette.background);
-    this.foreground = css(frame.foreground, this.palette.foreground);
+    this.background = css(frame.background, "#000000");
+    this.foreground = css(frame.foreground, "#ffffff");
     if (frame.full || frame.cols !== this.cols) {
       this.cols = frame.cols;
       this.rows.clear();
@@ -65,14 +64,15 @@ export class CanvasRenderer {
       this.drawRow(row);
       drawn.add(row.y);
     }
-    // The cursor's old row is redrawn from the cache when it moved.
-    if (this.cursorRow !== undefined && this.cursorRow !== frame.cursor?.y && !drawn.has(this.cursorRow)) {
+    // The cursor's old row is redrawn from the cache when the cursor
+    // moved or went away; the engine marks no row dirty for either.
+    const cursor = frame.cursor?.visible ? frame.cursor : undefined;
+    if (this.cursorRow !== undefined && this.cursorRow !== cursor?.y && !drawn.has(this.cursorRow)) {
       const cells = this.rows.get(this.cursorRow);
       if (cells) this.drawRow({ y: this.cursorRow, cells });
     }
     this.cursorRow = undefined;
-    const cursor = frame.cursor;
-    if (!cursor || !cursor.visible) return;
+    if (!cursor) return;
     if (!drawn.has(cursor.y)) {
       const cells = this.rows.get(cursor.y);
       if (cells) this.drawRow({ y: cursor.y, cells });

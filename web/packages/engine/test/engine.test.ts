@@ -103,6 +103,11 @@ test("keys encode with the terminal's modes", () => {
   expect(press("KeyA", "A", { shift: true })).toBe("A");
   expect(press("KeyC", "c", { ctrl: true })).toBe("\x03");
   expect(press("KeyX", "x", { alt: true })).toBe("\x1bx");
+  // Option and AltGr compose characters: the text goes through as typed.
+  expect(press("Digit8", "[", { alt: true, altComposed: true, unshifted: "8" })).toBe("[");
+  expect(press("Digit8", "{", { alt: true, shift: true, altComposed: true, unshifted: "8" })).toBe("{");
+  expect(press("Digit2", "@", { ctrl: true, alt: true, altComposed: true, unshifted: "2" })).toBe("@");
+  expect(press("KeyB", "∫", { alt: true, altComposed: true, unshifted: "b" })).toBe("∫");
   expect(press("Enter", "Enter")).toBe("\r");
   expect(press("Backspace", "Backspace")).toBe("\x7f");
   expect(press("ArrowUp", "ArrowUp")).toBe("\x1b[A");
@@ -110,6 +115,11 @@ test("keys encode with the terminal's modes", () => {
   expect(press("KeyA", "a", { composing: true })).toBe("");
   term.write(utf8("\x1b[?1h"));
   expect(press("ArrowUp", "ArrowUp")).toBe("\x1bOA");
+  // Under the kitty protocol the key is the unshifted character.
+  term.write(utf8("\x1b[>11u"));
+  expect(press("Digit1", "!", { shift: true, unshifted: "1" })).toBe("\x1b[49;2u");
+  expect(press("Digit1", "!", { shift: true, ctrl: true, unshifted: "1" })).toBe("\x1b[49;6u");
+  expect(press("KeyA", "A", { shift: true })).toBe("\x1b[97;2u");
   keys.free();
   term.free();
 });

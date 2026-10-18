@@ -5,19 +5,36 @@
  */
 const ESC = 0x1b;
 const BEL = 0x07;
-/** Longer OSC payloads are abandoned, not buffered. */
+/** Longer OSC 52 payloads are abandoned, not buffered. */
 const MAX_OSC = 1 << 20;
+const PREFIX = "52;";
 
 export interface ClipboardWrite {
-  /** The selection parameter, `c` for the clipboard. */
+  /** The selection parameter: `c` or empty for the clipboard, `p`, `s`, `q` otherwise. */
   selection: string;
   text: string;
 }
 
+type State = "text" | "esc" | "osc" | "osc-esc";
+
 export class Osc52Scanner {
-  private state: "text" | "esc" | "osc" | "osc-esc" = "text";
+  private state: State = "text";
+  /** Inside an OSC that may still be a 52; otherwise its bytes are skipped. */
+  private collecting = false;
   private payload: number[] = [];
-  private overflowed = false;
+
+  /** Forgets a sequence in progress: the stream it came from is gone. */
+  reset(): void {
+    this.state = "text";
+    this.collecting = false;
+    this.payload = [];
+  }
+
+  private startOsc(): void {
+    this.state = "osc";
+    this.collecting = true;
+    this.payload = [];
+  }
 
   /** Feeds output bytes; returns the clipboard writes they completed. */
   feed(bytes: Uint8Array): ClipboardWrite[] {
@@ -28,32 +45,29 @@ export class Osc52Scanner {
           if (b === ESC) this.state = "esc";
           break;
         case "esc":
-          if (b === 0x5d) {
-            this.state = "osc";
-            this.payload = [];
-            this.overflowed = false;
-          } else {
-            this.state = b === ESC ? "esc" : "text";
-          }
+          if (b === 0x5d) this.startOsc();
+          else this.state = b === ESC ? "esc" : "text";
           break;
         case "osc":
           if (b === BEL) {
             this.finish(writes);
           } else if (b === ESC) {
             this.state = "osc-esc";
-          } else if (this.payload.length < MAX_OSC) {
+          } else if (this.collecting) {
             this.payload.push(b);
-          } else {
-            this.overflowed = true;
+            // Only a 52 is collected; anything else is skipped to its end.
+            const head = String.fromCharCode(...this.payload.slice(0, PREFIX.length));
+            if (!PREFIX.startsWith(head) || this.payload.length > MAX_OSC) {
+              this.collecting = false;
+              this.payload = [];
+            }
           }
           break;
         case "osc-esc":
-          if (b === 0x5c) {
-            this.finish(writes);
-          } else {
-            // Not ST: the OSC was cut short by another sequence.
-            this.state = b === ESC ? "esc" : "text";
-          }
+          if (b === 0x5c) this.finish(writes);
+          // Another OSC may start before this one ended.
+          else if (b === 0x5d) this.startOsc();
+          else this.state = b === ESC ? "esc" : "text";
           break;
       }
     }
@@ -61,9 +75,10 @@ export class Osc52Scanner {
   }
 
   private finish(writes: ClipboardWrite[]): void {
-    this.state = "text";
-    if (this.overflowed) return;
+    const collected = this.collecting;
     const payload = new TextDecoder().decode(Uint8Array.from(this.payload));
+    this.reset();
+    if (!collected) return;
     const match = /^52;([^;]*);(.*)$/s.exec(payload);
     if (!match || match[2] === "?") return;
     try {

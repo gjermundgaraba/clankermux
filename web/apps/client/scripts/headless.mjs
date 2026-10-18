@@ -1,14 +1,47 @@
 // Drives the page in headless Chrome over the DevTools protocol: waits for
-// the attach, types a line, screenshots. A development check, not a test.
+// the attach, types a line, screenshots, and checks the typed text reached
+// the session's screen through the server's own `read`. Exits non-zero
+// when any step fails. A development check; it types plain ASCII only, so
+// it says nothing about modifiers or layouts.
 //
-//   node scripts/headless.mjs <page url> <screenshot.png> [text to type]
+//   node scripts/headless.mjs <page url> <socket> <session id> <screenshot.png>
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
+import { connect } from "node:net";
 
-const [url, shot, typed = "echo browser-ok\n"] = process.argv.slice(2);
-if (!url || !shot) {
-  console.error("usage: headless.mjs <url> <screenshot.png> [text]");
+import { FrameType, StreamFramer, encodeFrame, parseFrame } from "../../../packages/proto/src/index.ts";
+
+const [url, socket, session, shot] = process.argv.slice(2);
+if (!url || !socket || !session || !shot) {
+  console.error("usage: headless.mjs <url> <socket> <session id> <screenshot.png>");
   process.exit(2);
+}
+const marker = `browser-ok-${process.pid}`;
+const typed = `echo ${marker}\n`;
+
+/** The session's screen text, through the control plane. */
+function readScreen() {
+  return new Promise((resolve, reject) => {
+    const unix = connect(socket);
+    const framer = new StreamFramer(1 << 30);
+    const json = (type, body) => unix.write(encodeFrame(type, 0, new TextEncoder().encode(JSON.stringify(body))));
+    unix.on("connect", () => json(FrameType.Hello, { version: 1, client: { name: "headless", version: "0" }, capabilities: [] }));
+    unix.on("data", (chunk) => {
+      for (const bytes of framer.feed(chunk)) {
+        const frame = parseFrame(bytes, 1 << 30);
+        const body = JSON.parse(new TextDecoder().decode(frame.payload));
+        if (frame.header.type === FrameType.Welcome) json(FrameType.Request, { id: 1, method: "read", params: { session } });
+        else if (frame.header.type === FrameType.Reply) {
+          unix.destroy();
+          resolve(body.result.text);
+        } else if (frame.header.type === FrameType.Error) {
+          unix.destroy();
+          reject(new Error(`${body.code}: ${body.message}`));
+        }
+      }
+    });
+    unix.on("error", reject);
+  });
 }
 const chrome = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const proc = spawn(chrome, [
@@ -83,7 +116,8 @@ try {
     await sleep(100);
   }
   console.log(`status: ${status}`);
-  if (status === "attached") {
+  let ok = status === "attached";
+  if (ok) {
     await evaluate("document.getElementById('screen').focus()");
     for (const ch of typed) {
       const key = ch === "\n" ? "Enter" : ch;
@@ -92,10 +126,15 @@ try {
       await send("Input.dispatchKeyEvent", { type: "keyUp", key, code });
     }
     await sleep(700);
+    const screen = await readScreen();
+    // The echo appears once as the command line and once as output.
+    ok = screen.split(marker).length >= 3;
+    console.log(ok ? `typed text reached the session` : `typed text missing from the screen:\n${screen}`);
   }
   const { data } = await send("Page.captureScreenshot", { format: "png" });
   writeFileSync(shot, Buffer.from(data, "base64"));
   console.log(`screenshot: ${shot}`);
+  process.exitCode = ok ? 0 : 1;
 } finally {
   for (const line of logs) console.log(line);
   proc.kill();

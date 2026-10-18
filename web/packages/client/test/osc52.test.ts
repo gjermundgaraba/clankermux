@@ -16,4 +16,16 @@ test("clipboard writes are found across chunks; queries and other OSCs are not",
     { selection: "c", text: "ok" },
   ]);
   expect(scanner.feed(bytes("\x1b]52;c;not base64!\x07"))).toEqual([]);
+  // An OSC interrupted by another OSC: the second one counts.
+  expect(scanner.feed(bytes(`\x1b]52;c;${hello}\x1b]52;c;${btoa("two")}\x07`))).toEqual([
+    { selection: "c", text: "two" },
+  ]);
+  // A reset forgets a sequence cut by a stream change.
+  expect(scanner.feed(bytes("\x1b]52;c;QUJD"))).toEqual([]);
+  scanner.reset();
+  expect(scanner.feed(bytes("\x07plain"))).toEqual([]);
+  // Other OSCs are skipped without being collected; a huge one does not grow memory.
+  expect(scanner.feed(bytes(`\x1b]8;;${"x".repeat(3000)}\x1b\\\x1b]52;;${btoa("k")}\x07`))).toEqual([
+    { selection: "", text: "k" },
+  ]);
 });

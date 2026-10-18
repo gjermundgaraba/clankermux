@@ -102,11 +102,11 @@ export class Connection {
   }
 
   /** A request; the reply's `result`, or a rejection with the server's error. */
-  request(method: string, params: unknown): Promise<unknown> {
+  call<R>(method: string, params: unknown): Promise<R> {
     if (this.ended) return Promise.reject(this.ended);
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
       try {
         this.sendJson(FrameType.Request, 0, { id, method, params });
       } catch (err) {
@@ -116,20 +116,17 @@ export class Connection {
     });
   }
 
-  call<R>(method: string, params: unknown): Promise<R> {
-    return this.request(method, params) as Promise<R>;
-  }
-
-  /** Opens `channel`; its frames go to `receive` for the connection's life. */
+  /** Opens `channel`; its frames go to `receive` until `release` or the
+   * connection's end. */
   open(channel: number, open: unknown, receive: (frame: Frame) => void): void {
     if (this.ended) throw this.ended;
     this.channels.set(channel, receive);
     this.sendJson(FrameType.Open, channel, open);
   }
 
-  /** The error the connection ended with, if it has. */
-  get error(): ClientError | undefined {
-    return this.ended;
+  /** Stops routing `channel`; later frames on it are dropped. */
+  release(channel: number): void {
+    this.channels.delete(channel);
   }
 
   close(): void {
@@ -186,6 +183,7 @@ export class Connection {
     this.ended = error;
     for (const waiter of this.pending.values()) waiter.reject(error);
     this.pending.clear();
+    this.channels.clear();
     this.transport.close();
     this.onEnd?.(error);
   }

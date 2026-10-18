@@ -8,7 +8,7 @@ check-rust:
     cargo test --workspace
 
 check-web: wasm fixtures
-    cd web && pnpm install --frozen-lockfile && pnpm -r typecheck && pnpm -r test
+    cd web && pnpm install --frozen-lockfile && pnpm -r typecheck && pnpm -r test && pnpm -r build
 
 # Build ghostty-vt.wasm from the vendored tree.
 wasm:

@@ -37,8 +37,10 @@ type State =
   /** `held`: stream frames after a `RESIZED` or `EXITED`, until `SNAPSHOT_END`. */
   | { kind: "bootstrapping"; decoder: Decoder; held: Frame[] }
   | { kind: "streaming"; term: Terminal }
-  /** After the final marker, `CLOSED` or a fatal error; the terminal stays for display. */
-  | { kind: "ended"; term: Terminal | undefined };
+  /** After the final marker, `CLOSED` or a fatal error. The terminal stays
+   * for display only; `closed` says the server ended the attachment, so no
+   * `CLOSE` is owed. */
+  | { kind: "ended"; term: Terminal | undefined; closed: boolean };
 
 const KEEPS_ATTACHMENT = new Set<ErrorMessage["code"]>(["read_only", "not_running", "input_overflow"]);
 
@@ -75,6 +77,11 @@ export class Attachment {
     return this.state.kind === "ended";
   }
 
+  /** The server ended the attachment (`CLOSED` or a fatal `ERROR`). */
+  closed(): boolean {
+    return this.state.kind === "ended" && this.state.closed;
+  }
+
   /** The local engine, once `READY` has been decoded. */
   term(): Terminal | undefined {
     switch (this.state.kind) {
@@ -97,7 +104,7 @@ export class Attachment {
   /** Releases the engine objects. */
   free(): void {
     this.discard();
-    this.state = { kind: "ended", term: undefined };
+    this.state = { kind: "ended", term: undefined, closed: true };
   }
 
   private json<T>(frame: Frame): T {
@@ -124,7 +131,12 @@ export class Attachment {
           if (attached.snapshot_bytes === undefined) throw ClientError.protocol("ATTACHED without snapshot_bytes");
           this.discard();
           const decoder = new Decoder(this.engine, attached.snapshot_bytes);
-          decoder.setMaxContinuationBytes(this.continuation);
+          try {
+            decoder.setMaxContinuationBytes(this.continuation);
+          } catch (err) {
+            decoder.free();
+            throw err;
+          }
           this.state = { kind: "bootstrapping", decoder, held: [] };
         } else if (this.state.kind !== "streaming") {
           throw ClientError.protocol("resume without a terminal");
@@ -166,6 +178,7 @@ export class Attachment {
           this.state.held.push(frame);
           return;
         }
+        if (this.state.kind === "ended") throw ClientError.protocol(`${type} after the attachment ended`);
         this.stream(frame, actions);
         break;
       case FrameType.Gap: {
@@ -176,13 +189,13 @@ export class Attachment {
       }
       case FrameType.Closed: {
         const closed = this.json<Closed>(frame);
-        this.end();
+        this.end(true);
         actions.push({ type: "closed", reason: closed.reason });
         break;
       }
       case FrameType.Error: {
         const error = this.json<ErrorMessage>(frame);
-        if (!KEEPS_ATTACHMENT.has(error.code)) this.end();
+        if (!KEEPS_ATTACHMENT.has(error.code)) this.end(true);
         actions.push({ type: "error", error });
         break;
       }
@@ -217,7 +230,7 @@ export class Attachment {
       case FrameType.Exited: {
         const exited = this.json<Exited>(frame);
         this.checkMarker(exited.seq, exited.offset);
-        this.end();
+        this.end(false);
         actions.push({ type: "exited", exit: exited.exit });
         break;
       }
@@ -234,7 +247,7 @@ export class Attachment {
   }
 
   /** Keeps the terminal for display, if there is one. */
-  private end(): void {
+  private end(closed: boolean): void {
     let term: Terminal | undefined;
     switch (this.state.kind) {
       case "bootstrapping":
@@ -245,7 +258,7 @@ export class Attachment {
         term = this.state.term;
         break;
     }
-    this.state = { kind: "ended", term };
+    this.state = { kind: "ended", term, closed };
   }
 
   /** Frees whatever engine objects the state holds. */

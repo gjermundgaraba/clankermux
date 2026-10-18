@@ -3,7 +3,7 @@
  * render state live here; the page draws frames and reports input.
  */
 import { type Action, Attachment, ClientError, Connection, Osc52Scanner, type Transport, hello } from "@clankermux/client";
-import { ENGINE, Engine, KeyEncoder, RenderState } from "@clankermux/engine";
+import { ENGINE, Engine, KeyEncoder, RenderState, type Terminal } from "@clankermux/engine";
 import { type Event, FrameType, type Page, type Profile, type Session, type Size } from "@clankermux/proto";
 
 import type { ToPage, ToWorker } from "./protocol.ts";
@@ -65,7 +65,15 @@ class Client {
   private sessions: Session[] = [];
   private readonly clipboard = new Osc52Scanner();
   private paintTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Shared by reconnects and re-attaches after a failure; reset by a screen. */
   private backoff = BACKOFF_MIN_MS;
+  private reopenTimer: ReturnType<typeof setTimeout> | undefined;
+
+  private delay(): number {
+    const delay = this.backoff;
+    this.backoff = Math.min(this.backoff * 2, BACKOFF_MAX_MS);
+    return delay;
+  }
 
   async init(message: Extract<ToWorker, { type: "init" }>): Promise<void> {
     this.url = message.url;
@@ -90,11 +98,9 @@ class Client {
         post({ type: "status", text: err.message });
         return;
       }
-      setTimeout(() => void this.connect(), this.backoff);
-      this.backoff = Math.min(this.backoff * 2, BACKOFF_MAX_MS);
+      setTimeout(() => void this.connect(), this.delay());
       return;
     }
-    this.backoff = BACKOFF_MIN_MS;
     this.conn = conn;
     conn.onEnd = (err) => {
       if (this.conn !== conn) return;
@@ -102,7 +108,7 @@ class Client {
       if (err.kind === "server") {
         post({ type: "status", text: err.message });
       } else {
-        setTimeout(() => void this.connect(), this.backoff);
+        setTimeout(() => void this.connect(), this.delay());
       }
     };
     conn.onEvent = (event) => this.event(event);
@@ -165,9 +171,13 @@ class Client {
         try {
           actions = attachment.handle(frame);
         } catch (err) {
+          // A client-side protocol error: CLOSE and OPEN again, afresh.
           post({ type: "status", text: String(err) });
-          this.detach();
+          this.reopen();
           return;
+        }
+        if (frame.header.type === FrameType.Attached && actions.length === 0) {
+          post({ type: "status", text: "attached" });
         }
         for (const action of actions) this.apply(action);
       });
@@ -176,16 +186,32 @@ class Client {
     }
   }
 
+  /** Detaches and attaches the same session again after a backoff. */
+  private reopen(): void {
+    this.detach();
+    this.reopenTimer ??= setTimeout(() => {
+      this.reopenTimer = undefined;
+      if (this.session !== undefined && !this.attachment) this.open();
+    }, this.delay());
+  }
+
   private apply(action: Action): void {
     switch (action.type) {
       case "screen": {
+        this.backoff = BACKOFF_MIN_MS;
+        this.clipboard.reset();
+        this.applyProfile(this.attachment?.term());
         this.paint();
         const exit = this.attachment?.session?.exit;
         post({ type: "status", text: exit ? `exited: ${describe(exit)}` : "attached" });
         break;
       }
       case "output":
-        for (const write of this.clipboard.feed(action.bytes)) post({ type: "clipboard", text: write.text });
+        for (const write of this.clipboard.feed(action.bytes)) {
+          // Only the clipboard selection; primary and secondary have no
+          // browser equivalent.
+          if (write.selection === "" || write.selection.includes("c")) post({ type: "clipboard", text: write.text });
+        }
         this.paintTimer ??= setTimeout(() => this.paint(), PAINT_MS);
         break;
       case "resized":
@@ -196,6 +222,7 @@ class Client {
         post({ type: "status", text: `exited: ${describe(action.exit)}` });
         break;
       case "gap":
+        this.clipboard.reset();
         post({ type: "status", text: "resynchronising" });
         break;
       case "closed":
@@ -203,8 +230,34 @@ class Client {
         break;
       case "error":
         post({ type: "status", text: `${action.error.code}: ${action.error.message}` });
+        // A fatal error ended the attachment; attach again after a backoff.
+        if (this.attachment?.closed()) this.reopen();
         break;
     }
+  }
+
+  /** The page's colours on the local terminal, as the server has them on
+   * its own: the stream does not carry default colours. */
+  private applyProfile(term: Terminal | undefined): void {
+    if (!term) return;
+    for (const [kind, value] of [
+      ["foreground", this.profile.fg],
+      ["background", this.profile.bg],
+      ["cursor", this.profile.cursor],
+    ] as const) {
+      if (value !== undefined) term.setColor(kind, parseInt(value.slice(1), 16));
+    }
+  }
+
+  repaint(): void {
+    const term = this.attachment?.term();
+    if (!term) return;
+    // Switching the render state to a fresh terminal makes the next
+    // update full; so does a resize. A full repaint of the same terminal
+    // comes from a clean render state.
+    this.render.free();
+    this.render = new RenderState(this.engine);
+    this.paint();
   }
 
   private paint(): void {
@@ -218,14 +271,19 @@ class Client {
     this.render.clean();
   }
 
-  /** Closes the current attachment's channel and forgets it. */
+  /** Closes the current attachment's channel and forgets it. An
+   * attachment the server ended needs no CLOSE; one whose stream ended
+   * (EXITED) does. */
   private detach(): void {
     if (!this.attachment) return;
-    if (this.conn && !this.attachment.ended()) {
-      try {
-        this.conn.send(FrameType.Close, this.channel, new Uint8Array());
-      } catch {
-        // The connection is gone; nothing to close.
+    if (this.conn) {
+      this.conn.release(this.channel);
+      if (!this.attachment.closed()) {
+        try {
+          this.conn.send(FrameType.Close, this.channel, new Uint8Array());
+        } catch {
+          // The connection is gone; nothing to close.
+        }
       }
     }
     this.attachment.free();
@@ -235,7 +293,6 @@ class Client {
   attach(session: string): void {
     this.detach();
     this.session = session;
-    this.render.clean();
     this.postSessions();
     this.open();
   }
@@ -251,7 +308,7 @@ class Client {
     }
   }
 
-  /** Input for the session, dropped unless streaming on a live connection. */
+  /** Input for the session, dropped unless attached on a live connection. */
   private input(bytes: Uint8Array): void {
     const attachment = this.attachment;
     if (bytes.length === 0 || !this.conn || !attachment || attachment.ended()) return;
@@ -279,6 +336,8 @@ class Client {
     this.profile = profile;
     const attachment = this.attachment;
     if (!this.conn || !attachment || attachment.ended()) return;
+    this.applyProfile(attachment.term());
+    this.paint();
     try {
       this.conn.sendJson(FrameType.Viewport, this.channel, { ...size, profile });
     } catch {
@@ -312,6 +371,9 @@ port.onmessage = (e) => {
       break;
     case "viewport":
       client.setViewport(message.size, message.profile);
+      break;
+    case "repaint":
+      client.repaint();
       break;
   }
 };

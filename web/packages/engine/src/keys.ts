@@ -1,4 +1,4 @@
-import { type Engine, EngineError, RESULT, type Terminal } from "./index.ts";
+import type { Engine, Terminal } from "./index.ts";
 
 /** A key event as the browser reports it. */
 export interface KeyInput {
@@ -13,6 +13,12 @@ export interface KeyInput {
   meta: boolean;
   /** An input method is composing; the engine encodes nothing. */
   composing?: boolean;
+  /** The character the key produces with no modifiers, from the layout
+   * when the browser exposes it. */
+  unshifted?: string;
+  /** Alt (with Ctrl, for AltGr) composed `key` rather than modifying the
+   * key: Option on macOS, AltGr elsewhere. The text is sent as typed. */
+  altComposed?: boolean;
 }
 
 const MODS = { SHIFT: 1 << 0, CTRL: 1 << 1, ALT: 1 << 2, SUPER: 1 << 3 };
@@ -55,10 +61,12 @@ export class KeyEncoder {
     e.call("ghostty_key_encoder_setopt_from_terminal", this.encoder, term.handle);
     const name = keyName(input.code);
     const key = e.hasEnumValue("GhosttyKey", name) ? e.enumValue("GhosttyKey", name) : this.unidentified;
+    // Modifiers that composed the text are not modifiers of the key.
+    const composed = input.altComposed === true;
     const mods =
       (input.shift ? MODS.SHIFT : 0) |
-      (input.ctrl ? MODS.CTRL : 0) |
-      (input.alt ? MODS.ALT : 0) |
+      (input.ctrl && !composed ? MODS.CTRL : 0) |
+      (input.alt && !composed ? MODS.ALT : 0) |
       (input.meta ? MODS.SUPER : 0);
     e.call("ghostty_key_event_set_action", this.event, e.enumValue("GhosttyKeyAction", input.action.toUpperCase()));
     e.call("ghostty_key_event_set_key", this.event, key);
@@ -70,22 +78,11 @@ export class KeyEncoder {
     const textPtr = utf8.length ? e.copyIn(utf8) : 0;
     try {
       e.call("ghostty_key_event_set_utf8", this.event, textPtr, utf8.length);
-      const unshifted = text ? text.toLowerCase().codePointAt(0)! : 0;
-      e.call("ghostty_key_event_set_unshifted_codepoint", this.event, unshifted);
-      let cap = 64;
-      for (;;) {
-        const out = e.scratch(cap, (buf) =>
-          e.scratch(4, (len) => {
-            const code = e.call("ghostty_key_encoder_encode", this.encoder, this.event, buf, cap, len);
-            const n = e.view.getUint32(len, true);
-            if (code === RESULT.OUT_OF_SPACE) return n;
-            if (code !== RESULT.SUCCESS) throw new EngineError("ghostty_key_encoder_encode", code);
-            return e.memory.slice(buf, buf + n);
-          }),
-        );
-        if (typeof out !== "number") return out;
-        cap = out;
-      }
+      const base = input.unshifted ?? (text ? text.toLowerCase() : "");
+      e.call("ghostty_key_event_set_unshifted_codepoint", this.event, base ? base.codePointAt(0)! : 0);
+      return e.growing("ghostty_key_encoder_encode", 64, (buf, cap, len) =>
+        e.call("ghostty_key_encoder_encode", this.encoder, this.event, buf, cap, len),
+      );
     } finally {
       if (textPtr) e.free(textPtr, utf8.length);
     }

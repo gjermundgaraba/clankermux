@@ -1,6 +1,7 @@
 import type { Profile, Scheme } from "@clankermux/proto";
 
-/** `#rrggbb` from a computed CSS colour (`rgb(r, g, b)` or hex); undefined otherwise. */
+/** `#rrggbb` from a CSS colour as a custom property holds it (hex, or
+ * `rgb()` when the stylesheet writes it that way); undefined otherwise. */
 export function hexColor(value: string): string | undefined {
   const text = value.trim();
   const hex = /^#([0-9a-f]{6})$/i.exec(text);

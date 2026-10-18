@@ -12,15 +12,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, expect, test } from "vitest";
 
 import { ENGINE, Engine } from "@clankermux/engine";
-import {
-  type Event,
-  type Frame,
-  FrameType,
-  HEADER_LEN,
-  type Read,
-  type Session,
-  parseHeader,
-} from "@clankermux/proto";
+import { type Event, type Frame, FrameType, type Read, type Session, StreamFramer } from "@clankermux/proto";
 
 import { type Action, Attachment, Connection, type Transport, hello } from "../src/index.ts";
 
@@ -31,12 +23,14 @@ const built = existsSync(binary);
 
 /** Frames over a stream socket, one `onMessage` per frame. */
 class StreamTransport implements Transport {
-  private buffer = new Uint8Array(0);
+  private readonly framer = new StreamFramer(1 << 30);
   onMessage: ((bytes: Uint8Array) => void) | undefined;
   onClose: (() => void) | undefined;
 
   constructor(private readonly socket: Socket) {
-    socket.on("data", (chunk: Buffer) => this.feed(chunk));
+    socket.on("data", (chunk: Buffer) => {
+      for (const frame of this.framer.feed(chunk)) this.onMessage?.(frame);
+    });
     socket.on("close", () => this.onClose?.());
     socket.on("error", () => {});
   }
@@ -56,21 +50,6 @@ class StreamTransport implements Transport {
   close(): void {
     this.socket.destroy();
   }
-
-  private feed(chunk: Uint8Array): void {
-    const joined = new Uint8Array(this.buffer.length + chunk.length);
-    joined.set(this.buffer);
-    joined.set(chunk, this.buffer.length);
-    let pos = 0;
-    while (joined.length - pos >= HEADER_LEN) {
-      const header = parseHeader(joined.subarray(pos), 1 << 30);
-      const end = pos + HEADER_LEN + header.length;
-      if (end > joined.length) break;
-      this.onMessage?.(joined.slice(pos, end));
-      pos = end;
-    }
-    this.buffer = joined.slice(pos);
-  }
 }
 
 let dir: string;
@@ -83,7 +62,7 @@ beforeAll(async () => {
   engine = await Engine.load(readFileSync(`${here}../../engine/ghostty-vt.wasm`));
   dir = mkdtempSync(join(tmpdir(), "cmx-"));
   socket = join(dir, "sock");
-  server = spawn(binary, ["--socket", socket, "serve"], { stdio: "ignore" });
+  server = spawn(binary, ["--socket", socket, "serve"], { stdio: ["ignore", "ignore", "inherit"] });
   const deadline = Date.now() + 10_000;
   for (;;) {
     try {
@@ -149,10 +128,11 @@ test.skipIf(!built)("bootstraps, streams, resumes and sees the exit", async () =
   const conn = await connect();
   expect(conn.welcome.engine).toBe(ENGINE);
   const session = await conn.call<Session>("create", { argv: ["/bin/cat"], cols: 20, rows: 5 });
-  await conn.request("write", { session: session.id, data: btoa("one\n") });
-  for (;;) {
+  await conn.call("write", { session: session.id, data: btoa("one\n") });
+  for (const deadline = Date.now() + 5000; ; ) {
     const read = await conn.call<Read>("read", { session: session.id });
     if (read.text.includes("one\none")) break;
+    if (Date.now() > deadline) throw new Error(`echo not seen: ${JSON.stringify(read.text)}`);
     await new Promise((r) => setTimeout(r, 10));
   }
 
@@ -180,12 +160,12 @@ test.skipIf(!built)("bootstraps, streams, resumes and sees the exit", async () =
   // A viewport report resizes; a kill ends the stream and the events say so.
   const events: Event[] = [];
   again.onEvent = (e) => events.push(e);
-  await again.request("subscribe", {});
+  await again.call("subscribe", {});
   again.sendJson(FrameType.Viewport, 1, { cols: 30, rows: 6 });
   actions = await drive(a, queue, (all) => all.some((x) => x.type === "resized"));
   expect(actions).toContainEqual({ type: "resized", cols: 30, rows: 6 });
   expect(a.term()!.cols).toBe(30);
-  await again.request("signal", { session: session.id, signal: "KILL" });
+  await again.call("signal", { session: session.id, signal: "KILL" });
   actions = await drive(a, queue, () => a.ended());
   expect(actions.at(-1)).toEqual({ type: "exited", exit: { signal: "KILL" } });
   for (let i = 0; i < 100 && !events.some((e) => e.event === "session_exited"); i++) {
@@ -194,7 +174,7 @@ test.skipIf(!built)("bootstraps, streams, resumes and sees the exit", async () =
   expect(events.some((e) => e.event === "session_exited" && e.session.id === session.id)).toBe(true);
 
   // Server errors arrive typed; a second HELLO ends the connection.
-  await expect(again.request("inspect", { session: "nope" })).rejects.toMatchObject({
+  await expect(again.call("inspect", { session: "nope" })).rejects.toMatchObject({
     server: { code: "no_such_session" },
   });
   const ended = new Promise((resolve) => (again.onEnd = resolve));

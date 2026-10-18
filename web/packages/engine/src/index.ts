@@ -10,10 +10,19 @@ export type { Cell, Frame, FrameRow } from "./render.ts";
 export const ENGINE: string = pin.engine;
 
 type Field = { offset: number; size: number; type: string };
-export type TypeInfo =
+/** A bit field of a packed type; a union arm nests its own bits. */
+type Bits = { lsb: number; width: number; arms?: Record<string, { bits: Record<string, Bits> }> };
+type TypeInfo =
   | { kind: "struct"; size: number; fields: Record<string, Field> }
   | { kind: "enum"; size: number; values: Record<string, number> }
-  | { kind: "pointer" | "array" | "union" | "opaque" | "primitive" | "alias" | "packed"; size: number };
+  | { kind: "packed"; size: number; bits: Record<string, Bits> }
+  | { kind: "pointer" | "array" | "union" | "opaque" | "primitive" | "alias"; size: number };
+
+/** Position and width of a bit field, from the manifest. */
+export interface BitField {
+  lsb: number;
+  width: number;
+}
 
 export const RESULT = {
   SUCCESS: 0,
@@ -181,6 +190,60 @@ export class Engine {
     }
   }
 
+  /** A bit field of a packed type: `path` names the field, or a union
+   * field, its arm and the arm's field. */
+  bits(name: string, ...path: string[]): BitField {
+    const info = this.types[name];
+    if (!info || info.kind !== "packed") throw new Error(`unknown packed type ${name}`);
+    const [field, arm, inner] = path;
+    const top = info.bits[field!];
+    if (!top) throw new Error(`${name} has no bit field ${field}`);
+    if (arm === undefined) return { lsb: top.lsb, width: top.width };
+    const nested = top.arms?.[arm]?.bits[inner!];
+    if (!nested) throw new Error(`${name}.${field} has no ${arm}.${inner}`);
+    return { lsb: top.lsb + nested.lsb, width: nested.width };
+  }
+
+  /** Reads a bit field of a 64-bit packed value at `ptr`. */
+  readBits(ptr: number, field: BitField): number {
+    const value = this.view.getBigUint64(ptr, true);
+    return Number((value >> BigInt(field.lsb)) & ((1n << BigInt(field.width)) - 1n));
+  }
+
+  /** Runs an encoder that reports `OUT_OF_SPACE` with the needed size,
+   * growing the output buffer until it fits. */
+  growing(name: string, initial: number, encode: (buf: number, cap: number, len: number) => number): Uint8Array {
+    let cap = initial;
+    for (;;) {
+      const out = this.scratch(cap, (buf) =>
+        this.scratch(4, (len) => {
+          const code = encode(buf, cap, len);
+          const n = this.view.getUint32(len, true);
+          if (code === RESULT.OUT_OF_SPACE) return n;
+          if (code !== RESULT.SUCCESS) throw new EngineError(name, code);
+          return this.memory.slice(buf, buf + n);
+        }),
+      );
+      if (typeof out !== "number") return out;
+      cap = out;
+    }
+  }
+
+  /** Runs an `*_alloc` call that returns bytes through `(ptr, len)` out
+   * parameters and frees them after copying. */
+  allocated(name: string, call: (ptr: number, len: number) => void): Uint8Array {
+    return this.scratch(8, (out) => {
+      call(out, out + 4);
+      const ptr = this.view.getUint32(out, true);
+      const len = this.view.getUint32(out + 4, true);
+      try {
+        return this.memory.slice(ptr, ptr + len);
+      } finally {
+        this.call("ghostty_free", 0, ptr, len);
+      }
+    });
+  }
+
   /** The offset of a struct field, for nested reads. */
   offsetOf(name: string, key: string): number {
     const field = this.struct(name).fields[key];
@@ -245,30 +308,12 @@ export class Engine {
    */
   encodePaste(text: string, bracketed: boolean): Uint8Array {
     const data = new TextEncoder().encode(text);
+    if (data.length === 0) return data;
     const src = this.copyIn(data);
     try {
-      let cap = data.length + 16;
-      for (;;) {
-        const out = this.scratch(cap, (buf) =>
-          this.scratch(4, (written) => {
-            const code = this.call(
-              "ghostty_paste_encode",
-              src,
-              data.length,
-              bracketed ? 1 : 0,
-              buf,
-              cap,
-              written,
-            );
-            const len = this.view.getUint32(written, true);
-            if (code === RESULT.OUT_OF_SPACE) return len;
-            if (code !== RESULT.SUCCESS) throw new EngineError("ghostty_paste_encode", code);
-            return this.memory.slice(buf, buf + len);
-          }),
-        );
-        if (typeof out !== "number") return out;
-        cap = out;
-      }
+      return this.growing("ghostty_paste_encode", data.length + 16, (buf, cap, len) =>
+        this.call("ghostty_paste_encode", src, data.length, bracketed ? 1 : 0, buf, cap, len),
+      );
     } finally {
       this.free(src, data.length);
     }
@@ -353,18 +398,27 @@ export class Terminal {
     this.engine.check("ghostty_terminal_resize", this.handle, cols, rows, cellWidth, cellHeight);
   }
 
+  /** Sets or clears a default colour (0xRRGGBB), as OSC 10, 11 and 12 report it. */
+  setColor(kind: "foreground" | "background" | "cursor", color: number | undefined): void {
+    const option = this.engine.enumValue("GhosttyTerminalOption", `COLOR_${kind.toUpperCase()}`);
+    if (color === undefined) {
+      this.engine.check("ghostty_terminal_set", this.handle, option, 0);
+      return;
+    }
+    const rgb = this.engine.pack("GhosttyColorRgb", { r: (color >> 16) & 0xff, g: (color >> 8) & 0xff, b: color & 0xff });
+    const ptr = this.engine.copyIn(rgb);
+    try {
+      this.engine.check("ghostty_terminal_set", this.handle, option, ptr);
+    } finally {
+      this.engine.free(ptr, rgb.length);
+    }
+  }
+
   /** The whole terminal, history included, as a snapshot. */
   snapshot(): Uint8Array {
-    return this.engine.scratch(8, (out) => {
-      this.engine.check("ghostty_snapshot_encode_alloc", this.handle, 0, out, out + 4);
-      const ptr = this.engine.view.getUint32(out, true);
-      const len = this.engine.view.getUint32(out + 4, true);
-      try {
-        return this.engine.memory.slice(ptr, ptr + len);
-      } finally {
-        this.engine.call("ghostty_free", 0, ptr, len);
-      }
-    });
+    return this.engine.allocated("ghostty_snapshot_encode_alloc", (ptr, len) =>
+      this.engine.check("ghostty_snapshot_encode_alloc", this.handle, 0, ptr, len),
+    );
   }
 
   /** The active screen as plain text, one line per row. */
@@ -377,16 +431,11 @@ export class Terminal {
     try {
       const formatter = this.engine.construct("ghostty_formatter_terminal_new", this.handle, optionsPtr);
       try {
-        return this.engine.scratch(8, (out) => {
-          this.engine.check("ghostty_formatter_format_alloc", formatter, 0, out, out + 4);
-          const ptr = this.engine.view.getUint32(out, true);
-          const len = this.engine.view.getUint32(out + 4, true);
-          try {
-            return new TextDecoder().decode(this.engine.memory.slice(ptr, ptr + len));
-          } finally {
-            this.engine.call("ghostty_free", 0, ptr, len);
-          }
-        });
+        return new TextDecoder().decode(
+          this.engine.allocated("ghostty_formatter_format_alloc", (ptr, len) =>
+            this.engine.check("ghostty_formatter_format_alloc", formatter, 0, ptr, len),
+          ),
+        );
       } finally {
         this.engine.call("ghostty_formatter_free", formatter);
       }

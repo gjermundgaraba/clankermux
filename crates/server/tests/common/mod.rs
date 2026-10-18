@@ -240,6 +240,11 @@ impl Client {
                 _ => boot.stream.push((header, payload)),
             }
         }
+        assert_eq!(
+            boot.attached.snapshot_bytes,
+            Some((boot.ready.len() + boot.rest.len()) as u64),
+            "ATTACHED announces the snapshot's total length"
+        );
         boot
     }
 

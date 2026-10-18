@@ -32,7 +32,7 @@ const metrics: Metrics = {
   italicFont: "i",
   boldItalicFont: "bi",
 };
-const palette = { foreground: "#fff", background: "#000", cursor: "#0f0" };
+const palette = { cursor: "#0f0" };
 
 const blank = (): Cell => ({ text: "", fg: NO_COLOR, bg: NO_COLOR, flags: 0, underline: 0 });
 const cell = (text: string, extra: Partial<Cell> = {}): Cell => ({ ...blank(), text, ...extra });
@@ -65,7 +65,7 @@ test("a full frame clears, rows draw their cells, and the cursor moves between f
       true,
     ),
   );
-  expect(ctx.ops[0]).toEqual(["rect", "#000", 0, 0, 30, 40]);
+  expect(ctx.ops[0]).toEqual(["rect", "#000000", 0, 0, 30, 40]);
   expect(ctx.ops).toContainEqual(["text", "b", "a", 0, 15]);
   expect(ctx.ops).toContainEqual(["text", "r", "漢", 10, 15]);
   expect(ctx.ops).toContainEqual(["rect", "#0000ff", 0, 20, 10, 20]);
@@ -80,13 +80,19 @@ test("a full frame clears, rows draw their cells, and the cursor moves between f
   // from the cache without the cursor, and the cursor drawn on row 0.
   ctx.ops = [];
   r.draw(frame([{ y: 0, cells: [cell("c"), blank(), blank()] }], { x: 2, y: 0, visible: true, blinking: false, style: 0, color: 0x00ff00 }));
-  expect(ctx.ops[0]).toEqual(["rect", "#000", 0, 0, 30, 20]);
+  expect(ctx.ops[0]).toEqual(["rect", "#000000", 0, 0, 30, 20]);
   expect(ctx.texts()).toEqual(["c", "b"]);
   expect(ctx.ops.at(-1)).toEqual(["rect", "#00ff00", 20, 0, 2, 20]);
 
-  // A hidden cursor draws nothing extra; inverse swaps the colours.
+  // Hiding the cursor on its own row erases it: row 0 is redrawn from
+  // the cache without the cursor. Inverse swaps the colours.
   ctx.ops = [];
-  r.draw(frame([{ y: 1, cells: [cell("x", { flags: FLAG.INVERSE }), blank(), blank()] }], { x: 0, y: 0, visible: false, blinking: false, style: 1, color: NO_COLOR }));
-  expect(ctx.ops).toContainEqual(["rect", "#fff", 0, 20, 10, 20]);
-  expect(ctx.ops.filter((op) => op[1] === "#0f0")).toEqual([]);
+  r.draw(frame([{ y: 1, cells: [cell("x", { flags: FLAG.INVERSE }), blank(), blank()] }], { x: 2, y: 0, visible: false, blinking: false, style: 0, color: 0x00ff00 }));
+  expect(ctx.ops).toContainEqual(["rect", "#ffffff", 0, 20, 10, 20]);
+  expect(ctx.texts()).toEqual(["x", "c"]);
+  expect(ctx.ops.filter((op) => op[1] === "#0f0" || op[1] === "#00ff00")).toEqual([]);
+  // Nothing to erase the next time.
+  ctx.ops = [];
+  r.draw(frame([], { x: 2, y: 0, visible: false, blinking: false, style: 0, color: 0x00ff00 }));
+  expect(ctx.ops).toEqual([]);
 });

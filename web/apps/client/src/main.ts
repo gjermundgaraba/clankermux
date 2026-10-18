@@ -2,7 +2,7 @@
 import { CanvasRenderer, type Metrics } from "@clankermux/renderer";
 import type { Session, Size } from "@clankermux/proto";
 
-import { browserKeeps, keyInput } from "./keyboard.ts";
+import { type Keyboard, browserKeeps, keyInput } from "./keyboard.ts";
 import { profileFrom } from "./profile.ts";
 import type { ToPage, ToWorker } from "./protocol.ts";
 
@@ -44,35 +44,43 @@ function measure(): Metrics {
 }
 
 const metrics = measure();
-const dpr = window.devicePixelRatio || 1;
 const ctx = canvas.getContext("2d")!;
-const renderer = new CanvasRenderer(ctx, metrics, {
-  foreground: colors().fg,
-  background: colors().bg,
-  cursor: colors().cursor,
-});
+const renderer = new CanvasRenderer(ctx, metrics, { cursor: colors().cursor });
+const dpr = () => window.devicePixelRatio || 1;
 
 function viewport(): Size {
   const rect = container.getBoundingClientRect();
   return {
     cols: Math.max(1, Math.floor(rect.width / metrics.cellWidth)),
     rows: Math.max(1, Math.floor(rect.height / metrics.cellHeight)),
-    cell_width: Math.round(metrics.cellWidth * dpr),
-    cell_height: Math.round(metrics.cellHeight * dpr),
+    cell_width: Math.round(metrics.cellWidth * dpr()),
+    cell_height: Math.round(metrics.cellHeight * dpr()),
   };
 }
 
-let grid = { cols: 0, rows: 0 };
+/** The canvas backing store for the grid at the current pixel ratio;
+ * the next frame is drawn in full after a change. */
+let grid = { cols: 0, rows: 0, dpr: 0 };
+let fullNext = false;
 function fitCanvas(cols: number, rows: number): void {
-  if (grid.cols === cols && grid.rows === rows) return;
-  grid = { cols, rows };
-  canvas.width = cols * metrics.cellWidth * dpr;
-  canvas.height = rows * metrics.cellHeight * dpr;
+  const scale = dpr();
+  if (grid.cols === cols && grid.rows === rows && grid.dpr === scale) return;
+  grid = { cols, rows, dpr: scale };
+  canvas.width = cols * metrics.cellWidth * scale;
+  canvas.height = rows * metrics.cellHeight * scale;
   canvas.style.width = `${cols * metrics.cellWidth}px`;
   canvas.style.height = `${rows * metrics.cellHeight}px`;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
   ctx.textBaseline = "alphabetic";
+  fullNext = true;
 }
+
+/** The keyboard layout, when the browser exposes it (Chromium does). */
+const keyboard: Keyboard = { layout: undefined, mac: /Mac|iPhone|iPad/.test(navigator.platform) };
+(navigator as { keyboard?: { getLayoutMap(): Promise<ReadonlyMap<string, string>> } }).keyboard
+  ?.getLayoutMap()
+  .then((map) => (keyboard.layout = map))
+  .catch(() => {});
 
 const worker = new Worker("./worker.js", { type: "module" });
 const send = (message: ToWorker) => worker.postMessage(message);
@@ -85,7 +93,13 @@ worker.onmessage = (e: MessageEvent<ToPage>) => {
       break;
     case "frame":
       fitCanvas(message.frame.cols, message.frame.rows);
-      renderer.draw(message.frame);
+      if (fullNext && !message.frame.full) {
+        // The backing store was recreated; a partial frame cannot fill it.
+        send({ type: "repaint" });
+      } else {
+        fullNext = false;
+        renderer.draw(message.frame);
+      }
       break;
     case "sessions":
       showSessions(message.sessions, message.current);
@@ -121,7 +135,7 @@ newButton.onclick = () => {
 for (const type of ["keydown", "keyup"] as const) {
   canvas.addEventListener(type, (e) => {
     if (browserKeeps(e)) return;
-    send({ type: "key", input: keyInput(e) });
+    send({ type: "key", input: keyInput(e, keyboard) });
     e.preventDefault();
   });
 }
@@ -132,12 +146,19 @@ canvas.addEventListener("paste", (e) => {
 });
 canvas.addEventListener("mousedown", () => canvas.focus());
 
-new ResizeObserver(() => send({ type: "viewport", size: viewport(), profile: profileFrom(colors(), scheme()) })).observe(
-  container,
-);
-matchMedia("(prefers-color-scheme: light)").addEventListener("change", () =>
-  send({ type: "viewport", size: viewport(), profile: profileFrom(colors(), scheme()) }),
-);
+const report = () => send({ type: "viewport", size: viewport(), profile: profileFrom(colors(), scheme()) });
+new ResizeObserver(report).observe(container);
+matchMedia("(prefers-color-scheme: light)").addEventListener("change", report);
+// Zoom or a move to another screen changes the pixel ratio: the canvas
+// is refitted on the next frame; the cell size in pixels is re-reported.
+const watchRatio = () => {
+  matchMedia(`(resolution: ${dpr()}dppx)`).addEventListener("change", () => {
+    send({ type: "repaint" });
+    report();
+    watchRatio();
+  }, { once: true });
+};
+watchRatio();
 
 send({
   type: "init",

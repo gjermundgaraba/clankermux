@@ -67,3 +67,16 @@ test("message vectors equal the typed literals", () => {
   const file = JSON.parse(readFileSync(`${dir}messages.json`, "utf8"));
   expect(file).toEqual(messages);
 });
+
+test("a stream is split into frames at any chunk boundary", async () => {
+  const { StreamFramer } = await import("../src/stream.ts");
+  const a = encodeFrame(FrameType.Input, 1, new TextEncoder().encode("abc"));
+  const b = encodeFrame(FrameType.Close, 1, new Uint8Array());
+  const all = new Uint8Array([...a, ...b]);
+  for (const cut of [0, 1, 9, 10, 12, 13, 20, all.length]) {
+    const framer = new StreamFramer(1 << 20);
+    const frames = [...framer.feed(all.subarray(0, cut)), ...framer.feed(all.subarray(cut))];
+    expect(frames.map((f) => [...f])).toEqual([[...a], [...b]]);
+  }
+  expect(() => new StreamFramer(2).feed(a)).toThrow(FrameError);
+});

@@ -1,6 +1,7 @@
 // Development only: serves dist/ over HTTP and bridges /ws (plaintext
-// WebSocket, one frame per message) to the server's Unix socket. The TLS
-// WebSocket carrier with an Origin allowlist is the server's own (M6).
+// WebSocket, one frame per message) to the server's Unix socket. Only the
+// page it serves may connect: any other origin is refused, as the server's
+// own TLS WebSocket carrier (M6) will refuse origins outside its allowlist.
 import { createReadStream, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { connect } from "node:net";
@@ -9,6 +10,8 @@ import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { WebSocketServer } from "ws";
+
+import { StreamFramer } from "../../../packages/proto/src/stream.ts";
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => {
@@ -25,8 +28,6 @@ const socket = option(
 const dist = fileURLToPath(new URL("../dist/", import.meta.url));
 const types = { ".html": "text/html", ".js": "text/javascript", ".map": "application/json", ".wasm": "application/wasm" };
 
-const HEADER_LEN = 10;
-
 const http = createServer((req, res) => {
   const path = normalize(new URL(req.url, "http://x").pathname);
   const file = join(dist, path === "/" ? "index.html" : path);
@@ -38,20 +39,17 @@ const http = createServer((req, res) => {
   createReadStream(file).pipe(res);
 });
 
-const wss = new WebSocketServer({ server: http, path: "/ws" });
+const origins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`]);
+const wss = new WebSocketServer({
+  server: http,
+  path: "/ws",
+  verifyClient: ({ origin }) => origins.has(origin ?? ""),
+});
 wss.on("connection", (ws) => {
   const unix = connect(socket);
-  let buffer = Buffer.alloc(0);
+  const framer = new StreamFramer(1 << 30);
   unix.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    let pos = 0;
-    while (buffer.length - pos >= HEADER_LEN) {
-      const end = pos + HEADER_LEN + buffer.readUInt32LE(pos + 6);
-      if (end > buffer.length) break;
-      ws.send(buffer.subarray(pos, end));
-      pos = end;
-    }
-    buffer = buffer.subarray(pos);
+    for (const frame of framer.feed(chunk)) ws.send(frame);
   });
   unix.on("close", () => ws.close());
   unix.on("error", (err) => {

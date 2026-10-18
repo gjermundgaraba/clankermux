@@ -115,8 +115,11 @@ test("bootstraps, holds after a resize, and resumes", () => {
     { type: "exited", exit: { code: 0 } },
   ]);
   expect(a.ended()).toBe(true);
+  expect(a.closed()).toBe(false);
   expect(a.resume()).toBeUndefined();
-  // The terminal stays for display.
+  // The terminal stays for display but takes no more of the stream.
+  expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo\nxy");
+  expect(() => a.handle(output(102, "late"))).toThrow(/after the attachment ended/);
   expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo\nxy");
   a.free();
 });
@@ -168,5 +171,6 @@ test("a gap discards and errors classify", () => {
   const hard: ErrorMessage = { code: "too_slow", message: "" };
   a.handle(json(FrameType.Error, hard));
   expect(a.ended()).toBe(true);
+  expect(a.closed()).toBe(true);
   expect(() => a.handle(json(FrameType.Welcome, {}))).toThrow(/on an attachment/);
 });

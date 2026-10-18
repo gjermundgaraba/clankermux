@@ -42,6 +42,13 @@ export function stepEnd(buf: Uint8Array, pos: number, len = buf.length): number 
  * An incremental snapshot decoder over a buffer of known capacity, filled
  * as bytes arrive. The library reads the buffer lazily, so `ready` and
  * `nextPage` are called only once the bytes they consume are in place.
+ *
+ * This leans on the engine's behaviour, not its contract: the header asks
+ * for an immutable buffer, but the wasm build cannot call back into JS
+ * for a `GhosttyReader` (no function-type reflection to add a table
+ * entry), so the buffer is filled behind the decoder instead. The engine
+ * is pinned; its decoder test pushes the bytes piecewise, so an engine
+ * that validated ahead would fail there before shipping.
  */
 export class Decoder {
   private readonly buffer: number;
@@ -56,6 +63,8 @@ export class Decoder {
     readonly capacity: number,
   ) {
     this.buffer = engine.alloc(capacity);
+    // Never let the decoder see another allocation's leftovers.
+    engine.memory.fill(0, this.buffer, this.buffer + capacity);
     this.decoder = engine.construct("ghostty_snapshot_decoder_new_buf", this.buffer, capacity);
   }
 

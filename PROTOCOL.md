@@ -287,7 +287,7 @@ On any other session it is ignored. A `cols` or `rows` of 0, in `OPEN` or
 | `cols`    | int     |                                                         |
 | `rows`    | int     |                                                         |
 | `session` | Session |                                                         |
-| `snapshot_bytes` | int | In mode `snapshot`: the total length of the snapshot that follows, so a client can size its buffer |
+| `snapshot_bytes` | int? | Mode `snapshot` only: the total length of the snapshot that follows (the sum of the `SNAPSHOT` payloads), so a client can size its buffer |
 
 `resume` is chosen when `OPEN.resume.incarnation` equals the server's
 incarnation, `OPEN.resume.offset` lies within the retained stream, and
@@ -431,7 +431,9 @@ and cell size are those of the latest reports that carried them. They
 answer the queries below, persist while no attachment is open, and are
 parked with the session. When the answer to the colour scheme query
 changes and mode 2031 is set, the server writes the colour scheme report
-to the PTY.
+to the PTY. Default colours are not part of the stream: a client that
+reports a profile sets the same colours on its own terminal, as the server
+does on the session's.
 
 ## Queries
 
