@@ -548,7 +548,8 @@ async fn a_park_naming_another_session_is_skipped() {
     // A `remove` of the restored session would delete `sessions/<id>`
     // for the id the file claims, so a file under the wrong directory is
     // left alone and not restored.
-    let state = tempfile::tempdir().unwrap().keep();
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().to_path_buf();
     let dir = sessions_dir(&state).join("mislabeled").join("1");
     std::fs::create_dir_all(&dir).unwrap();
     let file = server::park::ParkFile {

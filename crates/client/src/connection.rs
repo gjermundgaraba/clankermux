@@ -174,7 +174,7 @@ impl Connection {
                 }
             }
             match reader.read(&mut buf).await? {
-                0 => return Err(Error::Protocol("closed before WELCOME".into())),
+                0 => return Err(Error::Closed),
                 n => decoder.push(&buf[..n]),
             }
         };
@@ -433,6 +433,11 @@ impl Endpoint {
                     Ok(connection) => Ok(connection),
                     Err(error) => {
                         drop(child);
+                        // What ssh said explains a transport failure; a
+                        // server's refusal stands on its own.
+                        if !matches!(error, Error::Io(_) | Error::Closed) {
+                            return Err(error);
+                        }
                         let said = tokio::time::timeout(std::time::Duration::from_secs(2), drain)
                             .await
                             .ok()

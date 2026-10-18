@@ -456,10 +456,10 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
         (None, None) => Endpoint::Unix(socket),
     };
     let conn = endpoint
-        .connect(hello("clankermux", None))
+        .connect(hello("clankermux", Some(ghostty_vt::ENGINE)))
         .await
         .map_err(|e| match e {
-            Error::Io(e) => usage(format!("cannot connect to {endpoint}: {e}")),
+            Error::Io(_) | Error::Closed => usage(format!("cannot connect to {endpoint}: {e}")),
             other => other,
         })?;
     match command {
@@ -487,13 +487,15 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             };
             let created: Session = conn.call("create", params).await?;
             if attach {
-                drop(conn);
-                return attach::run(attach::Options {
-                    endpoint,
-                    session: created.id,
-                    read_only: false,
-                    detach_key,
-                })
+                return attach::run(
+                    attach::Options {
+                        endpoint,
+                        session: created.id,
+                        read_only: false,
+                        detach_key,
+                    },
+                    conn,
+                )
                 .await;
             }
             print(json, &created, |s| emit(&format!("{}\n", s.id)));
@@ -519,13 +521,15 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
         } => {
             let detach_key = parse_detach_key(&detach_key)?;
             let params = resolve(&conn, &session).await?;
-            drop(conn);
-            return attach::run(attach::Options {
-                endpoint,
-                session: params.session,
-                read_only,
-                detach_key,
-            })
+            return attach::run(
+                attach::Options {
+                    endpoint,
+                    session: params.session,
+                    read_only,
+                    detach_key,
+                },
+                conn,
+            )
             .await;
         }
         Command::End { session } => {
@@ -603,14 +607,16 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                 }
             };
             // Each request's base64 fits the server's control body with
-            // room for the rest of the JSON, and its bytes the input queue.
+            // room for the rest of the JSON, and its bytes the input queue
+            // (at least one byte, so an absurd limit still makes progress).
             let limits = &conn.welcome.limits;
             let chunk = ((limits.control_body as usize).saturating_sub(1024) / 4 * 3)
-                .min(limits.input_queue as usize);
+                .min(limits.input_queue as usize)
+                .max(1);
             let chunks: Vec<&[u8]> = if data.is_empty() {
                 vec![&[]]
             } else {
-                data.chunks(chunk.max(3)).collect()
+                data.chunks(chunk).collect()
             };
             for chunk in chunks {
                 conn.request(

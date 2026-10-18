@@ -409,8 +409,8 @@ fn open(shell: &mut Shell, conn: &Connection) -> Result<mpsc::UnboundedReceiver<
     )
 }
 
-pub async fn run(opts: Options) -> Result<ExitCode, Error> {
-    let conn = connect(&opts.endpoint).await?;
+/// Attaches over `conn`, reconnecting to the endpoint when it is lost.
+pub async fn run(opts: Options, conn: Connection) -> Result<ExitCode, Error> {
     let raw = Raw::enter().map_err(Error::Io)?;
     let mut shell = Shell {
         attachment: Attachment::new(),

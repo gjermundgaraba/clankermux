@@ -349,9 +349,8 @@ impl Registry {
         Page { sessions, next }
     }
 
-    /// Registers a subscriber, answering request `id` with the first page
-    /// before any event the subscriber gets: both under the lock, so an
-    /// event produced after the page cannot precede it.
+    /// Queues `event` for every subscriber under the state lock, so it
+    /// follows any page replied before it.
     pub fn emit(&self, event: &Event) {
         let bytes = frame_json(FrameType::Event, 0, event);
         self.state

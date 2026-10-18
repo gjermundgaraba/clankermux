@@ -147,7 +147,7 @@ export class Engine {
   }
 
   /** Builds a zeroed, sized struct with the given fields set. */
-  pack(name: string, values: Record<string, number | boolean | Record<string, unknown>>): Uint8Array {
+  pack(name: string, values: Record<string, number | Record<string, unknown>>): Uint8Array {
     const info = this.struct(name);
     const out = new Uint8Array(info.size);
     const view = new DataView(out.buffer);
@@ -157,9 +157,7 @@ export class Engine {
       const field = info.fields[key];
       if (!field) throw new Error(`${name} has no field ${key}`);
       if (typeof value === "object") {
-        out.set(this.pack(field.type, value as Record<string, number | boolean>), field.offset);
-      } else if (typeof value === "boolean") {
-        out[field.offset] = value ? 1 : 0;
+        out.set(this.pack(field.type, value as Record<string, number>), field.offset);
       } else if (field.size === 4) {
         view.setInt32(field.offset, value, true);
       } else if (field.size === 2) {
@@ -233,7 +231,7 @@ export class Engine {
 
   /** Runs an `*_alloc` call that returns bytes through `(ptr, len)` out
    * parameters and frees them after copying. */
-  allocated(name: string, call: (ptr: number, len: number) => void): Uint8Array {
+  allocated(call: (ptr: number, len: number) => void): Uint8Array {
     return this.scratch(8, (out) => {
       call(out, out + 4);
       const ptr = this.view.getUint32(out, true);
@@ -400,13 +398,9 @@ export class Terminal {
     this.engine.check("ghostty_terminal_resize", this.handle, cols, rows, cellWidth, cellHeight);
   }
 
-  /** Sets or clears a default colour (0xRRGGBB), as OSC 10, 11 and 12 report it. */
-  setColor(kind: "foreground" | "background" | "cursor", color: number | undefined): void {
+  /** Sets a default colour (0xRRGGBB), as OSC 10, 11 and 12 report it. */
+  setColor(kind: "foreground" | "background" | "cursor", color: number): void {
     const option = this.engine.enumValue("GhosttyTerminalOption", `COLOR_${kind.toUpperCase()}`);
-    if (color === undefined) {
-      this.engine.check("ghostty_terminal_set", this.handle, option, 0);
-      return;
-    }
     const rgb = this.engine.pack("GhosttyColorRgb", { r: (color >> 16) & 0xff, g: (color >> 8) & 0xff, b: color & 0xff });
     const ptr = this.engine.copyIn(rgb);
     try {
@@ -418,7 +412,7 @@ export class Terminal {
 
   /** The whole terminal, history included, as a snapshot. */
   snapshot(): Uint8Array {
-    return this.engine.allocated("ghostty_snapshot_encode_alloc", (ptr, len) =>
+    return this.engine.allocated((ptr, len) =>
       this.engine.check("ghostty_snapshot_encode_alloc", this.handle, 0, ptr, len),
     );
   }
@@ -434,7 +428,7 @@ export class Terminal {
       const formatter = this.engine.construct("ghostty_formatter_terminal_new", this.handle, optionsPtr);
       try {
         return new TextDecoder().decode(
-          this.engine.allocated("ghostty_formatter_format_alloc", (ptr, len) =>
+          this.engine.allocated((ptr, len) =>
             this.engine.check("ghostty_formatter_format_alloc", formatter, 0, ptr, len),
           ),
         );

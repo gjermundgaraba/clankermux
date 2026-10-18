@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 /// A test's whole wait for a condition.
 const DEADLINE: Duration = Duration::from_secs(10);
 
-async fn start() -> Server {
+fn start() -> Server {
     Server::start(Limits {
         remove_grace: 200,
         ..Limits::default()
@@ -53,7 +53,7 @@ async fn drive(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn bootstrap_stream_and_resume() {
-    let server = start().await;
+    let server = start();
     let conn = Connection::connect_unix(&server.socket, hello("test", Some(ghostty_vt::ENGINE)))
         .await
         .unwrap();

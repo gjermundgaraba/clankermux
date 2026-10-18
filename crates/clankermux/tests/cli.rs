@@ -12,7 +12,7 @@ use tokio::process::Child;
 
 use testkit::Server;
 
-async fn start() -> Server {
+fn start() -> Server {
     Server::start(Limits::default())
 }
 
@@ -162,7 +162,7 @@ fn count(haystack: &[u8], needle: &[u8]) -> usize {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn attach_types_and_detaches() {
-    let server = start().await;
+    let server = start();
     let conn = connect(&server).await;
     let session = create(&conn, json!({"argv": ["/bin/cat"], "cols": 80, "rows": 24})).await;
     let mut term = Term::attach(&server, 80, 24, &[&session.id, "--detach-key", "C-a"]);
@@ -186,7 +186,7 @@ async fn attach_types_and_detaches() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repaint_clips_a_larger_session_to_the_bottom() {
-    let server = start().await;
+    let server = start();
     let conn = connect(&server).await;
     let session = create(
         &conn,
@@ -222,7 +222,7 @@ async fn repaint_clips_a_larger_session_to_the_bottom() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn detaches_while_the_server_is_gone() {
-    let mut server = start().await;
+    let mut server = start();
     let conn = connect(&server).await;
     let session = create(&conn, json!({"argv": ["/bin/cat"], "cols": 80, "rows": 24})).await;
     let mut term = Term::attach(&server, 80, 24, &[&session.id]);
@@ -237,8 +237,49 @@ async fn detaches_while_the_server_is_gone() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_reconnect_retries_a_bare_close_and_ends_on_a_refusal() {
+    let mut server = start();
+    let conn = connect(&server).await;
+    let session = create(&conn, json!({"argv": ["/bin/cat"], "cols": 80, "rows": 24})).await;
+    let mut term = Term::attach(&server, 80, 24, &[&session.id]);
+    term.read_until(b"\x1b[?25h").await;
+    drop(conn);
+    server.shutdown();
+    // A stand-in on the same path: as a forwarder would, it accepts and
+    // drops two connections, then answers HELLO with a refusal.
+    let _ = std::fs::remove_file(&server.socket);
+    let listener = tokio::net::UnixListener::bind(&server.socket).unwrap();
+    for _ in 0..2 {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    }
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut buf = [0u8; 1024];
+    let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+        .await
+        .unwrap();
+    assert!(n > 0, "HELLO expected");
+    let refusal = encode_frame(
+        FrameType::Error,
+        0,
+        br#"{"code":"version_mismatch","message":"the stand-in speaks version 9"}"#,
+    );
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &refusal)
+        .await
+        .unwrap();
+    drop(stream);
+    let out = term.read_until(b"version 9").await;
+    assert!(
+        String::from_utf8_lossy(&out).contains("version_mismatch"),
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(term.exit_code().await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn attaching_to_an_exited_session_reports_its_exit() {
-    let server = start().await;
+    let server = start();
     let conn = connect(&server).await;
     let session = create(
         &conn,
@@ -259,7 +300,7 @@ async fn attaching_to_an_exited_session_reports_its_exit() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn connect_reaches_a_tcp_carrier() {
-    let server = start().await;
+    let server = start();
     let conn = connect(&server).await;
     let session = create(&conn, json!({"label": "over-tcp", "argv": ["/bin/cat"]})).await;
     let addr = server.listen_tcp().await.to_string();
@@ -271,7 +312,7 @@ async fn connect_reaches_a_tcp_carrier() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ssh_relays_through_stdio() {
-    let server = start().await;
+    let server = start();
     let conn = connect(&server).await;
     create(&conn, json!({"label": "over-ssh", "argv": ["/bin/cat"]})).await;
     // A stand-in `ssh` that runs the relay against the test socket, as
@@ -382,7 +423,7 @@ async fn write_chunks_to_the_input_queue() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_sends_one_request_even_for_empty_text() {
-    let server = start().await;
+    let server = start();
     let conn = connect(&server).await;
     let session = create(
         &conn,

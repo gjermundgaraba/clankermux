@@ -703,8 +703,6 @@ pub fn report(registry: &Arc<Registry>, session: &Shared, report: Viewport, imme
 /// from Ghostty's integration), percent-decoded; a bare path as is.
 pub fn pwd_path(value: &str) -> String {
     let path = match value.split_once("://") {
-        // `file://host/path`, or `kitty-shell-cwd://host/path` from
-        // Ghostty's shell integration: the path, percent-decoded.
         Some((_, rest)) => rest.find('/').map_or("", |i| &rest[i..]),
         None => value,
     };
