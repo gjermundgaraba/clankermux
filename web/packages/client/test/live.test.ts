@@ -1,7 +1,7 @@
 /**
- * The client against a real server over the Unix socket, from node. The
- * browser has no stream sockets, so the test reframes the byte stream
- * itself; the message transport the browser uses is M6's carrier.
+ * The client against a real server, from node: over the Unix socket, where
+ * the test reframes the byte stream itself, and over the TLS WebSocket
+ * carrier the browser uses, one frame per message.
  */
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, expect, test } from "vitest";
+import WebSocket from "ws";
 
 import { ENGINE, Engine } from "@clankermux/engine";
 import { type Event, type Frame, FrameType, type Read, type Session, StreamFramer } from "@clankermux/proto";
@@ -52,17 +53,65 @@ class StreamTransport implements Transport {
   }
 }
 
+/** Frames over a WebSocket, as the browser carries them. */
+class WsTransport implements Transport {
+  onMessage: ((bytes: Uint8Array) => void) | undefined;
+  onClose: (() => void) | undefined;
+
+  constructor(private readonly ws: WebSocket) {
+    ws.on("message", (data: Buffer) => this.onMessage?.(new Uint8Array(data)));
+    ws.on("close", () => this.onClose?.());
+    ws.on("error", () => {});
+  }
+
+  static connect(url: string, origin: string): Promise<WsTransport> {
+    return new Promise((resolve, reject) => {
+      // The fixture certificate is self-signed.
+      const ws = new WebSocket(url, { origin, rejectUnauthorized: false });
+      ws.once("open", () => resolve(new WsTransport(ws)));
+      ws.once("error", reject);
+    });
+  }
+
+  send(bytes: Uint8Array): void {
+    this.ws.send(bytes);
+  }
+
+  close(): void {
+    this.ws.close();
+  }
+}
+
 let dir: string;
 let socket: string;
+let wsUrl: string;
 let server: ReturnType<typeof spawn>;
 let engine: Engine;
+
+const ORIGIN = "http://page.test";
 
 beforeAll(async () => {
   if (!built) return;
   engine = await Engine.load(readFileSync(`${here}../../engine/ghostty-vt.wasm`));
   dir = mkdtempSync(join(tmpdir(), "cmx-"));
   socket = join(dir, "sock");
-  server = spawn(binary, ["--socket", socket, "serve"], { stdio: ["ignore", "ignore", "inherit"] });
+  const tls = `${here}fixtures/tls/`;
+  server = spawn(
+    binary,
+    ["--socket", socket, "serve", "--ws", "127.0.0.1:0", "--origin", ORIGIN, "--tls-cert", `${tls}cert.pem`, "--tls-key", `${tls}key.pem`],
+    { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, XDG_STATE_HOME: join(dir, "state") } },
+  );
+  // The bound port is announced on stderr.
+  wsUrl = await new Promise((resolve, reject) => {
+    let seen = "";
+    server.stderr!.on("data", (chunk: Buffer) => {
+      process.stderr.write(chunk);
+      seen += chunk;
+      const m = /listening on (wss:\/\/\S+)/.exec(seen);
+      if (m) resolve(m[1]!);
+    });
+    server.once("exit", (code) => reject(new Error(`server exited: ${code}`)));
+  });
   const deadline = Date.now() + 10_000;
   for (;;) {
     try {
@@ -75,8 +124,9 @@ beforeAll(async () => {
   }
 });
 
-afterAll(() => {
-  server?.kill();
+afterAll(async () => {
+  // A graceful stop parks into the state directory; wait before removing it.
+  if (server) await new Promise((resolve) => (server.once("exit", resolve), server.kill()));
   if (dir) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -182,3 +232,18 @@ test.skipIf(!built)("bootstraps, streams, resumes and sees the exit", async () =
   await expect(ended).resolves.toMatchObject({ kind: "server", server: { code: "protocol_error" } });
   a.free();
 });
+
+test.skipIf(!built)("the TLS WebSocket carrier checks the origin and carries one frame per message", async () => {
+  await expect(WsTransport.connect(wsUrl, "http://elsewhere.test")).rejects.toThrow(/403/);
+  const conn = await Connection.connect(await WsTransport.connect(wsUrl, ORIGIN), hello("test", ENGINE));
+  expect(conn.welcome.engine).toBe(ENGINE);
+  const session = await conn.call<Session>("create", { argv: ["/bin/cat"], cols: 20, rows: 5 });
+  const a = new Attachment(engine);
+  const queue = attach(conn, a, { session: session.id, viewport: { cols: 20, rows: 5 } });
+  await drive(a, queue, (actions) => actions.some((x) => x.type === "screen"));
+  conn.send(FrameType.Input, 1, new TextEncoder().encode("over wss\n"));
+  await drive(a, queue, () => screen(a).includes("over wss\nover wss"));
+  const read = await conn.call<Read>("read", { session: session.id });
+  expect(read.text).toContain("over wss");
+  conn.close();
+}, 20_000);

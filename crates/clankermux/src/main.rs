@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use client::connection::hello;
-use client::{Connection, Error};
+use client::{Connection, Endpoint, Error};
 use proto::{
     CreateParams, ListParams, OnExit, Page, Read, ReadParams, Session, SessionParams,
     SetLabelParams, SetSizeParams, SignalParams, WriteParams,
@@ -25,17 +25,50 @@ struct Cli {
     /// Unix socket path.
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
+    /// Connect over TCP to `HOST:PORT` on the tailnet.
+    #[arg(long, global = true, value_name = "HOST:PORT", conflicts_with_all = ["socket", "ssh"])]
+    connect: Option<String>,
+    /// Connect through `ssh DESTINATION clankermux --stdio`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "DESTINATION",
+        conflicts_with = "socket"
+    )]
+    ssh: Option<String>,
     /// Print replies as JSON.
     #[arg(long, global = true)]
     json: bool,
+    /// Relay between stdio and the Unix socket, for `ssh`.
+    #[arg(long, conflicts_with_all = ["connect", "ssh", "json"])]
+    stdio: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Run the server.
-    Serve,
+    Serve {
+        /// Also listen on the tailnet address, plaintext.
+        #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "7437")]
+        tcp: Option<u16>,
+        /// Also serve TLS WebSocket: `PORT` on the tailnet address, or
+        /// `127.0.0.1:PORT` / `[::1]:PORT`.
+        #[arg(long, value_name = "BIND", num_args = 0..=1, default_missing_value = "7438")]
+        ws: Option<String>,
+        /// A page origin allowed on the WebSocket (repeatable); none
+        /// refuses every page.
+        #[arg(long, value_name = "ORIGIN")]
+        origin: Vec<String>,
+        /// Certificate chain PEM; without it the node's Tailscale
+        /// certificate is used.
+        #[arg(long, value_name = "PATH", requires = "tls_key")]
+        tls_cert: Option<PathBuf>,
+        /// Private key PEM.
+        #[arg(long, value_name = "PATH", requires = "tls_cert")]
+        tls_key: Option<PathBuf>,
+    },
     /// Start a session; `argv` after `--`, the login shell by default.
     Create {
         #[arg(long)]
@@ -215,31 +248,182 @@ fn session_line(s: &Session) {
     ));
 }
 
+/// Binds the carriers `serve` was asked for and runs them with the Unix
+/// socket until a signal; then parks every running session.
+async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
+    use std::net::{IpAddr, SocketAddr};
+    let Carriers {
+        tcp,
+        ws,
+        origin,
+        tls_cert,
+        tls_key,
+    } = carriers;
+    // The tailnet address and certificate domain, when a carrier needs them.
+    let api = server::tailscale::LocalApi::discover();
+    let tailnet = async |api: &std::io::Result<server::tailscale::LocalApi>| {
+        let api = api.as_ref().map_err(|e| usage(e.to_string()))?;
+        api.status().await.map_err(Error::Io)
+    };
+    let tailnet_addr = async |status: &server::tailscale::Status, port: u16| {
+        let ip = status
+            .this
+            .tailscale_ips
+            .iter()
+            .find(|ip| ip.is_ipv4())
+            .or(status.this.tailscale_ips.first())
+            .ok_or_else(|| usage("this node has no tailnet address".into()))?;
+        Ok::<SocketAddr, Error>(SocketAddr::new(*ip, port))
+    };
+    let mut tcp_listener = None;
+    if let Some(port) = tcp {
+        let status = tailnet(&api).await?;
+        let addr = tailnet_addr(&status, port).await?;
+        tcp_listener = Some(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(Error::Io)?,
+        );
+    }
+    let mut ws_listener = None;
+    if let Some(bind) = ws {
+        let addr: SocketAddr = match bind.parse::<u16>() {
+            Ok(port) => tailnet_addr(&tailnet(&api).await?, port).await?,
+            Err(_) => match bind.parse::<SocketAddr>() {
+                Ok(addr) if addr.ip().is_loopback() => addr,
+                _ => {
+                    return Err(usage(format!(
+                        "--ws takes a port on the tailnet address or a loopback address, not {bind:?}"
+                    )));
+                }
+            },
+        };
+        let source = match (tls_cert, tls_key) {
+            (Some(cert), Some(key)) => server::tls::Source::Files { cert, key },
+            _ => {
+                let status = tailnet(&api).await?;
+                let domain = status.cert_domains.first().cloned().ok_or_else(|| {
+                    usage(
+                        "this node has no certificate domain; pass --tls-cert and --tls-key".into(),
+                    )
+                })?;
+                server::tls::Source::Tailscale {
+                    api: api.as_ref().unwrap().clone(),
+                    domain,
+                }
+            }
+        };
+        let tls = server::tls::Tls::start(source).await.map_err(Error::Io)?;
+        tokio::spawn(tls.clone().renew_forever());
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(Error::Io)?;
+        ws_listener = Some((listener, tls));
+    }
+    let _ = IpAddr::V4; // keep the import list honest on every platform
+
+    let registry = server::Registry::new(server::default_config()).map_err(Error::Io)?;
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(server::serve_unix(socket.clone(), registry.clone()));
+    eprintln!("listening on {}", socket.display());
+    if let Some(listener) = tcp_listener {
+        eprintln!(
+            "listening on tcp://{}",
+            listener.local_addr().map_err(Error::Io)?
+        );
+        tasks.spawn(server::serve_tcp(listener, registry.clone()));
+    }
+    if let Some((listener, tls)) = ws_listener {
+        eprintln!(
+            "listening on wss://{}",
+            listener.local_addr().map_err(Error::Io)?
+        );
+        tasks.spawn(server::ws::serve_ws(
+            listener,
+            registry.clone(),
+            tls,
+            origin,
+        ));
+    }
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(Error::Io)?;
+    let result = tokio::select! {
+        result = tasks.join_next() => result.unwrap().unwrap_or_else(|e| Err(std::io::Error::other(e))),
+        _ = tokio::signal::ctrl_c() => Ok(()),
+        _ = terminate.recv() => Ok(()),
+    };
+    // A graceful stop parks every running session first.
+    registry.stop().await;
+    result.map(|()| ExitCode::SUCCESS).map_err(Error::Io)
+}
+
+struct Carriers {
+    tcp: Option<u16>,
+    ws: Option<String>,
+    origin: Vec<String>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+}
+
+/// `--stdio`: bytes both ways between stdio and the socket until either
+/// side ends.
+async fn relay(socket: PathBuf) -> Result<ExitCode, Error> {
+    let mut unix = tokio::net::UnixStream::connect(&socket)
+        .await
+        .map_err(|e| usage(format!("cannot connect to {}: {e}", socket.display())))?;
+    let mut stdio = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+    let _ = tokio::io::copy_bidirectional(&mut unix, &mut stdio).await;
+    Ok(ExitCode::SUCCESS)
+}
+
 async fn run(cli: Cli) -> Result<ExitCode, Error> {
     let socket = cli.socket.unwrap_or_else(server::socket_path);
     let json = cli.json;
-    if let Command::Serve = cli.command {
-        let registry = server::Registry::new(server::default_config()).map_err(Error::Io)?;
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .map_err(Error::Io)?;
-        let result = tokio::select! {
-            result = server::serve_unix(socket, registry.clone()) => result,
-            _ = tokio::signal::ctrl_c() => Ok(()),
-            _ = terminate.recv() => Ok(()),
-        };
-        // A graceful stop parks every running session first.
-        registry.stop().await;
-        return result.map(|()| ExitCode::SUCCESS).map_err(Error::Io);
+    let command = match (cli.stdio, cli.command) {
+        (true, None) => return relay(socket).await,
+        (true, Some(_)) => return Err(usage("--stdio takes no command".into())),
+        (false, None) => return Err(usage("a command is required; see --help".into())),
+        (false, Some(command)) => command,
+    };
+    if let Command::Serve {
+        tcp,
+        ws,
+        origin,
+        tls_cert,
+        tls_key,
+    } = command
+    {
+        if cli.connect.is_some() || cli.ssh.is_some() {
+            return Err(usage(
+                "serve runs locally; --connect and --ssh do not apply".into(),
+            ));
+        }
+        return serve(
+            socket,
+            Carriers {
+                tcp,
+                ws,
+                origin,
+                tls_cert,
+                tls_key,
+            },
+        )
+        .await;
     }
-    let conn = Connection::connect_unix(&socket, hello("clankermux", None))
+    let endpoint = match (cli.connect, cli.ssh) {
+        (Some(addr), _) => Endpoint::Tcp(addr),
+        (None, Some(destination)) => Endpoint::Ssh(destination),
+        (None, None) => Endpoint::Unix(socket),
+    };
+    let conn = endpoint
+        .connect(hello("clankermux", None))
         .await
         .map_err(|e| match e {
-            Error::Io(e) => usage(format!("cannot connect to {}: {e}", socket.display())),
+            Error::Io(e) => usage(format!("cannot connect to {endpoint}: {e}")),
             other => other,
         })?;
-    match cli.command {
-        Command::Serve => unreachable!(),
+    match command {
+        Command::Serve { .. } => unreachable!(),
         Command::Create {
             label,
             cwd,
@@ -265,7 +449,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             if attach {
                 drop(conn);
                 return attach::run(attach::Options {
-                    socket,
+                    endpoint,
                     session: created.id,
                     read_only: false,
                     detach_key,
@@ -297,7 +481,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             let params = resolve(&conn, &session).await?;
             drop(conn);
             return attach::run(attach::Options {
-                socket,
+                endpoint,
                 session: params.session,
                 read_only,
                 detach_key,

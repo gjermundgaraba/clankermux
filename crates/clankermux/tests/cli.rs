@@ -14,6 +14,7 @@ use tokio::process::Child;
 struct Server {
     socket: PathBuf,
     dir: tempfile::TempDir,
+    registry: std::sync::Arc<server::Registry>,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
@@ -34,12 +35,34 @@ async fn start() -> Server {
         state_dir: dir.path().join("state"),
     })
     .unwrap();
-    let task = tokio::spawn(server::serve_unix(socket.clone(), registry));
+    let task = tokio::spawn(server::serve_unix(socket.clone(), registry.clone()));
     // The socket file exists before the server listens on it.
     while tokio::net::UnixStream::connect(&socket).await.is_err() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    Server { socket, dir, task }
+    Server {
+        socket,
+        dir,
+        registry,
+        task,
+    }
+}
+
+/// Runs the binary with `args` and returns its stdout; the process must
+/// succeed.
+async fn run(args: &[&str], env: &[(&str, String)]) -> String {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"));
+    command.args(args);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let output = command.output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
 }
 
 async fn connect(server: &Server) -> Connection {
@@ -263,4 +286,51 @@ async fn attaching_to_an_exited_session_reports_its_exit() {
         "the final screen is painted first"
     );
     assert_eq!(term.exit_code().await, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_reaches_a_tcp_carrier() {
+    let server = start().await;
+    let conn = connect(&server).await;
+    let session = create(&conn, json!({"label": "over-tcp", "argv": ["/bin/cat"]})).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let task = tokio::spawn(server::serve_tcp(listener, server.registry.clone()));
+    let listed = run(&["--connect", &addr, "list"], &[]).await;
+    assert!(listed.contains("over-tcp"), "{listed}");
+    let read = run(&["--connect", &addr, "--json", "read", &session.id], &[]).await;
+    assert!(read.contains("\"status\": \"running\""), "{read}");
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ssh_relays_through_stdio() {
+    let server = start().await;
+    let conn = connect(&server).await;
+    create(&conn, json!({"label": "over-ssh", "argv": ["/bin/cat"]})).await;
+    // A stand-in `ssh` that runs the relay against the test socket, as
+    // the real one would run it on the remote host.
+    let bin = server.dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(
+        bin.join("ssh"),
+        format!(
+            "#!/bin/sh\ntest \"$1\" = remote-host || exit 9\nexec {} --socket {} --stdio\n",
+            env!("CARGO_BIN_EXE_clankermux"),
+            server.socket.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        bin.join("ssh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let listed = run(&["--ssh", "remote-host", "list"], &[("PATH", path)]).await;
+    assert!(listed.contains("over-ssh"), "{listed}");
 }

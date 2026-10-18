@@ -1,0 +1,256 @@
+//! The TCP and TLS WebSocket carriers.
+
+mod common;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use common::*;
+use futures_util::{SinkExt, StreamExt};
+use proto::*;
+use serde_json::json;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+
+/// A session, an attach with its bootstrap, and a close, over `c`.
+async fn full_attach(c: &mut Client) {
+    let session = c
+        .create(json!({"argv": ["/bin/sh", "-c", "echo over-the-wire; exec cat"]}))
+        .await;
+    wait_text(c, &session.id, "over-the-wire").await;
+    c.open(
+        1,
+        json!({"session": session.id, "viewport": {"cols": 40, "rows": 8}}),
+    )
+    .await;
+    let boot = c.bootstrap(1).await;
+    assert!(boot.text().contains("over-the-wire"), "{:?}", boot.text());
+    c.send(FrameType::Close, 1, &[]).await;
+    assert_eq!(c.expect_closed(1).await, ClosedReason::Closed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tcp_carries_frames() {
+    let server = start(fast_limits()).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(server::serve_tcp(listener, server.registry.clone()));
+    let mut c = Client::over(TcpStream::connect(addr).await.unwrap());
+    c.hello().await;
+    full_attach(&mut c).await;
+    task.abort();
+}
+
+/// A WebSocket carrier on loopback with a self-signed certificate the
+/// client trusts.
+struct Ws {
+    addr: SocketAddr,
+    connector: TlsConnector,
+    _dir: tempfile::TempDir,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl Drop for Ws {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn serve_ws(server: &Server, origins: Vec<String>) -> Ws {
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, certified.cert.pem()).unwrap();
+    std::fs::write(&key, certified.signing_key.serialize_pem()).unwrap();
+    let tls = server::tls::Tls::start(server::tls::Source::Files { cert, key })
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(server::ws::serve_ws(
+        listener,
+        server.registry.clone(),
+        tls,
+        origins,
+    ));
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from_pem_slice(certified.cert.pem().as_bytes()).unwrap())
+        .unwrap();
+    let config = ClientConfig::builder_with_provider(Arc::new(
+        tokio_rustls::rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ws {
+        addr,
+        connector: TlsConnector::from(Arc::new(config)),
+        _dir: dir,
+        task,
+    }
+}
+
+type ClientWs = WebSocketStream<TlsStream<TcpStream>>;
+
+impl Ws {
+    async fn connect(&self, origin: Option<&str>) -> Result<ClientWs, WsError> {
+        let tcp = TcpStream::connect(self.addr).await.unwrap();
+        let tls = self
+            .connector
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .unwrap();
+        let mut request = format!("wss://localhost:{}/any/path", self.addr.port())
+            .into_client_request()
+            .unwrap();
+        if let Some(origin) = origin {
+            request
+                .headers_mut()
+                .insert("Origin", origin.parse().unwrap());
+        }
+        tokio_tungstenite::client_async(request, tls)
+            .await
+            .map(|(ws, _)| ws)
+    }
+}
+
+fn refused(result: Result<ClientWs, WsError>) -> StatusCode {
+    match result {
+        Err(WsError::Http(response)) => response.status(),
+        Ok(_) => panic!("upgrade accepted"),
+        Err(other) => panic!("{other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_websocket_admits_allowed_origins_only() {
+    let server = start(fast_limits()).await;
+    let ws = serve_ws(&server, vec!["http://allowed".into()]).await;
+    assert_eq!(refused(ws.connect(None).await), StatusCode::FORBIDDEN);
+    assert_eq!(
+        refused(ws.connect(Some("http://other")).await),
+        StatusCode::FORBIDDEN
+    );
+    let accepted = ws.connect(Some("http://allowed")).await.unwrap();
+    let mut c = Client::over(server::ws::WsStream::new(
+        accepted,
+        Limits::default().max_frame,
+    ));
+    c.hello().await;
+    full_attach(&mut c).await;
+
+    // No allowlist admits nobody.
+    let closed = serve_ws(&server, Vec::new()).await;
+    assert_eq!(
+        refused(closed.connect(Some("http://allowed")).await),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_message_is_exactly_one_frame() {
+    let server = start(fast_limits()).await;
+    let ws = serve_ws(&server, vec!["http://allowed".into()]).await;
+    let mut raw = ws.connect(Some("http://allowed")).await.unwrap();
+    let max_frame = Limits::default().max_frame;
+    let json = |frame_type, body: serde_json::Value| {
+        Message::Binary(encode_frame(frame_type, 0, &serde_json::to_vec(&body).unwrap()).into())
+    };
+    // Every message from the server is one whole frame.
+    let next = async |raw: &mut ClientWs| -> (Header, Vec<u8>) {
+        let bytes = match raw.next().await.expect("a message").unwrap() {
+            Message::Binary(bytes) => bytes,
+            other => panic!("{other:?}"),
+        };
+        let (header, payload) = parse_frame(&bytes, max_frame).unwrap();
+        assert_eq!(HEADER_LEN + header.length as usize, bytes.len());
+        (header, payload.to_vec())
+    };
+    raw.send(json(
+        FrameType::Hello,
+        json!({"version": 1, "client": {"name": "raw", "version": "0"}, "capabilities": [],
+            "engine": ghostty_vt::ENGINE}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(next(&mut raw).await.0.frame_type, FrameType::Welcome);
+    raw.send(json(
+        FrameType::Request,
+        json!({"id": 1, "method": "create", "params": {"argv": ["/bin/cat"]}}),
+    ))
+    .await
+    .unwrap();
+    let (header, payload) = next(&mut raw).await;
+    assert_eq!(header.frame_type, FrameType::Reply);
+    let reply: Reply = serde_json::from_slice(&payload).unwrap();
+    let session: Session = serde_json::from_value(reply.result).unwrap();
+    raw.send(Message::Binary(
+        encode_frame(
+            FrameType::Open,
+            1,
+            &serde_json::to_vec(
+                &json!({"session": session.id, "viewport": {"cols": 20, "rows": 5}}),
+            )
+            .unwrap(),
+        )
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let mut seen = Vec::new();
+    loop {
+        let (header, payload) = next(&mut raw).await;
+        assert_ne!(
+            header.frame_type,
+            FrameType::Error,
+            "{}",
+            String::from_utf8_lossy(&payload)
+        );
+        seen.push(header.frame_type);
+        if header.frame_type == FrameType::SnapshotEnd {
+            break;
+        }
+    }
+    assert_eq!(seen[0], FrameType::Attached);
+    assert!(seen.contains(&FrameType::SnapshotReady));
+
+    // Two frames in one message end the connection.
+    let mut two = encode_frame(
+        FrameType::Request,
+        0,
+        br#"{"id":2,"method":"list","params":{}}"#,
+    );
+    two.extend(encode_frame(
+        FrameType::Request,
+        0,
+        br#"{"id":3,"method":"list","params":{}}"#,
+    ));
+    raw.send(Message::Binary(two.into())).await.unwrap();
+    let ended = loop {
+        match raw.next().await {
+            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break true,
+            Some(Ok(Message::Binary(bytes))) => {
+                let (header, _) = parse_frame(&bytes, max_frame).unwrap();
+                // Whatever was still queued for channel 1 may arrive first.
+                assert_ne!(
+                    header.frame_type,
+                    FrameType::Reply,
+                    "a reply to a bad message"
+                );
+            }
+            Some(Ok(_)) => {}
+        }
+    };
+    assert!(ended);
+}

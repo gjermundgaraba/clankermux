@@ -367,3 +367,53 @@ fn route(routes: &Mutex<Routes>, frame: Frame) -> Result<(), Ended> {
     }
     Ok(())
 }
+
+/// Where a server is reached: the local socket, a tailnet address, or a
+/// relay over SSH.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    Unix(std::path::PathBuf),
+    /// `host:port`, plaintext.
+    Tcp(String),
+    /// An `ssh` destination running `clankermux --stdio`.
+    Ssh(String),
+}
+
+impl Endpoint {
+    pub async fn connect(&self, hello: Hello) -> Result<Connection, Error> {
+        match self {
+            Endpoint::Unix(path) => Connection::connect_unix(path, hello).await,
+            Endpoint::Tcp(addr) => {
+                let stream = tokio::net::TcpStream::connect(addr.as_str()).await?;
+                let _ = stream.set_nodelay(true);
+                Connection::handshake(stream, hello).await
+            }
+            Endpoint::Ssh(destination) => {
+                let mut child = tokio::process::Command::new("ssh")
+                    .arg(destination)
+                    .args(["clankermux", "--stdio"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()?;
+                let stdin = child.stdin.take().expect("piped");
+                let stdout = child.stdout.take().expect("piped");
+                // The child outlives this handle; a closed stdin ends it.
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+                Connection::handshake(tokio::io::join(stdout, stdin), hello).await
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Endpoint::Unix(path) => write!(f, "{}", path.display()),
+            Endpoint::Tcp(addr) => write!(f, "{addr}"),
+            Endpoint::Ssh(destination) => write!(f, "ssh {destination}"),
+        }
+    }
+}

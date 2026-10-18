@@ -119,10 +119,11 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
                             break;
                         }
                     }
+                    let _ = socket.flush().await;
                     break;
                 }
             };
-            if socket.write_all(&bytes).await.is_err() {
+            if socket.write_all(&bytes).await.is_err() || socket.flush().await.is_err() {
                 break;
             }
             if queued.fetch_sub(bytes.len(), Ordering::AcqRel) - bytes.len() <= HIGH_WATER {

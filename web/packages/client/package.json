@@ -10,5 +10,9 @@
   "dependencies": {
     "@clankermux/engine": "workspace:*",
     "@clankermux/proto": "workspace:*"
+  },
+  "devDependencies": {
+    "ws": "^8.18.0",
+    "@types/ws": "^8.18.0"
   }
 }

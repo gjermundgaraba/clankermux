@@ -71,8 +71,12 @@ pub fn fast_limits() -> Limits {
     }
 }
 
+/// Any byte stream a carrier speaks over.
+pub trait Transport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Transport for T {}
+
 pub struct Client {
-    pub stream: UnixStream,
+    pub stream: Box<dyn Transport>,
     pub decoder: FrameDecoder,
     pub next_id: i64,
     /// Events that arrived while waiting for a reply.
@@ -81,8 +85,13 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(server: &Server) -> Self {
+        Self::over(UnixStream::connect(&server.socket).await.unwrap())
+    }
+
+    /// A client over any carrier's stream.
+    pub fn over(stream: impl Transport + 'static) -> Self {
         Client {
-            stream: UnixStream::connect(&server.socket).await.unwrap(),
+            stream: Box::new(stream),
             decoder: FrameDecoder::default(),
             next_id: 1,
             events: Default::default(),
@@ -94,6 +103,8 @@ impl Client {
             .write_all(&encode_frame(frame_type, channel, payload))
             .await
             .unwrap();
+        // A message carrier sends on flush.
+        self.stream.flush().await.unwrap();
     }
 
     pub async fn send_json(&mut self, frame_type: FrameType, channel: u32, body: &Value) {

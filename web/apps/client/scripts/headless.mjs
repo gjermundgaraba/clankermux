@@ -47,6 +47,8 @@ const chrome = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/M
 const proc = spawn(chrome, [
   "--headless=new",
   "--no-first-run",
+  // A loopback check runs on a self-signed certificate.
+  "--ignore-certificate-errors",
   "--disable-gpu",
   `--user-data-dir=/tmp/clankermux-headless-${process.pid}`,
   "--window-size=900,500",

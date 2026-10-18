@@ -8,4 +8,4 @@ pub mod expect;
 pub mod vt;
 
 pub use attachment::{Action, Attachment};
-pub use connection::{Connection, Error, Frame};
+pub use connection::{Connection, Endpoint, Error, Frame};

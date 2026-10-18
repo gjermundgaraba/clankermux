@@ -288,9 +288,9 @@ async fn create_defaults_and_limits() {
         ErrorCode::InvalidRequest
     );
 
-    let env = c.create(json!({"argv": ["/bin/sh", "-c", "printf '%s|%s' \"$TERM\" \"$FOO\"; sleep 1"], "env": {"FOO": "bar"}})).await;
+    let env = c.create(json!({"argv": ["/bin/sh", "-c", "printf '%s|%s' \"$TERM\" \"$FOO\"; sleep 10"], "env": {"FOO": "bar"}})).await;
     let mut text = String::new();
-    for _ in 0..50 {
+    for _ in 0..200 {
         let read: Read =
             serde_json::from_value(c.ok("read", json!({"session": env.id})).await).unwrap();
         text = read.text;

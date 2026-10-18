@@ -194,9 +194,6 @@ importers:
       esbuild:
         specifier: ^0.28.0
         version: 0.28.2
-      ws:
-        specifier: ^8.18.0
-        version: 8.22.0
 
   packages/client:
     dependencies:
@@ -206,6 +203,13 @@ importers:
       '@clankermux/proto':
         specifier: workspace:*
         version: link:../proto
+    devDependencies:
+      '@types/ws':
+        specifier: ^8.18.0
+        version: 8.18.2
+      ws:
+        specifier: ^8.18.0
+        version: 8.22.0
 
   packages/engine: {}
 
@@ -534,6 +538,9 @@ packages:
 
   '@types/node@24.19.2':
     resolution: {integrity: sha512-93d49wCWJkCyN87MxLpNN6KXPCwFw7bVUg79mGUV1OS40JGWwVCr8n61DXCSqz7CV6/VfPkb7xec7uP2M+QHWQ==}
+
+  '@types/ws@8.18.2':
+    resolution: {integrity: sha512-67MQl+fpWKVTT1NYdnmo3U4sc/xPo/zQBncVnI74qmQa0z/b+1g6iYqNmGCPbxO+zz2aklb08a0oHfegiVd0/w==}
 
   '@vitest/expect@3.2.7':
     resolution: {integrity: sha512-E8eBXaKibuvH2pSZErOjdVb5vF4PbKYcrnluBTYxEk1l/VhhwZg1kZQsdtjq+CsF5CFydf2Rdkz7jDHKSisi3w==}
@@ -970,6 +977,10 @@ snapshots:
   '@types/node@24.19.2':
     dependencies:
       undici-types: 7.24.6
+
+  '@types/ws@8.18.2':
+    dependencies:
+      '@types/node': 24.19.2
 
   '@vitest/expect@3.2.7':
     dependencies:

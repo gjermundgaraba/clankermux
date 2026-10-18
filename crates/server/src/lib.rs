@@ -9,6 +9,9 @@ pub mod records;
 pub mod registry;
 pub mod session;
 pub mod stream;
+pub mod tailscale;
+pub mod tls;
+pub mod ws;
 
 use std::io;
 use std::path::PathBuf;
@@ -65,6 +68,26 @@ pub async fn serve_unix(socket: PathBuf, registry: Arc<Registry>) -> io::Result<
                 tokio::spawn(connection::serve_connection(stream, registry.clone()));
             }
             _ => drop(stream),
+        }
+    }
+}
+
+/// Serves `listener` until cancelled: plaintext frames, `TCP_NODELAY`.
+/// Trust is the caller's: the binary binds the tailnet address only.
+pub async fn serve_tcp(
+    listener: tokio::net::TcpListener,
+    registry: Arc<Registry>,
+) -> io::Result<()> {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let _ = stream.set_nodelay(true);
+                tokio::spawn(connection::serve_connection(stream, registry.clone()));
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "accept failed");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
     }
 }

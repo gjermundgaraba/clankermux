@@ -3,7 +3,6 @@
 
 use std::future::Future;
 use std::io::Write;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -11,7 +10,7 @@ use std::time::Duration;
 use client::connection::hello;
 use client::expect::Expect;
 use client::vt::{self, Scan};
-use client::{Action, Attachment, Connection, Error, Frame};
+use client::{Action, Attachment, Connection, Endpoint, Error, Frame};
 use ghostty_vt::formatter::{self, Format, Region};
 use proto::{ClosedReason, Exit, FrameType, Open, Size, Viewport};
 use rustix::termios::{self, OptionalActions, Termios};
@@ -21,7 +20,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 pub struct Options {
-    pub socket: PathBuf,
+    pub endpoint: Endpoint,
     pub session: String,
     pub read_only: bool,
     /// The prefix byte; followed by `d` it detaches, twice it is sent.
@@ -312,21 +311,23 @@ impl Shell {
 type Connecting = Pin<Box<dyn Future<Output = Connection> + Send>>;
 
 /// Retries with backoff until the server answers.
-fn reconnect(socket: PathBuf) -> Connecting {
+fn reconnect(endpoint: Endpoint) -> Connecting {
     Box::pin(async move {
         let mut backoff = Duration::from_millis(250);
         loop {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(5));
-            if let Ok(conn) = connect(&socket).await {
+            if let Ok(conn) = connect(&endpoint).await {
                 return conn;
             }
         }
     })
 }
 
-async fn connect(socket: &std::path::Path) -> Result<Connection, Error> {
-    Connection::connect_unix(socket, hello("clankermux", Some(ghostty_vt::ENGINE))).await
+async fn connect(endpoint: &Endpoint) -> Result<Connection, Error> {
+    endpoint
+        .connect(hello("clankermux", Some(ghostty_vt::ENGINE)))
+        .await
 }
 
 /// The connection and the channel's frames, or the reconnect in progress.
@@ -372,7 +373,7 @@ fn open(shell: &mut Shell, conn: &Connection) -> Result<mpsc::UnboundedReceiver<
 }
 
 pub async fn run(opts: Options) -> Result<ExitCode, Error> {
-    let conn = connect(&opts.socket).await?;
+    let conn = connect(&opts.endpoint).await?;
     let raw = Raw::enter().map_err(Error::Io)?;
     let mut shell = Shell {
         attachment: Attachment::new(),
@@ -421,14 +422,14 @@ pub async fn run(opts: Options) -> Result<ExitCode, Error> {
                     break Outcome::Failed(Error::Server(error).to_string());
                 }
                 LinkEvent::Lost(_) => {
-                    link = Link::Down(reconnect(shell.opts.socket.clone()));
+                    link = Link::Down(reconnect(shell.opts.endpoint.clone()));
                     continue;
                 }
                 LinkEvent::Connected(conn) => {
                     // A `snapshot` answer repaints; `resume` continues.
                     link = match open(&mut shell, &conn) {
                         Ok(frames) => Link::Up { conn, frames },
-                        Err(_) => Link::Down(reconnect(shell.opts.socket.clone())),
+                        Err(_) => Link::Down(reconnect(shell.opts.endpoint.clone())),
                     };
                     continue;
                 }
@@ -512,7 +513,7 @@ mod tests {
     fn shell(detach_key: u8) -> Shell {
         Shell {
             opts: Options {
-                socket: PathBuf::new(),
+                endpoint: Endpoint::Unix(Default::default()),
                 session: String::new(),
                 read_only: false,
                 detach_key,

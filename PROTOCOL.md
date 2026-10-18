@@ -513,6 +513,10 @@ Frames are carried on any ordered reliable byte stream.
 | SSH         | `clankermux --stdio` on the remote host relays frames between its stdio and the local Unix socket                 |
 | WebSocket   | TLS only; one frame per binary message, same header; bound to the tailnet address or loopback, default port 7438; the server refuses a connection whose `Origin` header is not in the configured allowlist, and every connection while the allowlist is empty |
 
+A WebSocket upgrade is accepted on any request path; a refused `Origin`
+gets HTTP 403. A binary message that is not exactly one frame, or a text
+message, is a protocol error that ends the connection.
+
 Over TCP and WebSocket, trust is the tailnet policy alone: any process on
 any node the policy admits, under any user on that node, can do everything
 the server's user can. The `Origin` allowlist only keeps pages from other
