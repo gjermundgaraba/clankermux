@@ -5,7 +5,7 @@ use std::ptr;
 
 use ghostty_vt_sys as sys;
 
-use crate::error::{Result, check};
+use crate::error::{Error, Result, check};
 use crate::io;
 use crate::terminal::{Handler, Term, Terminal};
 
@@ -22,8 +22,15 @@ pub const TAG_FINISH: u16 = 6;
 pub fn encode(term: &Term) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     // SAFETY: the writer borrows `out` only for the duration of this call.
-    check(unsafe { sys::ghostty_snapshot_encode(term.raw(), io::writer(&mut out)) })?;
-    Ok(out)
+    match check(unsafe { sys::ghostty_snapshot_encode(term.raw(), io::writer(&mut out)) }) {
+        Ok(()) => Ok(out),
+        // The engine reports an unfinished sequence that outgrew the
+        // continuation limit as an unavailable continuation, with the same
+        // code as a bad argument; a valid terminal and writer leave only
+        // that cause.
+        Err(Error::InvalidValue) => Err(Error::LimitExceeded),
+        Err(err) => Err(err),
+    }
 }
 
 /// The record starting at `pos`: its tag and the position just past it,

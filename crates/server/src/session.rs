@@ -734,7 +734,7 @@ pub async fn snapshot_with_retry<T>(
             let Some(live) = s.live() else {
                 return Ok(None);
             };
-            // Encoding holds the session still (by design); on a
+            // Encoding holds the session still; on a
             // multi-thread runtime the worker is released meanwhile.
             let encode = || snapshot::encode(&live.term);
             let encoded = match tokio::runtime::Handle::current().runtime_flavor() {

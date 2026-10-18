@@ -25,6 +25,9 @@ pub type Fail = (ErrorCode, String);
 
 /// Running sessions are parked this often.
 const PARK_INTERVAL: Duration = Duration::from_secs(300);
+/// JSON overhead allowed around a page's sessions within `max_frame`.
+const PAGE_MARGIN: usize = 4096;
+
 /// How long a park retries while the continuation limit is exceeded.
 const PARK_RETRY: Duration = Duration::from_secs(5);
 
@@ -273,21 +276,30 @@ impl Registry {
         self.page_of(&self.state.lock().unwrap(), after)
     }
 
+    /// Up to `limits.page` sessions after `after`, fewer when the page
+    /// would not fit `max_frame` as JSON (a session's text fields escape
+    /// to up to six bytes a character); `next` names the last one when
+    /// more follow.
     fn page_of(&self, state: &State, after: Option<&str>) -> Page {
         let page = self.config.limits.page as usize;
-        let mut sessions: Vec<proto::Session> = state
-            .sessions
-            .range::<str, _>((
-                after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
-                std::ops::Bound::Unbounded,
-            ))
-            .take(page + 1)
-            .map(|(_, s)| s.lock().unwrap().to_proto(false))
-            .collect();
-        let next = (sessions.len() > page).then(|| {
-            sessions.truncate(page);
-            sessions.last().unwrap().id.clone()
-        });
+        let budget = (self.config.limits.max_frame as usize).saturating_sub(PAGE_MARGIN);
+        let mut sessions = Vec::new();
+        let mut bytes = 0;
+        let mut next = None;
+        for (id, s) in state.sessions.range::<str, _>((
+            after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+            std::ops::Bound::Unbounded,
+        )) {
+            let session = s.lock().unwrap().to_proto(false);
+            bytes += serde_json::to_vec(&session).map_or(0, |v| v.len() + 1);
+            if sessions.len() == page || (!sessions.is_empty() && bytes > budget) {
+                next = Some(id.clone());
+                break;
+            }
+            sessions.push(session);
+        }
+        // `next` is the last session sent, per the protocol.
+        let next = next.and_then(|_| sessions.last().map(|s| s.id.clone()));
         Page { sessions, next }
     }
 

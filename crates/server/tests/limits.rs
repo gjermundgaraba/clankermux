@@ -1,5 +1,7 @@
 //! Limits conformance: one check per row of PROTOCOL.md's Limits table
-//! that earlier suites do not already cover. `ring` and `input_queue`
+//! that earlier suites do not already cover (`max_frame` both ways,
+//! `scrollback`, `continuation`, `label`, `text`, `markers`, and the
+//! default limits against the largest replies). `ring` and `input_queue`
 //! are in attach.rs, `page`, `hello_timeout`, `remove_grace` and
 //! `control_body` in control.rs, `records` in park.rs.
 
@@ -110,11 +112,11 @@ async fn label_and_text_are_bounded_everywhere() {
     assert_eq!(
         c.err(
             "create",
-            json!({"argv": ["/bin/sh", "-c", format!("echo {long}")]})
+            json!({"argv": ["/bin/sh", "-c", "a".repeat(30), "a".repeat(30)]})
         )
         .await,
         ErrorCode::LimitExceeded,
-        "argv is bounded as a whole"
+        "argv is bounded as a whole: two elements under the limit, over it together"
     );
     // argv is bounded as a whole, so the long title is typed into `cat`,
     // which writes it back to the terminal.
@@ -123,10 +125,11 @@ async fn label_and_text_are_bounded_everywhere() {
         .create(json!({"label": "12345678", "argv": ["/bin/cat"], "cwd": "/tmp"}))
         .await;
     let title = "0123456789abcdef".repeat(4);
+    let pwd = format!("/{}", "p".repeat(63));
     c.ok(
         "write",
         json!({"session": session.id, "data": base64::engine::general_purpose::STANDARD
-            .encode(format!("\x1b]2;{title}\x07titled\n"))}),
+            .encode(format!("\x1b]2;{title}\x07\x1b]7;file://host{pwd}\x07titled\n"))}),
     )
     .await;
     assert_eq!(
@@ -139,18 +142,21 @@ async fn label_and_text_are_bounded_everywhere() {
     );
     // The PTY echoes the typed line (ESC as `^[`) before `cat` writes it
     // back raw, so "titled" appears twice once the title is set.
+    let mut echoed = false;
     for _ in 0..200 {
         let read: Read =
             serde_json::from_value(c.ok("read", json!({"session": session.id})).await).unwrap();
         if read.text.matches("titled").count() == 2 {
+            echoed = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    assert!(echoed, "cat never wrote the line back");
     let inspected: Session =
         serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
     assert_eq!(inspected.title, title[..48], "title truncated to text");
-    assert!(inspected.pwd.len() <= 48);
+    assert_eq!(inspected.pwd, pwd[..48], "pwd truncated to text");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -184,7 +190,9 @@ async fn markers_bound_what_a_resume_can_find() {
     let inspected: Session =
         serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
     assert_eq!(inspected.marker, first + 3);
-    // A cursor at `first` has not received `first + 1`, which is gone.
+    // A cursor at `first` has not received `first + 1`, which is gone: the
+    // spec requires at least `markers` retained; this server keeps exactly
+    // that many, which is what makes the limit observable.
     c.open(
         2,
         json!({"session": session.id, "viewport": {"cols": 80, "rows": 12},
@@ -212,10 +220,16 @@ async fn markers_bound_what_a_resume_can_find() {
     );
 }
 
-/// A record or session at the protocol's maxima, with the bytes that
-/// JSON escapes to two.
+/// A record field at the protocol's maxima, with the bytes that JSON
+/// escapes to two (OSC 7501 forbids control characters in records).
 fn worst(len: usize) -> String {
     "\"".repeat(len)
+}
+
+/// A session field at its maximum, with the bytes that JSON escapes to
+/// six (`\u0001`); labels, argv and cwd come from clients unfiltered.
+fn worst_text(len: usize) -> String {
+    "\u{1}".repeat(len)
 }
 
 #[test]
@@ -233,15 +247,15 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
     };
     let session = |records: bool| Session {
         id: "a8098c1a-f86e-11da-bd1a-00112444be1e".into(),
-        label: worst(limits.label as usize),
+        label: worst_text(limits.label as usize),
         status: Status::Running,
-        argv: vec![worst(limits.text as usize)],
-        cwd: worst(limits.text as usize),
+        argv: vec![worst_text(limits.text as usize)],
+        cwd: worst_text(limits.text as usize),
         pid: Some(u32::MAX),
         cols: u16::MAX,
         rows: u16::MAX,
-        title: worst(limits.text as usize),
-        pwd: worst(limits.text as usize),
+        title: worst_text(limits.text as usize),
+        pwd: worst_text(limits.text as usize),
         on_exit: OnExit::Remove,
         created_at: "2026-10-18T16:00:00.123456789Z".into(),
         exited_at: Some("2026-10-18T16:00:00.123456789Z".into()),
@@ -262,19 +276,132 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
         .len() as u64
     };
     let inspect = reply(serde_json::to_value(session(true)).unwrap());
-    let page = reply(
-        serde_json::to_value(Page {
-            sessions: vec![session(false); limits.page as usize],
-            next: Some("a8098c1a-f86e-11da-bd1a-00112444be1e".into()),
-        })
-        .unwrap(),
-    );
     assert!(
         inspect <= limits.max_frame,
         "inspect reply of {inspect} bytes"
     );
-    assert!(
-        page <= limits.max_frame,
-        "list or subscribe reply of {page} bytes"
+    // A page is cut to what fits (`a_page_is_cut_to_max_frame`), so only
+    // one worst session must fit with the page's overhead.
+    let one = reply(
+        serde_json::to_value(Page {
+            sessions: vec![session(false)],
+            next: Some("a8098c1a-f86e-11da-bd1a-00112444be1e".into()),
+        })
+        .unwrap(),
     );
+    assert!(one * 2 <= limits.max_frame, "one session of {one} bytes");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_replies_stay_under_max_frame() {
+    let server = start(Limits::default()).await;
+    let mut c = client(&server).await;
+    // 16,000 lines of 79 bytes: over max_frame of text, each newline
+    // escaping to two bytes in the reply.
+    let session = c
+        .create(json!({"argv": ["/bin/sh", "-c",
+            "awk 'BEGIN { for (i = 0; i < 16000; i++) printf \"%08d %s\\n\", i, \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\" }'; echo END; exec cat"]}))
+        .await;
+    wait_text(&mut c, &session.id, "END").await;
+    // The harness decodes with the server's max_frame; a larger frame
+    // fails the test there.
+    let reply = c
+        .ok("read", json!({"session": session.id, "scrollback": 100000}))
+        .await;
+    let read: Read = serde_json::from_value(reply.clone()).unwrap();
+    assert!(read.text.ends_with("END\n"), "the newest lines stay");
+    assert!(
+        read.text.lines().count() > 12000,
+        "most of the history stays"
+    );
+    let encoded = serde_json::to_vec(&json!({"id": 1, "result": reply})).unwrap();
+    assert!(encoded.len() as u64 <= Limits::default().max_frame);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_is_cut_to_max_frame() {
+    let server = start(Limits {
+        page: 100,
+        ..Limits::default()
+    })
+    .await;
+    let mut c = client(&server).await;
+    // Sessions whose label and argv escape to six bytes a character: about
+    // 14 KiB each, so a page of 100 would be over max_frame.
+    let label = "\u{1}".repeat(Limits::default().label as usize);
+    let arg = "\u{1}".repeat(2000);
+    let mut ids = std::collections::BTreeSet::new();
+    for _ in 0..100 {
+        let session = c
+            .create(json!({"label": label, "argv": ["/bin/sh", "-c", ":", arg]}))
+            .await;
+        ids.insert(session.id);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut after = None;
+    let mut pages = 0;
+    loop {
+        let reply = c.ok("list", json!({"after": after})).await;
+        let page: Page = serde_json::from_value(reply.clone()).unwrap();
+        pages += 1;
+        let encoded = serde_json::to_vec(&json!({"id": 1, "result": reply})).unwrap();
+        assert!(encoded.len() as u64 <= Limits::default().max_frame);
+        assert!(page.sessions.len() < 100, "cut below the page limit");
+        for s in &page.sessions {
+            assert!(seen.insert(s.id.clone()), "a session listed twice");
+        }
+        assert_eq!(
+            page.next.as_deref(),
+            (seen.len() < 100).then(|| page.sessions.last().unwrap().id.as_str())
+        );
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, ids);
+    assert!(pages >= 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn continuation_bounds_a_snapshot() {
+    let server = start(Limits {
+        continuation: 4096,
+        ..fast_limits()
+    })
+    .await;
+    let mut c = client(&server).await;
+    // An OSC left open with more bytes than the limit tracks.
+    let session = c
+        .create(json!({"argv": ["/bin/sh", "-c",
+            "printf 'up\\033]2;'; head -c 6000 /dev/zero | tr '\\0' a; exec cat"]}))
+        .await;
+    for _ in 0..200 {
+        let inspected: Session =
+            serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+        if inspected.offset >= 6000 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // No snapshot can be taken for the whole 5 s retry window, so the
+    // bootstrap fails and the attachment ends.
+    c.open(1, json!({"session": session.id})).await;
+    // The error comes after the 5 s window; the harness waits 5 s per
+    // frame, so start that wait a little later.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(c.expect_error(1).await, ErrorCode::LimitExceeded);
+    c.wait_attachments(&session.id, 0).await;
+    // Closing the sequence and writing at ground again makes the session
+    // attachable (the engine's continuation stays unavailable until input
+    // follows the overflowed sequence).
+    c.ok(
+        "write",
+        json!({"session": session.id, "data": base64::engine::general_purpose::STANDARD
+            .encode("\x07done\n")}),
+    )
+    .await;
+    wait_text(&mut c, &session.id, "done").await;
+    c.open(1, json!({"session": session.id})).await;
+    c.bootstrap(1).await;
 }

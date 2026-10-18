@@ -6,3 +6,5 @@ zig-pkg
 web/packages/engine/ghostty-vt.wasm
 web/packages/engine/test/fixtures
 web/apps/client/dist
+proptest-regressions/
+*.proptest-regressions

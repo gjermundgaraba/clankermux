@@ -23,6 +23,7 @@ tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tempfile = "3"
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }

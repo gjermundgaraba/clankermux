@@ -52,14 +52,15 @@ async fn lab() -> Lab {
     let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tcp = tcp_listener.local_addr().unwrap();
     tokio::spawn(server::serve_tcp(tcp_listener, registry.clone()));
-    let fixtures =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/packages/client/test/fixtures/tls");
-    let tls = server::tls::Tls::start(server::tls::Source::Files {
-        cert: fixtures.join("cert.pem"),
-        key: fixtures.join("key.pem"),
-    })
-    .await
-    .unwrap();
+    // A certificate for the run, trusted by the client below.
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert = dir.path().join("cert.pem");
+    let key = dir.path().join("key.pem");
+    std::fs::write(&cert, certified.cert.pem()).unwrap();
+    std::fs::write(&key, certified.signing_key.serialize_pem()).unwrap();
+    let tls = server::tls::Tls::start(server::tls::Source::Files { cert, key })
+        .await
+        .unwrap();
     let wss_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let wss = wss_listener.local_addr().unwrap();
     tokio::spawn(server::ws::serve_ws(
@@ -70,7 +71,7 @@ async fn lab() -> Lab {
     ));
     let mut roots = RootCertStore::empty();
     roots
-        .add(CertificateDer::from_pem_file(fixtures.join("cert.pem")).unwrap())
+        .add(CertificateDer::from_pem_slice(certified.cert.pem().as_bytes()).unwrap())
         .unwrap();
     let config = ClientConfig::builder_with_provider(Arc::new(
         tokio_rustls::rustls::crypto::ring::default_provider(),
@@ -282,6 +283,7 @@ fn dir_size(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// macOS only; empty elsewhere.
 fn sysctl(name: &str) -> String {
     std::process::Command::new("sysctl")
         .args(["-n", name])
@@ -403,5 +405,9 @@ async fn main() {
         println!("| {carrier} | {rate:.0} | {gaps} |");
     }
 
+    // The temporary directory goes before the exit, which skips `Drop`;
+    // the exit itself is for the PTY reader threads of the killed
+    // sessions, which a runtime drop would wait for.
+    drop(lab);
     std::process::exit(0);
 }

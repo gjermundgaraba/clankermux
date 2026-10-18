@@ -14,6 +14,29 @@ use crate::session::{self, Report};
 /// JSON overhead allowed around `read`'s text within `max_frame`.
 const READ_REPLY_MARGIN: usize = 4096;
 
+/// The bytes `text` takes as a JSON string, without the quotes.
+fn json_len(text: &str) -> usize {
+    serde_json::to_string(text).map_or(usize::MAX, |s| s.len() - 2)
+}
+
+/// Drops the oldest lines of `text` until its JSON string fits `budget`.
+fn fit_json(text: &mut String, budget: usize) {
+    if json_len(text) <= budget {
+        return;
+    }
+    let mut kept = 0;
+    let mut start = text.len();
+    for line in text.split_inclusive('\n').rev() {
+        let len = json_len(line);
+        if kept + len > budget {
+            break;
+        }
+        kept += len;
+        start -= line.len();
+    }
+    text.drain(..start);
+}
+
 fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
     serde_json::from_value(value)
         .map_err(|e| (ErrorCode::InvalidRequest, format!("bad params: {e}")))
@@ -114,14 +137,10 @@ pub async fn handle(
             let mut text = s
                 .read_text(p.scrollback.unwrap_or(0) as usize)
                 .map_err(internal)?;
-            let max = (registry.config.limits.max_frame as usize).saturating_sub(READ_REPLY_MARGIN);
-            if text.len() > max {
-                let excess = text.len() - max;
-                let cut = text[excess..]
-                    .find('\n')
-                    .map_or(text.len(), |i| excess + i + 1);
-                text.drain(..cut);
-            }
+            fit_json(
+                &mut text,
+                (registry.config.limits.max_frame as usize).saturating_sub(READ_REPLY_MARGIN),
+            );
             if !text.is_empty() {
                 text.push('\n');
             }

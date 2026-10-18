@@ -1,5 +1,6 @@
-//! Framing properties: no input panics the decoder, and every chunking
-//! of a valid stream decodes to the same frames.
+//! Framing properties: no input panics the decoder, every chunking of a
+//! valid stream decodes to the same frames, and a valid stream with a few
+//! bytes changed decodes exactly as far as a message parser would.
 
 use proptest::prelude::*;
 
@@ -11,15 +12,46 @@ fn frame_type() -> impl Strategy<Value = FrameType> {
     prop::sample::select(FrameType::ALL.to_vec())
 }
 
+/// A payload length: small, or at the frame limit.
+fn payload_len() -> impl Strategy<Value = usize> {
+    prop_oneof![
+        4 => 0..300usize,
+        1 => (MAX_FRAME as usize - 2)..=(MAX_FRAME as usize),
+    ]
+}
+
 fn frames() -> impl Strategy<Value = Vec<(FrameType, u32, Vec<u8>)>> {
     prop::collection::vec(
-        (
-            frame_type(),
-            any::<u32>(),
-            prop::collection::vec(any::<u8>(), 0..300),
-        ),
+        (frame_type(), any::<u32>()).prop_flat_map(|(frame_type, channel)| {
+            payload_len()
+                .prop_flat_map(|len| prop::collection::vec(any::<u8>(), len))
+                .prop_map(move |payload| (frame_type, channel, payload))
+        }),
         0..12,
     )
+}
+
+/// Random bytes, or a valid stream with up to four bytes replaced, so
+/// the decoder meets frames as well as garbage.
+fn bytes() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        1 => prop::collection::vec(any::<u8>(), 0..2048),
+        2 => (frames(), prop::collection::vec((any::<usize>(), any::<u8>()), 0..4)).prop_map(
+            |(frames, edits)| {
+                let mut stream = Vec::new();
+                for (frame_type, channel, payload) in &frames {
+                    stream.extend(encode_frame(*frame_type, *channel, payload));
+                }
+                for (at, byte) in edits {
+                    if !stream.is_empty() {
+                        let at = at % stream.len();
+                        stream[at] = byte;
+                    }
+                }
+                stream
+            }
+        ),
+    ]
 }
 
 /// Splits `bytes` at the given cut points, in order.
@@ -61,7 +93,7 @@ proptest! {
 
     #[test]
     fn any_bytes_decode_or_fail_without_panicking(
-        bytes in prop::collection::vec(any::<u8>(), 0..2048),
+        bytes in bytes(),
         cuts in prop::collection::vec(any::<usize>(), 0..8),
     ) {
         let (frames, error) = decode_all(&chunks(&bytes, &cuts));
@@ -106,22 +138,26 @@ proptest! {
     }
 
     #[test]
-    fn headers_fail_as_specified(frame_type in frame_type(), channel in any::<u32>(), length in any::<u32>(), bad_type in any::<u8>()) {
+    fn headers_fail_as_specified(
+        frame_type in frame_type(),
+        channel in any::<u32>(),
+        length in prop_oneof![0..=(MAX_FRAME as u32), any::<u32>()],
+        bad_type in any::<u8>(),
+    ) {
         let header = encode_header(frame_type, channel, length);
         let parsed = parse_header(&header, MAX_FRAME);
         if u64::from(length) > MAX_FRAME {
             prop_assert_eq!(parsed, Err(FrameError::TooLong { length, max_frame: MAX_FRAME }));
         } else {
             prop_assert_eq!(parsed, Ok(Header { frame_type, channel, length }));
-            // A message with any other payload length is a mismatch.
+            // A message with exactly `length` payload bytes parses; one
+            // with any other count is a mismatch.
             let mut message = header.to_vec();
-            message.extend(std::iter::repeat_n(0u8, (length as usize + 1) % 64));
-            let parsed = parse_frame(&message, MAX_FRAME);
-            if message.len() - HEADER_LEN == length as usize {
-                prop_assert!(parsed.is_ok());
-            } else {
-                prop_assert_eq!(parsed, Err(FrameError::LengthMismatch { length, payload: message.len() - HEADER_LEN }));
-            }
+            message.extend(std::iter::repeat_n(0u8, length as usize));
+            prop_assert_eq!(parse_frame(&message, MAX_FRAME).map(|(h, p)| (h, p.len())), Ok((Header { frame_type, channel, length }, length as usize)));
+            let payload = (length as usize + 1) % 64;
+            message.resize(HEADER_LEN + payload, 0);
+            prop_assert_eq!(parse_frame(&message, MAX_FRAME), Err(FrameError::LengthMismatch { length, payload }));
         }
         // The flags byte is ignored; an unknown type is not.
         let mut flagged = header;

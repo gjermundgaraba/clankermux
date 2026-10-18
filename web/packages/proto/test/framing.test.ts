@@ -10,15 +10,20 @@ import { FrameError, FrameType, HEADER_LEN, StreamFramer, encodeFrame, parseFram
 const MAX_FRAME = 1024;
 const CASES = Number(process.env["CLANKERMUX_FUZZ_CASES"] ?? 400);
 
-/** xorshift32, so a failure reproduces from its case number. */
+/**
+ * xorshift32 from a mixed seed, so a failure reproduces from its case
+ * number and small seeds do not start with tiny values.
+ */
 function rng(seed: number): () => number {
-  let x = seed || 1;
-  return () => {
+  let x = Math.imul(seed + 1, 0x9e37_79b1) >>> 0 || 1;
+  const next = () => {
     x ^= x << 13;
     x ^= x >>> 17;
     x ^= x << 5;
     return (x >>> 0) / 0x1_0000_0000;
   };
+  for (let i = 0; i < 8; i++) next();
+  return next;
 }
 
 const int = (r: () => number, max: number) => Math.floor(r() * max);
@@ -53,11 +58,12 @@ function decodeAll(chunks: Uint8Array[]): { frames: Uint8Array[]; error: FrameEr
 
 test("a valid stream decodes the same under every chunking", () => {
   for (let n = 0; n < CASES; n++) {
-    const r = rng(n + 1);
+    const r = rng(n);
     const frames = Array.from({ length: int(r, 12) }, () => ({
       type: types[int(r, types.length)]!,
       channel: int(r, 0x1_0000_0000),
-      payload: bytes(r, int(r, 300)),
+      // Small payloads, and some at the frame limit.
+      payload: bytes(r, r() < 0.2 ? MAX_FRAME - int(r, 3) : int(r, 300)),
     }));
     const encoded = frames.map((f) => encodeFrame(f.type, f.channel, f.payload));
     const stream = new Uint8Array(encoded.reduce((n, f) => n + f.length, 0));

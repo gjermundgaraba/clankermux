@@ -15,7 +15,6 @@ use proto::*;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinSet;
 
 const SESSIONS: usize = 8;
 
@@ -25,7 +24,6 @@ struct Proxy {
     addr: SocketAddr,
     delay_ms: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
-    cuts: Arc<AtomicUsize>,
     connections: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -43,7 +41,6 @@ impl Proxy {
         let addr = listener.local_addr().unwrap();
         let delay_ms = Arc::new(AtomicU64::new(0));
         let paused = Arc::new(AtomicBool::new(false));
-        let cuts = Arc::new(AtomicUsize::new(0));
         let connections = Arc::new(std::sync::Mutex::new(Vec::new()));
         let task = {
             let delay_ms = delay_ms.clone();
@@ -78,7 +75,6 @@ impl Proxy {
             addr,
             delay_ms,
             paused,
-            cuts,
             connections,
             task,
         }
@@ -89,7 +85,6 @@ impl Proxy {
         for handle in self.connections.lock().unwrap().drain(..) {
             handle.abort();
         }
-        self.cuts.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -119,13 +114,19 @@ async fn relay(
 struct Server {
     tcp: SocketAddr,
     _dir: tempfile::TempDir,
-    _tasks: JoinSet<std::io::Result<()>>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
-async fn start() -> Server {
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn start(limits: Limits) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let registry = server::Registry::new(server::Config {
-        limits: Limits::default(),
+        limits,
         shell: vec!["/bin/sh".into()],
         home: dir.path().to_path_buf(),
         version: "test".into(),
@@ -134,12 +135,11 @@ async fn start() -> Server {
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tcp = listener.local_addr().unwrap();
-    let mut tasks = JoinSet::new();
-    tasks.spawn(server::serve_tcp(listener, registry));
+    let task = tokio::spawn(server::serve_tcp(listener, registry));
     Server {
         tcp,
         _dir: dir,
-        _tasks: tasks,
+        task,
     }
 }
 
@@ -159,22 +159,24 @@ fn screen(a: &mut Attachment) -> String {
     String::from_utf8(out).unwrap()
 }
 
-/// What one client saw.
+/// What one client saw. `errors` holds server errors and the client's
+/// own protocol errors, which a correct run has none of.
 #[derive(Default, Debug)]
 struct Seen {
     reconnects: usize,
     resumes: usize,
     snapshots: usize,
     gaps: usize,
-    errors: Vec<ErrorCode>,
+    errors: Vec<String>,
 }
 
 /// Runs `follow` on its own thread: the engine behind an attachment is
-/// not `Send`.
+/// not `Send`. `bootstrapped` counts the snapshots as they complete.
 fn follow_thread(
     endpoint: Endpoint,
     session: String,
     done: String,
+    bootstrapped: Arc<AtomicUsize>,
 ) -> std::thread::JoinHandle<(String, Seen)> {
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
@@ -182,15 +184,21 @@ fn follow_thread(
             .build()
             .unwrap()
             .block_on(async {
-                let (mut a, seen) = follow(endpoint, session, &done).await;
+                let (mut a, seen) = follow(endpoint, session, &done, &bootstrapped).await;
                 (screen(&mut a), seen)
             })
     })
 }
 
 /// Attaches to `session` through `endpoint` until its screen shows
-/// `done`, reconnecting with resume whenever the connection drops.
-async fn follow(endpoint: Endpoint, session: String, done: &str) -> (Attachment, Seen) {
+/// `done`, reconnecting with resume whenever the connection drops. The
+/// run fails after 60 s, connected or not.
+async fn follow(
+    endpoint: Endpoint,
+    session: String,
+    done: &str,
+    bootstrapped: &AtomicUsize,
+) -> (Attachment, Seen) {
     let mut a = Attachment::new();
     let mut seen = Seen::default();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -233,7 +241,10 @@ async fn follow(endpoint: Endpoint, session: String, done: &str) -> (Attachment,
         }
         let mut first = true;
         loop {
-            let Some(frame) = rx.recv().await else {
+            let Ok(frame) = tokio::time::timeout_at(deadline, rx.recv()).await else {
+                panic!("{session}: no end in 60 s: {seen:?}");
+            };
+            let Some(frame) = frame else {
                 break;
             };
             if first && frame.header.frame_type == FrameType::Attached {
@@ -244,14 +255,21 @@ async fn follow(endpoint: Endpoint, session: String, done: &str) -> (Attachment,
                     AttachMode::Snapshot => seen.snapshots += 1,
                 }
             }
+            let was_bootstrapping = a.term().is_none();
             let actions = match a.handle(frame) {
                 Ok(actions) => actions,
-                Err(_) => break,
+                Err(error) => {
+                    seen.errors.push(format!("client: {error}"));
+                    break;
+                }
             };
+            if was_bootstrapping && a.term().is_some() {
+                bootstrapped.fetch_add(1, Ordering::Relaxed);
+            }
             for action in actions {
                 match action {
                     Action::Gap(_) => seen.gaps += 1,
-                    Action::Error(error) => seen.errors.push(error.code),
+                    Action::Error(error) => seen.errors.push(format!("server: {error:?}")),
                     _ => {}
                 }
             }
@@ -266,7 +284,7 @@ async fn follow(endpoint: Endpoint, session: String, done: &str) -> (Attachment,
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn clients_converge_through_delay_and_cuts() {
-    let server = start().await;
+    let server = start(Limits::default()).await;
     let proxy = Proxy::start(server.tcp).await;
     let direct = Endpoint::Tcp(server.tcp.to_string());
     let control = direct
@@ -293,10 +311,18 @@ async fn clients_converge_through_delay_and_cuts() {
     let clients: Vec<_> = sessions
         .iter()
         .enumerate()
-        .map(|(n, id)| follow_thread(through.clone(), id.clone(), format!("DONE-{n}")))
+        .map(|(n, id)| {
+            follow_thread(
+                through.clone(),
+                id.clone(),
+                format!("DONE-{n}"),
+                Arc::new(AtomicUsize::new(0)),
+            )
+        })
         .collect();
     // Cuts while the output flows, then a calm end.
-    for _ in 0..6 {
+    const CUTS: usize = 6;
+    for _ in 0..CUTS {
         tokio::time::sleep(Duration::from_millis(400)).await;
         proxy.cut();
     }
@@ -329,9 +355,11 @@ async fn clients_converge_through_delay_and_cuts() {
         total.gaps += seen.gaps;
     }
     // Six cuts over eight clients: reconnects happened, and most of them
-    // resumed rather than bootstrapped again.
-    assert!(total.reconnects >= 6, "{total:?}");
-    assert!(total.resumes > 0, "{total:?}");
+    // resumed rather than bootstrapped again (a cut during a bootstrap
+    // costs one more snapshot).
+    assert!(total.reconnects >= CUTS, "{total:?}");
+    assert!(total.resumes * 2 >= total.reconnects, "{total:?}");
+    assert!(total.snapshots <= SESSIONS + CUTS, "{total:?}");
     assert_eq!(total.gaps, 0, "nothing fell behind the ring: {total:?}");
     eprintln!("loss run: {total:?}");
     drop(proxy);
@@ -344,23 +372,13 @@ async fn clients_converge_through_delay_and_cuts() {
 /// behind while attached).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_small_ring_turns_a_long_cut_into_a_snapshot() {
-    let dir = tempfile::tempdir().unwrap();
-    let registry = server::Registry::new(server::Config {
-        limits: Limits {
-            ring: 2048,
-            ..Limits::default()
-        },
-        shell: vec!["/bin/sh".into()],
-        home: dir.path().to_path_buf(),
-        version: "test".into(),
-        state_dir: dir.path().join("state"),
+    let server = start(Limits {
+        ring: 2048,
+        ..Limits::default()
     })
-    .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let tcp = listener.local_addr().unwrap();
-    let task = tokio::spawn(server::serve_tcp(listener, registry));
-    let proxy = Proxy::start(tcp).await;
-    let control = Endpoint::Tcp(tcp.to_string())
+    .await;
+    let proxy = Proxy::start(server.tcp).await;
+    let control = Endpoint::Tcp(server.tcp.to_string())
         .connect(hello("control", Some(ghostty_vt::ENGINE)))
         .await
         .unwrap();
@@ -378,28 +396,40 @@ async fn a_small_ring_turns_a_long_cut_into_a_snapshot() {
         control.call::<_, serde_json::Value>("write", json!({"session": session.id, "data": data}))
     };
     type_line("echo hello").await.unwrap();
+    let bootstrapped = Arc::new(AtomicUsize::new(0));
     let client = follow_thread(
         Endpoint::Tcp(proxy.addr.to_string()),
         session.id.clone(),
         "DONE".into(),
+        bootstrapped.clone(),
     );
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The client is attached and streaming before it is kept away.
+    for _ in 0..500 {
+        if bootstrapped.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(bootstrapped.load(Ordering::Relaxed), 1, "no first attach");
     proxy.paused.store(true, Ordering::Relaxed);
     proxy.cut();
     // More than a ring of output goes by while the client is kept away.
     type_line("i=0; while [ $i -lt 100 ]; do echo \"line $i ..............................\"; i=$((i+1)); done")
         .await
         .unwrap();
-    loop {
+    let mut typed = false;
+    for _ in 0..500 {
         let read: Read = control
             .call("read", json!({"session": session.id}))
             .await
             .unwrap();
         if read.text.contains("line 99") {
+            typed = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(typed, "the typed loop never ran");
     proxy.paused.store(false, Ordering::Relaxed);
     // The typed command must not show the word the client waits for.
     type_line("printf 'DO%sNE\\n' ''").await.unwrap();
@@ -416,6 +446,7 @@ async fn a_small_ring_turns_a_long_cut_into_a_snapshot() {
         (1, 2, 0, 0),
         "{seen:?}"
     );
-    task.abort();
+    assert!(seen.errors.is_empty(), "{seen:?}");
     drop(proxy);
+    drop(server);
 }

@@ -1,7 +1,10 @@
 //! Framing fuzz against a live server: after any sequence of well-framed
-//! or garbage frames, the server either still answers a request or has
-//! closed the connection after an id-less `ERROR`; it never hangs, and
-//! it serves the next connection.
+//! or garbage frames and the end of input, the server answers the trailing
+//! request when the bytes framed it, closes after an id-less `ERROR` when
+//! they broke the stream, or closes quietly at the end of input (garbage
+//! can form a valid header the rest of the input does not fill); it never
+//! hangs, and it serves the next connection. The connection is past
+//! `HELLO`; `OPEN` on `@session` reaches a live session.
 
 mod common;
 
@@ -31,8 +34,10 @@ fn payload(frame_type: FrameType) -> BoxedStrategy<Vec<u8>> {
             json!({"method": "list", "params": {}}),
         ])),
         FrameType::Open => Some(prop::sample::select(vec![
+            json!({"session": "@session"}),
+            json!({"session": "@session", "viewport": {"cols": 20, "rows": 5}}),
             json!({"session": "nope"}),
-            json!({"session": "nope", "resume": {"incarnation": "i", "offset": 0, "marker": 0}}),
+            json!({"session": "@session", "resume": {"incarnation": "i", "offset": 0, "marker": 0}}),
             json!({}),
         ])),
         FrameType::Viewport => Some(prop::sample::select(vec![
@@ -87,31 +92,56 @@ proptest! {
         runtime.block_on(async {
             let server = start(fast_limits()).await;
             let mut c = client(&server).await;
+            let session = c.create(json!({"argv": ["/bin/cat"]})).await;
             let mut bytes = Vec::new();
             for piece in &pieces {
                 match piece {
                     Piece::Garbage(raw) => bytes.extend(raw),
                     Piece::Frame { frame_type, channel, payload } => {
-                        bytes.extend(encode_frame(*frame_type, *channel, payload));
+                        let payload = match std::str::from_utf8(payload) {
+                            Ok(text) => text.replace("@session", &session.id).into_bytes(),
+                            Err(_) => payload.clone(),
+                        };
+                        bytes.extend(encode_frame(*frame_type, *channel, &payload));
                     }
                 }
             }
-            bytes.extend(encode_frame(
+            let trailing = encode_frame(
                 FrameType::Request,
                 0,
                 &serde_json::to_vec(&json!({"id": 999, "method": "list", "params": {}})).unwrap(),
-            ));
-            // The server may close before everything is written.
+            );
+            bytes.extend(&trailing);
+            // What the server will make of the bytes: the trailing request
+            // is a frame of its own only if everything before it framed.
+            let mut decoder = FrameDecoder::default();
+            decoder.push(&bytes);
+            let mut consumed = 0;
+            let mut broke = false;
+            loop {
+                match decoder.next_frame(Limits::default().max_frame) {
+                    Ok(Some((header, _))) => consumed += HEADER_LEN + header.length as usize,
+                    Ok(None) => break,
+                    Err(_) => {
+                        broke = true;
+                        break;
+                    }
+                }
+            }
+            let framed = !broke && consumed == bytes.len()
+                && bytes[..bytes.len() - trailing.len()].len() == consumed - trailing.len();
+            // The server may close before everything is written. The end
+            // of input lets it close rather than wait for a frame the
+            // garbage promised.
             let _ = c.stream.write_all(&bytes).await;
+            let _ = c.stream.shutdown().await;
             // An id-less ERROR on channel 0 is the last frame before the
             // close; a request error carries its id.
             let mut closing = false;
+            let mut answered = false;
             loop {
                 match c.recv().await {
-                    None => {
-                        prop_assert!(closing, "closed without an id-less ERROR first");
-                        break;
-                    }
+                    None => break,
                     Some((header, payload)) => {
                         prop_assert!(!closing, "{:?} after an id-less ERROR", header);
                         if header.frame_type == FrameType::Error && header.channel == 0 {
@@ -128,11 +158,14 @@ proptest! {
                         if header.frame_type == FrameType::Reply {
                             let reply: Reply = serde_json::from_slice(&payload).unwrap();
                             if reply.id == 999 {
-                                break;
+                                answered = true;
                             }
                         }
                     }
                 }
+            }
+            if framed {
+                prop_assert!(answered || closing, "a framed request got no answer");
             }
             // The server lives on.
             client(&server).await.ok("list", json!({})).await;

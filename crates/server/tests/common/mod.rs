@@ -78,6 +78,8 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Transport f
 pub struct Client {
     pub stream: Box<dyn Transport>,
     pub decoder: FrameDecoder,
+    /// The server's limit, from `WELCOME`; a larger server frame fails.
+    pub max_frame: u64,
     pub next_id: i64,
     /// Events that arrived while waiting for a reply.
     pub events: std::collections::VecDeque<Event>,
@@ -93,6 +95,7 @@ impl Client {
         Client {
             stream: Box::new(stream),
             decoder: FrameDecoder::default(),
+            max_frame: Limits::default().max_frame,
             next_id: 1,
             events: Default::default(),
         }
@@ -116,7 +119,7 @@ impl Client {
     pub async fn recv(&mut self) -> Option<(Header, Vec<u8>)> {
         let mut buf = [0u8; 4096];
         loop {
-            if let Some(frame) = self.decoder.next_frame(u64::MAX).unwrap() {
+            if let Some(frame) = self.decoder.next_frame(self.max_frame).unwrap() {
                 return Some(frame);
             }
             match tokio::time::timeout(Duration::from_secs(5), self.stream.read(&mut buf))
@@ -148,7 +151,9 @@ impl Client {
         self.send_json(FrameType::Hello, 0, &hello).await;
         let (header, body) = self.recv_json().await;
         assert_eq!(header.frame_type, FrameType::Welcome);
-        serde_json::from_value(body).unwrap()
+        let welcome: Welcome = serde_json::from_value(body).unwrap();
+        self.max_frame = welcome.limits.max_frame;
+        welcome
     }
 
     /// Sends a request and returns its reply or error, queuing events that
