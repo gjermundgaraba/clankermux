@@ -87,7 +87,7 @@ impl Server {
 
     /// Binds a loopback TCP listener on the server's runtime and serves it
     /// with `carrier`; the address to connect to.
-    pub async fn listen<F, Fut>(&self, carrier: F) -> SocketAddr
+    async fn listen<F, Fut>(&self, carrier: F) -> SocketAddr
     where
         F: FnOnce(TcpListener) -> Fut + Send + 'static,
         Fut: Future<Output = std::io::Result<()>> + Send + 'static,
@@ -141,7 +141,7 @@ impl Drop for Server {
 
 /// The server's TLS from a self-signed certificate for `localhost`
 /// written under `dir`, and a client connector that trusts it.
-pub async fn tls(dir: &Path) -> (Arc<server::tls::Tls>, TlsConnector) {
+async fn tls(dir: &Path) -> (Arc<server::tls::Tls>, TlsConnector) {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert = dir.join("cert.pem");
     let key = dir.join("key.pem");

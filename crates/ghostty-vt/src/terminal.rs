@@ -27,6 +27,15 @@ pub enum ColorScheme {
     Dark,
 }
 
+impl ColorScheme {
+    fn raw(self) -> sys::GhosttyColorScheme {
+        match self {
+            ColorScheme::Light => sys::GHOSTTY_COLOR_SCHEME_LIGHT,
+            ColorScheme::Dark => sys::GHOSTTY_COLOR_SCHEME_DARK,
+        }
+    }
+}
+
 /// Answer to a size query: the grid size in cells and the cell size in
 /// pixels, zero when unknown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -107,16 +116,12 @@ impl Handler for () {}
 
 /// The mode 2031 report announcing `scheme`.
 pub fn color_scheme_report(scheme: ColorScheme) -> Vec<u8> {
-    let raw = match scheme {
-        ColorScheme::Light => sys::GHOSTTY_COLOR_SCHEME_LIGHT,
-        ColorScheme::Dark => sys::GHOSTTY_COLOR_SCHEME_DARK,
-    };
     let mut buf = [0u8; 32];
     let mut written = 0;
     // SAFETY: buf holds buf.len() writable bytes; the report is short.
     let result = unsafe {
         sys::ghostty_color_scheme_report_encode(
-            raw,
+            scheme.raw(),
             buf.as_mut_ptr().cast(),
             buf.len(),
             &mut written,
@@ -262,56 +267,42 @@ impl<H: Handler> Terminal<H> {
             handler,
             xtversion: Vec::new(),
         }));
+        let callbacks: [(sys::GhosttyTerminalOption, *const c_void); 9] = [
+            (sys::GHOSTTY_TERMINAL_OPT_WRITE_PTY, cb::write_pty::<H> as _),
+            (
+                sys::GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS,
+                cb::program_status::<H> as _,
+            ),
+            (
+                sys::GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT,
+                cb::semantic_prompt::<H> as _,
+            ),
+            (
+                sys::GHOSTTY_TERMINAL_OPT_COLOR_SCHEME,
+                cb::color_scheme::<H> as _,
+            ),
+            (sys::GHOSTTY_TERMINAL_OPT_SIZE, cb::size::<H> as _),
+            (
+                sys::GHOSTTY_TERMINAL_OPT_TITLE_CHANGED,
+                cb::title_changed::<H> as _,
+            ),
+            (
+                sys::GHOSTTY_TERMINAL_OPT_PWD_CHANGED,
+                cb::pwd_changed::<H> as _,
+            ),
+            (sys::GHOSTTY_TERMINAL_OPT_RESET, cb::reset::<H> as _),
+            // An empty answer reports the engine's default.
+            (sys::GHOSTTY_TERMINAL_OPT_XTVERSION, cb::xtversion::<H> as _),
+        ];
         // SAFETY: the slot lives as long as the terminal, and each callback
-        // pointer has the type the option documents.
+        // pointer has the type its option documents; callback options take
+        // the function pointer itself as the value.
         unsafe {
             sys::ghostty_terminal_set(raw, sys::GHOSTTY_TERMINAL_OPT_USERDATA, slot as *mut c_void);
-            set_fn(
-                raw,
-                sys::GHOSTTY_TERMINAL_OPT_WRITE_PTY,
-                cb::write_pty::<H> as *const (),
-            );
-            set_fn(
-                raw,
-                sys::GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS,
-                cb::program_status::<H> as *const (),
-            );
-            set_fn(
-                raw,
-                sys::GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT,
-                cb::semantic_prompt::<H> as *const (),
-            );
-            set_fn(
-                raw,
-                sys::GHOSTTY_TERMINAL_OPT_COLOR_SCHEME,
-                cb::color_scheme::<H> as *const (),
-            );
-            set_fn(
-                raw,
-                sys::GHOSTTY_TERMINAL_OPT_SIZE,
-                cb::size::<H> as *const (),
-            );
-            set_fn(
-                raw,
-                sys::GHOSTTY_TERMINAL_OPT_TITLE_CHANGED,
-                cb::title_changed::<H> as *const (),
-            );
-            set_fn(
-                raw,
-                sys::GHOSTTY_TERMINAL_OPT_PWD_CHANGED,
-                cb::pwd_changed::<H> as *const (),
-            );
-            set_fn(
-                raw,
-                sys::GHOSTTY_TERMINAL_OPT_RESET,
-                cb::reset::<H> as *const (),
-            );
-            // An empty answer reports the engine's default.
-            set_fn(
-                raw,
-                sys::GHOSTTY_TERMINAL_OPT_XTVERSION,
-                cb::xtversion::<H> as *const (),
-            );
+            for (option, f) in callbacks {
+                let result = sys::ghostty_terminal_set(raw, option, f);
+                debug_assert_eq!(check(result), Ok::<(), Error>(()));
+            }
         }
         Terminal {
             term: Term(raw),
@@ -424,12 +415,6 @@ impl<H: Handler> Terminal<H> {
     }
 }
 
-unsafe fn set_fn(raw: sys::GhosttyTerminal, option: sys::GhosttyTerminalOption, f: *const ()) {
-    // SAFETY: callback options take the function pointer itself as the value.
-    let result = unsafe { sys::ghostty_terminal_set(raw, option, f as *const c_void) };
-    debug_assert_eq!(check(result), Ok::<(), Error>(()));
-}
-
 mod cb {
     use super::*;
 
@@ -510,12 +495,7 @@ mod cb {
         match unsafe { slot::<H>(ud) }.handler.color_scheme() {
             Some(scheme) => {
                 // SAFETY: out is a valid output pointer for this call.
-                unsafe {
-                    *out = match scheme {
-                        ColorScheme::Light => sys::GHOSTTY_COLOR_SCHEME_LIGHT,
-                        ColorScheme::Dark => sys::GHOSTTY_COLOR_SCHEME_DARK,
-                    }
-                };
+                unsafe { *out = scheme.raw() };
                 true
             }
             None => false,

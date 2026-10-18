@@ -10,6 +10,8 @@ export type { Cell, Frame, FrameRow } from "./render.ts";
 export const ENGINE: string = pin.engine;
 
 type Field = { offset: number; size: number; type: string };
+/** Struct fields to set: numbers, or the fields of a nested struct. */
+type Packed = { [field: string]: number | Packed };
 /** A bit field of a packed type; a union arm nests its own bits. */
 type Bits = { lsb: number; width: number; arms?: Record<string, { bits: Record<string, Bits> }> };
 type TypeInfo =
@@ -147,7 +149,7 @@ export class Engine {
   }
 
   /** Builds a zeroed, sized struct with the given fields set. */
-  pack(name: string, values: Record<string, number | Record<string, unknown>>): Uint8Array {
+  pack(name: string, values: Packed): Uint8Array {
     const info = this.struct(name);
     const out = new Uint8Array(info.size);
     const view = new DataView(out.buffer);
@@ -157,7 +159,7 @@ export class Engine {
       const field = info.fields[key];
       if (!field) throw new Error(`${name} has no field ${key}`);
       if (typeof value === "object") {
-        out.set(this.pack(field.type, value as Record<string, number>), field.offset);
+        out.set(this.pack(field.type, value), field.offset);
       } else if (field.size === 4) {
         view.setInt32(field.offset, value, true);
       } else if (field.size === 2) {
@@ -177,7 +179,6 @@ export class Engine {
     if (!field) throw new Error(`${name} has no field ${key}`);
     const view = this.view;
     const at = ptr + field.offset;
-    if (field.type === "bool") return view.getUint8(at);
     switch (field.size) {
       case 1:
         return view.getUint8(at);
@@ -192,14 +193,14 @@ export class Engine {
 
   /** A bit field of a packed type: `path` names the field, or a union
    * field, its arm and the arm's field. */
-  bits(name: string, ...path: string[]): BitField {
+  bits(name: string, ...path: [field: string] | [field: string, arm: string, inner: string]): BitField {
     const info = this.types[name];
     if (!info || info.kind !== "packed") throw new Error(`unknown packed type ${name}`);
+    const top = info.bits[path[0]];
+    if (!top) throw new Error(`${name} has no bit field ${path[0]}`);
+    if (path.length === 1) return { lsb: top.lsb, width: top.width };
     const [field, arm, inner] = path;
-    const top = info.bits[field!];
-    if (!top) throw new Error(`${name} has no bit field ${field}`);
-    if (arm === undefined) return { lsb: top.lsb, width: top.width };
-    const nested = top.arms?.[arm]?.bits[inner!];
+    const nested = top.arms?.[arm]?.bits[inner];
     if (!nested) throw new Error(`${name}.${field} has no ${arm}.${inner}`);
     return { lsb: top.lsb + nested.lsb, width: nested.width };
   }

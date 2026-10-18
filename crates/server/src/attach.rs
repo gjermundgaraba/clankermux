@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::connection::Writer;
 use crate::registry::Registry;
-use crate::session::{Attachment, SNAPSHOT_RETRY, Session, Shared, snapshot_with_retry};
+use crate::session::{Attachment, Body, SNAPSHOT_RETRY, Session, Shared, snapshot_with_retry};
 use crate::stream::MarkerKind;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -231,7 +231,6 @@ impl Task {
             Err(end) => return end,
             Ok(Some(cursor)) => {
                 let session = self.session.lock().unwrap().to_proto(false);
-                let (cols, rows) = (session.cols, session.rows);
                 self.cursor = cursor;
                 self.send_json(
                     FrameType::Attached,
@@ -239,8 +238,8 @@ impl Task {
                         mode: AttachMode::Resume,
                         offset: cursor.offset,
                         marker: cursor.marker,
-                        cols,
-                        rows,
+                        cols: session.cols,
+                        rows: session.rows,
                         session,
                         snapshot_bytes: None,
                     },
@@ -314,11 +313,11 @@ impl Task {
         };
         // A parked session has no stream to resume on.
         let live = match &s.body {
-            crate::session::Body::Live(live) => live,
-            crate::session::Body::Parked(parked) if resume.marker > parked.marker => {
+            Body::Live(live) => live,
+            Body::Parked(parked) if resume.marker > parked.marker => {
                 return above_latest();
             }
-            crate::session::Body::Parked(_) => return Ok(None),
+            Body::Parked(_) => return Ok(None),
         };
         if resume.marker > live.stream.latest_seq() {
             return above_latest();
@@ -530,14 +529,11 @@ impl Task {
             }
             self.done = s.status() != Status::Running && self.cursor.marker == stream.latest_seq();
         }
-        if frames.is_empty() {
-            self.note_finished();
-            return Pull::Idle;
-        }
+        let sent = !frames.is_empty();
         for frame in frames {
             self.writer.send(frame);
         }
         self.note_finished();
-        Pull::Sent
+        if sent { Pull::Sent } else { Pull::Idle }
     }
 }

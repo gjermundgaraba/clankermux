@@ -7,7 +7,6 @@
 
 mod common;
 
-use base64::Engine as _;
 use common::*;
 use proto::*;
 use serde_json::json;
@@ -125,8 +124,7 @@ async fn label_and_text_are_bounded_everywhere() {
     let pwd = format!("/{}", "p".repeat(63));
     c.ok(
         "write",
-        json!({"session": session.id, "data": base64::engine::general_purpose::STANDARD
-            .encode(format!("\x1b]2;{title}\x07\x1b]7;file://host{pwd}\x07titled\n"))}),
+        json!({"session": session.id, "data": b64(format!("\x1b]2;{title}\x07\x1b]7;file://host{pwd}\x07titled\n"))}),
     )
     .await;
     assert_eq!(
@@ -401,8 +399,7 @@ async fn continuation_bounds_a_snapshot() {
     // follows the overflowed sequence).
     c.ok(
         "write",
-        json!({"session": session.id, "data": base64::engine::general_purpose::STANDARD
-            .encode("\x07done\n")}),
+        json!({"session": session.id, "data": b64("\x07done\n")}),
     )
     .await;
     wait_text(&mut c, &session.id, "done").await;

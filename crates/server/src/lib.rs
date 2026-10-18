@@ -87,8 +87,7 @@ async fn accept_failed(err: io::Error) {
 }
 
 /// Serves `listener` until cancelled: `TCP_NODELAY` on every stream, then
-/// `handle` on a task of `registry.connections` with the instant it was
-/// accepted.
+/// `handle` on a task of `connections` with the instant it was accepted.
 pub(crate) async fn serve_tcp_with<F, Fut>(
     listener: TcpListener,
     connections: tokio_util::task::TaskTracker,

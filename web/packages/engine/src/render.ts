@@ -237,7 +237,7 @@ export class RenderState {
     const code = e.call("ghostty_render_state_row_cells_get", this.cells, key, out);
     if (code === e.result.INVALID_VALUE) return NO_COLOR;
     if (code !== e.result.SUCCESS) throw new Error(`cell colour: ${code}`);
-    return this.engine.readRgb(out);
+    return e.readRgb(out);
   }
 
   private graphemes(buffer: number, utf8: number, cap: number): string {

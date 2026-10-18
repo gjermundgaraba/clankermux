@@ -186,7 +186,7 @@ impl InputQueue {
 }
 
 /// `cols` and `rows` of a size are at least 1.
-pub fn check_size(size: &Size) -> Result<(), crate::registry::Fail> {
+pub fn check_size(size: &Size) -> Result<(), Fail> {
     if size.cols == 0 || size.rows == 0 {
         return Err((
             ErrorCode::InvalidRequest,

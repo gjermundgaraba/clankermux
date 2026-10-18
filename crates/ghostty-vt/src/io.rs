@@ -4,11 +4,7 @@ use std::ffi::c_void;
 
 use ghostty_vt_sys as sys;
 
-pub(crate) unsafe extern "C" fn write_to_vec(
-    userdata: *mut c_void,
-    data: *const u8,
-    len: usize,
-) -> bool {
+unsafe extern "C" fn write_to_vec(userdata: *mut c_void, data: *const u8, len: usize) -> bool {
     // SAFETY: userdata is the `*mut Vec<u8>` passed by the caller that owns
     // the writer, and data points at len readable bytes for this call.
     unsafe {

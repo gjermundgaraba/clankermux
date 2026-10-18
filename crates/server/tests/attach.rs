@@ -5,16 +5,11 @@ mod common;
 
 use std::time::Duration;
 
-use base64::Engine as _;
 use common::*;
 use ghostty_vt::snapshot;
 use proto::*;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
-
-fn b64(s: &str) -> String {
-    base64::engine::general_purpose::STANDARD.encode(s)
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_bootstrap_then_stream_then_close() {
@@ -214,7 +209,7 @@ async fn resume_when_retained_else_snapshot() {
     // Push offset 0 out of the 64-byte ring.
     c.ok(
         "write",
-        json!({"session": session.id, "data": b64(&"x".repeat(100))}),
+        json!({"session": session.id, "data": b64("x".repeat(100))}),
     )
     .await;
     wait_text(&mut c, &session.id, &"x".repeat(100)).await;

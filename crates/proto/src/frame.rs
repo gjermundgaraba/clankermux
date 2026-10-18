@@ -12,11 +12,9 @@ macro_rules! frame_types {
         }
 
         impl FrameType {
-            pub const ALL: [FrameType; frame_types!(@count $($name)*)] = [$(FrameType::$name,)*];
+            pub const ALL: &[FrameType] = &[$(FrameType::$name,)*];
         }
     };
-    (@count) => { 0 };
-    (@count $head:ident $($tail:ident)*) => { 1 + frame_types!(@count $($tail)*) };
 }
 
 frame_types! {
@@ -43,7 +41,7 @@ frame_types! {
 
 impl FrameType {
     pub fn from_u8(byte: u8) -> Option<Self> {
-        Self::ALL.into_iter().find(|t| *t as u8 == byte)
+        Self::ALL.iter().copied().find(|t| *t as u8 == byte)
     }
 
     /// Frames the server sends have the high bit set.

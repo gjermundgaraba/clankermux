@@ -20,6 +20,12 @@ pub fn start_with(limits: Limits, state_dir: PathBuf) -> Server {
     Server::start_with_state(limits, state_dir)
 }
 
+/// Standard base64, as `write` takes its data.
+pub fn b64(data: impl AsRef<[u8]>) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
 pub fn fast_limits() -> Limits {
     Limits {
         hello_timeout: 300,

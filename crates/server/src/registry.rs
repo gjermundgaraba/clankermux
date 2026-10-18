@@ -506,9 +506,8 @@ impl Registry {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
-                let mut guard = match reader_master.readable().await {
-                    Ok(guard) => guard,
-                    Err(_) => break,
+                let Ok(mut guard) = reader_master.readable().await else {
+                    break;
                 };
                 match guard.try_io(|fd| {
                     rustix::io::read(fd.get_ref(), &mut buf).map_err(std::io::Error::from)
@@ -627,12 +626,15 @@ impl Registry {
         }
         let session = self.get(id)?;
         let all_finished = {
-            let s = session.lock().unwrap();
+            let mut s = session.lock().unwrap();
             if s.status() == Status::Running {
                 return Err((ErrorCode::Running, "session is running".into()));
             }
             let all_finished = s.attachments_finished();
             if !all_finished {
+                // The files stay for the grace (a parked session serves
+                // its snapshot from them); a stop within it deletes them.
+                s.removed = true;
                 s.close_attachments(ClosedReason::Removed, true);
             }
             all_finished
@@ -640,9 +642,6 @@ impl Registry {
         if all_finished {
             self.remove_now(id);
         } else {
-            // The files stay for the grace (a parked session serves its
-            // snapshot from them); a stop within it deletes them.
-            session.lock().unwrap().removed = true;
             self.remove_after_grace(id.to_string());
         }
         Ok(())

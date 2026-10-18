@@ -10,13 +10,13 @@ use crate::io;
 use crate::terminal::{Handler, Term, Terminal};
 
 /// Bytes before the first record: the 8-byte magic and the u16 version.
-pub(crate) const ENVELOPE_LEN: usize = 10;
+const ENVELOPE_LEN: usize = 10;
 /// Bytes in a record header: tag u16, payload length u32, CRC32C u32.
-pub(crate) const RECORD_HEADER_LEN: usize = 10;
+const RECORD_HEADER_LEN: usize = 10;
 
-pub(crate) const TAG_PAGE: u16 = 3;
-pub(crate) const TAG_READY: u16 = 5;
-pub(crate) const TAG_FINISH: u16 = 6;
+const TAG_PAGE: u16 = 3;
+const TAG_READY: u16 = 5;
+const TAG_FINISH: u16 = 6;
 
 /// Encodes the whole terminal, history included, into one buffer.
 pub fn encode(term: &Term) -> Result<Vec<u8>> {
@@ -35,7 +35,7 @@ pub fn encode(term: &Term) -> Result<Vec<u8>> {
 
 /// The record starting at `pos`: its tag and the position just past it,
 /// or `None` when the buffer ends before the record does.
-pub(crate) fn record_at(buf: &[u8], pos: usize) -> Option<(u16, usize)> {
+fn record_at(buf: &[u8], pos: usize) -> Option<(u16, usize)> {
     let header = buf.get(pos..pos + RECORD_HEADER_LEN)?;
     let tag = u16::from_le_bytes([header[0], header[1]]);
     let len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
@@ -51,7 +51,7 @@ pub fn ready_end(buf: &[u8]) -> Option<usize> {
 
 /// Position just past the next `PAGE` or `FINISH` record at or after
 /// `pos`, which is what one decoder `next_page` call consumes.
-pub(crate) fn step_end(buf: &[u8], pos: usize) -> Option<usize> {
+fn step_end(buf: &[u8], pos: usize) -> Option<usize> {
     end_of_step(buf, pos, |tag| tag == TAG_PAGE || tag == TAG_FINISH)
 }
 

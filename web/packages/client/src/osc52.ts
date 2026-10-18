@@ -11,6 +11,8 @@
  */
 const ESC = 0x1b;
 const BEL = 0x07;
+const CAN = 0x18;
+const SUB = 0x1a;
 /** Longer OSC 52 payloads are abandoned, not buffered. */
 const MAX_OSC = 1 << 20;
 const PREFIX = "52;";
@@ -20,9 +22,6 @@ export interface ClipboardWrite {
   selection: string;
   text: string;
 }
-
-const CAN = 0x18;
-const SUB = 0x1a;
 
 type State = "text" | "esc" | "osc";
 

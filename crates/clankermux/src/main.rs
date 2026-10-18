@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use base64::Engine as _;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use client::connection::hello;
 use client::{Connection, Endpoint, Error};
 use proto::{
@@ -49,26 +49,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the server.
-    Serve {
-        /// Also listen on the tailnet address, plaintext.
-        #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "7437")]
-        tcp: Option<u16>,
-        /// Also serve TLS WebSocket: `PORT` on the tailnet address, or
-        /// `127.0.0.1:PORT` / `[::1]:PORT`.
-        #[arg(long, value_name = "BIND", num_args = 0..=1, default_missing_value = "7438")]
-        ws: Option<String>,
-        /// A page origin allowed on the WebSocket (repeatable); none
-        /// refuses every page.
-        #[arg(long, value_name = "ORIGIN", requires = "ws")]
-        origin: Vec<String>,
-        /// Certificate chain PEM; without it the node's Tailscale
-        /// certificate is used.
-        #[arg(long, value_name = "PATH", requires = "ws", requires = "tls_key")]
-        tls_cert: Option<PathBuf>,
-        /// Private key PEM.
-        #[arg(long, value_name = "PATH", requires = "ws", requires = "tls_cert")]
-        tls_key: Option<PathBuf>,
-    },
+    Serve(Carriers),
     /// Start a session; `argv` after `--`, the login shell by default.
     Create {
         #[arg(long)]
@@ -138,13 +119,9 @@ enum Command {
     Events,
 }
 
-fn usage(message: String) -> Error {
-    Error::Usage(message)
-}
-
 fn parse_detach_key(spec: &str) -> Result<u8, Error> {
     attach::parse_key(spec).ok_or_else(|| {
-        usage(format!(
+        Error::Usage(format!(
             "unusable detach key {spec:?}: use C-<letter> or C-<@ [ \\ ] ^ _ ?>"
         ))
     })
@@ -158,9 +135,18 @@ fn parse_env(entries: &[String]) -> Result<BTreeMap<String, String>, Error> {
                 .split_once('=')
                 .filter(|(name, _)| !name.is_empty())
                 .map(|(name, value)| (name.to_string(), value.to_string()))
-                .ok_or_else(|| usage(format!("environment entry {entry:?} is not NAME=value")))
+                .ok_or_else(|| {
+                    Error::Usage(format!("environment entry {entry:?} is not NAME=value"))
+                })
         })
         .collect()
+}
+
+/// The CLI's connections all name the engine, so any of them can attach.
+async fn connect(endpoint: &Endpoint) -> Result<Connection, Error> {
+    endpoint
+        .connect(hello("clankermux", Some(ghostty_vt::ENGINE)))
+        .await
 }
 
 /// Every session, page by page.
@@ -198,8 +184,8 @@ async fn resolve(conn: &Connection, needle: &str) -> Result<SessionParams, Error
         [s] => Ok(SessionParams {
             session: s.id.clone(),
         }),
-        [] => Err(usage(format!("no session matches {needle:?}"))),
-        _ => Err(usage(format!("{needle:?} matches several sessions"))),
+        [] => Err(Error::Usage(format!("no session matches {needle:?}"))),
+        _ => Err(Error::Usage(format!("{needle:?} matches several sessions"))),
     }
 }
 
@@ -259,7 +245,7 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
     } = carriers;
     let origins = origin
         .iter()
-        .map(|o| server::ws::origin(o).map_err(usage))
+        .map(|o| server::ws::origin(o).map_err(Error::Usage))
         .collect::<Result<Vec<_>, _>>()?;
     let ws_bind = ws
         .as_deref()
@@ -267,7 +253,7 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
             Ok(port) => Ok(WsBind::Port(port)),
             Err(_) => match bind.parse::<SocketAddr>() {
                 Ok(addr) if addr.ip().is_loopback() => Ok(WsBind::Loopback(addr)),
-                _ => Err(usage(format!(
+                _ => Err(Error::Usage(format!(
                     "--ws takes a port on the tailnet address or a loopback address, not {bind:?}"
                 ))),
             },
@@ -279,14 +265,15 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
     };
     // The state lock comes first: a second server learns of the first
     // before any tailnet work.
-    let registry = server::Registry::new(server::default_config()).map_err(Error::Io)?;
+    let registry = server::Registry::new(server::default_config())?;
     // One status request serves every carrier that needs the tailnet.
     let needs_tailnet = tcp.is_some()
         || matches!(ws_bind, Some(WsBind::Port(_)))
         || (ws_bind.is_some() && tls_files.is_none());
     let tailnet = if needs_tailnet {
-        let api = server::tailscale::LocalApi::discover().map_err(|e| usage(e.to_string()))?;
-        let status = api.status().await.map_err(Error::Io)?;
+        let api =
+            server::tailscale::LocalApi::discover().map_err(|e| Error::Usage(e.to_string()))?;
+        let status = api.status().await?;
         Some((api, status))
     } else {
         None
@@ -299,16 +286,12 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
             .iter()
             .find(|ip| ip.is_ipv4())
             .or(status.this.tailscale_ips.first())
-            .ok_or_else(|| usage("this node has no tailnet address".into()))?;
+            .ok_or_else(|| Error::Usage("this node has no tailnet address".into()))?;
         Ok::<SocketAddr, Error>(SocketAddr::new(*ip, port))
     };
     let mut tcp_listener = None;
     if let Some(port) = tcp {
-        tcp_listener = Some(
-            tokio::net::TcpListener::bind(tailnet_addr(port)?)
-                .await
-                .map_err(Error::Io)?,
-        );
+        tcp_listener = Some(tokio::net::TcpListener::bind(tailnet_addr(port)?).await?);
     }
     let mut ws_listener = None;
     if let Some(bind) = ws_bind {
@@ -321,7 +304,7 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
             None => {
                 let (api, status) = tailnet.as_ref().expect("needed, so requested");
                 let domain = status.cert_domains.first().cloned().ok_or_else(|| {
-                    usage(
+                    Error::Usage(
                         "this node has no certificate domain; pass --tls-cert and --tls-key".into(),
                     )
                 })?;
@@ -331,30 +314,22 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
                 }
             }
         };
-        let tls = server::tls::Tls::start(source).await.map_err(Error::Io)?;
+        let tls = server::tls::Tls::start(source).await?;
         tokio::spawn(tls.clone().renew_forever());
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(Error::Io)?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
         ws_listener = Some((listener, tls));
     }
 
     let mut tasks = tokio::task::JoinSet::new();
-    let unix_listener = server::bind_unix(&socket).map_err(Error::Io)?;
+    let unix_listener = server::bind_unix(&socket)?;
     eprintln!("listening on {}", socket.display());
     tasks.spawn(server::serve_unix(unix_listener, registry.clone()));
     if let Some(listener) = tcp_listener {
-        eprintln!(
-            "listening on tcp://{}",
-            listener.local_addr().map_err(Error::Io)?
-        );
+        eprintln!("listening on tcp://{}", listener.local_addr()?);
         tasks.spawn(server::serve_tcp(listener, registry.clone()));
     }
     if let Some((listener, tls)) = ws_listener {
-        eprintln!(
-            "listening on wss://{}",
-            listener.local_addr().map_err(Error::Io)?
-        );
+        eprintln!("listening on wss://{}", listener.local_addr()?);
         tasks.spawn(server::ws::serve_ws(
             listener,
             registry.clone(),
@@ -363,8 +338,8 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
         ));
     }
     use tokio::signal::unix::{SignalKind, signal};
-    let mut terminate = signal(SignalKind::terminate()).map_err(Error::Io)?;
-    let mut hangup = signal(SignalKind::hangup()).map_err(Error::Io)?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut hangup = signal(SignalKind::hangup())?;
     let result = tokio::select! {
         result = tasks.join_next() => result.unwrap().unwrap_or_else(|e| Err(std::io::Error::other(e))),
         _ = tokio::signal::ctrl_c() => Ok(()),
@@ -377,11 +352,25 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
     result.map(|()| ExitCode::SUCCESS).map_err(Error::Io)
 }
 
+#[derive(Args)]
 struct Carriers {
+    /// Also listen on the tailnet address, plaintext.
+    #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "7437")]
     tcp: Option<u16>,
+    /// Also serve TLS WebSocket: `PORT` on the tailnet address, or
+    /// `127.0.0.1:PORT` / `[::1]:PORT`.
+    #[arg(long, value_name = "BIND", num_args = 0..=1, default_missing_value = "7438")]
     ws: Option<String>,
+    /// A page origin allowed on the WebSocket (repeatable); none
+    /// refuses every page.
+    #[arg(long, value_name = "ORIGIN", requires = "ws")]
     origin: Vec<String>,
+    /// Certificate chain PEM; without it the node's Tailscale
+    /// certificate is used.
+    #[arg(long, value_name = "PATH", requires = "ws", requires = "tls_key")]
     tls_cert: Option<PathBuf>,
+    /// Private key PEM.
+    #[arg(long, value_name = "PATH", requires = "ws", requires = "tls_cert")]
     tls_key: Option<PathBuf>,
 }
 
@@ -398,7 +387,7 @@ async fn relay(socket: PathBuf) -> Result<ExitCode, Error> {
     use tokio::io::AsyncWriteExt as _;
     let unix = tokio::net::UnixStream::connect(&socket)
         .await
-        .map_err(|e| usage(format!("cannot connect to {}: {e}", socket.display())))?;
+        .map_err(|e| Error::Usage(format!("cannot connect to {}: {e}", socket.display())))?;
     let (mut from_server, mut to_server) = unix.into_split();
     // Stdin EOF shuts down the socket's write half; the server then ends
     // the connection, and its last bytes end the relay.
@@ -421,49 +410,29 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
     let json = cli.json;
     let command = match (cli.stdio, cli.command) {
         (true, None) => return relay(socket).await,
-        (true, Some(_)) => return Err(usage("--stdio takes no command".into())),
-        (false, None) => return Err(usage("a command is required; see --help".into())),
+        (true, Some(_)) => return Err(Error::Usage("--stdio takes no command".into())),
+        (false, None) => return Err(Error::Usage("a command is required; see --help".into())),
         (false, Some(command)) => command,
     };
-    if let Command::Serve {
-        tcp,
-        ws,
-        origin,
-        tls_cert,
-        tls_key,
-    } = command
-    {
+    if let Command::Serve(carriers) = command {
         if cli.connect.is_some() || cli.ssh.is_some() {
-            return Err(usage(
+            return Err(Error::Usage(
                 "serve runs locally; --connect and --ssh do not apply".into(),
             ));
         }
-        return serve(
-            socket,
-            Carriers {
-                tcp,
-                ws,
-                origin,
-                tls_cert,
-                tls_key,
-            },
-        )
-        .await;
+        return serve(socket, carriers).await;
     }
     let endpoint = match (cli.connect, cli.ssh) {
         (Some(addr), _) => Endpoint::Tcp(addr),
         (None, Some(destination)) => Endpoint::Ssh(destination),
         (None, None) => Endpoint::Unix(socket),
     };
-    let conn = endpoint
-        .connect(hello("clankermux", Some(ghostty_vt::ENGINE)))
-        .await
-        .map_err(|e| match e {
-            Error::Io(_) | Error::Closed => usage(format!("cannot connect to {endpoint}: {e}")),
-            other => other,
-        })?;
+    let conn = connect(&endpoint).await.map_err(|e| match e {
+        Error::Io(_) | Error::Closed => Error::Usage(format!("cannot connect to {endpoint}: {e}")),
+        other => other,
+    })?;
     match command {
-        Command::Serve { .. } => unreachable!(),
+        Command::Serve(_) => unreachable!(),
         Command::Create {
             label,
             cwd,

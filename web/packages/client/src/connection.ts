@@ -94,7 +94,7 @@ export class Connection {
             reject(ClientError.protocol(`${frame.header.type} before WELCOME`));
           }
         } catch (err) {
-          reject(err instanceof ClientError ? err : ClientError.protocol(String(err)));
+          reject(ClientError.protocol(String(err)));
         }
       };
       transport.onClose = () => reject(new ClientError("closed", "closed before WELCOME"));

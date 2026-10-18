@@ -5,15 +5,14 @@ mod common;
 
 use std::time::Duration;
 
-use base64::Engine as _;
 use common::*;
 use proto::*;
 use serde_json::json;
+use tokio::io::AsyncWriteExt;
 
 /// What `read` may return under `max_frame` 8192: the server keeps the
 /// rest for the JSON around the text.
 const TEXT_BUDGET: usize = 8192 - 4096;
-use tokio::io::AsyncWriteExt;
 
 #[tokio::test]
 async fn handshake_and_protocol_errors() {
@@ -118,7 +117,7 @@ async fn session_lifecycle() {
         matches!(events.event().await, Event::SessionCreated { session: s } if s.id == session.id)
     );
 
-    let data = base64::engine::general_purpose::STANDARD.encode("hello\n");
+    let data = b64("hello\n");
     c.ok("write", json!({"session": session.id, "data": data}))
         .await;
     let read = wait_text(&mut c, &session.id, "hello\nhello").await;
@@ -144,13 +143,13 @@ async fn session_lifecycle() {
     // A title set by the program is announced, and so is its clearing
     // by a full reset (RIS), which the engine reports separately.
     // `cat` passes a line on once it is complete.
-    let data = base64::engine::general_purpose::STANDARD.encode("\x1b]2;titled\x07\n");
+    let data = b64("\x1b]2;titled\x07\n");
     c.ok("write", json!({"session": session.id, "data": data}))
         .await;
     assert!(
         matches!(events.event().await, Event::SessionChanged { session: s } if s.title == "titled")
     );
-    let data = base64::engine::general_purpose::STANDARD.encode("\x1bc\n");
+    let data = b64("\x1bc\n");
     c.ok("write", json!({"session": session.id, "data": data}))
         .await;
     assert!(
@@ -497,7 +496,7 @@ async fn write_replies_come_in_request_order() {
     for _ in 0..20 {
         let mut pipelined = Vec::new();
         for id in 1..=4 {
-            let data = base64::engine::general_purpose::STANDARD.encode([b'0' + id as u8]);
+            let data = b64([b'0' + id as u8]);
             let request = json!({"id": id, "method": "write",
                 "params": {"session": session.id, "data": data}});
             pipelined.extend(encode_frame(

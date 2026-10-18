@@ -276,7 +276,7 @@ async fn program_status_records_follow_the_protocol() {
     c.ok("subscribe", json!({})).await;
     let session = c.create(json!({})).await;
     let id = session.id.clone();
-    let report = |body: &str| json!({"session": id, "data": base64(&format!("printf '\\033]7501;{body}\\033\\\\'\n"))});
+    let report = |body: &str| json!({"session": id, "data": b64(format!("printf '\\033]7501;{body}\\033\\\\'\n"))});
 
     c.ok("write", report("state=working:app=cargo:progress=40"))
         .await;
@@ -336,7 +336,7 @@ async fn program_status_records_follow_the_protocol() {
     // A prompt start drops the blocked record, not the done one.
     c.ok(
         "write",
-        json!({"session": session.id, "data": base64("printf '\\033]133;A\\033\\\\'\n")}),
+        json!({"session": session.id, "data": b64("printf '\\033]133;A\\033\\\\'\n")}),
     )
     .await;
     let removed = event_where(&mut c, |e| match e {
@@ -359,40 +359,27 @@ async fn program_status_records_follow_the_protocol() {
     assert_eq!(inspected.program_status, Some(vec![]));
 }
 
-fn base64(text: &str) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(text)
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lock_refuses_a_second_server() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let a = start_with(fast_limits(), state.clone());
-    let second = server::Registry::new(server::Config {
-        limits: fast_limits(),
-        shell: vec!["/bin/sh".into()],
-        home: dir.path().to_path_buf(),
-        version: "test".into(),
-        state_dir: state.clone(),
-    });
-    assert_eq!(
-        second.err().map(|e| e.kind()),
-        Some(std::io::ErrorKind::WouldBlock),
-        "the first server holds the lock"
-    );
-    a.registry.stop().await;
-    assert!(
+    let second = || {
         server::Registry::new(server::Config {
             limits: fast_limits(),
             shell: vec!["/bin/sh".into()],
             home: dir.path().to_path_buf(),
             version: "test".into(),
-            state_dir: state,
+            state_dir: state.clone(),
         })
-        .is_ok(),
-        "a stopped server has released it"
+    };
+    assert_eq!(
+        second().err().map(|e| e.kind()),
+        Some(std::io::ErrorKind::WouldBlock),
+        "the first server holds the lock"
     );
+    a.registry.stop().await;
+    assert!(second().is_ok(), "a stopped server has released it");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -7,7 +7,6 @@ use std::pin::Pin;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use client::connection::hello;
 use client::expect::Expect;
 use client::vt::{self, Scan};
 use client::{Action, Attachment, Connection, Endpoint, Error, Frame};
@@ -156,6 +155,19 @@ enum Keys {
 }
 
 impl Shell {
+    fn new(opts: Options, outer: Size) -> Self {
+        Shell {
+            opts,
+            attachment: Attachment::new(),
+            outer,
+            repaint_at: None,
+            pending: Vec::new(),
+            keys_at: None,
+            armed: None,
+            reopen: false,
+        }
+    }
+
     /// Output goes straight to the outer terminal while its size equals
     /// the session's; otherwise the screen is repainted from the engine.
     /// The engine's handler expects answers only in passthrough.
@@ -347,19 +359,13 @@ fn reconnect(endpoint: Endpoint) -> Connecting {
         loop {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(5));
-            match connect(&endpoint).await {
+            match crate::connect(&endpoint).await {
                 Ok(conn) => return Ok(conn),
                 Err(err @ (Error::Server(_) | Error::Protocol(_))) => return Err(err),
                 Err(_) => {}
             }
         }
     })
-}
-
-async fn connect(endpoint: &Endpoint) -> Result<Connection, Error> {
-    endpoint
-        .connect(hello("clankermux", Some(ghostty_vt::ENGINE)))
-        .await
 }
 
 /// The connection and the channel's frames, or the reconnect in progress.
@@ -411,17 +417,8 @@ fn open(shell: &mut Shell, conn: &Connection) -> Result<mpsc::UnboundedReceiver<
 
 /// Attaches over `conn`, reconnecting to the endpoint when it is lost.
 pub async fn run(opts: Options, conn: Connection) -> Result<ExitCode, Error> {
-    let raw = Raw::enter().map_err(Error::Io)?;
-    let mut shell = Shell {
-        attachment: Attachment::new(),
-        opts,
-        outer: outer_size(),
-        repaint_at: None,
-        pending: Vec::new(),
-        keys_at: None,
-        armed: None,
-        reopen: false,
-    };
+    let raw = Raw::enter()?;
+    let mut shell = Shell::new(opts, outer_size());
     let frames = open(&mut shell, &conn)?;
     let mut link = Link::Up {
         conn: Box::new(conn),
@@ -429,11 +426,11 @@ pub async fn run(opts: Options, conn: Connection) -> Result<ExitCode, Error> {
     };
     let mut stdin = tokio::io::stdin();
     let mut buf = vec![0u8; 4096];
-    let mut winch = signal(SignalKind::window_change()).map_err(Error::Io)?;
-    let mut term_signal = signal(SignalKind::terminate()).map_err(Error::Io)?;
-    let mut int_signal = signal(SignalKind::interrupt()).map_err(Error::Io)?;
-    let mut hup_signal = signal(SignalKind::hangup()).map_err(Error::Io)?;
-    let mut quit_signal = signal(SignalKind::quit()).map_err(Error::Io)?;
+    let mut winch = signal(SignalKind::window_change())?;
+    let mut term_signal = signal(SignalKind::terminate())?;
+    let mut int_signal = signal(SignalKind::interrupt())?;
+    let mut hup_signal = signal(SignalKind::hangup())?;
+    let mut quit_signal = signal(SignalKind::quit())?;
 
     let outcome = loop {
         let far = Instant::now() + Duration::from_secs(3600);
@@ -557,26 +554,20 @@ mod tests {
     use super::*;
 
     fn shell(detach_key: u8) -> Shell {
-        Shell {
-            opts: Options {
+        Shell::new(
+            Options {
                 endpoint: Endpoint::Unix(Default::default()),
                 session: String::new(),
                 read_only: false,
                 detach_key,
             },
-            attachment: Attachment::new(),
-            outer: Size {
+            Size {
                 cols: 80,
                 rows: 24,
                 cell_width: None,
                 cell_height: None,
             },
-            repaint_at: None,
-            pending: Vec::new(),
-            keys_at: None,
-            armed: None,
-            reopen: false,
-        }
+        )
     }
 
     fn feed(shell: &mut Shell, bytes: &[u8]) -> Option<Vec<u8>> {

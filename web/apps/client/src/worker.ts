@@ -3,10 +3,11 @@
  * render state live here; the page draws frames and reports input.
  */
 import { type Action, Attachment, ClientError, Connection, Osc52Scanner, type Transport, hello } from "@clankermux/client";
-import { ENGINE, Engine, KeyEncoder, RenderState, type Terminal } from "@clankermux/engine";
+import { ENGINE, Engine, KeyEncoder, type KeyInput, RenderState, type Terminal } from "@clankermux/engine";
 import {
   type ErrorMessage,
   type Event,
+  type Exit,
   FrameType,
   type Page,
   type Profile,
@@ -379,7 +380,7 @@ class Client {
     });
   }
 
-  key(input: Extract<ToWorker, { type: "key" }>["input"]): void {
+  key(input: KeyInput): void {
     const term = this.attachment?.term();
     if (!term) return;
     this.input(this.keys.encode(term, input), false);
@@ -406,7 +407,7 @@ class Client {
   }
 }
 
-function describe(exit: { code: number } | { signal: string }): string {
+function describe(exit: Exit): string {
   return "code" in exit ? `code ${exit.code}` : `signal ${exit.signal}`;
 }
 

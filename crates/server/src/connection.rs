@@ -23,14 +23,6 @@ use crate::{control, frame_json};
 /// instead of growing server memory.
 pub const HIGH_WATER: usize = 256 * 1024;
 
-/// Queued bytes above which the connection is closed: a client that stops
-/// reading altogether would otherwise grow its queue of events and
-/// replies without bound. Attachments may legitimately overshoot the
-/// high-water mark by a few frames.
-pub fn ceiling(max_frame: u64) -> usize {
-    HIGH_WATER + 4 * max_frame as usize
-}
-
 /// How long a closing connection may take to flush its queue.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -43,6 +35,10 @@ pub struct Writer {
     tx: mpsc::UnboundedSender<(Vec<u8>, bool)>,
     queued: Arc<AtomicUsize>,
     drained: Arc<Notify>,
+    /// Queued bytes above which the connection is closed: a client that
+    /// stops reading altogether would otherwise grow its queue of events
+    /// and replies without bound. Attachments may legitimately overshoot
+    /// the high-water mark by a few frames.
     ceiling: usize,
     overflow: Arc<Notify>,
     /// Set once the last frame is queued (an id-less `ERROR`, or the
@@ -117,7 +113,7 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
         tx,
         queued: Arc::new(AtomicUsize::new(0)),
         drained: Arc::new(Notify::new()),
-        ceiling: ceiling(registry.config.limits.max_frame),
+        ceiling: HIGH_WATER + 4 * registry.config.limits.max_frame as usize,
         overflow: Arc::new(Notify::new()),
         closing: Arc::new(AtomicBool::new(false)),
     };
@@ -246,12 +242,8 @@ struct Connection {
 }
 
 impl Connection {
-    fn send<T: serde::Serialize>(&self, frame_type: FrameType, channel: u32, body: &T) {
-        self.writer.send_json(frame_type, channel, body);
-    }
-
     fn error(&self, channel: u32, code: ErrorCode, message: impl Into<String>) {
-        self.send(
+        self.writer.send_json(
             FrameType::Error,
             channel,
             &ErrorMessage {
@@ -293,7 +285,6 @@ impl Connection {
                 channel,
                 ..
             } = header;
-            let json_client = !frame_type.is_server() && frame_type.is_json();
             let misplaced = if channel == 0 {
                 !frame_type.is_control()
             } else {
@@ -301,7 +292,7 @@ impl Connection {
             };
             if frame_type.is_server()
                 || misplaced
-                || (json_client && payload.len() > limits.control_body as usize)
+                || (frame_type.is_json() && payload.len() > limits.control_body as usize)
             {
                 self.fatal(
                     ErrorCode::ProtocolError,
@@ -368,7 +359,7 @@ impl Connection {
             return false;
         };
         self.hello = Some(hello);
-        self.send(
+        self.writer.send_json(
             FrameType::Welcome,
             0,
             &Welcome {
