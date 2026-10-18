@@ -311,6 +311,9 @@ pub struct Attached {
     pub cols: u16,
     pub rows: u16,
     pub session: Session,
+    /// Total length of the snapshot that follows, in mode `snapshot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

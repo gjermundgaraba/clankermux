@@ -354,7 +354,7 @@ mod tests {
         }
     }
 
-    fn attached(offset: u64, marker: u64, _bytes: &[u8]) -> Frame {
+    fn attached(offset: u64, marker: u64, bytes: &[u8]) -> Frame {
         json(
             FrameType::Attached,
             &Attached {
@@ -364,6 +364,7 @@ mod tests {
                 cols: 10,
                 rows: 3,
                 session: session(10, 3),
+                snapshot_bytes: Some(bytes.len() as u64),
             },
         )
     }

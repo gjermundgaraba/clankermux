@@ -320,6 +320,7 @@
     "marker": 2,
     "cols": 120,
     "rows": 40,
+    "snapshot_bytes": 65536,
     "session": {
       "id": "0f1e2d3c-0000-4000-8000-000000000001",
       "label": "build",

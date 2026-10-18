@@ -172,9 +172,25 @@ async fn resolve(conn: &Connection, needle: &str) -> Result<SessionParams, Error
     }
 }
 
+/// Writes to stdout; a closed pipe (`| head`) ends the program quietly.
+fn emit(text: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    if let Err(err) = out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        if err.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("clankermux: {err}");
+        std::process::exit(1);
+    }
+}
+
 fn print<T: Serialize>(json: bool, value: &T, human: impl FnOnce(&T)) {
     if json {
-        println!("{}", serde_json::to_string_pretty(value).unwrap());
+        emit(&format!(
+            "{}\n",
+            serde_json::to_string_pretty(value).unwrap()
+        ));
     } else {
         human(value);
     }
@@ -186,8 +202,8 @@ fn session_line(s: &Session) {
         Some(proto::Exit::Signal { signal }) => format!(" {signal}"),
         None => String::new(),
     };
-    println!(
-        "{:<8} {:<12} {:<8}{:<9} {:>3}x{:<3} {} {}",
+    emit(&format!(
+        "{:<8} {:<12} {:<8}{:<9} {:>3}x{:<3} {} {}\n",
         &s.id[..8],
         s.label,
         format!("{:?}", s.status).to_lowercase(),
@@ -196,7 +212,7 @@ fn session_line(s: &Session) {
         s.rows,
         s.title,
         s.pwd
-    );
+    ));
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, Error> {
@@ -250,7 +266,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                 })
                 .await;
             }
-            print(json, &created, |s| println!("{}", s.id));
+            print(json, &created, |s| emit(&format!("{}\n", s.id)));
         }
         Command::List => {
             let sessions = all_sessions(&conn).await?;
@@ -261,7 +277,10 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
         Command::Inspect { session } => {
             let params = resolve(&conn, &session).await?;
             let value = conn.request("inspect", params).await?;
-            println!("{}", serde_json::to_string_pretty(&value).unwrap());
+            emit(&format!(
+                "{}\n",
+                serde_json::to_string_pretty(&value).unwrap()
+            ));
         }
         Command::Attach {
             session,
@@ -341,7 +360,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                     },
                 )
                 .await?;
-            print(json, &read, |read| print!("{}", read.text));
+            print(json, &read, |read| emit(&read.text));
         }
         Command::Write { session, text } => {
             let params = resolve(&conn, &session).await?;
@@ -371,7 +390,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             loop {
                 tokio::select! {
                     event = events.recv() => match event {
-                        Some(event) => println!("{}", serde_json::to_string(&event).unwrap()),
+                        Some(event) => emit(&format!("{}\n", serde_json::to_string(&event).unwrap())),
                         None => return Err(conn.closed().await),
                     },
                     _ = tokio::signal::ctrl_c() => break,

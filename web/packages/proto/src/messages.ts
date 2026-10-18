@@ -217,6 +217,8 @@ export interface Attached {
   cols: number;
   rows: number;
   session: Session;
+  /** Total length of the snapshot that follows, in mode `snapshot`. */
+  snapshot_bytes?: number;
 }
 
 export interface Resized {

@@ -287,6 +287,7 @@ On any other session it is ignored. A `cols` or `rows` of 0, in `OPEN` or
 | `cols`    | int     |                                                         |
 | `rows`    | int     |                                                         |
 | `session` | Session |                                                         |
+| `snapshot_bytes` | int | In mode `snapshot`: the total length of the snapshot that follows, so a client can size its buffer |
 
 `resume` is chosen when `OPEN.resume.incarnation` equals the server's
 incarnation, `OPEN.resume.offset` lies within the retained stream, and

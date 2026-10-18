@@ -1,16 +1,26 @@
 import pin from "../../../../vendor/pin.json" with { type: "json" };
 
+export { Decoder } from "./decoder.ts";
+export { KeyEncoder, keyName } from "./keys.ts";
+export type { KeyInput } from "./keys.ts";
+export { RenderState } from "./render.ts";
+export type { Cell, Frame, FrameRow } from "./render.ts";
+
 /** Engine id of the vendored libghostty-vt build, matched by the server. */
 export const ENGINE: string = pin.engine;
 
 type Field = { offset: number; size: number; type: string };
-type TypeInfo =
+export type TypeInfo =
   | { kind: "struct"; size: number; fields: Record<string, Field> }
   | { kind: "enum"; size: number; values: Record<string, number> }
-  | { kind: "pointer" | "array" | "union" | "opaque" | "primitive"; size: number };
+  | { kind: "pointer" | "array" | "union" | "opaque" | "primitive" | "alias" | "packed"; size: number };
 
-const RESULT_SUCCESS = 0;
-const RESULT_NO_VALUE = -4;
+export const RESULT = {
+  SUCCESS: 0,
+  INVALID_VALUE: -2,
+  OUT_OF_SPACE: -3,
+  NO_VALUE: -4,
+} as const;
 
 export class EngineError extends Error {
   constructor(
@@ -23,7 +33,7 @@ export class EngineError extends Error {
 
 /** A loaded ghostty-vt.wasm instance. */
 export class Engine {
-  private readonly types: Record<string, TypeInfo>;
+  readonly types: Record<string, TypeInfo>;
 
   private constructor(
     private readonly exports: Record<string, Function> & { memory: WebAssembly.Memory },
@@ -38,8 +48,13 @@ export class Engine {
     return new Engine(instance.exports as Engine["exports"]);
   }
 
+  /** The current linear memory; reacquired on every access because it may grow. */
   get memory(): Uint8Array {
     return new Uint8Array(this.exports.memory.buffer);
+  }
+
+  get view(): DataView {
+    return new DataView(this.exports.memory.buffer);
   }
 
   call(name: string, ...args: number[]): number {
@@ -51,7 +66,7 @@ export class Engine {
   /** Calls a function returning GhosttyResult and throws on failure. */
   check(name: string, ...args: number[]): void {
     const code = this.call(name, ...args);
-    if (code !== RESULT_SUCCESS) throw new EngineError(name, code);
+    if (code !== RESULT.SUCCESS) throw new EngineError(name, code);
   }
 
   alloc(len: number): number {
@@ -71,6 +86,42 @@ export class Engine {
     return ptr;
   }
 
+  /** Runs `f` with a scratch allocation of `len` bytes. */
+  scratch<T>(len: number, f: (ptr: number) => T): T {
+    const ptr = this.alloc(len);
+    try {
+      return f(ptr);
+    } finally {
+      this.free(ptr, len);
+    }
+  }
+
+  /** Runs `f` with an opaque-handle slot; the handle is taken out before the slot is freed. */
+  withSlot<T>(f: (slot: number) => T): T {
+    const slot = this.call("ghostty_wasm_alloc_opaque");
+    try {
+      return f(slot);
+    } finally {
+      this.call("ghostty_wasm_free_opaque", slot);
+    }
+  }
+
+  /** Creates an opaque handle through a `(allocator, out_slot, ...args)` constructor. */
+  construct(name: string, ...args: number[]): number {
+    return this.withSlot((slot) => {
+      this.check(name, 0, slot, ...args);
+      return this.call("ghostty_wasm_take_opaque", slot);
+    });
+  }
+
+  /** Takes an opaque handle from a `(...args, out_slot)` call. */
+  take(name: string, ...args: number[]): number {
+    return this.withSlot((slot) => {
+      this.check(name, ...args, slot);
+      return this.call("ghostty_wasm_take_opaque", slot);
+    });
+  }
+
   private cString(ptr: number): string {
     const mem = this.memory;
     let end = ptr;
@@ -78,10 +129,15 @@ export class Engine {
     return new TextDecoder().decode(mem.subarray(ptr, end));
   }
 
-  /** Builds a zeroed, sized struct with the given fields set. */
-  struct(name: string, values: Record<string, number | boolean | Record<string, unknown>>): Uint8Array {
+  struct(name: string): Extract<TypeInfo, { kind: "struct" }> {
     const info = this.types[name];
     if (!info || info.kind !== "struct") throw new Error(`unknown struct ${name}`);
+    return info;
+  }
+
+  /** Builds a zeroed, sized struct with the given fields set. */
+  pack(name: string, values: Record<string, number | boolean | Record<string, unknown>>): Uint8Array {
+    const info = this.struct(name);
     const out = new Uint8Array(info.size);
     const view = new DataView(out.buffer);
     const sizeField = info.fields["size"];
@@ -90,7 +146,7 @@ export class Engine {
       const field = info.fields[key];
       if (!field) throw new Error(`${name} has no field ${key}`);
       if (typeof value === "object") {
-        out.set(this.struct(field.type, value as Record<string, number | boolean>), field.offset);
+        out.set(this.pack(field.type, value as Record<string, number | boolean>), field.offset);
       } else if (typeof value === "boolean") {
         out[field.offset] = value ? 1 : 0;
       } else if (field.size === 4) {
@@ -106,6 +162,32 @@ export class Engine {
     return out;
   }
 
+  /** Reads one numeric or boolean field of a struct at `ptr`. */
+  field(name: string, ptr: number, key: string): number {
+    const field = this.struct(name).fields[key];
+    if (!field) throw new Error(`${name} has no field ${key}`);
+    const view = this.view;
+    const at = ptr + field.offset;
+    if (field.type === "bool") return view.getUint8(at);
+    switch (field.size) {
+      case 1:
+        return view.getUint8(at);
+      case 2:
+        return view.getUint16(at, true);
+      case 4:
+        return field.type.startsWith("u") ? view.getUint32(at, true) : view.getInt32(at, true);
+      default:
+        throw new Error(`${name}.${key}: unsupported size ${field.size}`);
+    }
+  }
+
+  /** The offset of a struct field, for nested reads. */
+  offsetOf(name: string, key: string): number {
+    const field = this.struct(name).fields[key];
+    if (!field) throw new Error(`${name} has no field ${key}`);
+    return field.offset;
+  }
+
   enumValue(name: string, member: string): number {
     const info = this.types[name];
     if (!info || info.kind !== "enum") throw new Error(`unknown enum ${name}`);
@@ -114,24 +196,9 @@ export class Engine {
     return value;
   }
 
-  terminalNew(cols: number, rows: number): Terminal {
-    const slot = this.call("ghostty_wasm_alloc_opaque");
-    try {
-      this.check("ghostty_terminal_new", 0, slot, cols, rows);
-      return new Terminal(this, this.call("ghostty_wasm_take_opaque", slot));
-    } finally {
-      this.call("ghostty_wasm_free_opaque", slot);
-    }
-  }
-
-  /** Reads a GhosttyString at `ptr` using the manifest's layout. */
-  readString(ptr: number): string {
-    const info = this.types["GhosttyString"];
-    if (!info || info.kind !== "struct") throw new Error("GhosttyString missing from manifest");
-    const view = new DataView(this.memory.buffer);
-    const data = view.getUint32(ptr + info.fields["ptr"]!.offset, true);
-    const len = view.getUint32(ptr + info.fields["len"]!.offset, true);
-    return new TextDecoder().decode(this.memory.subarray(data, data + len));
+  hasEnumValue(name: string, member: string): boolean {
+    const info = this.types[name];
+    return info?.kind === "enum" && member in info.values;
   }
 
   sizeOf(name: string): number {
@@ -140,27 +207,75 @@ export class Engine {
     return info.size;
   }
 
+  /** Reads a GhosttyString at `ptr` using the manifest's layout. */
+  readString(ptr: number): string {
+    const data = this.field("GhosttyString", ptr, "ptr");
+    const len = this.field("GhosttyString", ptr, "len");
+    return new TextDecoder().decode(this.memory.subarray(data, data + len));
+  }
+
+  /** An RGB colour at `ptr` as 0xRRGGBB. */
+  readRgb(ptr: number): number {
+    const mem = this.memory;
+    return ((mem[ptr]! << 16) | (mem[ptr + 1]! << 8) | mem[ptr + 2]!) >>> 0;
+  }
+
+  terminalNew(cols: number, rows: number): Terminal {
+    return new Terminal(this, this.construct("ghostty_terminal_new", cols, rows));
+  }
+
   /** Decodes a complete snapshot held in memory. */
   decodeSnapshot(bytes: Uint8Array): Terminal {
     const src = this.copyIn(bytes);
-    const slot = this.call("ghostty_wasm_alloc_opaque");
     try {
-      this.check("ghostty_snapshot_decoder_new_buf", 0, slot, src, bytes.length);
-      const decoder = this.call("ghostty_wasm_take_opaque", slot);
+      const decoder = this.construct("ghostty_snapshot_decoder_new_buf", src, bytes.length);
       try {
-        this.check("ghostty_snapshot_decoder_decode", decoder, slot);
-        return new Terminal(this, this.call("ghostty_wasm_take_opaque", slot));
+        return new Terminal(this, this.take("ghostty_snapshot_decoder_decode", decoder));
       } finally {
         this.call("ghostty_snapshot_decoder_free", decoder);
       }
     } finally {
-      this.call("ghostty_wasm_free_opaque", slot);
       this.free(src, bytes.length);
     }
   }
 
+  /**
+   * Paste text encoded for the PTY: unsafe bytes blanked, wrapped in
+   * bracketed paste when `bracketed`, newlines to carriage returns otherwise.
+   */
+  encodePaste(text: string, bracketed: boolean): Uint8Array {
+    const data = new TextEncoder().encode(text);
+    const src = this.copyIn(data);
+    try {
+      let cap = data.length + 16;
+      for (;;) {
+        const out = this.scratch(cap, (buf) =>
+          this.scratch(4, (written) => {
+            const code = this.call(
+              "ghostty_paste_encode",
+              src,
+              data.length,
+              bracketed ? 1 : 0,
+              buf,
+              cap,
+              written,
+            );
+            const len = this.view.getUint32(written, true);
+            if (code === RESULT.OUT_OF_SPACE) return len;
+            if (code !== RESULT.SUCCESS) throw new EngineError("ghostty_paste_encode", code);
+            return this.memory.slice(buf, buf + len);
+          }),
+        );
+        if (typeof out !== "number") return out;
+        cap = out;
+      }
+    } finally {
+      this.free(src, data.length);
+    }
+  }
 }
 
+/** `ghostty_terminal_new` with the given `GhosttyTerminal` handle wrapped. */
 export class Terminal {
   constructor(
     readonly engine: Engine,
@@ -176,77 +291,104 @@ export class Terminal {
     }
   }
 
-  private getU16(key: string): number {
-    const out = this.engine.alloc(2);
-    try {
+  private get(key: string, size: number): number {
+    return this.engine.scratch(size, (out) => {
       this.engine.check(
         "ghostty_terminal_get",
         this.handle,
         this.engine.enumValue("GhosttyTerminalData", key),
         out,
       );
-      return new DataView(this.engine.memory.buffer).getUint16(out, true);
-    } finally {
-      this.engine.free(out, 2);
-    }
+      return size === 2 ? this.engine.view.getUint16(out, true) : this.engine.view.getUint32(out, true);
+    });
   }
 
   get cols(): number {
-    return this.getU16("COLS");
+    return this.get("COLS", 2);
   }
 
   get rows(): number {
-    return this.getU16("ROWS");
+    return this.get("ROWS", 2);
+  }
+
+  get scrollbackRows(): number {
+    return this.get("SCROLLBACK_ROWS", 4);
   }
 
   get title(): string {
     const size = this.engine.sizeOf("GhosttyString");
-    const out = this.engine.alloc(size);
-    try {
+    return this.engine.scratch(size, (out) => {
       const code = this.engine.call(
         "ghostty_terminal_get",
         this.handle,
         this.engine.enumValue("GhosttyTerminalData", "TITLE"),
         out,
       );
-      if (code === RESULT_NO_VALUE) return "";
-      if (code !== RESULT_SUCCESS) throw new EngineError("ghostty_terminal_get", code);
+      if (code === RESULT.NO_VALUE) return "";
+      if (code !== RESULT.SUCCESS) throw new EngineError("ghostty_terminal_get", code);
       return this.engine.readString(out);
+    });
+  }
+
+  /** Whether DEC private mode `number` is set. */
+  mode(number: number): boolean {
+    const config = this.engine.pack("GhosttyTerminalModeConfig", { mode: number });
+    const ptr = this.engine.copyIn(config);
+    try {
+      this.engine.check(
+        "ghostty_terminal_get",
+        this.handle,
+        this.engine.enumValue("GhosttyTerminalData", "MODE"),
+        ptr,
+      );
+      return this.engine.field("GhosttyTerminalModeConfig", ptr, "value") !== 0;
     } finally {
-      this.engine.free(out, size);
+      this.engine.free(ptr, config.length);
     }
+  }
+
+  resize(cols: number, rows: number, cellWidth = 0, cellHeight = 0): void {
+    this.engine.check("ghostty_terminal_resize", this.handle, cols, rows, cellWidth, cellHeight);
+  }
+
+  /** The whole terminal, history included, as a snapshot. */
+  snapshot(): Uint8Array {
+    return this.engine.scratch(8, (out) => {
+      this.engine.check("ghostty_snapshot_encode_alloc", this.handle, 0, out, out + 4);
+      const ptr = this.engine.view.getUint32(out, true);
+      const len = this.engine.view.getUint32(out + 4, true);
+      try {
+        return this.engine.memory.slice(ptr, ptr + len);
+      } finally {
+        this.engine.call("ghostty_free", 0, ptr, len);
+      }
+    });
   }
 
   /** The active screen as plain text, one line per row. */
   formatPlain(): string {
-    const options = this.engine.struct("GhosttyFormatterTerminalOptions", {
+    const options = this.engine.pack("GhosttyFormatterTerminalOptions", {
       emit: this.engine.enumValue("GhosttyFormatterFormat", "PLAIN"),
       extra: { screen: {} },
     });
     const optionsPtr = this.engine.copyIn(options);
-    const slot = this.engine.call("ghostty_wasm_alloc_opaque");
-    const outPtr = this.engine.alloc(4);
-    const outLen = this.engine.alloc(4);
     try {
-      this.engine.check("ghostty_formatter_terminal_new", 0, slot, this.handle, optionsPtr);
-      const formatter = this.engine.call("ghostty_wasm_take_opaque", slot);
+      const formatter = this.engine.construct("ghostty_formatter_terminal_new", this.handle, optionsPtr);
       try {
-        this.engine.check("ghostty_formatter_format_alloc", formatter, 0, outPtr, outLen);
-        const view = new DataView(this.engine.memory.buffer);
-        const ptr = view.getUint32(outPtr, true);
-        const len = view.getUint32(outLen, true);
-        try {
-          return new TextDecoder().decode(this.engine.memory.slice(ptr, ptr + len));
-        } finally {
-          this.engine.call("ghostty_free", 0, ptr, len);
-        }
+        return this.engine.scratch(8, (out) => {
+          this.engine.check("ghostty_formatter_format_alloc", formatter, 0, out, out + 4);
+          const ptr = this.engine.view.getUint32(out, true);
+          const len = this.engine.view.getUint32(out + 4, true);
+          try {
+            return new TextDecoder().decode(this.engine.memory.slice(ptr, ptr + len));
+          } finally {
+            this.engine.call("ghostty_free", 0, ptr, len);
+          }
+        });
       } finally {
         this.engine.call("ghostty_formatter_free", formatter);
       }
     } finally {
-      this.engine.free(outLen, 4);
-      this.engine.free(outPtr, 4);
-      this.engine.call("ghostty_wasm_free_opaque", slot);
       this.engine.free(optionsPtr, options.length);
     }
   }

@@ -136,7 +136,7 @@ export const vectors = {
   } satisfies Open,
   "open/minimal": { session: SESSION, read_only: true } satisfies Open,
   "viewport/with-profile": { cols: 100, rows: 30, profile: { scheme: "light" } } satisfies Viewport,
-  "attached/snapshot": { mode: "snapshot", offset: 1024, marker: 2, cols: 120, rows: 40, session: running } satisfies Attached,
+  "attached/snapshot": { mode: "snapshot", offset: 1024, marker: 2, cols: 120, rows: 40, session: running, snapshot_bytes: 65536 } satisfies Attached,
   "resized/basic": { seq: 3, offset: 2048, cols: 100, rows: 30 } satisfies Resized,
   "exited/code": { seq: 4, offset: 4096, exit: { code: 1 } } satisfies Exited,
   "gap/basic": { from: 100, to: 5000 } satisfies Gap,

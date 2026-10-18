@@ -224,6 +224,7 @@ impl Task {
                         cols,
                         rows,
                         session,
+                        snapshot_bytes: None,
                     },
                 );
             }
@@ -355,6 +356,7 @@ impl Task {
                             cols: session.cols,
                             rows: session.rows,
                             session,
+                            snapshot_bytes: Some(bytes.len() as u64),
                         },
                     );
                     let ready = snapshot::ready_end(&bytes).expect("a snapshot has READY");
