@@ -1,0 +1,15 @@
+{
+  "max_frame": 1048576,
+  "control_body": 65536,
+  "ring": 4194304,
+  "input_queue": 1048576,
+  "scrollback": 10485760,
+  "continuation": 8388608,
+  "label": 256,
+  "text": 2048,
+  "markers": 1024,
+  "records": 200,
+  "page": 32,
+  "hello_timeout": 10000,
+  "remove_grace": 10000
+}
