@@ -85,6 +85,24 @@ pub fn luminance(c: Rgb) -> f64 {
     0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
 }
 
+/// The colours OSC 10, 11 and 12 report when the profile leaves them
+/// unset: Ghostty's own defaults, so that programs that query before any
+/// client attached still get an answer.
+pub fn default_color(kind: ColorKind) -> Rgb {
+    match kind {
+        ColorKind::Foreground | ColorKind::Cursor => Rgb {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+        },
+        ColorKind::Background => Rgb {
+            r: 0x28,
+            g: 0x2c,
+            b: 0x34,
+        },
+    }
+}
+
 /// `#rrggbb`.
 pub fn parse_rgb(value: &str) -> Option<Rgb> {
     let hex = value.strip_prefix('#')?;
@@ -296,8 +314,8 @@ impl Session {
     }
 
     /// Makes `profile` the session's: default colours for OSC 10, 11 and
-    /// 12, the scheme for CSI ? 996 n, and a mode 2031 report when the
-    /// scheme answer changed.
+    /// 12 (falling back to [`DEFAULT_COLORS`]), the scheme for CSI ? 996
+    /// n, and a mode 2031 report when the scheme answer changed.
     pub fn set_profile(&mut self, profile: Profile) {
         let before = self.term.handler().scheme_answer();
         let effects = self.term.handler_mut();
@@ -311,9 +329,11 @@ impl Session {
             (ColorKind::Background, &profile.bg),
             (ColorKind::Cursor, &profile.cursor),
         ] {
-            let _ = self
-                .term
-                .set_color(kind, value.as_deref().and_then(parse_rgb));
+            let color = value
+                .as_deref()
+                .and_then(parse_rgb)
+                .unwrap_or(default_color(kind));
+            let _ = self.term.set_color(kind, Some(color));
         }
         let after = self.term.handler().scheme_answer();
         if after != before

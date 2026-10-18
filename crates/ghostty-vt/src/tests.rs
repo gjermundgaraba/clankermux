@@ -52,20 +52,31 @@ fn formats_a_tail_of_rows() {
     assert_eq!(tail(2), "line3\nline4\nline5\nline6");
     assert_eq!(tail(0), "line1\nline2\nline3\nline4\nline5\nline6");
 
-    let clipped = formatter::format(
-        &term,
-        Options {
-            trim: true,
-            region: Region::Clip { cols: 3, rows: 2 },
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(String::from_utf8(clipped).unwrap(), "lin\nlin");
+    let clip = |from_row, cols, rows| {
+        String::from_utf8(
+            formatter::format(
+                &term,
+                Options {
+                    trim: true,
+                    region: Region::Clip {
+                        from_row,
+                        cols,
+                        rows,
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(clip(0, 3, 2), "lin\nlin");
+    assert_eq!(clip(1, 10, 2), "line6");
+    assert_eq!(clip(9, 10, 9), "", "clamped to the screen");
 }
 
 #[test]
-fn vt_format_carries_modes_and_history() {
+fn vt_format_carries_modes_not_history() {
     let mut term = Terminal::new(10, 3).unwrap();
     term.vt_write(b"one\r\ntwo\r\nthree\r\nfour\x1b[?1049h\x1b[?2004halt");
     let vt = formatter::format(

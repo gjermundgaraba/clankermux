@@ -2,6 +2,7 @@
 
 mod attach;
 
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -10,8 +11,11 @@ use base64::Engine as _;
 use clap::{Parser, Subcommand};
 use client::connection::hello;
 use client::{Connection, Error};
-use proto::{Page, Session};
-use serde_json::{Value, json};
+use proto::{
+    CreateParams, ListParams, OnExit, Page, Read, ReadParams, Session, SessionParams,
+    SetLabelParams, SetSizeParams, SignalParams, WriteParams,
+};
+use serde::Serialize;
 
 const DETACH_KEY: &str = "C-\\";
 
@@ -51,8 +55,8 @@ enum Command {
         /// Attach once created.
         #[arg(long)]
         attach: bool,
-        /// Prefix key for `--attach`; followed by `d` it detaches, twice
-        /// it is sent.
+        /// Prefix key for `--attach` (`C-x`); followed by `d` it detaches,
+        /// twice it is sent.
         #[arg(long, default_value = DETACH_KEY)]
         detach_key: String,
         #[arg(last = true)]
@@ -67,7 +71,8 @@ enum Command {
         session: String,
         #[arg(long)]
         read_only: bool,
-        /// Prefix key; followed by `d` it detaches, twice it is sent.
+        /// Prefix key (`C-x`); followed by `d` it detaches, twice it is
+        /// sent.
         #[arg(long, default_value = DETACH_KEY)]
         detach_key: String,
     },
@@ -100,39 +105,74 @@ enum Command {
     Events,
 }
 
+fn usage(message: String) -> Error {
+    Error::Usage(message)
+}
+
 fn parse_detach_key(spec: &str) -> Result<u8, Error> {
-    attach::parse_key(spec).ok_or_else(|| Error::Protocol(format!("unusable detach key {spec:?}")))
+    attach::parse_key(spec).ok_or_else(|| {
+        usage(format!(
+            "unusable detach key {spec:?}: use C-<letter> or C-<@ [ \\ ] ^ _ ?>"
+        ))
+    })
+}
+
+fn parse_env(entries: &[String]) -> Result<BTreeMap<String, String>, Error> {
+    entries
+        .iter()
+        .map(|entry| {
+            entry
+                .split_once('=')
+                .filter(|(name, _)| !name.is_empty())
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .ok_or_else(|| usage(format!("environment entry {entry:?} is not NAME=value")))
+        })
+        .collect()
+}
+
+/// Every session, page by page.
+async fn all_sessions(conn: &Connection) -> Result<Vec<Session>, Error> {
+    let mut after: Option<String> = None;
+    let mut sessions = Vec::new();
+    loop {
+        let page: Page = conn
+            .call(
+                "list",
+                ListParams {
+                    after: after.take(),
+                },
+            )
+            .await?;
+        sessions.extend(page.sessions);
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return Ok(sessions),
+        }
+    }
 }
 
 /// A session argument: an id, a unique id prefix, or a unique label.
-async fn resolve(conn: &Connection, needle: &str) -> Result<String, Error> {
-    let mut after: Option<String> = None;
-    let mut matches = Vec::new();
-    loop {
-        let page: Page = conn.call("list", json!({"after": after})).await?;
-        for s in page.sessions {
-            if s.id == needle {
-                return Ok(s.id);
-            }
-            if s.id.starts_with(needle) || s.label == needle {
-                matches.push(s.id);
-            }
-        }
-        match page.next {
-            Some(next) => after = Some(next),
-            None => break,
-        }
+async fn resolve(conn: &Connection, needle: &str) -> Result<SessionParams, Error> {
+    let sessions = all_sessions(conn).await?;
+    if sessions.iter().any(|s| s.id == needle) {
+        return Ok(SessionParams {
+            session: needle.to_string(),
+        });
     }
+    let matches: Vec<&Session> = sessions
+        .iter()
+        .filter(|s| s.id.starts_with(needle) || s.label == needle)
+        .collect();
     match matches.as_slice() {
-        [id] => Ok(id.clone()),
-        [] => Err(Error::Protocol(format!("no session matches {needle:?}"))),
-        _ => Err(Error::Protocol(format!(
-            "{needle:?} matches several sessions"
-        ))),
+        [s] => Ok(SessionParams {
+            session: s.id.clone(),
+        }),
+        [] => Err(usage(format!("no session matches {needle:?}"))),
+        _ => Err(usage(format!("{needle:?} matches several sessions"))),
     }
 }
 
-fn print(json: bool, value: &Value, human: impl FnOnce(&Value)) {
+fn print<T: Serialize>(json: bool, value: &T, human: impl FnOnce(&T)) {
     if json {
         println!("{}", serde_json::to_string_pretty(value).unwrap());
     } else {
@@ -173,7 +213,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
     let conn = Connection::connect_unix(&socket, hello("clankermux", None))
         .await
         .map_err(|e| match e {
-            Error::Io(e) => Error::Protocol(format!("cannot connect to {}: {e}", socket.display())),
+            Error::Io(e) => usage(format!("cannot connect to {}: {e}", socket.display())),
             other => other,
         })?;
     match cli.command {
@@ -190,27 +230,15 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             argv,
         } => {
             let detach_key = parse_detach_key(&detach_key)?;
-            let env: serde_json::Map<String, Value> = env
-                .iter()
-                .map(|entry| {
-                    let (name, value) = entry.split_once('=').unwrap_or((entry, ""));
-                    (name.to_string(), json!(value))
-                })
-                .collect();
-            let mut params = json!({"env": env});
-            let fields = [
-                ("label", json!(label)),
-                ("cwd", json!(cwd)),
-                ("cols", json!(cols)),
-                ("rows", json!(rows)),
-                ("on_exit", json!(keep.then_some("keep"))),
-                ("argv", json!((!argv.is_empty()).then_some(argv))),
-            ];
-            for (name, value) in fields {
-                if !value.is_null() {
-                    params[name] = value;
-                }
-            }
+            let params = CreateParams {
+                label,
+                argv: (!argv.is_empty()).then_some(argv),
+                cwd,
+                env: Some(parse_env(&env)?),
+                cols,
+                rows,
+                on_exit: keep.then_some(OnExit::Keep),
+            };
             let created: Session = conn.call("create", params).await?;
             if attach {
                 drop(conn);
@@ -222,24 +250,17 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                 })
                 .await;
             }
-            print(json, &json!(created), |_| println!("{}", created.id));
+            print(json, &created, |s| println!("{}", s.id));
         }
         Command::List => {
-            let mut after: Option<String> = None;
-            loop {
-                let page: Page = conn.call("list", json!({"after": after})).await?;
-                print(json, &json!(page), |_| {
-                    page.sessions.iter().for_each(session_line)
-                });
-                match page.next {
-                    Some(next) => after = Some(next),
-                    None => break,
-                }
-            }
+            let sessions = all_sessions(&conn).await?;
+            print(json, &sessions, |sessions| {
+                sessions.iter().for_each(session_line)
+            });
         }
         Command::Inspect { session } => {
-            let id = resolve(&conn, &session).await?;
-            let value = conn.request("inspect", json!({"session": id})).await?;
+            let params = resolve(&conn, &session).await?;
+            let value = conn.request("inspect", params).await?;
             println!("{}", serde_json::to_string_pretty(&value).unwrap());
         }
         Command::Attach {
@@ -247,46 +268,62 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             read_only,
             detach_key,
         } => {
-            let id = resolve(&conn, &session).await?;
             let detach_key = parse_detach_key(&detach_key)?;
+            let params = resolve(&conn, &session).await?;
             drop(conn);
             return attach::run(attach::Options {
                 socket,
-                session: id,
+                session: params.session,
                 read_only,
                 detach_key,
             })
             .await;
         }
         Command::End { session } => {
-            let id = resolve(&conn, &session).await?;
-            conn.request("end", json!({"session": id})).await?;
+            let params = resolve(&conn, &session).await?;
+            conn.request("end", params).await?;
         }
         Command::Signal { session, signal } => {
-            let id = resolve(&conn, &session).await?;
-            conn.request("signal", json!({"session": id, "signal": signal}))
-                .await?;
+            let params = resolve(&conn, &session).await?;
+            conn.request(
+                "signal",
+                SignalParams {
+                    session: params.session,
+                    signal,
+                },
+            )
+            .await?;
         }
         Command::Remove { session } => {
-            let id = resolve(&conn, &session).await?;
-            conn.request("remove", json!({"session": id})).await?;
+            let params = resolve(&conn, &session).await?;
+            conn.request("remove", params).await?;
         }
         Command::Label { session, label } => {
-            let id = resolve(&conn, &session).await?;
-            let value = conn
-                .request("set_label", json!({"session": id, "label": label}))
+            let params = resolve(&conn, &session).await?;
+            let updated: Session = conn
+                .call(
+                    "set_label",
+                    SetLabelParams {
+                        session: params.session,
+                        label,
+                    },
+                )
                 .await?;
-            print(json, &value, |_| {});
+            print(json, &updated, |_| {});
         }
         Command::Resize {
             session,
             cols,
             rows,
         } => {
-            let id = resolve(&conn, &session).await?;
+            let params = resolve(&conn, &session).await?;
             conn.request(
                 "set_size",
-                json!({"session": id, "cols": cols, "rows": rows}),
+                SetSizeParams {
+                    session: params.session,
+                    cols,
+                    rows,
+                },
             )
             .await?;
         }
@@ -294,16 +331,20 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
             session,
             scrollback,
         } => {
-            let id = resolve(&conn, &session).await?;
-            let value = conn
-                .request("read", json!({"session": id, "scrollback": scrollback}))
+            let params = resolve(&conn, &session).await?;
+            let read: Read = conn
+                .call(
+                    "read",
+                    ReadParams {
+                        session: params.session,
+                        scrollback: Some(scrollback),
+                    },
+                )
                 .await?;
-            print(json, &value, |v| {
-                print!("{}", v["text"].as_str().unwrap_or(""));
-            });
+            print(json, &read, |read| print!("{}", read.text));
         }
         Command::Write { session, text } => {
-            let id = resolve(&conn, &session).await?;
+            let params = resolve(&conn, &session).await?;
             let data = match text {
                 Some(text) => text.into_bytes(),
                 None => {
@@ -312,15 +353,20 @@ async fn run(cli: Cli) -> Result<ExitCode, Error> {
                     data
                 }
             };
-            let data = base64::engine::general_purpose::STANDARD.encode(data);
-            conn.request("write", json!({"session": id, "data": data}))
-                .await?;
+            conn.request(
+                "write",
+                WriteParams {
+                    session: params.session,
+                    data: base64::engine::general_purpose::STANDARD.encode(data),
+                },
+            )
+            .await?;
         }
         Command::Events => {
             let mut events = conn.events();
-            let page: Page = conn.call("subscribe", json!({})).await?;
-            print(json, &json!(page), |_| {
-                page.sessions.iter().for_each(session_line)
+            let page: Page = conn.call("subscribe", ListParams::default()).await?;
+            print(json, &page.sessions, |sessions| {
+                sessions.iter().for_each(session_line)
             });
             loop {
                 tokio::select! {

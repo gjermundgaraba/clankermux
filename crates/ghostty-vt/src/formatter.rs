@@ -43,8 +43,9 @@ pub enum Region {
     /// From this row (counted from the top of the scrollback) to the end
     /// of the screen.
     FromRow(u32),
-    /// The top-left `cols` by `rows` cells of the screen.
-    Clip { cols: u16, rows: u16 },
+    /// A `cols` by `rows` window of the screen starting at its row
+    /// `from_row`, left-aligned.
+    Clip { from_row: u16, cols: u16, rows: u16 },
 }
 
 pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
@@ -77,29 +78,36 @@ pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
         selection: ptr::null(),
     };
     let active = sys::GHOSTTY_POINT_TAG_ACTIVE;
-    let last_cell = point(
-        term,
-        active,
-        term.cols().saturating_sub(1),
-        u32::from(term.rows().saturating_sub(1)),
-    );
     let selection = match options.region {
         Region::All => None,
         Region::FromRow(row) => Some(selection(
             point(term, sys::GHOSTTY_POINT_TAG_SCREEN, 0, row)?,
-            last_cell?,
-            false,
-        )),
-        Region::Clip { cols, rows } => Some(selection(
-            point(term, active, 0, 0)?,
             point(
                 term,
                 active,
-                cols.min(term.cols()).saturating_sub(1),
-                u32::from(rows.min(term.rows()).saturating_sub(1)),
+                term.cols().saturating_sub(1),
+                u32::from(term.rows().saturating_sub(1)),
             )?,
-            true,
+            false,
         )),
+        Region::Clip {
+            from_row,
+            cols,
+            rows,
+        } => {
+            let top = from_row.min(term.rows().saturating_sub(1));
+            let bottom = (u32::from(top) + u32::from(rows)).min(u32::from(term.rows())) - 1;
+            Some(selection(
+                point(term, active, 0, u32::from(top))?,
+                point(
+                    term,
+                    active,
+                    cols.min(term.cols()).saturating_sub(1),
+                    bottom,
+                )?,
+                true,
+            ))
+        }
     };
     if let Some(selection) = &selection {
         raw_options.selection = selection;

@@ -442,7 +442,7 @@ The server's terminal answers every query from the PTY.
 | Kitty keyboard, kitty graphics     | From the server's terminal                         |
 | XTVERSION                          | `clankermux <version>`                             |
 | XTGETTCAP                          | Ghostty's terminfo for `xterm-ghostty`             |
-| OSC 10, 11, 12                     | The session's profile; defaults if unset           |
+| OSC 10, 11, 12                     | The session's profile; `#ffffff`, `#282c34` and `#ffffff` if unset |
 | CSI ? 996 n colour scheme          | `profile.scheme`; else from `bg` when set, dark below relative luminance 0.5; else no answer |
 | XTWINOPS size reports              | Session size; the session's cell size, else 0      |
 | OSC 7501 `?`                       | Supported; the effect is installed                 |

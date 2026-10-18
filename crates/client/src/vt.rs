@@ -14,8 +14,11 @@ pub enum Scan {
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 
-/// Classifies the start of `buf`.
-pub fn scan(buf: &[u8]) -> Scan {
+/// Classifies the start of `buf`. With `strings`, `ESC ]`, `ESC P`,
+/// `ESC X`, `ESC ^` and `ESC _` introduce OSC, DCS, SOS, PM and APC
+/// strings that run to their terminator; without, they are two-byte
+/// sequences, as the alt-keys a terminal sends them for are.
+pub fn scan(buf: &[u8], strings: bool) -> Scan {
     let Some(&first) = buf.first() else {
         return Scan::Plain(0);
     };
@@ -39,7 +42,7 @@ pub fn scan(buf: &[u8]) -> Scan {
             Scan::Incomplete
         }
         // OSC ends with BEL or ST; DCS, SOS, PM and APC end with ST.
-        b']' | b'P' | b'X' | b'^' | b'_' => {
+        b']' | b'P' | b'X' | b'^' | b'_' if strings => {
             let mut i = 2;
             while i < buf.len() {
                 match buf[i] {
@@ -68,17 +71,48 @@ pub fn scan(buf: &[u8]) -> Scan {
     }
 }
 
-/// The length of the longest prefix of `buf` made of whole sequences and
-/// plain bytes; the rest is an incomplete sequence.
-pub fn complete_prefix(buf: &[u8]) -> usize {
+/// The length of the longest prefix of `buf` made of whole sequences,
+/// whole UTF-8 characters and plain bytes; the rest has not fully arrived.
+pub fn complete_prefix(buf: &[u8], strings: bool) -> usize {
     let mut pos = 0;
     while pos < buf.len() {
-        match scan(&buf[pos..]) {
-            Scan::Sequence(n) | Scan::Plain(n) => pos += n,
+        match scan(&buf[pos..], strings) {
+            Scan::Sequence(n) => pos += n,
+            Scan::Plain(n) => {
+                let tail = utf8_tail(&buf[pos..pos + n]);
+                pos += n - tail;
+                if tail > 0 {
+                    break;
+                }
+            }
             Scan::Incomplete => break,
         }
     }
     pos
+}
+
+/// Bytes at the end of `bytes` that begin a UTF-8 character without
+/// completing it.
+fn utf8_tail(bytes: &[u8]) -> usize {
+    let Some(start) = bytes
+        .iter()
+        .rposition(|&b| b & 0xc0 != 0x80)
+        .filter(|&i| bytes.len() - i < 4)
+    else {
+        return 0;
+    };
+    let lead = bytes[start];
+    let need = match lead {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    };
+    if bytes.len() - start < need {
+        bytes.len() - start
+    } else {
+        0
+    }
 }
 
 /// The shape of a terminal response, enough to recognise another
@@ -92,6 +126,16 @@ pub enum Shape {
     },
     Osc(Vec<u8>),
     Dcs(Vec<u8>),
+    /// By the first byte after the introducer: `G` for kitty graphics.
+    Apc(Option<u8>),
+}
+
+impl Shape {
+    /// Whether the response is a string (OSC, DCS or APC) rather than a
+    /// CSI sequence.
+    pub fn is_string(&self) -> bool {
+        !matches!(self, Shape::Csi { .. })
+    }
 }
 
 /// The shape of one complete sequence, when it can be a response.
@@ -133,8 +177,30 @@ pub fn shape(seq: &[u8]) -> Option<Shape> {
             }
             Some(Shape::Dcs(prefix))
         }
+        b'_' => Some(Shape::Apc(seq.get(2).copied())),
         _ => None,
     }
+}
+
+/// A kitty keyboard protocol key event `CSI code ; mods [: event] u`:
+/// the Unicode key code and the modifier bits (shift 1, alt 2, ctrl 4,
+/// super 8), as the terminal sends them when a program enabled the
+/// protocol.
+pub fn kitty_key(seq: &[u8]) -> Option<(u32, u32)> {
+    let body = seq.strip_prefix(b"\x1b[")?.strip_suffix(b"u")?;
+    let body = std::str::from_utf8(body).ok()?;
+    let mut fields = body.split(';');
+    let code = fields.next()?.split(':').next()?.parse().ok()?;
+    let mods = match fields.next() {
+        Some(mods) => mods
+            .split(':')
+            .next()?
+            .parse::<u32>()
+            .ok()?
+            .saturating_sub(1),
+        None => 0,
+    };
+    Some((code, mods))
 }
 
 #[cfg(test)]
@@ -143,17 +209,41 @@ mod tests {
 
     #[test]
     fn splits_sequences() {
-        assert_eq!(scan(b"abc\x1b[A"), Scan::Plain(3));
-        assert_eq!(scan(b"\x1b[1;2R"), Scan::Sequence(6));
-        assert_eq!(scan(b"\x1b[1;2"), Scan::Incomplete);
-        assert_eq!(scan(b"\x1b"), Scan::Incomplete);
-        assert_eq!(scan(b"\x1bOP"), Scan::Sequence(3));
-        assert_eq!(scan(b"\x1ba"), Scan::Sequence(2));
-        assert_eq!(scan(b"\x1b]11;rgb:00/00/00\x1b\\x"), Scan::Sequence(19));
-        assert_eq!(scan(b"\x1b]11;rgb:00/00/00\x07"), Scan::Sequence(18));
-        assert_eq!(scan(b"\x1bP>|ghostty\x1b"), Scan::Incomplete);
-        assert_eq!(complete_prefix(b"ab\x1b[A\x1b["), 5);
-        assert_eq!(complete_prefix(b"\x1b"), 0);
+        assert_eq!(scan(b"abc\x1b[A", true), Scan::Plain(3));
+        assert_eq!(scan(b"\x1b[1;2R", true), Scan::Sequence(6));
+        assert_eq!(scan(b"\x1b[1;2", true), Scan::Incomplete);
+        assert_eq!(scan(b"\x1b", true), Scan::Incomplete);
+        assert_eq!(scan(b"\x1bOP", true), Scan::Sequence(3));
+        assert_eq!(scan(b"\x1ba", true), Scan::Sequence(2));
+        assert_eq!(
+            scan(b"\x1b]11;rgb:00/00/00\x1b\\x", true),
+            Scan::Sequence(19)
+        );
+        assert_eq!(scan(b"\x1b]11;rgb:00/00/00\x07", true), Scan::Sequence(18));
+        assert_eq!(scan(b"\x1bP>|ghostty\x1b", true), Scan::Incomplete);
+        assert_eq!(scan(b"\x1b_Gi=1;OK\x1b\\", true), Scan::Sequence(11));
+        assert_eq!(complete_prefix(b"ab\x1b[A\x1b[", true), 5);
+        assert_eq!(complete_prefix(b"\x1b", true), 0);
+    }
+
+    #[test]
+    fn alt_keys_are_not_string_introducers_unless_expected() {
+        // Alt-] then "abc" and Enter: whole keys when no string answer is
+        // expected, one unfinished OSC otherwise.
+        let typed = b"\x1b]abc\r";
+        assert_eq!(scan(typed, false), Scan::Sequence(2));
+        assert_eq!(complete_prefix(typed, false), typed.len());
+        assert_eq!(complete_prefix(typed, true), 0);
+        assert_eq!(scan(b"\x1b_", false), Scan::Sequence(2));
+    }
+
+    #[test]
+    fn unfinished_utf8_waits() {
+        assert_eq!(complete_prefix("hé".as_bytes(), false), 3);
+        assert_eq!(complete_prefix(&"hé".as_bytes()[..2], false), 1);
+        assert_eq!(complete_prefix(&"漢".as_bytes()[..2], false), 0);
+        assert_eq!(complete_prefix(b"a\x1b[A", false), 4);
+        assert_eq!(complete_prefix(b"\xff\xfe", false), 2, "invalid bytes pass");
     }
 
     #[test]
@@ -173,7 +263,22 @@ mod tests {
             shape(b"\x1bP>|ghostty 1.3\x1b\\")
         );
         assert_eq!(shape(b"\x1bP1+r524742\x1b\\"), shape(b"\x1bP0+r\x1b\\"));
+        assert_eq!(
+            shape(b"\x1b_Gi=31;OK\x1b\\"),
+            shape(b"\x1b_Gi=2;EINVAL\x1b\\")
+        );
+        assert!(shape(b"\x1b_Gi=31;OK\x1b\\").unwrap().is_string());
         assert_eq!(shape(b"\x1bOP"), None);
         assert_eq!(shape(b"plain"), None);
+    }
+
+    #[test]
+    fn kitty_keys_decode() {
+        assert_eq!(kitty_key(b"\x1b[92;5u"), Some((92, 4)));
+        assert_eq!(kitty_key(b"\x1b[100u"), Some((100, 0)));
+        assert_eq!(kitty_key(b"\x1b[100;1:1u"), Some((100, 0)));
+        assert_eq!(kitty_key(b"\x1b[97:65;2u"), Some((97, 1)));
+        assert_eq!(kitty_key(b"\x1b[A"), None);
+        assert_eq!(kitty_key(b"\x1b[1;2R"), None);
     }
 }

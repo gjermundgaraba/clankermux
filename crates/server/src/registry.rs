@@ -124,6 +124,14 @@ impl Registry {
             .map_err(internal)?
             .with_handler(Effects::default());
         term.set_xtversion(&format!("clankermux {}", self.config.version));
+        for kind in [
+            ghostty_vt::ColorKind::Foreground,
+            ghostty_vt::ColorKind::Background,
+            ghostty_vt::ColorKind::Cursor,
+        ] {
+            term.set_color(kind, Some(crate::session::default_color(kind)))
+                .map_err(internal)?;
+        }
         term.set_scrollback_max_bytes(limits.scrollback as usize)
             .map_err(internal)?;
         term.set_continuation_max_bytes(limits.continuation as usize)

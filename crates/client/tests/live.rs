@@ -94,7 +94,18 @@ async fn bootstrap_stream_and_resume() {
     conn.request("write", json!({"session": session.id, "data": "b25lCg=="}))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The echo is on the screen before the attach, so it comes with the
+    // snapshot rather than as OUTPUT.
+    loop {
+        let read: Read = conn
+            .call("read", json!({"session": session.id}))
+            .await
+            .unwrap();
+        if read.text.contains("one\none") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     let open = Open {
         session: session.id.clone(),
@@ -108,15 +119,10 @@ async fn bootstrap_stream_and_resume() {
         profile: None,
         resume: None,
     };
+    let mut a = Attachment::new();
+    a.open_on(&conn.welcome);
     let mut rx = conn.open(1, &open).unwrap();
-    let mut a = Attachment::new(
-        &conn.welcome.incarnation,
-        conn.welcome.limits.continuation as usize,
-    );
-    let actions = drive(&mut a, &mut rx, |a, _| {
-        !a.bootstrapping() && a.term().is_some()
-    })
-    .await;
+    let actions = drive(&mut a, &mut rx, |a, _| a.resume().is_some()).await;
     assert_eq!(actions, vec![Action::Screen]);
     assert_eq!(text(&mut a), "one\none");
     assert_eq!(a.session.as_ref().unwrap().id, session.id);
@@ -132,6 +138,7 @@ async fn bootstrap_stream_and_resume() {
     let conn = Connection::connect_unix(&server.socket, hello("test", Some(ghostty_vt::ENGINE)))
         .await
         .unwrap();
+    a.open_on(&conn.welcome);
     let mut rx = conn
         .open(
             1,
@@ -199,11 +206,13 @@ async fn bootstrap_stream_and_resume() {
         .await
         .unwrap();
     assert!(
-        matches!(&closed, client::Error::Protocol(m) if m.contains("ProtocolError")),
+        matches!(&closed, client::Error::Server(e) if e.code == ErrorCode::ProtocolError),
         "{closed}"
     );
     assert!(matches!(
         conn.request("list", json!({})).await,
         Err(client::Error::Closed)
     ));
+    assert!(matches!(conn.open(2, &open), Err(client::Error::Closed)));
+    assert!(conn.events().recv().await.is_none());
 }

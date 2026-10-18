@@ -147,6 +147,7 @@ dependencies = [
  "ghostty-vt",
  "proto",
  "rustix",
+ "serde",
  "serde_json",
  "server",
  "tempfile",

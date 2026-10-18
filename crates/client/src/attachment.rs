@@ -2,20 +2,20 @@
 //! local engine current (bootstrapping from the snapshot, then feeding
 //! the stream) and tracks the cursor for resuming.
 
-use ghostty_vt::Terminal;
 use ghostty_vt::snapshot::Decoder;
+use ghostty_vt::{Handler, Terminal};
 use proto::{
     AttachMode, Attached, Closed, ClosedReason, ErrorMessage, Exit, Exited, FrameType, Gap,
-    Resized, Resume, Session, parse_output,
+    Resized, Resume, Session, Welcome, parse_output,
 };
 
 use crate::connection::{Error, Frame};
-use crate::expect::Expect;
 
 /// What a client does in response to frames.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    /// The screen is renderable from the local engine; paint it.
+    /// The screen is renderable from the local engine; paint it. The
+    /// session may already have exited: see [`Attachment::session`].
     Screen,
     /// Stream bytes, already applied to the local engine.
     Output(Vec<u8>),
@@ -35,55 +35,66 @@ pub enum Action {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cursor {
-    pub offset: u64,
-    pub marker: u64,
+struct Cursor {
+    offset: u64,
+    marker: u64,
 }
 
-enum State {
+enum State<H: Handler> {
     /// Before `ATTACHED`.
     Opening,
     Bootstrapping {
-        decoder: Decoder<Expect>,
-        /// Stream frames held back after a `RESIZED` until `SNAPSHOT_END`.
+        decoder: Decoder<H>,
+        /// Stream frames held back after a `RESIZED` or `EXITED` until
+        /// `SNAPSHOT_END`.
         held: Vec<Frame>,
     },
-    Streaming(Terminal<Expect>),
+    Streaming(Terminal<H>),
     /// After the final marker, `CLOSED` or a fatal error.
-    Ended(Option<Terminal<Expect>>),
+    Ended,
 }
 
-pub struct Attachment {
+/// The attachment of one channel. `H` is the handler installed on the
+/// local engine from `READY` on; a fresh `H::default()` per bootstrap.
+pub struct Attachment<H: Handler + Default = ()> {
+    /// The server the cursor was obtained from, and its limit.
     incarnation: String,
     continuation: usize,
-    state: State,
+    /// The server of the connection the next `ATTACHED` arrives on.
+    next: Option<(String, usize)>,
+    state: State<H>,
     cursor: Cursor,
     pub session: Option<Session>,
-    pub cols: u16,
-    pub rows: u16,
-    /// Whether output is passed to an outer terminal; see [`Expect`].
-    passthrough: bool,
 }
 
-impl Attachment {
-    pub fn new(incarnation: &str, continuation: usize) -> Self {
+impl<H: Handler + Default> Default for Attachment<H> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<H: Handler + Default> Attachment<H> {
+    pub fn new() -> Self {
         Attachment {
-            incarnation: incarnation.into(),
-            continuation,
+            incarnation: String::new(),
+            continuation: 0,
+            next: None,
             state: State::Opening,
             cursor: Cursor {
                 offset: 0,
                 marker: 0,
             },
             session: None,
-            cols: 0,
-            rows: 0,
-            passthrough: false,
         }
     }
 
-    pub fn cursor(&self) -> Cursor {
-        self.cursor
+    /// Records the server an `OPEN` is about to go to; its incarnation
+    /// becomes the cursor's once that `ATTACHED` arrives.
+    pub fn open_on(&mut self, welcome: &Welcome) {
+        self.next = Some((
+            welcome.incarnation.clone(),
+            welcome.limits.continuation as usize,
+        ));
     }
 
     /// The cursor to resume from, once the terminal reflects the stream.
@@ -98,28 +109,16 @@ impl Attachment {
         }
     }
 
-    pub fn bootstrapping(&self) -> bool {
-        matches!(self.state, State::Bootstrapping { .. })
-    }
-
     pub fn ended(&self) -> bool {
-        matches!(self.state, State::Ended(_))
+        matches!(self.state, State::Ended)
     }
 
-    /// The local engine, once `SNAPSHOT_READY` has been reached.
-    pub fn term(&mut self) -> Option<&mut Terminal<Expect>> {
+    /// The local engine, once `READY` has been decoded.
+    pub fn term(&mut self) -> Option<&mut Terminal<H>> {
         match &mut self.state {
-            State::Opening => None,
             State::Bootstrapping { decoder, .. } => decoder.terminal(),
-            State::Streaming(term) | State::Ended(Some(term)) => Some(term),
-            State::Ended(None) => None,
-        }
-    }
-
-    pub fn set_passthrough(&mut self, passthrough: bool) {
-        self.passthrough = passthrough;
-        if let Some(term) = self.term() {
-            term.handler_mut().passthrough = passthrough;
+            State::Streaming(term) => Some(term),
+            State::Opening | State::Ended => None,
         }
     }
 
@@ -134,17 +133,18 @@ impl Attachment {
         match kind {
             FrameType::Attached => {
                 let attached: Attached = frame.json()?;
+                if let Some((incarnation, continuation)) = self.next.take() {
+                    self.incarnation = incarnation;
+                    self.continuation = continuation;
+                }
                 self.cursor = Cursor {
                     offset: attached.offset,
                     marker: attached.marker,
                 };
-                self.cols = attached.cols;
-                self.rows = attached.rows;
                 self.session = Some(attached.session);
                 match attached.mode {
                     AttachMode::Snapshot => {
-                        let mut decoder =
-                            Decoder::with_handler(Expect::new(self.passthrough)).map_err(engine)?;
+                        let mut decoder = Decoder::with_handler(H::default()).map_err(engine)?;
                         decoder
                             .set_max_continuation_bytes(self.continuation)
                             .map_err(engine)?;
@@ -183,12 +183,14 @@ impl Attachment {
                 }
             }
             FrameType::SnapshotEnd => {
-                let State::Bootstrapping { decoder, held } =
+                if !matches!(self.state, State::Bootstrapping { .. }) {
+                    return Err(Error::Protocol("SNAPSHOT_END outside a bootstrap".into()));
+                }
+                let State::Bootstrapping { mut decoder, held } =
                     std::mem::replace(&mut self.state, State::Opening)
                 else {
-                    return Err(Error::Protocol("SNAPSHOT_END outside a bootstrap".into()));
+                    unreachable!()
                 };
-                let mut decoder = decoder;
                 while decoder.step_available() && decoder.next_page().map_err(engine)? {}
                 let term = decoder
                     .into_terminal()
@@ -200,7 +202,7 @@ impl Attachment {
             }
             FrameType::Output | FrameType::Resized | FrameType::Exited => {
                 if let State::Bootstrapping { held, .. } = &mut self.state
-                    && (!held.is_empty() || kind == FrameType::Resized)
+                    && (!held.is_empty() || kind != FrameType::Output)
                 {
                     held.push(frame);
                     return Ok(());
@@ -214,7 +216,7 @@ impl Attachment {
             }
             FrameType::Closed => {
                 let closed: Closed = frame.json()?;
-                self.end();
+                self.state = State::Ended;
                 actions.push(Action::Closed(closed.reason));
             }
             FrameType::Error => {
@@ -225,7 +227,7 @@ impl Attachment {
                         | proto::ErrorCode::NotRunning
                         | proto::ErrorCode::InputOverflow
                 ) {
-                    self.end();
+                    self.state = State::Ended;
                 }
                 actions.push(Action::Error(error));
             }
@@ -261,8 +263,6 @@ impl Attachment {
                     term.resize(resized.cols, resized.rows, 0, 0)
                         .map_err(engine)?;
                 }
-                self.cols = resized.cols;
-                self.rows = resized.rows;
                 actions.push(Action::Resized {
                     cols: resized.cols,
                     rows: resized.rows,
@@ -271,7 +271,7 @@ impl Attachment {
             FrameType::Exited => {
                 let exited: Exited = frame.json()?;
                 self.check_marker(exited.seq, exited.offset)?;
-                self.end();
+                self.state = State::Ended;
                 actions.push(Action::Exited(exited.exit));
             }
             _ => unreachable!("only stream frames reach here"),
@@ -290,15 +290,6 @@ impl Attachment {
         self.cursor.marker = seq;
         Ok(())
     }
-
-    fn end(&mut self) {
-        let term = match std::mem::replace(&mut self.state, State::Opening) {
-            State::Streaming(term) | State::Ended(Some(term)) => Some(term),
-            State::Bootstrapping { decoder, .. } => decoder.into_terminal(),
-            State::Opening | State::Ended(None) => None,
-        };
-        self.state = State::Ended(term);
-    }
 }
 
 fn engine(err: ghostty_vt::Error) -> Error {
@@ -309,7 +300,7 @@ fn engine(err: ghostty_vt::Error) -> Error {
 mod tests {
     use super::*;
     use ghostty_vt::snapshot;
-    use proto::{Header, Status};
+    use proto::{Header, Limits, Status};
 
     fn frame(frame_type: FrameType, payload: Vec<u8>) -> Frame {
         Frame {
@@ -324,6 +315,20 @@ mod tests {
 
     fn json(frame_type: FrameType, body: &impl serde::Serialize) -> Frame {
         frame(frame_type, serde_json::to_vec(body).unwrap())
+    }
+
+    fn welcome(incarnation: &str) -> Welcome {
+        Welcome {
+            version: 1,
+            server: proto::Peer {
+                name: "test".into(),
+                version: "0".into(),
+            },
+            engine: ghostty_vt::ENGINE.into(),
+            incarnation: incarnation.into(),
+            capabilities: vec![],
+            limits: Limits::default(),
+        }
     }
 
     fn session(cols: u16, rows: u16) -> Session {
@@ -349,7 +354,21 @@ mod tests {
         }
     }
 
-    fn text(term: &Terminal<Expect>) -> String {
+    fn attached(offset: u64, marker: u64, _bytes: &[u8]) -> Frame {
+        json(
+            FrameType::Attached,
+            &Attached {
+                mode: AttachMode::Snapshot,
+                offset,
+                marker,
+                cols: 10,
+                rows: 3,
+                session: session(10, 3),
+            },
+        )
+    }
+
+    fn text(term: &Terminal) -> String {
         let out = ghostty_vt::formatter::format(
             term,
             ghostty_vt::formatter::Options {
@@ -361,27 +380,20 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
+    fn snapshot_of(lines: &[u8]) -> Vec<u8> {
+        let mut source = Terminal::new(10, 3).unwrap();
+        source.vt_write(lines);
+        snapshot::encode(&source).unwrap()
+    }
+
     #[test]
     fn bootstraps_holds_after_resize_and_resumes() {
-        let mut source = Terminal::new(10, 3).unwrap();
-        source.vt_write(b"one\r\ntwo\r\n");
-        let bytes = snapshot::encode(&source).unwrap();
+        let bytes = snapshot_of(b"one\r\ntwo\r\n");
         let ready = snapshot::ready_end(&bytes).unwrap();
 
-        let mut a = Attachment::new("inc", 1 << 20);
-        let attached = Attached {
-            mode: AttachMode::Snapshot,
-            offset: 100,
-            marker: 2,
-            cols: 10,
-            rows: 3,
-            session: session(10, 3),
-        };
-        assert_eq!(
-            a.handle(json(FrameType::Attached, &attached)).unwrap(),
-            vec![]
-        );
-        assert!(a.bootstrapping());
+        let mut a: Attachment = Attachment::new();
+        a.open_on(&welcome("inc"));
+        assert_eq!(a.handle(attached(100, 2, &bytes)).unwrap(), vec![]);
         // The snapshot arrives in two pieces: the READY part split oddly,
         // then the rest.
         assert_eq!(
@@ -464,8 +476,61 @@ mod tests {
     }
 
     #[test]
+    fn exited_during_a_bootstrap_waits_for_snapshot_end() {
+        let bytes = snapshot_of(b"one\r\ntwo\r\n");
+        let ready = snapshot::ready_end(&bytes).unwrap();
+        let mut a: Attachment = Attachment::new();
+        a.open_on(&welcome("inc"));
+        a.handle(attached(100, 0, &bytes)).unwrap();
+        assert_eq!(
+            a.handle(frame(FrameType::Snapshot, bytes[..ready].to_vec()))
+                .unwrap(),
+            vec![Action::Screen]
+        );
+        a.handle(frame(FrameType::SnapshotReady, vec![])).unwrap();
+        let exited = Exited {
+            seq: 1,
+            offset: 100,
+            exit: Exit::Code { code: 3 },
+        };
+        assert_eq!(a.handle(json(FrameType::Exited, &exited)).unwrap(), vec![]);
+        assert!(!a.ended(), "held until the history has arrived");
+        a.handle(frame(FrameType::Snapshot, bytes[ready..].to_vec()))
+            .unwrap();
+        assert_eq!(
+            a.handle(frame(FrameType::SnapshotEnd, vec![])).unwrap(),
+            vec![Action::Exited(Exit::Code { code: 3 })]
+        );
+        assert!(a.ended());
+        // Nothing more is accepted on an ended attachment.
+        assert!(a.handle(frame(FrameType::SnapshotEnd, vec![])).is_err());
+        assert!(a.ended());
+    }
+
+    #[test]
+    fn the_cursor_keeps_the_incarnation_it_was_obtained_under() {
+        let bytes = snapshot_of(b"");
+        let mut a: Attachment = Attachment::new();
+        a.open_on(&welcome("first"));
+        a.handle(attached(7, 0, &bytes)).unwrap();
+        a.handle(frame(FrameType::Snapshot, bytes.clone())).unwrap();
+        a.handle(frame(FrameType::SnapshotReady, vec![])).unwrap();
+        a.handle(frame(FrameType::SnapshotEnd, vec![])).unwrap();
+        assert_eq!(a.resume().unwrap().incarnation, "first");
+        // Reconnected to a restarted server: the resume offered carries
+        // the old incarnation until the new ATTACHED arrives.
+        a.open_on(&welcome("second"));
+        assert_eq!(a.resume().unwrap().incarnation, "first");
+        a.handle(attached(0, 0, &bytes)).unwrap();
+        a.handle(frame(FrameType::Snapshot, bytes.clone())).unwrap();
+        a.handle(frame(FrameType::SnapshotReady, vec![])).unwrap();
+        a.handle(frame(FrameType::SnapshotEnd, vec![])).unwrap();
+        assert_eq!(a.resume().unwrap().incarnation, "second");
+    }
+
+    #[test]
     fn gap_discards_and_errors_classify() {
-        let mut a = Attachment::new("inc", 1 << 20);
+        let mut a: Attachment = Attachment::new();
         let gap = Gap { from: 1, to: 9 };
         assert_eq!(
             a.handle(json(FrameType::Gap, &gap)).unwrap(),

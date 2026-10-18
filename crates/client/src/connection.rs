@@ -27,6 +27,8 @@ pub enum Error {
     Server(ErrorMessage),
     /// The connection is closed.
     Closed,
+    /// A caller's mistake, reported as given.
+    Usage(String),
 }
 
 impl fmt::Display for Error {
@@ -34,8 +36,12 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "{e}"),
             Error::Protocol(m) => write!(f, "protocol error: {m}"),
-            Error::Server(e) => write!(f, "{:?}: {}", e.code, e.message),
+            Error::Server(e) => {
+                let code = serde_json::to_value(e.code).expect("serializable");
+                write!(f, "{}: {}", code.as_str().unwrap_or("error"), e.message)
+            }
             Error::Closed => write!(f, "connection closed"),
+            Error::Usage(m) => write!(f, "{m}"),
         }
     }
 }
@@ -55,7 +61,7 @@ impl From<ErrorMessage> for Error {
 }
 
 /// One received frame.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Frame {
     pub header: Header,
     pub payload: Vec<u8>,
@@ -74,7 +80,25 @@ struct Routes {
     channels: HashMap<u32, mpsc::UnboundedSender<Frame>>,
     events: Option<mpsc::UnboundedSender<Event>>,
     /// Set once the reader ended.
-    closed: Option<String>,
+    closed: Option<Ended>,
+}
+
+/// Why a connection ended.
+#[derive(Debug, Clone)]
+enum Ended {
+    /// The server sent an `ERROR` without id.
+    Server(ErrorMessage),
+    /// The stream ended or broke.
+    Lost(String),
+}
+
+impl From<&Ended> for Error {
+    fn from(ended: &Ended) -> Self {
+        match ended {
+            Ended::Server(error) => Error::Server(error.clone()),
+            Ended::Lost(reason) => Error::Protocol(reason.clone()),
+        }
+    }
 }
 
 pub struct Connection {
@@ -220,24 +244,35 @@ impl Connection {
         serde_json::from_value(value).map_err(|e| Error::Protocol(format!("{method} reply: {e}")))
     }
 
-    /// Opens `channel` and returns the frames the server sends on it.
-    /// The channel stays routed until [`Connection::release`].
+    /// Opens `channel` and returns the frames the server sends on it. The
+    /// receiver ends when the connection does.
     pub fn open(&self, channel: u32, open: &Open) -> Result<mpsc::UnboundedReceiver<Frame>, Error> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.routes.lock().unwrap().channels.insert(channel, tx);
+        {
+            let mut routes = self.routes.lock().unwrap();
+            if routes.closed.is_some() {
+                return Err(Error::Closed);
+            }
+            routes.channels.insert(channel, tx);
+        }
         self.send_json(FrameType::Open, channel, open)?;
         Ok(rx)
     }
 
-    pub fn release(&self, channel: u32) {
-        self.routes.lock().unwrap().channels.remove(&channel);
-    }
-
     /// The sink for `EVENT` frames; `subscribe` must be requested too.
+    /// The receiver ends when the connection does.
     pub fn events(&self) -> mpsc::UnboundedReceiver<Event> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.routes.lock().unwrap().events = Some(tx);
+        let mut routes = self.routes.lock().unwrap();
+        if routes.closed.is_none() {
+            routes.events = Some(tx);
+        }
         rx
+    }
+
+    /// Why the connection ended, once it has.
+    pub fn ended(&self) -> Option<Error> {
+        self.routes.lock().unwrap().closed.as_ref().map(Error::from)
     }
 
     /// Resolves once the connection has ended, with the reason.
@@ -246,8 +281,8 @@ impl Connection {
             let notified = self.ended.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(reason) = &self.routes.lock().unwrap().closed {
-                return Error::Protocol(reason.clone());
+            if let Some(error) = self.ended() {
+                return error;
             }
             notified.await;
         }
@@ -271,12 +306,12 @@ async fn read_loop<R: AsyncRead + Unpin>(
                 continue;
             }
             Ok(None) => {}
-            Err(err) => break err.to_string(),
+            Err(err) => break Ended::Lost(err.to_string()),
         }
         match reader.read(&mut buf).await {
-            Ok(0) => break "connection closed by the server".to_string(),
+            Ok(0) => break Ended::Lost("connection closed by the server".into()),
             Ok(n) => decoder.push(&buf[..n]),
-            Err(err) => break err.to_string(),
+            Err(err) => break Ended::Lost(err.to_string()),
         }
     };
     let mut routes = routes.lock().unwrap();
@@ -288,7 +323,8 @@ async fn read_loop<R: AsyncRead + Unpin>(
 }
 
 /// Delivers one frame; an error ends the connection.
-fn route(routes: &Mutex<Routes>, frame: Frame) -> Result<(), String> {
+fn route(routes: &Mutex<Routes>, frame: Frame) -> Result<(), Ended> {
+    let lost = |e: Error| Ended::Lost(e.to_string());
     let mut routes = routes.lock().unwrap();
     let channel = frame.header.channel;
     if channel != 0 {
@@ -301,29 +337,33 @@ fn route(routes: &Mutex<Routes>, frame: Frame) -> Result<(), String> {
     }
     match frame.header.frame_type {
         FrameType::Reply => {
-            let reply: proto::Reply = frame.json().map_err(|e| e.to_string())?;
+            let reply: proto::Reply = frame.json().map_err(lost)?;
+            // A reply or error for a request no longer waited for is dropped.
             if let Some(tx) = routes.pending.remove(&reply.id) {
                 let _ = tx.send(Ok(reply.result));
             }
         }
         FrameType::Error => {
-            let error: ErrorMessage = frame.json().map_err(|e| e.to_string())?;
-            match error.id.and_then(|id| routes.pending.remove(&id)) {
-                Some(tx) => {
-                    let _ = tx.send(Err(error));
+            let error: ErrorMessage = frame.json().map_err(lost)?;
+            match error.id {
+                Some(id) => {
+                    if let Some(tx) = routes.pending.remove(&id) {
+                        let _ = tx.send(Err(error));
+                    }
                 }
-                None => return Err(format!("{:?}: {}", error.code, error.message)),
+                // An error without id precedes the server closing.
+                None => return Err(Ended::Server(error)),
             }
         }
         FrameType::Event => {
-            let event: Event = frame.json().map_err(|e| e.to_string())?;
+            let event: Event = frame.json().map_err(lost)?;
             if let Some(tx) = &routes.events
                 && tx.send(event).is_err()
             {
                 routes.events = None;
             }
         }
-        other => return Err(format!("{other:?} on channel 0")),
+        other => return Err(Ended::Lost(format!("{other:?} on channel 0"))),
     }
     Ok(())
 }

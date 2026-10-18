@@ -16,6 +16,7 @@ client = { workspace = true }
 ghostty-vt = { workspace = true }
 proto = { workspace = true }
 rustix = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 server = { workspace = true }
 tokio = { workspace = true }
