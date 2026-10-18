@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use crate::formatter::{self, Format, Options};
 use crate::snapshot;
@@ -116,17 +115,17 @@ struct Recorder {
     clipboard: Vec<ClipboardContent>,
 }
 
-struct Shared(Rc<RefCell<Recorder>>);
+struct Shared(Arc<Mutex<Recorder>>);
 
 impl Handler for Shared {
     fn write_pty(&mut self, data: &[u8]) {
-        self.0.borrow_mut().pty.extend_from_slice(data);
+        self.0.lock().unwrap().pty.extend_from_slice(data);
     }
     fn program_status(&mut self, report: ProgramStatus) {
-        self.0.borrow_mut().statuses.push(report);
+        self.0.lock().unwrap().statuses.push(report);
     }
     fn semantic_prompt(&mut self, event: SemanticPrompt) {
-        self.0.borrow_mut().prompts.push(event.kind);
+        self.0.lock().unwrap().prompts.push(event.kind);
     }
     fn color_scheme(&mut self) -> Option<ColorScheme> {
         Some(ColorScheme::Dark)
@@ -144,21 +143,22 @@ impl Handler for Shared {
         _location: ClipboardLocation,
         contents: &[ClipboardContent],
     ) -> bool {
-        self.0.borrow_mut().clipboard.extend_from_slice(contents);
+        self.0.lock().unwrap().clipboard.extend_from_slice(contents);
         true
     }
     fn resize_window(&mut self, cols: u16, rows: u16) {
-        self.0.borrow_mut().resize = Some((cols, rows));
+        self.0.lock().unwrap().resize = Some((cols, rows));
     }
     fn title_changed(&mut self, term: &Term) {
-        self.0.borrow_mut().titles.push(term.title());
+        self.0.lock().unwrap().titles.push(term.title());
     }
 }
 
-fn recorded() -> (Terminal, Rc<RefCell<Recorder>>) {
-    let rec = Rc::new(RefCell::new(Recorder::default()));
-    let mut term = Terminal::new(80, 24).unwrap();
-    term.set_handler(Box::new(Shared(rec.clone())));
+fn recorded() -> (Terminal<Shared>, Arc<Mutex<Recorder>>) {
+    let rec = Arc::new(Mutex::new(Recorder::default()));
+    let term = Terminal::new(80, 24)
+        .unwrap()
+        .with_handler(Shared(rec.clone()));
     (term, rec)
 }
 
@@ -168,26 +168,26 @@ fn effects_reach_the_handler() {
     term.set_xtversion("clankermux test");
     term.vt_write(b"\x1b[c");
     assert!(
-        rec.borrow().pty.starts_with(b"\x1b[?"),
+        rec.lock().unwrap().pty.starts_with(b"\x1b[?"),
         "DA1 answer: {:?}",
-        rec.borrow().pty
+        rec.lock().unwrap().pty
     );
-    rec.borrow_mut().pty.clear();
+    rec.lock().unwrap().pty.clear();
 
     term.vt_write(b"\x1b[>q");
-    assert_eq!(rec.borrow().pty, b"\x1bP>|clankermux test\x1b\\");
-    rec.borrow_mut().pty.clear();
+    assert_eq!(rec.lock().unwrap().pty, b"\x1bP>|clankermux test\x1b\\");
+    rec.lock().unwrap().pty.clear();
 
     term.vt_write(b"\x1b[?996n");
-    assert_eq!(rec.borrow().pty, b"\x1b[?997;1n");
-    rec.borrow_mut().pty.clear();
+    assert_eq!(rec.lock().unwrap().pty, b"\x1b[?997;1n");
+    rec.lock().unwrap().pty.clear();
 
     term.vt_write(b"\x1b[18t");
-    assert_eq!(rec.borrow().pty, b"\x1b[8;24;80t");
+    assert_eq!(rec.lock().unwrap().pty, b"\x1b[8;24;80t");
 
     term.vt_write(b"\x1b]7501;state=working:id=abc:title=QnVpbGQ=\x07");
     {
-        let statuses = &rec.borrow().statuses;
+        let statuses = &rec.lock().unwrap().statuses;
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].state, ProgramStatusState::Working);
         assert_eq!(statuses[0].id, "abc");
@@ -195,16 +195,19 @@ fn effects_reach_the_handler() {
     }
 
     term.vt_write(b"\x1b]133;A\x07");
-    assert_eq!(rec.borrow().prompts, [SemanticPromptKind::PromptStart]);
+    assert_eq!(
+        rec.lock().unwrap().prompts,
+        [SemanticPromptKind::PromptStart]
+    );
 
     term.vt_write(b"\x1b]2;new title\x07");
-    assert_eq!(rec.borrow().titles, ["new title"]);
+    assert_eq!(rec.lock().unwrap().titles, ["new title"]);
 
     term.vt_write(b"\x1b[8;30;100t");
-    assert_eq!(rec.borrow().resize, Some((100, 30)));
+    assert_eq!(rec.lock().unwrap().resize, Some((100, 30)));
 
     term.vt_write(b"\x1b]52;c;aGVsbG8=\x07");
-    let clipboard = &rec.borrow().clipboard;
+    let clipboard = &rec.lock().unwrap().clipboard;
     assert_eq!(clipboard.len(), 1);
     assert_eq!(clipboard[0].data, b"hello");
 }

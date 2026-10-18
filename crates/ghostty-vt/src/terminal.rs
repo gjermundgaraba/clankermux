@@ -34,7 +34,7 @@ pub enum Screen {
 
 /// Answer to a size query: the grid size in cells and the cell size in
 /// pixels, zero when unknown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SizeReport {
     pub cols: u16,
     pub rows: u16,
@@ -105,7 +105,7 @@ pub struct ClipboardContent {
 /// default that ignores the effect, except that clipboard writes are
 /// denied. The engine calls these from `extern "C"` trampolines, so a panic
 /// in a handler aborts the process.
-pub trait Handler: 'static {
+pub trait Handler: Send + 'static {
     /// Bytes the terminal wants written to the PTY: query answers and mode
     /// reports.
     fn write_pty(&mut self, _data: &[u8]) {}
@@ -137,8 +137,8 @@ pub trait Handler: 'static {
 
 impl Handler for () {}
 
-struct Slot {
-    handler: Box<dyn Handler>,
+struct Slot<H> {
+    handler: H,
     xtversion: Vec<u8>,
 }
 
@@ -239,21 +239,26 @@ impl Term {
 }
 
 /// An owned terminal with its effect handler.
-pub struct Terminal {
+pub struct Terminal<H: Handler = ()> {
     term: Term,
     /// Heap slot the callbacks reach through userdata; a raw pointer so
     /// that Rust-side access and the callbacks share one provenance.
-    slot: *mut Slot,
+    slot: *mut Slot<H>,
 }
 
-impl std::ops::Deref for Terminal {
+// SAFETY: libghostty-vt keeps no thread-local state, so a terminal may be
+// used from any thread as long as calls are serialized, which `&mut`
+// access guarantees. The handler is `Send` by its trait bound.
+unsafe impl<H: Handler> Send for Terminal<H> {}
+
+impl<H: Handler> std::ops::Deref for Terminal<H> {
     type Target = Term;
     fn deref(&self) -> &Term {
         &self.term
     }
 }
 
-impl Terminal {
+impl Terminal<()> {
     pub fn new(cols: u16, rows: u16) -> Result<Self> {
         let mut raw = ptr::null_mut();
         // SAFETY: a null allocator selects the default allocator.
@@ -262,12 +267,19 @@ impl Terminal {
         Ok(unsafe { Self::from_raw(raw) })
     }
 
-    /// Wraps a caller-owned raw terminal and installs the effect callbacks.
+    /// Wraps a caller-owned raw terminal.
     pub(crate) unsafe fn from_raw(raw: sys::GhosttyTerminal) -> Self {
-        let slot = Box::into_raw(Box::new(Slot {
-            handler: Box::new(()),
-            xtversion: Vec::new(),
-        }));
+        // SAFETY: forwarded from the caller.
+        unsafe { Terminal::install(raw, (), Vec::new()) }
+    }
+}
+
+impl<H: Handler> Terminal<H> {
+    /// Installs `handler` and the effect callbacks on a caller-owned raw
+    /// terminal.
+    unsafe fn install(raw: sys::GhosttyTerminal, handler: H, xtversion: Vec<u8>) -> Self {
+        let has_xtversion = !xtversion.is_empty();
+        let slot = Box::into_raw(Box::new(Slot { handler, xtversion }));
         // SAFETY: the slot lives as long as the terminal, and each callback
         // pointer has the type the option documents.
         unsafe {
@@ -275,45 +287,60 @@ impl Terminal {
             set_fn(
                 raw,
                 sys::GHOSTTY_TERMINAL_OPT_WRITE_PTY,
-                cb::write_pty as *const (),
+                cb::write_pty::<H> as *const (),
             );
             set_fn(
                 raw,
                 sys::GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS,
-                cb::program_status as *const (),
+                cb::program_status::<H> as *const (),
             );
             set_fn(
                 raw,
                 sys::GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT,
-                cb::semantic_prompt as *const (),
+                cb::semantic_prompt::<H> as *const (),
             );
             set_fn(
                 raw,
                 sys::GHOSTTY_TERMINAL_OPT_COLOR_SCHEME,
-                cb::color_scheme as *const (),
+                cb::color_scheme::<H> as *const (),
             );
-            set_fn(raw, sys::GHOSTTY_TERMINAL_OPT_SIZE, cb::size as *const ());
+            set_fn(
+                raw,
+                sys::GHOSTTY_TERMINAL_OPT_SIZE,
+                cb::size::<H> as *const (),
+            );
             set_fn(
                 raw,
                 sys::GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE,
-                cb::clipboard_write as *const (),
+                cb::clipboard_write::<H> as *const (),
             );
             set_fn(
                 raw,
                 sys::GHOSTTY_TERMINAL_OPT_RESIZE_WINDOW,
-                cb::resize_window as *const (),
+                cb::resize_window::<H> as *const (),
             );
             set_fn(
                 raw,
                 sys::GHOSTTY_TERMINAL_OPT_TITLE_CHANGED,
-                cb::title_changed as *const (),
+                cb::title_changed::<H> as *const (),
             );
             set_fn(
                 raw,
                 sys::GHOSTTY_TERMINAL_OPT_PWD_CHANGED,
-                cb::pwd_changed as *const (),
+                cb::pwd_changed::<H> as *const (),
             );
-            set_fn(raw, sys::GHOSTTY_TERMINAL_OPT_BELL, cb::bell as *const ());
+            set_fn(
+                raw,
+                sys::GHOSTTY_TERMINAL_OPT_BELL,
+                cb::bell::<H> as *const (),
+            );
+            if has_xtversion {
+                set_fn(
+                    raw,
+                    sys::GHOSTTY_TERMINAL_OPT_XTVERSION,
+                    cb::xtversion::<H> as *const (),
+                );
+            }
         }
         Terminal {
             term: Term(raw),
@@ -321,25 +348,47 @@ impl Terminal {
         }
     }
 
-    fn slot(&mut self) -> &mut Slot {
+    fn slot(&self) -> &Slot<H> {
         // SAFETY: the slot is live until Drop, and the library only reaches
         // it during calls that take `&mut self`.
+        unsafe { &*self.slot }
+    }
+
+    fn slot_mut(&mut self) -> &mut Slot<H> {
+        // SAFETY: as in `slot`.
         unsafe { &mut *self.slot }
     }
 
-    pub fn set_handler(&mut self, handler: Box<dyn Handler>) {
-        self.slot().handler = handler;
+    /// Replaces the handler, keeping the terminal state.
+    pub fn with_handler<N: Handler>(self, handler: N) -> Terminal<N> {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped, so the slot is freed exactly once
+        // here and the raw terminal is adopted by the new wrapper.
+        let slot = unsafe { Box::from_raw(this.slot) };
+        let raw = this.term.0;
+        let xtversion = slot.xtversion.clone();
+        drop(slot);
+        // SAFETY: raw is the caller-owned terminal this wrapper held.
+        unsafe { Terminal::install(raw, handler, xtversion) }
+    }
+
+    pub fn handler(&self) -> &H {
+        &self.slot().handler
+    }
+
+    pub fn handler_mut(&mut self) -> &mut H {
+        &mut self.slot_mut().handler
     }
 
     /// Answer to XTVERSION.
     pub fn set_xtversion(&mut self, version: &str) {
-        self.slot().xtversion = version.as_bytes().to_vec();
+        self.slot_mut().xtversion = version.as_bytes().to_vec();
         // SAFETY: the callback reads the slot's xtversion, which the slot owns.
         unsafe {
             set_fn(
                 self.term.0,
                 sys::GHOSTTY_TERMINAL_OPT_XTVERSION,
-                cb::xtversion as *const (),
+                cb::xtversion::<H> as *const (),
             )
         };
     }
@@ -408,7 +457,7 @@ impl Terminal {
     }
 }
 
-impl Drop for Terminal {
+impl<H: Handler> Drop for Terminal<H> {
     fn drop(&mut self) {
         // SAFETY: the terminal was created by the library and is freed once,
         // before the slot its callbacks point at, which Box::into_raw made.
@@ -428,12 +477,12 @@ unsafe fn set_fn(raw: sys::GhosttyTerminal, option: sys::GhosttyTerminalOption, 
 mod cb {
     use super::*;
 
-    unsafe fn slot<'a>(userdata: *mut c_void) -> &'a mut Slot {
-        // SAFETY: userdata is the Slot installed by Terminal::from_raw.
-        unsafe { &mut *(userdata as *mut Slot) }
+    unsafe fn slot<'a, H: Handler>(userdata: *mut c_void) -> &'a mut Slot<H> {
+        // SAFETY: userdata is the Slot<H> installed by Terminal::install.
+        unsafe { &mut *(userdata as *mut Slot<H>) }
     }
 
-    pub(super) unsafe extern "C" fn write_pty(
+    pub(super) unsafe extern "C" fn write_pty<H: Handler>(
         _t: sys::GhosttyTerminal,
         ud: *mut c_void,
         data: *const u8,
@@ -441,10 +490,10 @@ mod cb {
     ) {
         // SAFETY: data points at len bytes for this call.
         let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-        unsafe { slot(ud) }.handler.write_pty(bytes);
+        unsafe { slot::<H>(ud) }.handler.write_pty(bytes);
     }
 
-    pub(super) unsafe extern "C" fn program_status(
+    pub(super) unsafe extern "C" fn program_status<H: Handler>(
         _t: sys::GhosttyTerminal,
         ud: *mut c_void,
         report: *const sys::GhosttyTerminalProgramStatus,
@@ -477,10 +526,10 @@ mod cb {
                 message: string(&r.message),
             }
         };
-        unsafe { slot(ud) }.handler.program_status(status);
+        unsafe { slot::<H>(ud) }.handler.program_status(status);
     }
 
-    pub(super) unsafe extern "C" fn semantic_prompt(
+    pub(super) unsafe extern "C" fn semantic_prompt<H: Handler>(
         _t: sys::GhosttyTerminal,
         ud: *mut c_void,
         event: *const sys::GhosttyTerminalSemanticPrompt,
@@ -500,15 +549,15 @@ mod cb {
             // SAFETY: the string is valid for this call.
             command: unsafe { string(&e.command) },
         };
-        unsafe { slot(ud) }.handler.semantic_prompt(prompt);
+        unsafe { slot::<H>(ud) }.handler.semantic_prompt(prompt);
     }
 
-    pub(super) unsafe extern "C" fn color_scheme(
+    pub(super) unsafe extern "C" fn color_scheme<H: Handler>(
         _t: sys::GhosttyTerminal,
         ud: *mut c_void,
         out: *mut sys::GhosttyColorScheme,
     ) -> bool {
-        match unsafe { slot(ud) }.handler.color_scheme() {
+        match unsafe { slot::<H>(ud) }.handler.color_scheme() {
             Some(scheme) => {
                 // SAFETY: out is a valid output pointer for this call.
                 unsafe {
@@ -523,12 +572,12 @@ mod cb {
         }
     }
 
-    pub(super) unsafe extern "C" fn size(
+    pub(super) unsafe extern "C" fn size<H: Handler>(
         _t: sys::GhosttyTerminal,
         ud: *mut c_void,
         out: *mut sys::GhosttySizeReportSize,
     ) -> bool {
-        match unsafe { slot(ud) }.handler.size() {
+        match unsafe { slot::<H>(ud) }.handler.size() {
             Some(size) => {
                 // SAFETY: out is a valid output pointer for this call.
                 unsafe {
@@ -545,7 +594,7 @@ mod cb {
         }
     }
 
-    pub(super) unsafe extern "C" fn clipboard_write(
+    pub(super) unsafe extern "C" fn clipboard_write<H: Handler>(
         _t: sys::GhosttyTerminal,
         ud: *mut c_void,
         write: *const sys::GhosttyClipboardWrite,
@@ -573,13 +622,17 @@ mod cb {
                 })
                 .collect()
         };
-        unsafe { slot(ud) }
+        let applied = unsafe { slot::<H>(ud) }
             .handler
             .clipboard_write(location, &contents);
         if let Some(reply) = w.reply {
             let answer = sys::GhosttyClipboardWriteReply {
                 size: size_of::<sys::GhosttyClipboardWriteReply>(),
-                result: sys::GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS,
+                result: if applied {
+                    sys::GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS
+                } else {
+                    sys::GHOSTTY_CLIPBOARD_WRITE_RESULT_DENIED
+                },
                 remember: false,
             };
             // SAFETY: the request requires exactly this reply call during
@@ -588,7 +641,7 @@ mod cb {
         }
     }
 
-    pub(super) unsafe extern "C" fn resize_window(
+    pub(super) unsafe extern "C" fn resize_window<H: Handler>(
         _t: sys::GhosttyTerminal,
         ud: *mut c_void,
         request: *const sys::GhosttyTerminalResizeWindow,
@@ -598,29 +651,35 @@ mod cb {
         if r.tag == sys::GHOSTTY_TERMINAL_RESIZE_WINDOW_GRID {
             // SAFETY: the grid arm is active for this tag.
             let grid = unsafe { r.value.grid };
-            unsafe { slot(ud) }
+            unsafe { slot::<H>(ud) }
                 .handler
                 .resize_window(grid.columns, grid.rows);
         }
     }
 
-    pub(super) unsafe extern "C" fn title_changed(t: sys::GhosttyTerminal, ud: *mut c_void) {
-        unsafe { slot(ud) }.handler.title_changed(&Term(t));
+    pub(super) unsafe extern "C" fn title_changed<H: Handler>(
+        t: sys::GhosttyTerminal,
+        ud: *mut c_void,
+    ) {
+        unsafe { slot::<H>(ud) }.handler.title_changed(&Term(t));
     }
 
-    pub(super) unsafe extern "C" fn pwd_changed(t: sys::GhosttyTerminal, ud: *mut c_void) {
-        unsafe { slot(ud) }.handler.pwd_changed(&Term(t));
+    pub(super) unsafe extern "C" fn pwd_changed<H: Handler>(
+        t: sys::GhosttyTerminal,
+        ud: *mut c_void,
+    ) {
+        unsafe { slot::<H>(ud) }.handler.pwd_changed(&Term(t));
     }
 
-    pub(super) unsafe extern "C" fn bell(_t: sys::GhosttyTerminal, ud: *mut c_void) {
-        unsafe { slot(ud) }.handler.bell();
+    pub(super) unsafe extern "C" fn bell<H: Handler>(_t: sys::GhosttyTerminal, ud: *mut c_void) {
+        unsafe { slot::<H>(ud) }.handler.bell();
     }
 
-    pub(super) unsafe extern "C" fn xtversion(
+    pub(super) unsafe extern "C" fn xtversion<H: Handler>(
         _t: sys::GhosttyTerminal,
         ud: *mut c_void,
     ) -> sys::GhosttyString {
-        let v = &unsafe { slot(ud) }.xtversion;
+        let v = &unsafe { slot::<H>(ud) }.xtversion;
         sys::GhosttyString {
             ptr: v.as_ptr(),
             len: v.len(),
