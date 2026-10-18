@@ -6,17 +6,9 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use proto::Profile;
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL: u32 = 1;
-
-/// The cell size in pixels last reported, 0 when unknown.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Cell {
-    pub width: u32,
-    pub height: u32,
-}
 
 /// `session.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,8 +18,9 @@ pub struct ParkFile {
     pub parked_at: String,
     /// The session as `inspect` reports it, records included.
     pub session: proto::Session,
-    pub profile: Profile,
-    pub cell: Cell,
+    /// How many leading lines of `screen.txt` are history, the rest being
+    /// the screen; `read` takes `scrollback` from them.
+    pub history_lines: u64,
 }
 
 /// A session's newest complete park, as loaded at start.
@@ -65,6 +58,7 @@ pub fn write(
     screen: &str,
 ) -> io::Result<()> {
     let dir = sessions.join(&file.session.id);
+    let first = !dir.is_dir();
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -78,7 +72,9 @@ pub fn write(
         write_file(&temp.join(FILES[2]), screen.as_bytes())?;
         sync_dir(&temp)?;
         fs::rename(&temp, dir.join(generation.to_string()))?;
-        sync_dir(&dir)
+        sync_dir(&dir)?;
+        // The session's own directory entry is new too.
+        if first { sync_dir(sessions) } else { Ok(()) }
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&temp);
@@ -98,58 +94,79 @@ pub fn write(
 }
 
 /// Loads every session under `sessions`: the newest generation holding all
-/// three files; the others and any dot-directory are deleted, as is a
-/// session directory without a complete generation.
-pub fn load(sessions: &Path) -> io::Result<Vec<Loaded>> {
+/// three files and a readable `session.json`; the others and any
+/// dot-directory are deleted, as is a session directory left with
+/// nothing. A session that cannot be read is logged and skipped, never a
+/// reason not to start.
+pub fn load(sessions: &Path) -> Vec<Loaded> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(sessions) else {
-        return Ok(out);
+        return out;
     };
     for session_dir in entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
-        let mut generations: Vec<(u64, PathBuf)> = Vec::new();
-        for entry in fs::read_dir(&session_dir)?.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            match name.parse::<u64>() {
-                Ok(generation)
-                    if !name.starts_with('.') && FILES.iter().all(|f| path.join(f).is_file()) =>
-                {
-                    generations.push((generation, path));
-                }
-                _ => {
-                    let _ = fs::remove_dir_all(&path);
-                }
+        match load_session(&session_dir) {
+            Ok(Some(loaded)) => out.push(loaded),
+            Ok(None) => {
+                let _ = fs::remove_dir_all(&session_dir);
             }
-        }
-        generations.sort();
-        let Some((_, newest)) = generations.pop() else {
-            let _ = fs::remove_dir_all(&session_dir);
-            continue;
-        };
-        for (_, older) in generations {
-            let _ = fs::remove_dir_all(older);
-        }
-        let file: ParkFile = match fs::read(newest.join(FILES[0]))
-            .and_then(|b| serde_json::from_slice(&b).map_err(io::Error::other))
-        {
-            Ok(file) => file,
             Err(err) => {
-                tracing::warn!(path = %newest.display(), error = %err, "unreadable park file");
-                continue;
+                tracing::warn!(path = %session_dir.display(), error = %err, "park directory skipped");
             }
-        };
-        if file.protocol != PROTOCOL {
-            tracing::warn!(path = %newest.display(), protocol = file.protocol, "unknown park protocol");
-            continue;
         }
-        let screen = fs::read_to_string(newest.join(FILES[2]))?;
-        out.push(Loaded {
-            file,
-            screen,
-            snapshot_path: newest.join(FILES[1]),
-        });
     }
-    Ok(out)
+    out
+}
+
+/// The newest readable generation of one session, `None` when there is
+/// none left.
+fn load_session(session_dir: &Path) -> io::Result<Option<Loaded>> {
+    let mut generations: Vec<(u64, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(session_dir)?.flatten() {
+        let path = entry.path();
+        // A dot-directory is an unfinished park; its name does not parse.
+        match entry.file_name().to_string_lossy().parse::<u64>() {
+            Ok(generation) if FILES.iter().all(|f| path.join(f).is_file()) => {
+                generations.push((generation, path));
+            }
+            _ => {
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
+    }
+    generations.sort();
+    let mut chosen = None;
+    while let Some((_, newest)) = generations.pop() {
+        match read_generation(&newest) {
+            Ok(loaded) => {
+                chosen = Some(loaded);
+                break;
+            }
+            Err(err) => {
+                tracing::warn!(path = %newest.display(), error = %err, "unreadable park; deleted");
+                let _ = fs::remove_dir_all(&newest);
+            }
+        }
+    }
+    for (_, older) in generations {
+        let _ = fs::remove_dir_all(older);
+    }
+    Ok(chosen)
+}
+
+fn read_generation(dir: &Path) -> io::Result<Loaded> {
+    let file: ParkFile = serde_json::from_slice(&fs::read(dir.join(FILES[0]))?)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if file.protocol != PROTOCOL {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("park protocol {}", file.protocol),
+        ));
+    }
+    Ok(Loaded {
+        file,
+        screen: fs::read_to_string(dir.join(FILES[2]))?,
+        snapshot_path: dir.join(FILES[1]),
+    })
 }
 
 /// Deletes everything parked for `id`.

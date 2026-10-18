@@ -435,7 +435,7 @@ impl Connection {
             return None;
         }
         let session = handle.session()?;
-        if let Err((code, message)) = control::running(session.lock().unwrap().status) {
+        if let Err((code, message)) = session.lock().unwrap().running() {
             self.error(channel, code, message);
             return None;
         }
@@ -449,12 +449,12 @@ impl Connection {
         let pushed = session
             .lock()
             .unwrap()
-            .live()
-            .expect("a running session is live")
-            .input
-            .push(payload.to_vec());
-        if pushed.is_none() {
-            self.error(channel, ErrorCode::InputOverflow, "input queue full");
+            .running()
+            .map(|live| live.input.push(payload.to_vec()));
+        match pushed {
+            Err((code, message)) => self.error(channel, code, message),
+            Ok(None) => self.error(channel, ErrorCode::InputOverflow, "input queue full"),
+            Ok(Some(_)) => {}
         }
     }
 

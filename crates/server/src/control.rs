@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use base64::Engine as _;
-use proto::{ErrorCode, Event, Request, Size, Status, Viewport};
+use proto::{ErrorCode, Event, Request, Size, Viewport};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
@@ -17,14 +17,6 @@ const READ_REPLY_MARGIN: usize = 4096;
 fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
     serde_json::from_value(value)
         .map_err(|e| (ErrorCode::InvalidRequest, format!("bad params: {e}")))
-}
-
-pub(crate) fn running(status: Status) -> Result<(), Fail> {
-    if status == Status::Running {
-        Ok(())
-    } else {
-        Err((ErrorCode::NotRunning, "session is not running".into()))
-    }
 }
 
 /// Handles one request on a connection whose `subscribed` flag records
@@ -65,8 +57,7 @@ pub async fn handle(
             let session = registry.get(&id)?;
             let (pgid, slave) = {
                 let s = session.lock().unwrap();
-                running(s.status)?;
-                let live = s.live().expect("a running session is live");
+                let live = s.running()?;
                 (live.pgid, live.slave_path.clone())
             };
             if crate::pty::signal(pgid, &slave, signal) {
@@ -106,7 +97,7 @@ pub async fn handle(
             };
             session::check_size(&size)?;
             let session = registry.get(&p.session)?;
-            running(session.lock().unwrap().status)?;
+            session.lock().unwrap().running()?;
             let report = Report {
                 viewport: Viewport {
                     size,
@@ -144,7 +135,7 @@ pub async fn handle(
                     proto::Cursor { x, y }
                 }),
                 offset: info.offset,
-                status: s.status,
+                status: s.status(),
             }))
         }
         "write" => {
@@ -158,15 +149,13 @@ pub async fn handle(
                     )
                 })?;
             let session = registry.get(&p.session)?;
-            let wait = {
-                let s = session.lock().unwrap();
-                running(s.status)?;
-                s.live()
-                    .expect("a running session is live")
-                    .input
-                    .push(data)
-                    .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?
-            };
+            let wait = session
+                .lock()
+                .unwrap()
+                .running()?
+                .input
+                .push(data)
+                .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?;
             wait.await
                 .map_err(|_| internal("the PTY refused the bytes"))?;
             Ok(json!({}))

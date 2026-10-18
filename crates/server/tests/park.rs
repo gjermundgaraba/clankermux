@@ -23,22 +23,45 @@ fn sessions_dir(state: &std::path::Path) -> std::path::PathBuf {
     state.join("sessions")
 }
 
+/// The complete generation directories of `id`, oldest first.
+fn generations(state: &std::path::Path, id: &str) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(sessions_dir(state).join(id))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let generation = entry.file_name().to_string_lossy().parse().ok()?;
+                    entry
+                        .path()
+                        .join("screen.txt")
+                        .is_file()
+                        .then(|| (generation, entry.path()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
 /// Waits until a complete generation exists for `id`.
 async fn wait_parked(state: &std::path::Path, id: &str) -> std::path::PathBuf {
     for _ in 0..500 {
-        if let Ok(entries) = std::fs::read_dir(sessions_dir(state).join(id)) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !entry.file_name().to_string_lossy().starts_with('.')
-                    && path.join("screen.txt").is_file()
-                {
-                    return path;
-                }
-            }
+        if let Some(path) = generations(state, id).pop() {
+            return path;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("session {id} was not parked");
+}
+
+/// The `read` text of a session.
+async fn read(c: &mut Client, id: &str, scrollback: u32) -> Read {
+    serde_json::from_value(
+        c.ok("read", json!({"session": id, "scrollback": scrollback}))
+            .await,
+    )
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -63,7 +86,9 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
 
     a.registry.stop().await;
     assert_eq!(c.expect_closed(1).await, ClosedReason::Stopping);
-    let generation = wait_parked(&state, &session.id).await;
+    let generation = generations(&state, &session.id)
+        .pop()
+        .expect("parked by the stop");
     assert!(generation.join("session.json").is_file());
     assert!(generation.join("snapshot.ghostsnp").is_file());
     drop(c);
@@ -82,11 +107,7 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
     assert_eq!(restored.attachments, 0);
     assert!(restored.exit.is_none());
 
-    let read: Read = serde_json::from_value(
-        c.ok("read", json!({"session": session.id, "scrollback": 100}))
-            .await,
-    )
-    .unwrap();
+    let read = read(&mut c, &session.id, 100).await;
     assert!(read.text.contains("hello-park"), "{:?}", read.text);
     assert_eq!(read.status, Status::Restored);
     assert!(read.cursor.is_none(), "no cursor from a park file");
@@ -322,6 +343,7 @@ async fn loading_keeps_the_newest_complete_generation_only() {
         protocol: server::park::PROTOCOL,
         engine: ghostty_vt::ENGINE.into(),
         parked_at: "2026-10-18T00:00:00Z".into(),
+        history_lines: 1,
         session: Session {
             id: id.into(),
             label: "old".into(),
@@ -363,8 +385,6 @@ async fn loading_keeps_the_newest_complete_generation_only() {
                 },
             ]),
         },
-        profile: Profile::default(),
-        cell: server::park::Cell::default(),
     };
     let write = |generation: &str, files: &[&str]| {
         let g = session_dir.join(generation);
@@ -389,6 +409,7 @@ async fn loading_keeps_the_newest_complete_generation_only() {
     std::fs::create_dir_all(&other_dir).unwrap();
     let mut other = file.clone();
     other.engine = "ghostty-vt@0.0.0+none".into();
+    other.history_lines = 0;
     other.session.id = OTHER.into();
     std::fs::write(
         other_dir.join("session.json"),
@@ -413,10 +434,10 @@ async fn loading_keeps_the_newest_complete_generation_only() {
         .collect();
     assert_eq!(names, vec!["100"]);
     assert!(!sessions_dir(&state).join("empty").exists());
-    let read: Read =
-        serde_json::from_value(c.ok("read", json!({"session": id, "scrollback": 1})).await)
-            .unwrap();
-    assert_eq!(read.text, "line one\nline two 100\n");
+    // One history line before the screen.
+    assert_eq!(read(&mut c, id, 1).await.text, "line one\nline two 100\n");
+    assert_eq!(read(&mut c, id, 0).await.text, "line two 100\n");
+    assert_eq!(read(&mut c, id, 5).await.text, "line one\nline two 100\n");
     let inspected: Session =
         serde_json::from_value(c.ok("inspect", json!({"session": id})).await).unwrap();
     assert_eq!(
@@ -430,6 +451,23 @@ async fn loading_keeps_the_newest_complete_generation_only() {
         "the working record is dropped on load"
     );
 
+    // A resume marker above the parked one is invalid, as on a live session.
+    c.open(
+        1,
+        json!({"session": id, "viewport": {"cols": 80, "rows": 24},
+        "resume": {"incarnation": server.registry.incarnation, "offset": 7, "marker": 3}}),
+    )
+    .await;
+    assert_eq!(c.expect_error(1).await, ErrorCode::InvalidRequest);
+    // The fixture's snapshot is not one: the attach fails and is gone.
+    c.open(
+        1,
+        json!({"session": id, "viewport": {"cols": 80, "rows": 24}}),
+    )
+    .await;
+    assert_eq!(c.expect_error(1).await, ErrorCode::Internal);
+    c.wait_attachments(id, 0).await;
+
     // After an engine change only `read` and `remove` work.
     c.open(
         1,
@@ -437,9 +475,80 @@ async fn loading_keeps_the_newest_complete_generation_only() {
     )
     .await;
     assert_eq!(c.expect_error(1).await, ErrorCode::EngineMismatch);
-    let read: Read = serde_json::from_value(c.ok("read", json!({"session": OTHER})).await).unwrap();
-    assert_eq!(read.text, "elsewhere\n");
+    assert_eq!(read(&mut c, OTHER, 0).await.text, "elsewhere\n");
     c.ok("remove", json!({"session": OTHER})).await;
 }
 
 const OTHER: &str = "99999999-2222-3333-4444-555555555555";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_server_leaves_the_directory_to_its_successor() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let a = start_with(fast_limits(), state.clone()).await;
+    let mut c = client(&a).await;
+    // `on_exit: remove` with a 200 ms grace: once the stop's SIGHUP ends
+    // the process, the old server must not delete the park.
+    let session = c
+        .create(json!({"argv": ["/bin/sh", "-c", "echo left-behind; exec cat"]}))
+        .await;
+    wait_text(&mut c, &session.id, "left-behind").await;
+    a.registry.stop().await;
+    // And the old registry accepts nothing new.
+    assert_eq!(c.err("create", json!({})).await, ErrorCode::Internal);
+    drop(c);
+
+    let b = start_with(fast_limits(), state.clone()).await;
+    let mut c = client(&b).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let page: Page = serde_json::from_value(c.ok("list", json!({})).await).unwrap();
+    assert_eq!(page.sessions.len(), 1);
+    assert!(
+        read(&mut c, &session.id, 0)
+            .await
+            .text
+            .contains("left-behind")
+    );
+    assert_eq!(generations(&state, &session.id).len(), 1);
+    drop(a);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompt_start_in_the_same_read_still_drops_the_working_record() {
+    let server = start(fast_limits()).await;
+    let mut c = client(&server).await;
+    let session = c
+        .create(json!({"argv": ["/bin/sh", "-c",
+            "printf '\\033]7501;state=working:id=w\\033\\\\\\033]133;A\\033\\\\'; echo same-chunk; exec cat"]}))
+        .await;
+    wait_text(&mut c, &session.id, "same-chunk").await;
+    let inspected: Session =
+        serde_json::from_value(c.ok("inspect", json!({"session": session.id})).await).unwrap();
+    assert_eq!(inspected.program_status, Some(vec![]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parked_read_takes_scrollback_from_the_history_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let a = start_with(fast_limits(), state.clone()).await;
+    let mut c = client(&a).await;
+    let session = c
+        .create(json!({"rows": 10, "argv": ["/bin/sh", "-c",
+            "seq 1 40; printf '\\033[H\\033[2J'; echo TOP; exec cat"]}))
+        .await;
+    wait_text(&mut c, &session.id, "TOP").await;
+    let live_screen = read(&mut c, &session.id, 0).await.text;
+    let live_two = read(&mut c, &session.id, 2).await.text;
+    // Ten rows: the last scroll before the clear left 1 to 31 in history.
+    assert_eq!(live_screen, "TOP\n");
+    assert_eq!(live_two, "30\n31\nTOP\n");
+    a.registry.stop().await;
+    drop(c);
+    drop(a);
+
+    let b = start_with(fast_limits(), state.clone()).await;
+    let mut c = client(&b).await;
+    assert_eq!(read(&mut c, &session.id, 0).await.text, live_screen);
+    assert_eq!(read(&mut c, &session.id, 2).await.text, live_two);
+}

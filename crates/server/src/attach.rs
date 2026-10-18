@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ghostty_vt::snapshot;
 use proto::{
@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::connection::Writer;
 use crate::registry::Registry;
-use crate::session::{Attachment, Report, Session, Shared};
+use crate::session::{Attachment, Report, Session, Shared, snapshot_with_retry};
 use crate::stream::MarkerKind;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -65,7 +65,7 @@ pub fn open(
     let (close_tx, close_rx) = mpsc::unbounded_channel();
     let finished = Arc::new(AtomicBool::new(false));
     let ended = Arc::new(AtomicBool::new(false));
-    let snapshot = {
+    let (events, snapshot) = {
         let mut s = session.lock().unwrap();
         // A writable OPEN's viewport and profile are one immediate report.
         if !open.read_only && (open.viewport.is_some() || open.profile.is_some()) {
@@ -82,8 +82,9 @@ pub fn open(
             close: close_tx.downgrade(),
             finished: finished.clone(),
         });
-        s.to_proto(false)
+        (s.take_events(), s.to_proto(false))
     };
+    registry.emit_all(events);
     registry.emit(&Event::SessionChanged { session: snapshot });
     let handle = Handle {
         id,
@@ -286,15 +287,22 @@ impl Task {
             return Ok(None);
         };
         let s = self.session.lock().unwrap();
-        // A parked session has no stream to resume on.
-        let Some(live) = s.live() else {
-            return Ok(None);
-        };
-        if resume.marker > live.stream.latest_seq() {
-            return Err(End::Error(
+        let above_latest = || {
+            Err(End::Error(
                 ErrorCode::InvalidRequest,
                 "resume marker above the latest".into(),
-            ));
+            ))
+        };
+        // A parked session has no stream to resume on.
+        let live = match &s.body {
+            crate::session::Body::Live(live) => live,
+            crate::session::Body::Parked(parked) if resume.marker > parked.marker => {
+                return above_latest();
+            }
+            crate::session::Body::Parked(_) => return Ok(None),
+        };
+        if resume.marker > live.stream.latest_seq() {
+            return above_latest();
         }
         let retained = live.stream.retained_start() <= resume.offset
             && resume.offset <= live.stream.offset()
@@ -308,115 +316,98 @@ impl Task {
     /// Takes a snapshot, retrying while the continuation limit is exceeded,
     /// then sends `GAP` (after a gap), `ATTACHED`, the snapshot through
     /// `READY` and `SNAPSHOT_READY`. The rest of the snapshot is sent as
-    /// the stream allows.
+    /// the stream allows. A parked session streams its park file, nothing
+    /// after.
     async fn bootstrap(&mut self, gap_from: Option<u64>) -> Result<(), End> {
-        let deadline = Instant::now() + SNAPSHOT_RETRY;
-        loop {
-            let wake = self.session.lock().unwrap().wake.clone();
-            let notified = wake.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            self.done = false;
-            let taken = {
+        self.done = false;
+        let internal = |message: String| End::Error(ErrorCode::Internal, message);
+        let parked_path = {
+            let s = self.session.lock().unwrap();
+            s.parked().map(|p| p.snapshot_path.clone())
+        };
+        let (bytes, cursor, session) = match parked_path {
+            Some(path) => {
+                let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
+                    .await
+                    .map_err(|e| internal(e.to_string()))?
+                    .map_err(|e| internal(format!("park file unreadable: {e}")))?;
+                self.done = true;
                 let s = self.session.lock().unwrap();
-                match s.live() {
-                    Some(live) => {
-                        // Encoding holds the session still (PLAN.md's choice);
-                        // on a multi-thread runtime the worker is released
-                        // meanwhile.
-                        let encode = || snapshot::encode(&live.term);
-                        let encoded = match tokio::runtime::Handle::current().runtime_flavor() {
-                            tokio::runtime::RuntimeFlavor::CurrentThread => encode(),
-                            _ => tokio::task::block_in_place(encode),
-                        };
-                        encoded.map(|bytes| {
-                            (
-                                bytes,
-                                Cursor {
-                                    offset: live.stream.offset(),
-                                    marker: live.stream.latest_seq(),
-                                },
-                                s.to_proto(false),
-                            )
-                        })
-                    }
-                    // A parked session streams its park file, nothing after.
-                    None => {
-                        let parked = s.parked().expect("not live");
-                        match std::fs::read(&parked.snapshot_path) {
-                            Ok(bytes) => {
-                                self.done = true;
-                                Ok((
-                                    bytes,
-                                    Cursor {
-                                        offset: parked.offset,
-                                        marker: parked.marker,
-                                    },
-                                    s.to_proto(false),
-                                ))
-                            }
-                            Err(err) => {
-                                return Err(End::Error(
-                                    ErrorCode::Internal,
-                                    format!("park file unreadable: {err}"),
-                                ));
-                            }
-                        }
-                    }
-                }
-            };
-            match taken {
-                Ok((bytes, cursor, session)) => {
-                    if let Some(from) = gap_from {
-                        self.send_json(
-                            FrameType::Gap,
-                            &Gap {
-                                from,
-                                to: cursor.offset,
+                let Some(parked) = s.parked() else {
+                    return Err(internal("session changed while reading its park".into()));
+                };
+                (
+                    bytes,
+                    Cursor {
+                        offset: parked.offset,
+                        marker: parked.marker,
+                    },
+                    s.to_proto(false),
+                )
+            }
+            None => {
+                let taken = tokio::select! {
+                    taken = snapshot_with_retry(&self.session, SNAPSHOT_RETRY, |s, live, bytes| {
+                        (
+                            bytes,
+                            Cursor {
+                                offset: live.stream.offset(),
+                                marker: live.stream.latest_seq(),
                             },
-                        );
+                            s.to_proto(false),
+                        )
+                    }) => taken,
+                    reason = self.close.recv() => return Err(reason.into()),
+                };
+                match taken {
+                    Ok(Some(taken)) => taken,
+                    Ok(None) => return Err(internal("session is no longer live".into())),
+                    Err(err) => {
+                        let code = match err {
+                            ghostty_vt::Error::LimitExceeded => ErrorCode::LimitExceeded,
+                            _ => ErrorCode::Internal,
+                        };
+                        return Err(End::Error(code, format!("snapshot failed: {err}")));
                     }
-                    self.cursor = cursor;
-                    self.send_json(
-                        FrameType::Attached,
-                        &Attached {
-                            mode: AttachMode::Snapshot,
-                            offset: cursor.offset,
-                            marker: cursor.marker,
-                            cols: session.cols,
-                            rows: session.rows,
-                            session,
-                            snapshot_bytes: Some(bytes.len() as u64),
-                        },
-                    );
-                    let ready = snapshot::ready_end(&bytes).expect("a snapshot has READY");
-                    for chunk in bytes[..ready].chunks(self.max_frame) {
-                        self.send(FrameType::Snapshot, chunk);
-                    }
-                    self.send(FrameType::SnapshotReady, &[]);
-                    self.snapshot = Some(PendingSnapshot {
-                        bytes,
-                        sent: ready,
-                        after_gap: gap_from.is_some(),
-                    });
-                    return Ok(());
-                }
-                Err(ghostty_vt::Error::LimitExceeded) if Instant::now() < deadline => {
-                    tokio::select! {
-                        reason = self.close.recv() => return Err(reason.into()),
-                        _ = notified => {}
-                        _ = tokio::time::sleep_until(deadline.into()) => {}
-                    }
-                }
-                Err(err) => {
-                    let code = match err {
-                        ghostty_vt::Error::LimitExceeded => ErrorCode::LimitExceeded,
-                        _ => ErrorCode::Internal,
-                    };
-                    return Err(End::Error(code, format!("snapshot failed: {err}")));
                 }
             }
+        };
+        // A file from disk is checked before anything is promised.
+        let Some(ready) = snapshot::ready_end(&bytes) else {
+            return Err(internal("snapshot has no READY".into()));
+        };
+        if let Some(from) = gap_from {
+            self.send_json(
+                FrameType::Gap,
+                &Gap {
+                    from,
+                    to: cursor.offset,
+                },
+            );
         }
+        self.cursor = cursor;
+        self.send_json(
+            FrameType::Attached,
+            &Attached {
+                mode: AttachMode::Snapshot,
+                offset: cursor.offset,
+                marker: cursor.marker,
+                cols: session.cols,
+                rows: session.rows,
+                session,
+                snapshot_bytes: Some(bytes.len() as u64),
+            },
+        );
+        for chunk in bytes[..ready].chunks(self.max_frame) {
+            self.send(FrameType::Snapshot, chunk);
+        }
+        self.send(FrameType::SnapshotReady, &[]);
+        self.snapshot = Some(PendingSnapshot {
+            bytes,
+            sent: ready,
+            after_gap: gap_from.is_some(),
+        });
+        Ok(())
     }
 
     /// Sends the next remaining snapshot chunk, and `SNAPSHOT_END` after
@@ -510,7 +501,7 @@ impl Task {
                 ));
                 self.cursor.offset += bytes.len() as u64;
             }
-            self.done = s.status != Status::Running && self.cursor.marker == stream.latest_seq();
+            self.done = s.status() != Status::Running && self.cursor.marker == stream.latest_seq();
         }
         if frames.is_empty() {
             self.note_finished();

@@ -15,6 +15,8 @@ pub struct Server {
     pub socket: PathBuf,
     pub registry: std::sync::Arc<server::Registry>,
     _dir: tempfile::TempDir,
+    /// The state directory, when this server owns it.
+    _state: Option<tempfile::TempDir>,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
@@ -26,8 +28,9 @@ impl Drop for Server {
 
 pub async fn start(limits: Limits) -> Server {
     let dir = tempfile::tempdir().unwrap();
-    let state_dir = dir.path().join("state");
-    start_with(limits, state_dir).await
+    let mut server = start_with(limits, dir.path().join("state")).await;
+    server._state = Some(dir);
+    server
 }
 
 /// A server on `state_dir`, which may hold a previous server's parks.
@@ -54,6 +57,7 @@ pub async fn start_with(limits: Limits, state_dir: PathBuf) -> Server {
         socket,
         registry,
         _dir: dir,
+        _state: None,
         task,
     }
 }

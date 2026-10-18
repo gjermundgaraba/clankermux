@@ -5,13 +5,11 @@ use std::collections::BTreeMap;
 use ghostty_vt::{ProgramStatus, ProgramStatusKind, ProgramStatusState};
 use proto::StatusRecord;
 
-/// The records of one session, with the order of their last updates for
-/// eviction.
+/// The records of one session. Each carries the tick of its last report;
+/// the lowest is evicted first.
 #[derive(Default)]
 pub struct Records {
-    by_id: BTreeMap<String, StatusRecord>,
-    /// The tick of each record's last report; the lowest is evicted first.
-    touched: BTreeMap<String, u64>,
+    by_id: BTreeMap<String, (StatusRecord, u64)>,
     tick: u64,
 }
 
@@ -24,7 +22,7 @@ pub struct Change {
 
 /// Whether a record's state is one the program is still in the middle
 /// of: dropped at a prompt start, at the end of the stream, and on load.
-pub fn transient(record: &StatusRecord) -> bool {
+fn transient(record: &StatusRecord) -> bool {
     matches!(record.state.as_str(), "working" | "blocked")
 }
 
@@ -33,10 +31,13 @@ fn text(value: String) -> Option<String> {
 }
 
 impl Records {
-    /// Records loaded from a park file, minus the transient ones.
-    pub fn load(records: Vec<StatusRecord>) -> Self {
+    /// Records loaded from a park file, minus the transient ones, in the
+    /// order of their last updates.
+    pub fn load(mut records: Vec<StatusRecord>) -> Self {
+        records.retain(|r| !transient(r));
+        records.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
         let mut out = Records::default();
-        for record in records.into_iter().filter(|r| !transient(r)) {
+        for record in records {
             out.insert(record);
         }
         out
@@ -44,13 +45,7 @@ impl Records {
 
     fn insert(&mut self, record: StatusRecord) {
         self.tick += 1;
-        self.touched.insert(record.id.clone(), self.tick);
-        self.by_id.insert(record.id.clone(), record);
-    }
-
-    fn remove(&mut self, id: &str) -> bool {
-        self.touched.remove(id);
-        self.by_id.remove(id).is_some()
+        self.by_id.insert(record.id.clone(), (record, self.tick));
     }
 
     /// Applies one report: `clear` removes the record and those beneath
@@ -65,15 +60,14 @@ impl Records {
                     || id == report.id
                     || id.starts_with(&format!("{}/", report.id))
             };
-            let ids: Vec<String> = self
+            change.removed = self
                 .by_id
                 .keys()
                 .filter(|id| beneath(id))
                 .cloned()
                 .collect();
-            for id in ids {
-                self.remove(&id);
-                change.removed.push(id);
+            for id in &change.removed {
+                self.by_id.remove(id);
             }
             return change;
         }
@@ -85,17 +79,13 @@ impl Records {
             ProgramStatusState::Error => "error",
             ProgramStatusState::Clear => unreachable!(),
         };
-        let kind = match (report.state, report.kind) {
-            (ProgramStatusState::Blocked, ProgramStatusKind::Permission) => Some("permission"),
-            (ProgramStatusState::Blocked, ProgramStatusKind::Question) => Some("question"),
-            (ProgramStatusState::Blocked, ProgramStatusKind::Auth) => Some("auth"),
-            _ => None,
-        };
-        let progress = match report.state {
-            ProgramStatusState::Working | ProgramStatusState::Blocked => {
-                u8::try_from(report.progress).ok().filter(|p| *p <= 100)
-            }
-            _ => None,
+        // The engine clears `kind` outside `blocked` and `progress` outside
+        // `working` and `blocked` or 0..=100 (terminal.h).
+        let kind = match report.kind {
+            ProgramStatusKind::None => None,
+            ProgramStatusKind::Permission => Some("permission"),
+            ProgramStatusKind::Question => Some("question"),
+            ProgramStatusKind::Auth => Some("auth"),
         };
         let record = StatusRecord {
             id: report.id,
@@ -104,7 +94,7 @@ impl Records {
             app: text(report.app),
             title: text(report.title),
             msg: text(report.message),
-            progress,
+            progress: u8::try_from(report.progress).ok(),
             updated_at: now.into(),
         };
         let new = !self.by_id.contains_key(&record.id);
@@ -112,12 +102,12 @@ impl Records {
         change.set = Some(record);
         if new && self.by_id.len() > max {
             let oldest = self
-                .touched
+                .by_id
                 .iter()
-                .min_by_key(|(_, tick)| **tick)
+                .min_by_key(|(_, (_, tick))| *tick)
                 .map(|(id, _)| id.clone())
                 .expect("over max means at least one record");
-            self.remove(&oldest);
+            self.by_id.remove(&oldest);
             change.removed.push(oldest);
         }
         change
@@ -128,38 +118,39 @@ impl Records {
         let ids: Vec<String> = self
             .by_id
             .values()
-            .filter(|r| transient(r))
-            .map(|r| r.id.clone())
+            .filter(|(r, _)| transient(r))
+            .map(|(r, _)| r.id.clone())
             .collect();
         for id in &ids {
-            self.remove(id);
+            self.by_id.remove(id);
         }
         ids
     }
 
     /// The records as reported: every key of their last report.
     pub fn all(&self) -> Vec<StatusRecord> {
-        self.by_id.values().cloned().collect()
+        self.by_id.values().map(|(r, _)| r.clone()).collect()
     }
 
     /// The records for `inspect`: `app` taken from the nearest ancestor
     /// that has one when a record lacks it.
     pub fn resolved(&self) -> Vec<StatusRecord> {
+        let app_of = |id: &str| self.by_id.get(id).and_then(|(r, _)| r.app.clone());
         self.by_id
             .values()
-            .map(|record| {
+            .map(|(record, _)| {
                 let mut out = record.clone();
                 if out.app.is_none() {
                     let mut id = record.id.as_str();
                     while let Some(cut) = id.rfind('/') {
                         id = &id[..cut];
-                        if let Some(app) = self.by_id.get(id).and_then(|r| r.app.clone()) {
+                        if let Some(app) = app_of(id) {
                             out.app = Some(app);
                             break;
                         }
                     }
                     if out.app.is_none() && !record.id.is_empty() {
-                        out.app = self.by_id.get("").and_then(|r| r.app.clone());
+                        out.app = app_of("");
                     }
                 }
                 out
@@ -181,6 +172,19 @@ mod tests {
             app: app.into(),
             title: String::new(),
             message: String::new(),
+        }
+    }
+
+    fn record(id: &str, state: &str, updated_at: &str) -> StatusRecord {
+        StatusRecord {
+            id: id.into(),
+            state: state.into(),
+            kind: None,
+            app: None,
+            title: None,
+            msg: None,
+            progress: None,
+            updated_at: updated_at.into(),
         }
     }
 
@@ -244,35 +248,18 @@ mod tests {
         assert_eq!(r.all().len(), 1);
         let c = r.apply(report(ProgramStatusState::Clear, "", ""), 10, "t");
         assert_eq!(c.removed, vec!["x".to_string()]);
-        let loaded = Records::load(vec![
-            StatusRecord {
-                id: "a".into(),
-                state: "working".into(),
-                kind: None,
-                app: None,
-                title: None,
-                msg: None,
-                progress: None,
-                updated_at: "t".into(),
-            },
-            StatusRecord {
-                id: "b".into(),
-                state: "error".into(),
-                kind: None,
-                app: None,
-                title: None,
-                msg: None,
-                progress: None,
-                updated_at: "t".into(),
-            },
+    }
+
+    #[test]
+    fn loading_drops_transient_records_and_keeps_the_update_order() {
+        let mut loaded = Records::load(vec![
+            record("a", "working", "t3"),
+            record("b", "error", "t2"),
+            record("c", "done", "t1"),
         ]);
-        assert_eq!(
-            loaded
-                .all()
-                .iter()
-                .map(|r| r.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["b"]
-        );
+        assert_eq!(loaded.all().len(), 2);
+        // `c` was updated before `b`, so it is evicted first.
+        let c = loaded.apply(report(ProgramStatusState::Done, "d", ""), 2, "t4");
+        assert_eq!(c.removed, vec!["c".to_string()]);
     }
 }
