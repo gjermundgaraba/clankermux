@@ -8,3 +8,5 @@ web/packages/engine/test/fixtures
 web/apps/client/dist
 proptest-regressions/
 *.proptest-regressions
+web/dist-packages
+web/packages/*/dist

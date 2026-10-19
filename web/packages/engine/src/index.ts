@@ -1,13 +1,9 @@
-import pin from "../../../../vendor/pin.json" with { type: "json" };
-
 export { Decoder, readyEnd } from "./decoder.ts";
 export { KeyEncoder, isText, keyName } from "./keys.ts";
 export type { KeyInput } from "./keys.ts";
 export { FLAG, NO_COLOR, RenderState } from "./render.ts";
 export type { Cell, Frame, FrameRow } from "./render.ts";
-
-/** Engine id of the vendored libghostty-vt build, matched by the server. */
-export const ENGINE: string = pin.engine;
+export { ENGINE } from "./pin.ts";
 
 type Field = { offset: number; size: number; type: string };
 /** Struct fields to set: numbers, or the fields of a nested struct. */

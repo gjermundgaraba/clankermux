@@ -1,3 +1,6 @@
+# Zig 0.16 as mise pins it, for build-wasm.sh and ghostty-vt-sys; ZIG wins.
+export ZIG := env("ZIG", `mise which zig 2>/dev/null || echo zig`)
+
 # Required checks for every commit.
 check: check-rust check-web
 
@@ -25,3 +28,7 @@ bindings:
 # Re-pin libghostty-vt to an upstream main commit.
 pin sha:
     scripts/pin.sh {{sha}}
+
+# Build and pack the npm packages into web/dist-packages.
+pack-web: wasm
+    scripts/pack-web.sh
