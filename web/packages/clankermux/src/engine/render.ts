@@ -37,6 +37,8 @@ type CursorStyle = (typeof CURSOR_STYLES)[number];
 export interface FrameRow {
   y: number;
   cells: Cell[];
+  /** The selected cells of the row, first and last inclusive. */
+  selection?: [number, number];
 }
 
 export interface Frame {
@@ -86,7 +88,7 @@ export class RenderState {
       Object.fromEntries(members.map((m) => [m, engine.enumValue(name, m)]));
     this.keys = {
       data: values("GhosttyRenderStateData", ["COLS", "ROWS", "DIRTY", "ROW_ITERATOR", "COLORS", "CURSOR"]),
-      row: values("GhosttyRenderStateRowData", ["CELLS"]),
+      row: values("GhosttyRenderStateRowData", ["CELLS", "SELECTION"]),
       cell: values("GhosttyRenderStateRowCellsData", [
         "RAW",
         "STYLE",
@@ -165,10 +167,27 @@ export class RenderState {
       e.check("ghostty_render_state_get", this.state, this.keys.data["ROW_ITERATOR"]!, out);
       while (e.call("ghostty_render_state_row_iterator_next_dirty", this.iterator, out + 4)) {
         const y = e.view.getUint16(out + 4, true);
-        lines.push({ y, cells: this.readRow(cols) });
+        const row: FrameRow = { y, cells: this.readRow(cols) };
+        const selection = this.rowSelection();
+        if (selection) row.selection = selection;
+        lines.push(row);
       }
     });
     return { cols, rows, full, background, foreground, cursor, lines, scrollbar };
+  }
+
+  /** The row's selected cells, or undefined when the selection misses it. */
+  private rowSelection(): [number, number] | undefined {
+    const e = this.engine;
+    const size = e.sizeOf("GhosttyRenderStateRowSelection");
+    return e.scratch(size, (out) => {
+      e.view.setUint32(out, size, true);
+      const code = e.call("ghostty_render_state_row_get", this.iterator, this.keys.row["SELECTION"]!, out);
+      if (code === e.result.NO_VALUE) return undefined;
+      if (code !== e.result.SUCCESS) throw new Error(`row selection: ${code}`);
+      const field = (key: string) => e.field("GhosttyRenderStateRowSelection", out, key);
+      return [field("start_x"), field("end_x")];
+    });
   }
 
   private readRow(cols: number): Cell[] {

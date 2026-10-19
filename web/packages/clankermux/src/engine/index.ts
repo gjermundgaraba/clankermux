@@ -4,6 +4,8 @@ export type { KeyInput } from "./keys.ts";
 export { FLAG, NO_COLOR, RenderState } from "./render.ts";
 export type { Cell, Frame, FrameRow } from "./render.ts";
 export { ENGINE } from "./pin.ts";
+export { SelectionGesture } from "./selection.ts";
+export type { CellPoint } from "./selection.ts";
 
 type Field = { offset: number; size: number; type: string };
 /** Struct fields to set: numbers, or the fields of a nested struct. */
@@ -405,6 +407,77 @@ export class Terminal {
       if (code === this.engine.result.NO_VALUE) return "";
       if (code !== this.engine.result.SUCCESS) throw new EngineError("ghostty_terminal_get", code);
       return this.engine.readString(out);
+    });
+  }
+
+  /** An untracked `GhosttyGridRef` to the viewport cell at `at`, valid
+   * until the terminal changes. */
+  gridRef(at: { x: number; y: number }): Uint8Array {
+    const e = this.engine;
+    const point = e.sizeOf("GhosttyPoint");
+    const ref = e.sizeOf("GhosttyGridRef");
+    const x = Math.min(Math.max(0, Math.floor(at.x)), this.cols - 1);
+    const y = Math.min(Math.max(0, Math.floor(at.y)), this.rows - 1);
+    return e.scratch(point + ref, (ptr) => {
+      e.memory.fill(0, ptr, ptr + point + ref);
+      e.view.setInt32(ptr + e.offsetOf("GhosttyPoint", "tag"), e.enumValue("GhosttyPointTag", "VIEWPORT"), true);
+      const coordinate = ptr + e.offsetOf("GhosttyPoint", "value");
+      e.view.setUint16(coordinate + e.offsetOf("GhosttyPointCoordinate", "x"), x, true);
+      e.view.setUint32(coordinate + e.offsetOf("GhosttyPointCoordinate", "y"), y, true);
+      e.view.setUint32(ptr + point, ref, true);
+      // The point is passed by value, which the wasm ABI passes by address.
+      e.check("ghostty_terminal_grid_ref", this.handle, ptr, ptr + point);
+      return e.memory.slice(ptr + point, ptr + point + ref);
+    });
+  }
+
+  /** Installs `selection` (a `GhosttySelection`) as the terminal's, which
+   * the terminal then tracks through output, scrolling and resizes, or
+   * clears it. */
+  select(selection: Uint8Array | undefined): void {
+    const option = this.engine.enumValue("GhosttyTerminalOption", "SELECTION");
+    if (!selection) this.engine.check("ghostty_terminal_set", this.handle, option, 0);
+    else this.engine.withBytes(selection, (ptr) => this.engine.check("ghostty_terminal_set", this.handle, option, ptr));
+  }
+
+  /** The selection's text: soft-wrapped lines joined, trailing blanks
+   * trimmed, as Ghostty copies it; undefined with no selection. */
+  selectionText(): string | undefined {
+    const e = this.engine;
+    const options = e.pack("GhosttyTerminalSelectionFormatOptions", {
+      emit: e.enumValue("GhosttyFormatterFormat", "PLAIN"),
+      unwrap: 1,
+      trim: 1,
+    });
+    return e.withBytes(options, (optionsPtr) =>
+      e.scratch(8, (out) => {
+        e.view.setUint32(out, 0, true);
+        e.view.setUint32(out + 4, 0, true);
+        // The options are passed by value, which the wasm ABI passes by address.
+        const code = e.call("ghostty_terminal_selection_format_alloc", this.handle, 0, optionsPtr, out, out + 4);
+        if (code === e.result.NO_VALUE) return undefined;
+        if (code !== e.result.SUCCESS) throw new EngineError("ghostty_terminal_selection_format_alloc", code);
+        const ptr = e.view.getUint32(out, true);
+        const len = e.view.getUint32(out + 4, true);
+        try {
+          return new TextDecoder().decode(e.memory.slice(ptr, ptr + len));
+        } finally {
+          e.call("ghostty_free", 0, ptr, len);
+        }
+      }),
+    );
+  }
+
+  /** Whether the active screen has a selection. */
+  get selected(): boolean {
+    const e = this.engine;
+    const size = e.sizeOf("GhosttySelection");
+    return e.scratch(size, (out) => {
+      e.view.setUint32(out, size, true);
+      const code = e.call("ghostty_terminal_get", this.handle, e.enumValue("GhosttyTerminalData", "SELECTION"), out);
+      if (code === e.result.NO_VALUE) return false;
+      if (code !== e.result.SUCCESS) throw new EngineError("ghostty_terminal_get", code);
+      return true;
     });
   }
 

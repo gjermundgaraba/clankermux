@@ -126,3 +126,17 @@ test("a view scrolled back has a mark at the right edge, moved and erased with t
   expect(ctx.texts()).toEqual(["c"]);
   expect(ctx.ops.filter((op) => op[0] === "rect" && op[2] === 27)).toEqual([]);
 });
+
+test("selected cells are drawn inverted, and stay so when the cursor leaves their row", () => {
+  const ctx = new Recording();
+  const r = new CanvasRenderer(ctx, metrics, palette);
+  const selected = { y: 0, cells: [cell("a"), cell("b", { flags: FLAG.INVERSE }), blank()], selection: [0, 1] as [number, number] };
+  r.draw(frame([selected, { y: 1, cells: [blank(), blank(), blank()] }], { x: 2, y: 0, visible: true, blinking: false, style: "bar", color: NO_COLOR }, true));
+  // "a" selected: foreground background, background text; "b" inverse
+  // and selected: as it was.
+  expect(ctx.ops).toContainEqual(["rect", "#ffffff", 0, 0, 10, 20]);
+  expect(ctx.ops).not.toContainEqual(["rect", "#ffffff", 10, 0, 10, 20]);
+  ctx.ops = [];
+  r.draw(frame([], { x: 0, y: 1, visible: true, blinking: false, style: "bar", color: NO_COLOR }));
+  expect(ctx.ops).toContainEqual(["rect", "#ffffff", 0, 0, 10, 20]);
+});

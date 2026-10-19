@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { beforeAll, expect, test } from "vitest";
 
-import { Decoder, Engine, KeyEncoder, type KeyInput, RenderState, keyName } from "../../src/engine/index.ts";
+import { Decoder, Engine, KeyEncoder, type KeyInput, RenderState, SelectionGesture, keyName } from "../../src/engine/index.ts";
 import { readyEnd, stepEnd } from "../../src/engine/decoder.ts";
 import { FLAG, NO_COLOR } from "../../src/engine/render.ts";
 
@@ -176,6 +176,60 @@ test("the viewport scrolls through the history and stays there while output arri
   expect(term.scrollbar).toEqual({ total: 3, offset: 0, len: 3 });
   term.scroll(-2);
   expect(term.scrollbar.offset).toBe(0);
+  render.free();
+  term.free();
+});
+
+test("a selection drags by cells, words and lines, copies wrapped lines whole, and follows output", () => {
+  const term = engine.terminalNew(10, 3);
+  // "three four five" wraps after ten columns.
+  term.write(utf8("one two\r\nthree four five"));
+  const gesture = new SelectionGesture(engine);
+  const render = new RenderState(engine);
+  render.update(term);
+  render.clean();
+
+  // A press selects nothing; a drag selects from the pressed cell to the
+  // pointer's, the half of a cell it passed deciding the last.
+  expect(gesture.press(term, { x: 0.2, y: 0.5 }, 1000)).toBeUndefined();
+  expect(gesture.drag(term, { x: 0.4, y: 0.5 })).toBeUndefined();
+  const drag = gesture.drag(term, { x: 2.6, y: 2.5 });
+  expect(drag).toBeDefined();
+  term.select(drag);
+  gesture.release(term, { x: 2.6, y: 2.5 });
+  expect(term.selected).toBe(true);
+  // The wrapped line comes back whole.
+  expect(term.selectionText()).toBe("one two\nthree four fi");
+  const frame = render.update(term);
+  render.clean();
+  expect(frame.lines.map((l) => l.selection)).toEqual([
+    [0, 9],
+    [0, 9],
+    [0, 2],
+  ]);
+
+  // Output scrolls the selected text up a row; the selection goes with it.
+  term.write(utf8("\r\nsix"));
+  expect(term.selectionText()).toBe("one two\nthree four fi");
+  expect(render.update(term).lines.map((l) => l.selection)).toEqual([[0, 9], [0, 2], undefined]);
+  render.clean();
+
+  // Two presses select a word, three a line (the wrapped one whole).
+  const at = { x: 1.5, y: 0.5 };
+  gesture.press(term, at, 5000);
+  gesture.release(term, at);
+  term.select(gesture.press(term, at, 5100));
+  expect(term.selectionText()).toBe("three");
+  gesture.release(term, at);
+  term.select(gesture.press(term, at, 5200));
+  expect(term.selectionText()).toBe("three four five");
+  gesture.release(term, at);
+
+  term.select(undefined);
+  expect(term.selected).toBe(false);
+  expect(term.selectionText()).toBeUndefined();
+  expect(render.update(term).lines.every((l) => l.selection === undefined)).toBe(true);
+  gesture.free();
   render.free();
   term.free();
 });

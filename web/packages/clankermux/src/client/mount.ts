@@ -1,10 +1,11 @@
 /** The page side of a terminal: canvas, keyboard, paste and resize, with
  * the engine in a worker running `runWorker`. */
+import type { CellPoint } from "../engine/index.ts";
 import type { OnExit, Scheme, Session, Size } from "../proto/index.ts";
 import { CanvasRenderer, type Metrics } from "../renderer/index.ts";
 
 import { ClientError } from "./connection.ts";
-import { type Keyboard, browserKeeps, keyInput } from "./keyboard.ts";
+import { type Keyboard, type Typed, Typing } from "./keyboard.ts";
 import { profileFrom, schemeOf } from "./profile.ts";
 import type { Failure, Link, ToPage, ToWorker } from "./worker.ts";
 
@@ -19,7 +20,8 @@ export interface MountOptions {
   /** A module worker whose script calls `runWorker(self)`; the terminal
    * owns it from here. */
   worker: Worker;
-  /** Drawn on; takes keys and paste while focused. */
+  /** Drawn on. Focusing it focuses the terminal's input element, a
+   * textarea placed after it, which takes keys, paste and composed text. */
   canvas: HTMLCanvasElement;
   /** The element whose size sets the grid. */
   container: HTMLElement;
@@ -71,6 +73,11 @@ export interface MountedTerminal {
   /** Removes the attached session, which must be `exited` or `restored`
    * (else `running`); the link ends with `removed`. */
   remove(): Promise<void>;
+  /** Focuses the terminal's input element, as focusing the canvas does. */
+  focus(): void;
+  /** The selected text, as the last selection made copied it; undefined
+   * when nothing is selected. */
+  selection(): string | undefined;
   /** Reports the container's size, the colours and the scheme again;
    * to the session only while the page is visible and focused. */
   report(): void;
@@ -163,6 +170,8 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
   const failure = (error: Failure): Error =>
     error.kind ? new ClientError(error.kind, error.message, error.server) : new Error(error.message);
 
+  /** The selection's text, for a copy. */
+  let selected: string | undefined;
   /** Rows the view is scrolled back, as `onScroll` last reported. */
   let scrolled = 0;
   worker.onmessage = (e: MessageEvent<ToPage>) => {
@@ -182,6 +191,7 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
         break;
       }
       case "frame": {
+        if (message.frame.cursor) cursorAt = { x: message.frame.cursor.x, y: message.frame.cursor.y };
         const { total, offset, len } = message.frame.scrollbar;
         if (total - offset - len !== scrolled) {
           scrolled = total - offset - len;
@@ -203,21 +213,125 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
       case "clipboard":
         navigator.clipboard?.writeText(message.text).catch(() => {});
         break;
+      case "selection":
+        selected = message.text;
+        if (message.copy && message.text) navigator.clipboard?.writeText(message.text).catch(() => {});
+        break;
     }
   };
 
-  for (const type of ["keydown", "keyup"] as const) {
-    canvas.addEventListener(
-      type,
-      (e) => {
-        if (browserKeeps(e)) return;
-        send({ type: "key", input: keyInput(e, keyboard) });
-        e.preventDefault();
-      },
-      { signal },
-    );
+  /** Where the input element goes for a composition: the cursor's cell,
+   * as the latest frame that had the cursor in view placed it. */
+  let cursorAt = { x: 0, y: 0 };
+  // An input method composes only into an editable element: a textarea
+  // after the canvas takes the focus, invisible but at the cursor so the
+  // input method's window opens there, and shows the composition while
+  // there is one.
+  const input = document.createElement("textarea");
+  input.setAttribute("aria-label", "Terminal input");
+  input.setAttribute("autocapitalize", "off");
+  input.setAttribute("autocomplete", "off");
+  input.setAttribute("autocorrect", "off");
+  input.spellcheck = false;
+  input.tabIndex = -1;
+  const hidden = { opacity: "0", width: "1px", height: "1px" };
+  Object.assign(input.style, {
+    ...hidden,
+    position: "absolute",
+    margin: "0",
+    padding: "0",
+    border: "0",
+    outline: "none",
+    resize: "none",
+    overflow: "hidden",
+    whiteSpace: "pre",
+    pointerEvents: "none",
+    font: metrics.font,
+    lineHeight: `${metrics.cellHeight}px`,
+    caretColor: "transparent",
+  });
+  canvas.after(input);
+  /** Moves the input element to the cursor, and shows it while composing. */
+  function placeInput(composing: boolean): void {
+    input.style.left = `${canvas.offsetLeft + cursorAt.x * metrics.cellWidth}px`;
+    input.style.top = `${canvas.offsetTop + cursorAt.y * metrics.cellHeight}px`;
+    if (!composing) {
+      Object.assign(input.style, hidden);
+      return;
+    }
+    const { fg, bg } = colors();
+    Object.assign(input.style, {
+      opacity: "1",
+      width: `${Math.max(1, grid.cols - cursorAt.x) * metrics.cellWidth}px`,
+      height: `${metrics.cellHeight}px`,
+      color: fg,
+      background: bg,
+    });
   }
-  canvas.addEventListener(
+  canvas.addEventListener("focus", () => input.focus({ preventScroll: true }), { signal });
+
+  const typing = new Typing(keyboard);
+  const typed = (what: Typed) => send("text" in what ? { type: "text", text: what.text } : { type: "key", input: what.key });
+  input.addEventListener(
+    "keydown",
+    (e) => {
+      // Ctrl+Shift+C copies a selection, where Ctrl+C is the terminal's;
+      // without one it is a key.
+      if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === "KeyC" && selected) {
+        navigator.clipboard?.writeText(selected).catch(() => {});
+        e.preventDefault();
+        return;
+      }
+      const key = typing.keydown(e);
+      if (key) {
+        send({ type: "key", input: key });
+        e.preventDefault();
+      } else if (e.isComposing || e.key === "Dead" || e.keyCode === 229) {
+        placeInput(true);
+      }
+    },
+    { signal },
+  );
+  input.addEventListener(
+    "keyup",
+    (e) => {
+      const key = typing.keyup(e);
+      if (!key) return;
+      send({ type: "key", input: key });
+      e.preventDefault();
+    },
+    { signal },
+  );
+  input.addEventListener(
+    "beforeinput",
+    (e) => {
+      const what = typing.beforeinput(e);
+      if (!what) return;
+      typed(what);
+      e.preventDefault();
+    },
+    { signal },
+  );
+  input.addEventListener("compositionstart", () => placeInput(true), { signal });
+  input.addEventListener(
+    "compositionend",
+    (e) => {
+      const what = typing.compositionend(e.data);
+      if (what) typed(what);
+      placeInput(false);
+      // Emptied once the composition has left it.
+      setTimeout(() => (input.value = ""));
+    },
+    { signal },
+  );
+  input.addEventListener(
+    "input",
+    (e) => {
+      if (!(e as InputEvent).isComposing) input.value = "";
+    },
+    { signal },
+  );
+  input.addEventListener(
     "paste",
     (e) => {
       const text = e.clipboardData?.getData("text");
@@ -226,7 +340,59 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
     },
     { signal },
   );
-  canvas.addEventListener("mousedown", () => canvas.focus(), { signal });
+  // The browser's copy (Cmd+C, Ctrl+C in a menu) copies the selection.
+  input.addEventListener(
+    "copy",
+    (e) => {
+      if (selected === undefined || !e.clipboardData) return;
+      e.clipboardData.setData("text/plain", selected);
+      e.preventDefault();
+    },
+    { signal },
+  );
+
+  /** The pointer in cells of the grid, fractions included, kept inside it. */
+  function cellAt(e: MouseEvent): CellPoint {
+    const rect = canvas.getBoundingClientRect();
+    const inside = (value: number, cells: number) => Math.min(Math.max(value, 0), Math.max(cells - 0.01, 0));
+    return {
+      x: inside((e.clientX - rect.left) / metrics.cellWidth, grid.cols),
+      y: inside((e.clientY - rect.top) / metrics.cellHeight, grid.rows),
+    };
+  }
+  // Selection: press, drag (once a frame) and release, followed outside
+  // the canvas until the button is up.
+  canvas.addEventListener(
+    "mousedown",
+    (e) => {
+      e.preventDefault();
+      input.focus({ preventScroll: true });
+      if (e.button !== 0) return;
+      send({ type: "select", action: "press", at: cellAt(e), time: e.timeStamp });
+      let pending: CellPoint | undefined;
+      let frame = 0;
+      const flush = () => {
+        cancelAnimationFrame(frame);
+        frame = 0;
+        if (pending) send({ type: "select", action: "drag", at: pending, time: 0 });
+        pending = undefined;
+      };
+      const move = (m: MouseEvent) => {
+        pending = cellAt(m);
+        frame ||= requestAnimationFrame(flush);
+      };
+      const up = (u: MouseEvent) => {
+        if (u.button !== 0) return;
+        flush();
+        send({ type: "select", action: "release", at: cellAt(u), time: u.timeStamp });
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+      };
+      window.addEventListener("mousemove", move, { signal });
+      window.addEventListener("mouseup", up, { signal });
+    },
+    { signal },
+  );
   // The wheel scrolls the history in whole rows; what a trackpad sends in
   // pixels adds up until it makes one. Ctrl+wheel stays the browser's zoom.
   let wheeled = 0;
@@ -311,6 +477,8 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
     },
     end: async () => void (await request((id) => ({ type: "end", id }))),
     remove: async () => void (await request((id) => ({ type: "remove", id }))),
+    focus: () => input.focus({ preventScroll: true }),
+    selection: () => selected,
     report,
     paste: (text) => send({ type: "paste", text }),
     dispose: () => {
@@ -318,6 +486,7 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
       listening.abort();
       resizes.disconnect();
       restyles.disconnect();
+      input.remove();
       worker.onmessage = null;
       worker.terminate();
       for (const waiter of pending.values()) waiter.reject(new ClientError("closed", "disposed"));

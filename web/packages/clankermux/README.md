@@ -45,6 +45,17 @@ const terminal = mountTerminal({
 
 `end` and `remove` reject with a plain `Error` when no session is attached. Since 0.1.1 `create` returns this promise, where it returned nothing and dropped a request it could not make; a caller that ignores it should `.catch` it. Closing a pane for good is `end()` for a running session and `remove()` for one that has exited, or that a previous server left `restored`. With `onExit: "remove"` an ended session also removes itself.
 
+## Keys and composed text
+
+The terminal's input element is a textarea the mount places after the canvas: an input method composes only into an editable element. It is invisible, out of the tab order (`tabIndex = -1`) and ignores the pointer. Focusing the canvas (a click, `canvas.focus()`, a tab stop the page gives it) or calling `focus()` focuses the textarea, so `document.activeElement` is the textarea while the terminal has the keyboard: test for focus with `container.contains(document.activeElement)`, not `=== canvas`. Key events bubble from it through the container as they did from the canvas.
+
+- Keys go to the engine's key encoder, which follows the program's modes (cursor keys, the kitty keyboard protocol). The browser keeps Cmd (Meta) chords and Ctrl+Shift+V, its paste.
+- A key that belongs to an input method is left to it: one that is composing (`isComposing`), that it processes (`Process`, key code 229), or a dead key (`Dead`). The composition is shown at the cursor, in the terminal's colours, while it lasts, and its text is sent when it ends (`compositionend`). A key that ended a composition sends no release.
+- Text inserted with no key that sent it (a dead key's character, the emoji picker, dictation) is sent as it is inserted (`beforeinput` `insertText`); a line break or a backward delete from such a source is sent as Enter or Backspace.
+- Composed text goes to the program as UTF-8, as typed text does, not as a paste.
+
+Verified in headless Chrome on macOS through CDP (`Input.imeSetComposition`, `Input.insertText`, `Input.dispatchKeyEvent`): a Japanese composition sent once at its end, nothing during it; a dead key (Option+E, then é) with no Alt+E sent; an emoji inserted with no key; plain keys sent once. Not verified by hand with a real input method, in Safari or in Firefox.
+
 ## `onSessions`
 
 `onSessions(sessions, current)` reports every session on the server, and which one the page shows, at each change: a session created, exited or removed, and a `session_changed`, which the server sends when a session's label, size, attachments, title or working directory changes. The title is the program's (OSC 0 or 2), the working directory the one it reports (OSC 7, as a path), each empty until set, and both cleared by a full reset. A status line takes them from the session whose `id` is `current`; the `session` of a `connected` link is the one `ATTACHED` described, and does not follow these changes.
@@ -99,6 +110,27 @@ Nothing fires for:
 `reason: "closed"` is the connection's close. The worker detaches without waiting for the server's `CLOSED closed`, so that frame never shows up as a link change.
 
 "The server ended an answered connection with an error, and nothing will reconnect" is `ended` with `reason: "error"` and `retry: false` after a `connected`, with no `connecting` after it. An attached session is the latest `connected` with a `session`.
+
+## Selection and copy
+
+The mouse selects on the canvas, and what it selects is copied to the clipboard when the button comes up, with no keystroke:
+
+- a drag selects from the pressed cell to the pointer's, by cells (the half of a cell the pointer passed decides the last one);
+- a double click selects a word and a triple click a line (a soft-wrapped line whole), and a drag after them extends by words or lines;
+- a drag that leaves the canvas goes on, clamped to its edges; it does not scroll the history.
+
+The text is the engine's: soft-wrapped lines are joined, trailing blanks on each line trimmed, and lines end with `\n`. The browser's copy (Cmd+C, or the Copy menu) copies the selection again, through a `copy` event on the input element, and so does Ctrl+Shift+C (without a selection Ctrl+Shift+C goes to the program as a key, and Ctrl+C is always the program's). `selection()` returns the selected text. Paste is unchanged.
+
+The selection is the engine's, drawn inverted, and the engine keeps it on its cells:
+
+- output that scrolls the selected rows up moves the selection with them;
+- output that writes over the selected cells, or erases them (`clear`), leaves it on those cells; the text it copies stays the text selected at the release;
+- scrolling the view moves it with the text; it can reach into the history and beyond the view;
+- a resize reflows it with the text.
+
+It is cleared by a click (a press that selects nothing), by input sent to the session (a key that sends something, a paste, composed text; not a modifier alone), by a switch to the alternate screen (it is not back when the program leaves it), by a full reset (RIS), and by a new screen (attaching, a gap).
+
+The copy on release goes through `navigator.clipboard.writeText` once the worker has the text, a few milliseconds after `mouseup`. Chrome allows that (the page is focused); a browser that asks for the user gesture to be still running may refuse it silently, and Cmd+C then copies. Programs that ask for mouse reports get none from this client, so the mouse always selects.
 
 ## Scrollback
 

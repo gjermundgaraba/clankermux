@@ -1,4 +1,4 @@
-import { type Cell, FLAG, type Frame, type FrameRow, NO_COLOR } from "../engine/index.ts";
+import { FLAG, type Frame, type FrameRow, NO_COLOR } from "../engine/index.ts";
 
 /** The cell grid in CSS pixels and the fonts to draw with. */
 export interface Metrics {
@@ -41,7 +41,7 @@ const MARK_WIDTH = 3;
  * leaves can be redrawn.
  */
 export class CanvasRenderer {
-  private rows = new Map<number, Cell[]>();
+  private rows = new Map<number, FrameRow>();
   private cursorRow: number | undefined;
   /** The scrollback mark drawn last, in pixels from the top. */
   private mark: { top: number; height: number } | undefined;
@@ -69,7 +69,7 @@ export class CanvasRenderer {
     }
     const drawn = new Set<number>();
     for (const row of frame.lines) {
-      this.rows.set(row.y, row.cells);
+      this.rows.set(row.y, row);
       this.drawRow(row);
       drawn.add(row.y);
     }
@@ -79,9 +79,9 @@ export class CanvasRenderer {
       const { cellHeight } = this.metrics;
       const last = Math.ceil((this.mark.top + this.mark.height) / cellHeight);
       for (let y = Math.floor(this.mark.top / cellHeight); y < last; y++) {
-        const cells = this.rows.get(y);
-        if (cells && !drawn.has(y)) {
-          this.drawRow({ y, cells });
+        const row = this.rows.get(y);
+        if (row && !drawn.has(y)) {
+          this.drawRow(row);
           drawn.add(y);
         }
       }
@@ -90,14 +90,14 @@ export class CanvasRenderer {
     // moved or went away; the engine marks no row dirty for either.
     const cursor = frame.cursor?.visible ? frame.cursor : undefined;
     if (this.cursorRow !== undefined && this.cursorRow !== cursor?.y && !drawn.has(this.cursorRow)) {
-      const cells = this.rows.get(this.cursorRow);
-      if (cells) this.drawRow({ y: this.cursorRow, cells });
+      const row = this.rows.get(this.cursorRow);
+      if (row) this.drawRow(row);
     }
     this.cursorRow = undefined;
     if (cursor) {
       if (!drawn.has(cursor.y)) {
-        const cells = this.rows.get(cursor.y);
-        if (cells) this.drawRow({ y: cursor.y, cells });
+        const row = this.rows.get(cursor.y);
+        if (row) this.drawRow(row);
       }
       this.drawCursor(cursor);
       this.cursorRow = cursor.y;
@@ -134,7 +134,9 @@ export class CanvasRenderer {
       const width = cell.flags & FLAG.WIDE ? 2 : 1;
       let fg = css(cell.fg, this.foreground);
       let bg = css(cell.bg, this.background);
-      if (cell.flags & FLAG.INVERSE) [fg, bg] = [bg, fg];
+      // A selected cell is drawn inverted, an inverse one the other way.
+      const selected = row.selection !== undefined && x >= row.selection[0] && x <= row.selection[1];
+      if (((cell.flags & FLAG.INVERSE) !== 0) !== selected) [fg, bg] = [bg, fg];
       if (bg !== this.background) {
         this.ctx.fillStyle = bg;
         this.ctx.fillRect(x * cellWidth, y, width * cellWidth, cellHeight);
@@ -188,7 +190,7 @@ export class CanvasRenderer {
       default: {
         this.ctx.fillRect(x, y, cellWidth, cellHeight);
         // The cell's text in the background colour, over the block.
-        const cell = this.rows.get(cursor.y)?.[cursor.x];
+        const cell = this.rows.get(cursor.y)?.cells[cursor.x];
         if (cell && cell.text !== "" && cell.text !== " ") {
           this.ctx.fillStyle = this.background;
           this.ctx.font = this.font(cell.flags);

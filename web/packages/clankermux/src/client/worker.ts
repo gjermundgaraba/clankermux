@@ -4,7 +4,17 @@
  * reports input. Imported as `@gjermundgaraba/clankermux/worker`, so a worker
  * typechecked without the DOM library does not see the page's types.
  */
-import { ENGINE, Engine, type Frame, KeyEncoder, type KeyInput, RenderState, type Terminal } from "../engine/index.ts";
+import {
+  type CellPoint,
+  ENGINE,
+  Engine,
+  type Frame,
+  KeyEncoder,
+  type KeyInput,
+  RenderState,
+  SelectionGesture,
+  type Terminal,
+} from "../engine/index.ts";
 import {
   type CreateParams,
   type ErrorCode,
@@ -88,6 +98,11 @@ export type ToWorker =
   | { type: "remove"; id: number }
   | { type: "key"; input: KeyInput }
   | { type: "paste"; text: string }
+  /** The mouse on the canvas, `at` in cells of the viewport, fractions
+   * included; `time` in ms, for double and triple clicks. */
+  | { type: "select"; action: "press" | "drag" | "release"; at: CellPoint; time: number }
+  /** Text as typed, which no key sent: a composition's, the emoji picker's. */
+  | { type: "text"; text: string }
   /** The wheel: `rows` through the history, up when negative. */
   | { type: "scroll"; rows: number }
   /** The page's size and profile. Only an `active` page, one the user is
@@ -104,7 +119,10 @@ export type ToPage =
   | { type: "done"; id: number; session?: Session; error?: Failure }
   | { type: "frame"; frame: Frame }
   | { type: "sessions"; sessions: Session[]; current: string | undefined }
-  | { type: "clipboard"; text: string };
+  | { type: "clipboard"; text: string }
+  /** The selection's text, or undefined once there is none; `copy`: the
+   * selection was just made, so it goes to the clipboard. */
+  | { type: "selection"; text: string | undefined; copy: boolean };
 
 /** The worker's end of the page's messages: `self` in a dedicated worker. */
 export interface WorkerPort {
@@ -163,6 +181,9 @@ class Client {
   private engine!: Engine;
   private render!: RenderState;
   private keys!: KeyEncoder;
+  private gesture!: SelectionGesture;
+  /** The page holds a selection's text. */
+  private selected = false;
   private url = "";
   private viewport!: Size;
   private profile!: Profile;
@@ -228,6 +249,7 @@ class Client {
     }
     this.render = new RenderState(this.engine);
     this.keys = new KeyEncoder(this.engine);
+    this.gesture = new SelectionGesture(this.engine);
     await this.connect();
   }
 
@@ -385,6 +407,7 @@ class Client {
     switch (action.type) {
       case "screen": {
         this.backoff = BACKOFF_MIN_MS;
+        this.forgetSelection();
         this.clipboard.reset();
         this.applyProfile(this.attachment?.term());
         this.paint();
@@ -417,6 +440,7 @@ class Client {
         break;
       case "gap":
         this.clipboard.reset();
+        this.forgetSelection();
         this.post({ type: "status", text: "resynchronising" });
         break;
       case "closed":
@@ -475,6 +499,54 @@ class Client {
     if (!term) return;
     this.post({ type: "frame", frame: this.render.update(term) });
     this.render.clean();
+    // A switch to the alternate screen or a full reset took the selection.
+    if (this.selected && !term.selected) this.unselected();
+  }
+
+  /** The mouse: a press clears the selection, or selects a word or a line
+   * at once; a drag selects; the release copies what is selected. */
+  select(action: "press" | "drag" | "release", at: CellPoint, time: number): void {
+    const term = this.attachment?.term();
+    if (!term) return;
+    switch (action) {
+      case "press":
+        if (this.selected) this.unselected();
+        term.select(this.gesture.press(term, at, time));
+        break;
+      case "drag": {
+        const selection = this.gesture.drag(term, at);
+        if (selection) term.select(selection);
+        break;
+      }
+      case "release": {
+        this.gesture.release(term, at);
+        const text = term.selectionText();
+        this.selected = text !== undefined;
+        if (text !== undefined) this.post({ type: "selection", text, copy: true });
+        break;
+      }
+    }
+    this.paint();
+  }
+
+  /** Input clears the selection. */
+  private unselect(): void {
+    const term = this.attachment?.term();
+    if (!term?.selected) return;
+    term.select(undefined);
+    this.paint();
+    if (this.selected) this.unselected();
+  }
+
+  private unselected(): void {
+    this.selected = false;
+    this.post({ type: "selection", text: undefined, copy: false });
+  }
+
+  /** The terminal goes, and its selection and the gesture's anchor with it. */
+  private forgetSelection(): void {
+    this.gesture.forget();
+    if (this.selected) this.unselected();
   }
 
   /** Closes the current attachment's channel and forgets it. An
@@ -482,6 +554,7 @@ class Client {
    * (EXITED) does. */
   private detach(): void {
     if (!this.attachment) return;
+    this.forgetSelection();
     if (this.conn) {
       this.conn.release(this.channel);
       if (!this.attachment.closed()) {
@@ -568,6 +641,7 @@ class Client {
     const channel = this.channel;
     if (bytes.length === 0 || !conn || !attachment || attachment.ended() || session === undefined) return;
     this.live();
+    this.unselect();
     // Each request's base64 fits the control body with room for the rest,
     // and its bytes fit the input queue (at least one byte, so the loop
     // moves on an absurd limit).
@@ -635,6 +709,12 @@ class Client {
     this.paint();
   }
 
+  /** Text no key sent, as UTF-8: a composition's, the emoji picker's. */
+  text(text: string): void {
+    if (!this.attachment?.term()) return;
+    this.input(new TextEncoder().encode(text), false);
+  }
+
   paste(text: string): void {
     const term = this.attachment?.term();
     if (!term) return;
@@ -696,6 +776,12 @@ export function runWorker(port: WorkerPort): void {
         break;
       case "paste":
         client.paste(message.text);
+        break;
+      case "text":
+        client.text(message.text);
+        break;
+      case "select":
+        client.select(message.action, message.at, message.time);
         break;
       case "scroll":
         client.scroll(message.rows);

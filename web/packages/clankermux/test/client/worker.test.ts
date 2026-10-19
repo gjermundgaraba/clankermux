@@ -505,10 +505,14 @@ test("the wheel and Shift+PageUp scroll the history; input goes back to the live
   await vi.waitFor(() => expect(worker.scrollbar()).toEqual({ total: 7, offset: 0, len: 3 }));
   expect(inputs()).toEqual([]);
 
-  // Typing goes back to the live screen, and is sent.
+  // Typing goes back to the live screen, and is sent; so does composed
+  // text, as UTF-8.
   worker.send({ type: "key", input: key("KeyA", { key: "a" }) });
   expect(worker.scrollbar()).toEqual({ total: 7, offset: 4, len: 3 });
-  await vi.waitFor(() => expect(inputs()).toEqual(["a"]));
+  worker.send({ type: "scroll", rows: -1 });
+  worker.send({ type: "text", text: "\u65e5\u672c" });
+  expect(worker.scrollbar()).toEqual({ total: 7, offset: 4, len: 3 });
+  await vi.waitFor(() => expect(inputs()).toEqual(["a", "\u65e5\u672c"]));
 });
 
 test("on the alternate screen the wheel is arrow keys and Shift+PageUp is a key", async () => {
@@ -531,4 +535,47 @@ test("on the alternate screen the wheel is arrow keys and Shift+PageUp is a key"
   worker.send({ type: "scroll", rows: -2 });
   await new Promise((resolve) => setTimeout(resolve, 50));
   expect(inputs()).toHaveLength(3);
+});
+
+test("a drag selects and copies on release; a click, input or a new screen clears it", async () => {
+  const worker = start("s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const channel = await server.opened("s");
+  bootstrap(server, channel, session("s"), "one two\r\nthree four five");
+  await vi.waitFor(() => expect(worker.scrollbar()).toBeDefined());
+  const selections = () => worker.posted.filter((m) => m.type === "selection");
+  const selectedRows = () =>
+    worker.posted.flatMap((m) => (m.type === "frame" ? [m.frame.lines.map((l) => l.selection)] : [])).at(-1);
+
+  worker.send({ type: "select", action: "press", at: { x: 4.2, y: 0.5 }, time: 1000 });
+  worker.send({ type: "select", action: "drag", at: { x: 2.6, y: 1.5 }, time: 0 });
+  expect(selectedRows()).toEqual([[4, 9], [0, 2], undefined]);
+  expect(selections()).toEqual([]);
+  worker.send({ type: "select", action: "release", at: { x: 2.6, y: 1.5 }, time: 1100 });
+  expect(selections()).toEqual([{ type: "selection", text: "two\nthr", copy: true }]);
+
+  // A key clears it, and the page forgets the text.
+  worker.send({ type: "key", input: key("KeyA", { key: "a" }) });
+  expect(selections().at(-1)).toEqual({ type: "selection", text: undefined, copy: false });
+  expect(selectedRows()).toEqual([undefined, undefined, undefined]);
+
+  // A double click selects the word at once; a single click clears it.
+  worker.send({ type: "select", action: "press", at: { x: 1, y: 1.5 }, time: 5000 });
+  worker.send({ type: "select", action: "release", at: { x: 1, y: 1.5 }, time: 5050 });
+  worker.send({ type: "select", action: "press", at: { x: 1, y: 1.5 }, time: 5100 });
+  worker.send({ type: "select", action: "release", at: { x: 1, y: 1.5 }, time: 5150 });
+  expect(selections().at(-1)).toEqual({ type: "selection", text: "three", copy: true });
+  worker.send({ type: "select", action: "press", at: { x: 1, y: 0.5 }, time: 9000 });
+  expect(selections().at(-1)).toEqual({ type: "selection", text: undefined, copy: false });
+  worker.send({ type: "select", action: "release", at: { x: 1, y: 0.5 }, time: 9050 });
+  expect(selections()).toHaveLength(4);
+
+  // Selected again, then a new screen: gone.
+  worker.send({ type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 20000 });
+  worker.send({ type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
+  worker.send({ type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 20100 });
+  expect(selections().at(-1)).toEqual({ type: "selection", text: "one t", copy: true });
+  server.push(FrameType.Gap, channel, { from: 0, to: 10 });
+  expect(selections().at(-1)).toEqual({ type: "selection", text: undefined, copy: false });
 });
