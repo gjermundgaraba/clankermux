@@ -18,16 +18,14 @@ A terminal multiplexer server with CLI and browser clients; the wire protocol is
 | `just release-build` | `target/release/clankermux` |
 | `just dev-serve` | release server: state and socket in `target/dev/`, `wss://127.0.0.1:7438/` with a self-signed certificate, origins `http://app.clankerspace-dev.localhost:10094` and `http://127.0.0.1:8787` |
 | `just pack-web` | `web/dist-packages/clankermux-{proto,engine,renderer,client}-<version>.tgz` and `COMMIT` |
-| `cd web/apps/client && pnpm build && pnpm serve` | demo page on `http://127.0.0.1:8787/?ws=wss://127.0.0.1:7438/` |
+| `cd web/apps/client && pnpm build && pnpm serve` | demo page on `http://127.0.0.1:8787/?ws=wss://127.0.0.1:7438/`; after `just check`, which installs `web/` and builds the wasm |
 | `target/release/clankermux --socket target/dev/sock create` | a session on the dev server |
 
 ## Release
 
-| Step | |
-| --- | --- |
-| Bump `version` in `crates/clankermux/Cargo.toml` and `web/packages/*/package.json` | |
-| `git tag v<version> && git push --tags` | `release.yml` attaches `clankermux-<version>-{x86_64,aarch64}-unknown-linux-gnu` and `SHA256SUMS` |
-| `just pack-web`, then `npm publish <tarball>` for proto, engine, renderer, client | |
+1. Bump `version` in `crates/clankermux/Cargo.toml` and `web/packages/*/package.json` (`scripts/version.sh` checks they agree).
+2. `git tag v<version> && git push --tags`: `release.yml` attaches `clankermux-<version>-{x86_64,aarch64}-unknown-linux-gnu` and `SHA256SUMS`.
+3. `just pack-web`, then `npm publish <tarball>` for proto, engine, renderer, client.
 
 ## Using the packages before a release
 

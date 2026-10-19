@@ -5,6 +5,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out="$root/web/dist-packages"
 packages=(proto engine renderer client)
+version=$("$root/scripts/version.sh")
 
 cd "$root/web"
 pnpm install --frozen-lockfile
@@ -16,11 +17,14 @@ commit=$(git -C "$root" rev-parse --short HEAD)
 [ -z "$(git -C "$root" status --porcelain)" ] || commit="$commit-dirty"
 echo "$commit" > "$out/COMMIT"
 
-# Each tarball holds its manifest and build; the engine also its wasm and
-# the id the server matches.
+# Each tarball holds its manifest and build, and publishes every subpath
+# the workspace exports; the engine also holds its wasm and the id the
+# server matches.
 engine=$(jq -r .engine "$root/vendor/pin.json")
 for p in "${packages[@]}"; do
-    tarball="$out/clankermux-$p-0.1.0.tgz"
+    jq -e '(.exports | if type == "string" then ["."] else keys end) == (.publishConfig.exports | keys)' \
+        "packages/$p/package.json" >/dev/null || { echo "@clankermux/$p: publishConfig.exports and exports differ" >&2; exit 1; }
+    tarball="$out/clankermux-$p-$version.tgz"
     files=$(tar tzf "$tarball")
     for want in package/package.json package/dist/index.js package/dist/index.d.ts; do
         grep -qx "$want" <<< "$files" || { echo "$tarball lacks $want" >&2; exit 1; }
@@ -32,9 +36,9 @@ for p in "${packages[@]}"; do
         exit 1
     fi
 done
-engine_tgz="$out/clankermux-engine-0.1.0.tgz"
+engine_tgz="$out/clankermux-engine-$version.tgz"
 tar tzf "$engine_tgz" | grep -qx package/ghostty-vt.wasm || { echo "$engine_tgz lacks the wasm" >&2; exit 1; }
 tar xzOf "$engine_tgz" package/dist/pin.js | grep -qF "\"$engine\"" || { echo "$engine_tgz does not name $engine" >&2; exit 1; }
 
-echo "commit $commit, engine $engine"
+echo "version $version, commit $commit, engine $engine"
 ls -1 "$out"/*.tgz

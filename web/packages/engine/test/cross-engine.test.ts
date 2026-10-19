@@ -34,8 +34,3 @@ test("the wasm build reports the engine id", async () => {
     expect(`ghostty-vt@${engine.readString(out)}`).toBe(ENGINE);
   });
 });
-
-test("the published engine id is the pin's", () => {
-  const pin = JSON.parse(readFileSync(`${here}../../../../vendor/pin.json`, "utf8"));
-  expect(ENGINE).toBe(pin.engine);
-});
