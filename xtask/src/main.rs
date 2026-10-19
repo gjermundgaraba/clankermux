@@ -19,6 +19,14 @@ fn bindings(check: bool) -> ExitCode {
         .header(include.join("ghostty/vt.h").to_string_lossy())
         .clang_arg(format!("-I{}", include.display()))
         .clang_arg("-DGHOSTTY_STATIC")
+        // The same parse on every host: no system headers, and C23 so
+        // `GHOSTTY_ENUM_TYPED` is `: int` whether or not this libclang
+        // has `c_fixed_enum` (20+); `-std=c23` needs libclang 18+.
+        .clang_args([
+            "--target=x86_64-unknown-linux-gnu",
+            "-ffreestanding",
+            "-std=c23",
+        ])
         .allowlist_type("Ghostty.*")
         .allowlist_function("ghostty_.*")
         .allowlist_var("GHOSTTY_.*")
