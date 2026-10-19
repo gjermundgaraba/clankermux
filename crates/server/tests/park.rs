@@ -220,7 +220,7 @@ async fn a_stop_parks_an_exited_session_whose_final_park_is_waiting() {
     let mut c = client(&a).await;
     c.ok("subscribe", json!({})).await;
     let session = c
-        .create(json!({"on_exit": "keep", "argv": ["/bin/sh", "-c", "echo held; exit 4"]}))
+        .create(json!({"on_exit": "keep", "argv": ["/bin/sh", "-c", "read go; echo held; exit 4"]}))
         .await;
     let park_lock = a
         .registry
@@ -231,6 +231,9 @@ async fn a_stop_parks_an_exited_session_whose_final_park_is_waiting() {
         .park_lock
         .clone();
     let held = park_lock.lock().await;
+    // Not before: the exit's park could finish before the lock is held.
+    c.ok("write", json!({"session": session.id, "data": b64("go\n")}))
+        .await;
     assert_eq!(
         c.wait_exit(&session.id).await.exit,
         Some(Exit::Code { code: 4 })

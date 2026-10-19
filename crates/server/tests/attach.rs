@@ -320,10 +320,11 @@ async fn exit_ends_the_stream_and_removal_closes() {
     events.ok("subscribe", json!({})).await;
 
     let session = c
-        .create(json!({"argv": ["/bin/sh", "-c", "sleep 0.3; echo bye; exit 3"]}))
+        .create(json!({"argv": ["/bin/sh", "-c", "read go; echo bye; exit 3"]}))
         .await;
     c.open(1, json!({"session": session.id})).await;
     let boot = c.bootstrap(1).await;
+    c.send(FrameType::Input, 1, b"go\n").await;
     let (offset, bytes) = c.output_until(1, b"bye\r\n").await;
     assert_eq!(offset, boot.attached.offset);
     let (header, payload) = c.recv_on(1).await;
@@ -363,7 +364,8 @@ async fn exit_ends_the_stream_and_removal_closes() {
         "the snapshot reflects the exit; no EXITED frame"
     );
     assert!(boot.stream.is_empty());
-    c.ok("remove", json!({"session": kept.id})).await;
+    // From another connection: the reply and the CLOSED are unordered.
+    events.ok("remove", json!({"session": kept.id})).await;
     assert_eq!(
         c.expect_closed(2).await,
         ClosedReason::Removed,
@@ -379,22 +381,33 @@ async fn exit_ends_the_stream_and_removal_closes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gap_when_the_client_falls_behind() {
-    // The ring holds more than one PTY read, so the cursor is evicted by
-    // the unread bulk of the output, not by one burst.
+    // The first burst (1.05 MB with CRLFs) fits the ring but not what the
+    // connection holds in flight (its queue and the socket buffer, which
+    // is larger on Linux), so the cursor stops in it; the second, larger
+    // than the ring, evicts the stopped cursor, not one the server is
+    // still forwarding.
     let server = start(Limits {
-        ring: 256 * 1024,
+        ring: 1536 * 1024,
         ..fast_limits()
     });
     let mut c = client(&server).await;
     let mut events = client(&server).await;
     events.ok("subscribe", json!({})).await;
+    let script = "read go; yes | head -c 700000; echo FIRST-DONE; \
+                  read go; yes | head -c 1500000";
     let session = c
-        .create(json!({"argv": ["/bin/sh", "-c", "sleep 0.3; yes | head -c 1500000"], "on_exit": "keep", "cols": 20, "rows": 5}))
+        .create(
+            json!({"argv": ["/bin/sh", "-c", script], "on_exit": "keep", "cols": 20, "rows": 5}),
+        )
         .await;
+    let go = json!({"session": session.id, "data": b64("go\n")});
     c.open(1, json!({"session": session.id})).await;
     let boot = c.bootstrap(1).await;
     assert!(boot.stream.is_empty());
     // Read nothing until the session has produced everything and exited.
+    events.ok("write", go.clone()).await;
+    wait_text(&mut events, &session.id, "FIRST-DONE").await;
+    events.ok("write", go).await;
     let exited = events.wait_exit(&session.id).await;
     let mut delivered = 0u64;
     let gap = loop {
@@ -409,7 +422,7 @@ async fn gap_when_the_client_falls_behind() {
             other => panic!("{other:?}"),
         }
     };
-    assert!(delivered < 1_500_000);
+    assert!(delivered < 1_050_000);
     assert_eq!(gap.from, boot.attached.offset + delivered);
     let again = c.bootstrap(1).await;
     assert_eq!(gap.to, again.attached.offset);
@@ -421,8 +434,9 @@ async fn gap_when_the_client_falls_behind() {
 #[tokio::test(flavor = "multi_thread")]
 async fn gap_during_a_bootstrap_retries_once_then_too_slow() {
     // Small frames and a history that does not compress, so a snapshot is
-    // far larger than the connection's queue allows in flight; each burst
-    // is larger than the ring and waits for a line on stdin.
+    // far larger than the connection holds in flight (its queue and the
+    // socket buffer); each burst is larger than the ring, waits for a line
+    // on stdin, and is one line so it pushes little history out.
     let server = start(Limits {
         ring: 16 * 1024,
         max_frame: 16 * 1024,
@@ -432,8 +446,8 @@ async fn gap_during_a_bootstrap_retries_once_then_too_slow() {
     let mut ctl = client(&server).await;
     ctl.ok("subscribe", json!({})).await;
     let script = "head -c 600000 /dev/urandom | base64; echo FIRST-DONE; \
-                  read go; yes | head -c 100000; echo SECOND-DONE; \
-                  read go; yes | head -c 100000";
+                  read go; head -c 100000 /dev/zero | tr '\\0' y; echo SECOND-DONE; \
+                  read go; head -c 100000 /dev/zero | tr '\\0' y";
     let session = ctl
         .create(
             json!({"argv": ["/bin/sh", "-c", script], "on_exit": "keep", "cols": 20, "rows": 5}),
@@ -445,18 +459,21 @@ async fn gap_during_a_bootstrap_retries_once_then_too_slow() {
     c.open(1, json!({"session": session.id})).await;
     let first = c.bootstrap_ready(1).await;
     // Not reading: the remainder fills the queue to the high-water mark
-    // while the burst pushes the cursor out of the ring.
+    // while the burst pushes the cursor out of the ring. Output (the echo
+    // of `go`, the start of the burst) is forwarded until the queue fills.
     ctl.ok("write", go.clone()).await;
     wait_text(&mut ctl, &session.id, "SECOND-DONE").await;
+    let mut delivered = 0u64;
     let gap = loop {
         let (header, payload) = c.recv_on(1).await;
         match header.frame_type {
             FrameType::Snapshot => {}
+            FrameType::Output => delivered += parse_output(&payload).unwrap().1.len() as u64,
             FrameType::Gap => break serde_json::from_slice::<Gap>(&payload).unwrap(),
             other => panic!("{other:?}"),
         }
     };
-    assert_eq!(gap.from, first.attached.offset);
+    assert_eq!(gap.from, first.attached.offset + delivered);
     let second = c.bootstrap_ready(1).await;
     assert_eq!(gap.to, second.attached.offset);
     assert!(second.attached.offset > first.attached.offset);
@@ -467,7 +484,7 @@ async fn gap_during_a_bootstrap_retries_once_then_too_slow() {
     loop {
         let (header, payload) = c.recv_on(1).await;
         match header.frame_type {
-            FrameType::Snapshot => {}
+            FrameType::Snapshot | FrameType::Output => {}
             FrameType::Error => {
                 let error: ErrorMessage = serde_json::from_slice(&payload).unwrap();
                 assert_eq!(error.code, ErrorCode::TooSlow);
@@ -530,7 +547,10 @@ async fn queries_are_answered_from_the_latest_profile_and_cell_size() {
     c.output_until(1, b"\x1b]12;rgb:ffff/0000/0000\x1b\\").await;
     c.send(FrameType::Input, 1, b"\x1b[16t").await;
     c.output_until(1, b"\x1b[6;16;8t").await;
-    c.send(FrameType::Input, 1, b"\x1b[?2031h").await;
+    // `cat` echoes the mode back to the terminal; the answer after it
+    // shows it is set before the other attachment's profile arrives.
+    c.send(FrameType::Input, 1, b"\x1b[?2031h\x1b[?996n").await;
+    c.output_until(1, b"\x1b[?997;1n").await;
 
     // A second writable attachment's profile replaces it; with mode 2031
     // set the changed answer is reported unasked. Its report carries no
