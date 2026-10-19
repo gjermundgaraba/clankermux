@@ -135,3 +135,47 @@ test("paste is encoded for the PTY and modes are queried", () => {
   expect([term.cols, term.rows]).toEqual([20, 4]);
   term.free();
 });
+
+test("the viewport scrolls through the history and stays there while output arrives", () => {
+  const term = engine.terminalNew(10, 3);
+  term.write(utf8("l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6"));
+  const render = new RenderState(engine);
+  const rows = (frame: ReturnType<RenderState["update"]>) =>
+    frame.lines.map((l) => l.cells.map((c) => c.text || " ").join("").trimEnd());
+  expect(render.update(term).scrollbar).toEqual({ total: 6, offset: 3, len: 3 });
+  render.clean();
+
+  // A move is a full frame; the cursor, below the view, is not in it.
+  term.scroll(-2);
+  let frame = render.update(term);
+  render.clean();
+  expect(frame.full).toBe(true);
+  expect(rows(frame)).toEqual(["l2", "l3", "l4"]);
+  expect(frame.cursor).toBeUndefined();
+  expect(frame.scrollbar).toEqual({ total: 6, offset: 1, len: 3 });
+
+  // Output adds history below the view and changes no row of it.
+  term.write(utf8("\r\nl7\r\nl8"));
+  frame = render.update(term);
+  render.clean();
+  expect(frame.lines).toEqual([]);
+  expect(frame.scrollbar).toEqual({ total: 8, offset: 1, len: 3 });
+
+  term.scroll("top");
+  expect(term.scrollbar.offset).toBe(0);
+  term.scroll("bottom");
+  frame = render.update(term);
+  render.clean();
+  expect(rows(frame)).toEqual(["l6", "l7", "l8"]);
+  expect(frame.scrollbar).toEqual({ total: 8, offset: 5, len: 3 });
+
+  // The alternate screen has no history to scroll.
+  expect(term.alternate).toBe(false);
+  term.write(utf8("\x1b[?1049h"));
+  expect(term.alternate).toBe(true);
+  expect(term.scrollbar).toEqual({ total: 3, offset: 0, len: 3 });
+  term.scroll(-2);
+  expect(term.scrollbar.offset).toBe(0);
+  render.free();
+  term.free();
+});

@@ -43,6 +43,11 @@ export interface MountOptions {
   /** Each change of the link to the session, to switch on. */
   onLink?: (link: Link) => void;
   onSessions?: (sessions: Session[], current: string | undefined) => void;
+  /** The rows between the bottom of the view and the live screen's, when
+   * that changes: above 0 while the view is scrolled back into the
+   * history (and growing with output meanwhile), 0 when it shows the
+   * live screen again. The canvas draws a mark at its right edge too. */
+  onScroll?: (rows: number) => void;
 }
 
 export interface CreateOptions {
@@ -158,6 +163,8 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
   const failure = (error: Failure): Error =>
     error.kind ? new ClientError(error.kind, error.message, error.server) : new Error(error.message);
 
+  /** Rows the view is scrolled back, as `onScroll` last reported. */
+  let scrolled = 0;
   worker.onmessage = (e: MessageEvent<ToPage>) => {
     const message = e.data;
     switch (message.type) {
@@ -174,7 +181,12 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
         else waiter?.resolve(message.session);
         break;
       }
-      case "frame":
+      case "frame": {
+        const { total, offset, len } = message.frame.scrollbar;
+        if (total - offset - len !== scrolled) {
+          scrolled = total - offset - len;
+          options.onScroll?.(scrolled);
+        }
         fitCanvas(message.frame.cols, message.frame.rows);
         if (fullNext && !message.frame.full) {
           // The backing store was recreated; a partial frame cannot fill it.
@@ -184,6 +196,7 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
           renderer.draw(message.frame);
         }
         break;
+      }
       case "sessions":
         options.onSessions?.(message.sessions, message.current);
         break;
@@ -214,6 +227,28 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
     { signal },
   );
   canvas.addEventListener("mousedown", () => canvas.focus(), { signal });
+  // The wheel scrolls the history in whole rows; what a trackpad sends in
+  // pixels adds up until it makes one. Ctrl+wheel stays the browser's zoom.
+  let wheeled = 0;
+  canvas.addEventListener(
+    "wheel",
+    (e) => {
+      if (e.ctrlKey) return;
+      e.preventDefault();
+      const rows =
+        e.deltaMode === WheelEvent.DOM_DELTA_LINE
+          ? e.deltaY
+          : e.deltaMode === WheelEvent.DOM_DELTA_PAGE
+            ? e.deltaY * grid.rows
+            : e.deltaY / metrics.cellHeight;
+      wheeled += rows;
+      const whole = Math.trunc(wheeled);
+      if (whole === 0) return;
+      wheeled -= whole;
+      send({ type: "scroll", rows: whole });
+    },
+    { passive: false, signal },
+  );
 
   /** The profile last reported, to tell when it changed. */
   let reported = "";

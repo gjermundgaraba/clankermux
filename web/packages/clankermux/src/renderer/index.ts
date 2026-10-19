@@ -31,13 +31,20 @@ const hex = (color: number) => `#${color.toString(16).padStart(6, "0")}`;
 /** A cell or cursor colour, or `fallback` when it has none. */
 const css = (color: number, fallback: string) => (color === NO_COLOR ? fallback : hex(color));
 
+/** Width in CSS pixels of the mark at the right edge that shows the view
+ * scrolled back, and where it is in the history. */
+const MARK_WIDTH = 3;
+
 /**
- * Draws frames onto a 2D context: changed rows only, then the cursor.
- * Rows are cached so the row the cursor leaves can be redrawn.
+ * Draws frames onto a 2D context: changed rows only, then the cursor, then
+ * the scrollback mark. Rows are cached so the rows the cursor or the mark
+ * leaves can be redrawn.
  */
 export class CanvasRenderer {
   private rows = new Map<number, Cell[]>();
   private cursorRow: number | undefined;
+  /** The scrollback mark drawn last, in pixels from the top. */
+  private mark: { top: number; height: number } | undefined;
   private cols = 0;
   private background = "";
   private foreground = "";
@@ -55,6 +62,7 @@ export class CanvasRenderer {
     if (frame.full || frame.cols !== this.cols) {
       this.cols = frame.cols;
       this.rows.clear();
+      this.mark = undefined;
       this.ctx.globalAlpha = 1;
       this.ctx.fillStyle = this.background;
       this.ctx.fillRect(0, 0, frame.cols * this.metrics.cellWidth, frame.rows * this.metrics.cellHeight);
@@ -65,6 +73,19 @@ export class CanvasRenderer {
       this.drawRow(row);
       drawn.add(row.y);
     }
+    // A mark that moved or went away is erased with the rows under it.
+    const mark = this.markOf(frame);
+    if (this.mark && (this.mark.top !== mark?.top || this.mark.height !== mark?.height)) {
+      const { cellHeight } = this.metrics;
+      const last = Math.ceil((this.mark.top + this.mark.height) / cellHeight);
+      for (let y = Math.floor(this.mark.top / cellHeight); y < last; y++) {
+        const cells = this.rows.get(y);
+        if (cells && !drawn.has(y)) {
+          this.drawRow({ y, cells });
+          drawn.add(y);
+        }
+      }
+    }
     // The cursor's old row is redrawn from the cache when the cursor
     // moved or went away; the engine marks no row dirty for either.
     const cursor = frame.cursor?.visible ? frame.cursor : undefined;
@@ -73,13 +94,32 @@ export class CanvasRenderer {
       if (cells) this.drawRow({ y: this.cursorRow, cells });
     }
     this.cursorRow = undefined;
-    if (!cursor) return;
-    if (!drawn.has(cursor.y)) {
-      const cells = this.rows.get(cursor.y);
-      if (cells) this.drawRow({ y: cursor.y, cells });
+    if (cursor) {
+      if (!drawn.has(cursor.y)) {
+        const cells = this.rows.get(cursor.y);
+        if (cells) this.drawRow({ y: cursor.y, cells });
+      }
+      this.drawCursor(cursor);
+      this.cursorRow = cursor.y;
     }
-    this.drawCursor(cursor);
-    this.cursorRow = cursor.y;
+    // Over everything, on every frame: a row drawn under it erased it.
+    this.mark = mark;
+    if (mark) {
+      this.ctx.globalAlpha = 0.5;
+      this.ctx.fillStyle = this.foreground;
+      this.ctx.fillRect(this.cols * this.metrics.cellWidth - MARK_WIDTH, mark.top, MARK_WIDTH, mark.height);
+      this.ctx.globalAlpha = 1;
+    }
+  }
+
+  /** The scrollback mark for `frame`: the viewport's share of the history
+   * at the right edge, while the view is scrolled back. */
+  private markOf(frame: Frame): { top: number; height: number } | undefined {
+    const { total, offset, len } = frame.scrollbar;
+    if (offset + len >= total) return undefined;
+    const height = frame.rows * this.metrics.cellHeight;
+    const size = Math.max(Math.round((height * len) / total), Math.min(height, this.metrics.cellHeight));
+    return { top: Math.min(Math.round((height * offset) / total), height - size), height: size };
   }
 
   private drawRow(row: FrameRow): void {

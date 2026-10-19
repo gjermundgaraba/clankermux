@@ -100,6 +100,17 @@ Nothing fires for:
 
 "The server ended an answered connection with an error, and nothing will reconnect" is `ended` with `reason: "error"` and `retry: false` after a `connected`, with no `connecting` after it. An attached session is the latest `connected` with a `session`.
 
+## Scrollback
+
+The terminal holds the session's history (the server sends what it keeps with the screen), and the view scrolls through it:
+
+- the wheel over the canvas, in whole rows (a trackpad's pixels add up until they make one; Ctrl+wheel stays the browser's zoom);
+- Shift+PageUp and Shift+PageDown, a screen at a time; Shift+Home and Shift+End, to the top of the history and back to the live screen.
+
+Output while the view is scrolled back leaves it where it is. Any input that sends something (a key, a paste, composed text) brings it back to the live screen first; a modifier alone does not. The alternate screen of full-screen programs (`vim`, `less`) has no history: there Shift+PageUp and the rest go to the program as keys, and the wheel sends the up and down arrow keys while the program leaves alternate scroll (mode 1007) on, as it is by default, or nothing.
+
+While the view is scrolled back the canvas draws a mark at its right edge, the view's share of the history and its place in it. `onScroll(rows)` reports the rows between the bottom of the view and the live screen's at each change: above 0 when scrolled back (it grows as output arrives meanwhile), 0 at the live screen.
+
 ## Size between clients
 
 A session has one size, and the server applies the latest report (PROTOCOL.md, "Size"). The terminal reports its container's size, its colours and its scheme only while its page is visible and its window has the focus (`document.visibilityState === "visible"` and `document.hasFocus()`). It reports again when the page is shown or its window focused, even at an unchanged size. So with the same session open in several tabs or on several machines, the session takes the size of the one you look at, and a hidden or unfocused one never resizes it: its `OPEN` carries no viewport, it sends no `VIEWPORT`, and its canvas shows the session's size, clipped or with a margin. `report()` follows the same rule. `create()` makes the session at the container's current size, focused or not.

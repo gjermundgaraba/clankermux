@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 
-import { Engine } from "../../src/engine/index.ts";
+import { Engine, type KeyInput } from "../../src/engine/index.ts";
 import { type Frame, FrameType, type Limits, type Session, encodeFrame, parseFrame } from "../../src/proto/index.ts";
 
 import { type Link, type ToPage, type ToWorker, runWorker } from "../../src/client/worker.ts";
@@ -119,10 +119,10 @@ function session(id: string, status: Session["status"] = "running"): Session {
   };
 }
 
-/** A whole snapshot bootstrap of `s` on `channel`. */
-function bootstrap(socket: FakeSocket, channel: number, s: Session): void {
+/** A whole snapshot bootstrap of `s` on `channel`, its terminal showing `text`. */
+function bootstrap(socket: FakeSocket, channel: number, s: Session, text = "hello"): void {
   const source = engine.terminalNew(10, 3);
-  source.write(new TextEncoder().encode("hello"));
+  source.write(new TextEncoder().encode(text));
   const bytes = source.snapshot();
   source.free();
   socket.push(FrameType.Attached, channel, {
@@ -160,6 +160,8 @@ function start(attach?: string, active = true) {
   return {
     send,
     posted,
+    /** The latest frame's scrollbar, once one was posted. */
+    scrollbar: () => posted.flatMap((m) => (m.type === "frame" ? [m.frame.scrollbar] : [])).at(-1),
     links: () => posted.flatMap((m) => (m.type === "link" ? [m.link] : [])),
     async done(id: number) {
       let found: Extract<ToPage, { type: "done" }> | undefined;
@@ -170,6 +172,20 @@ function start(attach?: string, active = true) {
       return found!;
     },
   };
+}
+
+/** `OUTPUT` of `text` at stream `offset`. */
+function output(offset: number, text: string): Uint8Array {
+  const bytes = new TextEncoder().encode(text);
+  const payload = new Uint8Array(8 + bytes.length);
+  new DataView(payload.buffer).setBigUint64(0, BigInt(offset), true);
+  payload.set(bytes, 8);
+  return payload;
+}
+
+/** A key press, or its release. */
+function key(code: string, extra: Partial<KeyInput> = {}): KeyInput {
+  return { code, key: code, action: "press", shift: false, ctrl: false, alt: false, meta: false, ...extra };
 }
 
 /** The `index`th socket, once the worker opened it: the first waits for
@@ -460,4 +476,59 @@ test("the link: a server refusing the handshake ends it; a lost one is tried aga
   );
   await (await socket(2)).serve();
   await vi.waitFor(() => expect(lost.links().at(-1)).toEqual({ state: "connected", session: undefined }));
+});
+
+test("the wheel and Shift+PageUp scroll the history; input goes back to the live screen", async () => {
+  const worker = start("s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const channel = await server.opened("s");
+  bootstrap(server, channel, session("s"), "l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6");
+  await vi.waitFor(() => expect(worker.scrollbar()).toEqual({ total: 6, offset: 3, len: 3 }));
+  const inputs = () => server.sent.filter((f) => f.header.type === FrameType.Input).map((f) => new TextDecoder().decode(f.payload));
+
+  worker.send({ type: "scroll", rows: -1 });
+  expect(worker.scrollbar()).toEqual({ total: 6, offset: 2, len: 3 });
+  worker.send({ type: "key", input: key("PageUp", { shift: true }) });
+  worker.send({ type: "key", input: key("PageUp", { shift: true, action: "release" }) });
+  expect(worker.scrollbar()).toEqual({ total: 6, offset: 0, len: 3 });
+  worker.send({ type: "key", input: key("End", { shift: true }) });
+  expect(worker.scrollbar()).toEqual({ total: 6, offset: 3, len: 3 });
+  worker.send({ type: "key", input: key("Home", { shift: true }) });
+  expect(worker.scrollbar()).toEqual({ total: 6, offset: 0, len: 3 });
+  // A modifier alone encodes to nothing and stays where it is.
+  worker.send({ type: "key", input: key("ShiftLeft", { key: "Shift", shift: true }) });
+  expect(worker.scrollbar()).toEqual({ total: 6, offset: 0, len: 3 });
+
+  // Output while scrolled back leaves the view where it is.
+  server.pushRaw(encodeFrame(FrameType.Output, channel, output(0, "\r\nl7")));
+  await vi.waitFor(() => expect(worker.scrollbar()).toEqual({ total: 7, offset: 0, len: 3 }));
+  expect(inputs()).toEqual([]);
+
+  // Typing goes back to the live screen, and is sent.
+  worker.send({ type: "key", input: key("KeyA", { key: "a" }) });
+  expect(worker.scrollbar()).toEqual({ total: 7, offset: 4, len: 3 });
+  await vi.waitFor(() => expect(inputs()).toEqual(["a"]));
+});
+
+test("on the alternate screen the wheel is arrow keys and Shift+PageUp is a key", async () => {
+  const worker = start("s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const channel = await server.opened("s");
+  bootstrap(server, channel, session("s"), "l1\r\nl2\r\nl3\r\nl4\x1b[?1049h");
+  await vi.waitFor(() => expect(worker.scrollbar()).toEqual({ total: 3, offset: 0, len: 3 }));
+  const inputs = () => server.sent.filter((f) => f.header.type === FrameType.Input).map((f) => new TextDecoder().decode(f.payload));
+
+  worker.send({ type: "scroll", rows: -2 });
+  worker.send({ type: "scroll", rows: 1 });
+  worker.send({ type: "key", input: key("PageUp", { shift: true }) });
+  await vi.waitFor(() => expect(inputs()).toEqual(["\x1b[A\x1b[A", "\x1b[B", "\x1b[5;2~"]));
+  expect(worker.scrollbar()).toEqual({ total: 3, offset: 0, len: 3 });
+
+  // Without alternate scroll (mode 1007) the wheel does nothing.
+  server.pushRaw(encodeFrame(FrameType.Output, channel, output(0, "\x1b[?1007l")));
+  worker.send({ type: "scroll", rows: -2 });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(inputs()).toHaveLength(3);
 });

@@ -1,4 +1,4 @@
-import { type BitField, type Engine, type Terminal } from "./index.ts";
+import { type BitField, type Engine, type Scrollbar, type Terminal } from "./index.ts";
 
 /** Style flag bits of a [`Cell`]. */
 export const FLAG = {
@@ -58,6 +58,9 @@ export interface Frame {
     | undefined;
   /** The rows that changed, or every row when `full`. */
   lines: FrameRow[];
+  /** Where the viewport is in the history: scrolled back when it ends
+   * above the last row (`offset + len < total`). */
+  scrollbar: Scrollbar;
 }
 
 /**
@@ -115,6 +118,8 @@ export class RenderState {
   update(term: Terminal): Frame {
     const e = this.engine;
     e.check("ghostty_render_state_update", this.state, term.handle);
+    // Read with the update: the render state does not keep the scroll position.
+    const scrollbar = term.scrollbar;
     const u16 = (key: number) =>
       e.scratch(4, (out) => {
         e.check("ghostty_render_state_get", this.state, key, out);
@@ -163,7 +168,7 @@ export class RenderState {
         lines.push({ y, cells: this.readRow(cols) });
       }
     });
-    return { cols, rows, full, background, foreground, cursor, lines };
+    return { cols, rows, full, background, foreground, cursor, lines, scrollbar };
   }
 
   private readRow(cols: number): Cell[] {

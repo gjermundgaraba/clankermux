@@ -88,6 +88,8 @@ export type ToWorker =
   | { type: "remove"; id: number }
   | { type: "key"; input: KeyInput }
   | { type: "paste"; text: string }
+  /** The wheel: `rows` through the history, up when negative. */
+  | { type: "scroll"; rows: number }
   /** The page's size and profile. Only an `active` page, one the user is
    * looking at, reports them to the session: the server applies the
    * latest report, so the session takes the size of the page in use. */
@@ -109,6 +111,15 @@ export interface WorkerPort {
   postMessage(message: ToPage): void;
   onmessage: ((e: MessageEvent<ToWorker>) => void) | null;
 }
+
+/** The keys that, with Shift, scroll the history: by pages, or to its
+ * top or bottom. */
+const SCROLL_KEYS: Record<string, number | "top" | "bottom"> = {
+  PageUp: -1,
+  PageDown: 1,
+  Home: "top",
+  End: "bottom",
+};
 
 /** Coalescing window for paints. */
 const PAINT_MS = 16;
@@ -556,6 +567,7 @@ class Client {
     const session = this.session;
     const channel = this.channel;
     if (bytes.length === 0 || !conn || !attachment || attachment.ended() || session === undefined) return;
+    this.live();
     // Each request's base64 fits the control body with room for the rest,
     // and its bytes fit the input queue (at least one byte, so the loop
     // moves on an absurd limit).
@@ -582,7 +594,45 @@ class Client {
   key(input: KeyInput): void {
     const term = this.attachment?.term();
     if (!term) return;
+    // Shift+PageUp, PageDown, Home and End scroll the history, press and
+    // release; on the alternate screen, which has none, they are keys.
+    const scroll = SCROLL_KEYS[input.code];
+    if (scroll && input.shift && !input.ctrl && !input.alt && !input.meta && !term.alternate) {
+      if (input.action === "release") return;
+      term.scroll(typeof scroll === "number" ? scroll * term.rows : scroll);
+      this.paint();
+      return;
+    }
     this.input(this.keys.encode(term, input), false);
+  }
+
+  /** The wheel. On the alternate screen, with alternate scroll (mode
+   * 1007, on by default), it is the arrow keys, as a full-screen program
+   * such as `less` expects; without it, nothing. */
+  scroll(rows: number): void {
+    const term = this.attachment?.term();
+    if (!term || rows === 0) return;
+    if (!term.alternate) {
+      term.scroll(rows);
+      this.paint();
+      return;
+    }
+    if (!term.mode(1007)) return;
+    const code = rows < 0 ? "ArrowUp" : "ArrowDown";
+    const arrow = this.keys.encode(term, { code, key: code, action: "press", shift: false, ctrl: false, alt: false, meta: false });
+    const bytes = new Uint8Array(arrow.length * Math.abs(rows));
+    for (let i = 0; i < Math.abs(rows); i++) bytes.set(arrow, i * arrow.length);
+    this.input(bytes, false);
+  }
+
+  /** Back to the live screen before input, as any terminal does. */
+  private live(): void {
+    const term = this.attachment?.term();
+    if (!term) return;
+    const { total, offset, len } = term.scrollbar;
+    if (offset + len >= total) return;
+    term.scroll("bottom");
+    this.paint();
   }
 
   paste(text: string): void {
@@ -646,6 +696,9 @@ export function runWorker(port: WorkerPort): void {
         break;
       case "paste":
         client.paste(message.text);
+        break;
+      case "scroll":
+        client.scroll(message.rows);
         break;
       case "viewport":
         client.setViewport(message.size, message.profile, message.active);

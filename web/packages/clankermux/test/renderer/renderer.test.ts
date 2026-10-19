@@ -36,7 +36,8 @@ const palette = { cursor: "#0f0" };
 
 const blank = (): Cell => ({ text: "", fg: NO_COLOR, bg: NO_COLOR, flags: 0, underline: 0 });
 const cell = (text: string, extra: Partial<Cell> = {}): Cell => ({ ...blank(), text, ...extra });
-const frame = (lines: Frame["lines"], cursor: Frame["cursor"], full = false): Frame => ({
+const live = { total: 2, offset: 0, len: 2 };
+const frame = (lines: Frame["lines"], cursor: Frame["cursor"], full = false, scrollbar = live): Frame => ({
   cols: 3,
   rows: 2,
   full,
@@ -44,6 +45,7 @@ const frame = (lines: Frame["lines"], cursor: Frame["cursor"], full = false): Fr
   foreground: 0xffffff,
   cursor,
   lines,
+  scrollbar,
 });
 
 test("a full frame clears, rows draw their cells, and the cursor moves between frames", () => {
@@ -89,4 +91,38 @@ test("a full frame clears, rows draw their cells, and the cursor moves between f
   ctx.ops = [];
   r.draw(frame([], { x: 2, y: 0, visible: false, blinking: false, style: "bar", color: 0x00ff00 }));
   expect(ctx.ops).toEqual([]);
+});
+
+test("a view scrolled back has a mark at the right edge, moved and erased with the rows under it", () => {
+  const ctx = new Recording();
+  const r = new CanvasRenderer(ctx, metrics, palette);
+  const rows = [
+    { y: 0, cells: [cell("a"), blank(), blank()] },
+    { y: 1, cells: [cell("b"), blank(), blank()] },
+  ];
+  // 2 of 8 rows, at the top of the history: the mark is a quarter of the
+  // 40px grid, at least a row high.
+  r.draw(frame(rows, undefined, true, { total: 8, offset: 0, len: 2 }));
+  expect(ctx.ops.at(-1)).toEqual(["rect", "#ffffff", 27, 0, 3, 20]);
+  expect(ctx.globalAlpha).toBe(1);
+
+  // Output while scrolled back moves no row, but the history grew and the
+  // view moved within it: row 0 under the old mark is redrawn first.
+  ctx.ops = [];
+  r.draw(frame([], undefined, false, { total: 16, offset: 8, len: 2 }));
+  expect(ctx.texts()).toEqual(["a"]);
+  expect(ctx.ops.at(-1)).toEqual(["rect", "#ffffff", 27, 20, 3, 20]);
+
+  // Unchanged: drawn again over a row drawn under it.
+  ctx.ops = [];
+  r.draw(frame([{ y: 1, cells: [cell("c"), blank(), blank()] }], undefined, false, { total: 16, offset: 8, len: 2 }));
+  expect(ctx.texts()).toEqual(["c"]);
+  expect(ctx.ops.at(-1)).toEqual(["rect", "#ffffff", 27, 20, 3, 20]);
+
+  // Back at the live screen without a full frame: the rows under it are
+  // redrawn and no mark is drawn.
+  ctx.ops = [];
+  r.draw(frame([], undefined, false, { total: 16, offset: 14, len: 2 }));
+  expect(ctx.texts()).toEqual(["c"]);
+  expect(ctx.ops.filter((op) => op[0] === "rect" && op[2] === 27)).toEqual([]);
 });

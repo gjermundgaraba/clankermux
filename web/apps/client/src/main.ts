@@ -11,6 +11,7 @@ const schemeSelect = document.getElementById("scheme") as HTMLSelectElement;
 const status = document.getElementById("status") as HTMLElement;
 const linkText = document.getElementById("link") as HTMLElement;
 const where = document.getElementById("where") as HTMLElement;
+const scrolled = document.getElementById("scrolled") as HTMLElement;
 
 const params = new URLSearchParams(location.search);
 // The server's default WebSocket port on the host the page came from;
@@ -35,6 +36,12 @@ const terminal = mountTerminal({
   onStatus: (text) => (status.textContent = text),
   onLink: (link) => (linkText.textContent = describeLink(link)),
   onSessions: showSessions,
+  // Scrolled back with the wheel or Shift+PageUp: how far above the live
+  // screen the view ends.
+  onScroll: (rows) => {
+    scrolled.hidden = rows === 0;
+    scrolled.textContent = `\u2191 ${rows} rows`;
+  },
 });
 
 /** The link in a few words, so the page shows what a consumer would

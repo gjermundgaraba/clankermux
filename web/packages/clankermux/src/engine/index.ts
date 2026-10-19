@@ -16,6 +16,16 @@ type TypeInfo =
   | { kind: "packed"; size: number; bits: Record<string, Bits> }
   | { kind: "pointer" | "array" | "union" | "opaque" | "primitive" | "alias"; size: number };
 
+/** The viewport's place in the screen's rows, history included. */
+export interface Scrollbar {
+  /** Rows of the screen, history and the active area. */
+  total: number;
+  /** The viewport's first row. */
+  offset: number;
+  /** The viewport's rows. */
+  len: number;
+}
+
 /** Position and width of a bit field, from the manifest. */
 export interface BitField {
   lsb: number;
@@ -350,6 +360,37 @@ export class Terminal {
 
   get scrollbackRows(): number {
     return this.get("SCROLLBACK_ROWS", 4);
+  }
+
+  /** Whether the alternate screen (full-screen programs) is active; it
+   * has no history to scroll. */
+  get alternate(): boolean {
+    return this.get("ACTIVE_SCREEN", 4) === this.engine.enumValue("GhosttyTerminalScreen", "ALTERNATE");
+  }
+
+  get scrollbar(): Scrollbar {
+    const e = this.engine;
+    return e.scratch(e.sizeOf("GhosttyTerminalScrollbar"), (out) => {
+      e.check("ghostty_terminal_get", this.handle, e.enumValue("GhosttyTerminalData", "SCROLLBAR"), out);
+      const u64 = (key: string) => Number(e.view.getBigUint64(out + e.offsetOf("GhosttyTerminalScrollbar", key), true));
+      return { total: u64("total"), offset: u64("offset"), len: u64("len") };
+    });
+  }
+
+  /** Moves the viewport `rows` rows (up when negative) through the
+   * history, or to its top or the live screen at its bottom. Output does
+   * not move a viewport scrolled into the history. */
+  scroll(to: number | "top" | "bottom"): void {
+    const e = this.engine;
+    const size = e.sizeOf("GhosttyTerminalScrollViewport");
+    e.scratch(size, (ptr) => {
+      e.memory.fill(0, ptr, ptr + size);
+      const tag = typeof to === "number" ? "DELTA" : to.toUpperCase();
+      e.view.setInt32(ptr + e.offsetOf("GhosttyTerminalScrollViewport", "tag"), e.enumValue("GhosttyTerminalScrollViewportTag", tag), true);
+      if (typeof to === "number") e.view.setInt32(ptr + e.offsetOf("GhosttyTerminalScrollViewport", "value"), to, true);
+      // The tagged union is passed by value, which the wasm ABI passes by address.
+      e.call("ghostty_terminal_scroll_viewport", this.handle, ptr);
+    });
   }
 
   get title(): string {
