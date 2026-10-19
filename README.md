@@ -44,7 +44,7 @@ overrides:
 
 ```ts
 // worker.ts, started as a module worker
-import { runWorker } from "@clankermux/client";
+import { runWorker } from "@clankermux/client/worker";
 runWorker(self);
 
 // page

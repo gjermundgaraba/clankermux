@@ -1,7 +1,8 @@
 /**
  * The engine side of a mounted terminal: the connection, the attachment
  * and the render state live in a worker; the page draws frames and
- * reports input.
+ * reports input. Imported as `@clankermux/client/worker`, so a worker
+ * typechecked without the DOM library does not see the page's types.
  */
 import { ENGINE, Engine, type Frame, KeyEncoder, type KeyInput, RenderState, type Terminal } from "@clankermux/engine";
 import {
