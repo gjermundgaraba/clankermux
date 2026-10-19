@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::time::Instant;
 
-pub use registry::{Config, Registry};
+pub use registry::{Config, ParkTiming, Registry};
 
 /// Binds the Unix socket: directories it creates are 0700, the socket
 /// 0600. Refuses to replace a socket another server is listening on.
@@ -176,5 +176,6 @@ pub fn default_config() -> Config {
         home,
         version: env!("CARGO_PKG_VERSION").into(),
         state_dir: state_dir(),
+        park: ParkTiming::default(),
     }
 }

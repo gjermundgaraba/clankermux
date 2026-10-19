@@ -100,6 +100,7 @@ fn write(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
             .input
             .push(data)
             .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?;
+        s.touch();
         let previous = s.write_chain.take();
         let writer = writer.clone();
         s.write_chain = Some(tokio::spawn(async move {
@@ -167,6 +168,7 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
             let out = {
                 let mut s = session.lock().unwrap();
                 s.label = p.label;
+                s.touch();
                 s.to_proto(false)
             };
             registry.emit(&Event::SessionChanged {

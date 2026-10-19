@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use proto::{
@@ -15,6 +15,7 @@ use proto::{
 use rustix::process::Signal;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -23,15 +24,13 @@ use crate::park;
 use crate::pty;
 use crate::records::Records;
 use crate::session::{
-    Body, Effects, InputQueue, Live, Parked, SNAPSHOT_RETRY, Session, Shared, check_size,
+    Body, Effects, InputQueue, Live, Parked, SNAPSHOT_RETRY, Session, Shared, blocking, check_size,
     default_color, now, snapshot_with_retry,
 };
 use crate::stream::Stream;
 
 pub type Fail = (ErrorCode, String);
 
-/// Running sessions are parked this often.
-const PARK_INTERVAL: Duration = Duration::from_secs(300);
 /// JSON overhead allowed around a page's sessions within `max_frame`.
 const PAGE_MARGIN: usize = 4096;
 /// How long a stop waits for the attachments to end, and then for the
@@ -47,6 +46,29 @@ pub struct Config {
     pub version: String,
     /// Holds `lock` and `sessions/`.
     pub state_dir: PathBuf,
+    pub park: ParkTiming,
+}
+
+/// When running sessions are parked, besides the last detach and a stop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParkTiming {
+    /// Every running session, this often.
+    pub interval: Duration,
+    /// A session that changed, once it has been quiet this long...
+    pub quiet: Duration,
+    /// ...or this long after its first change since its last park,
+    /// whichever comes first.
+    pub busy: Duration,
+}
+
+impl Default for ParkTiming {
+    fn default() -> Self {
+        ParkTiming {
+            interval: Duration::from_secs(300),
+            quiet: Duration::from_secs(2),
+            busy: Duration::from_secs(30),
+        }
+    }
 }
 
 pub struct Registry {
@@ -113,10 +135,13 @@ impl Registry {
             registry.restore(loaded);
         }
         // The timer does not keep the registry alive and ends with `stop`.
+        // Its first tick is one interval after the start; a new session
+        // parks sooner, as a change (`park_when_due`).
         let timer = Arc::downgrade(&registry);
         let shutdown = registry.shutdown.clone();
+        let period = registry.config.park.interval;
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(PARK_INTERVAL);
+            let mut interval = tokio::time::interval(period);
             interval.tick().await;
             loop {
                 tokio::select! {
@@ -182,6 +207,8 @@ impl Registry {
             removed: false,
             announced: Default::default(),
             park_lock: Default::default(),
+            unparked: None,
+            park_due: Arc::new(Notify::new()),
             write_chain: None,
             last_generation: 0,
             body: Body::Parked(Parked {
@@ -204,8 +231,9 @@ impl Registry {
             .insert(info.id, Arc::new(Mutex::new(session)));
     }
 
-    /// Parks a live session (the timer and the end of a kept session):
-    /// nothing once the server is stopping, whose own parks come first.
+    /// Parks a live session (the timer, a change, the last detach and
+    /// the end of a kept session): nothing once the server is stopping,
+    /// whose own parks come first.
     pub async fn park(self: &Arc<Self>, session: &Shared) {
         let park_lock = session.lock().unwrap().park_lock.clone();
         let _one_at_a_time = park_lock.lock().await;
@@ -216,11 +244,18 @@ impl Registry {
 
     /// Writes a generation for a live session under its park lock,
     /// retrying the snapshot while the continuation limit is exceeded. A
-    /// failure keeps the previous generation and is logged. A removal or
+    /// failure keeps the previous generation and is logged; the next
+    /// change, the last detach or the timer parks again. A removal or
     /// an `on_exit: remove` end that overlaps the write takes the files
     /// with it.
     async fn park_locked(self: &Arc<Self>, session: &Shared) {
-        let id = session.lock().unwrap().id.clone();
+        // A change from here on is not certain to be in this park, so it
+        // counts towards the next.
+        let id = {
+            let mut s = session.lock().unwrap();
+            s.unparked = None;
+            s.id.clone()
+        };
         let at = jiff::Timestamp::now();
         let taken = snapshot_with_retry(session, SNAPSHOT_RETRY, |s, live, bytes| {
             s.park_file(live, at)
@@ -235,7 +270,8 @@ impl Registry {
                     s.last_generation = (at.as_millisecond() as u64).max(s.last_generation + 1);
                     s.last_generation
                 };
-                park::write(&self.sessions_dir(), &file, generation, &bytes, &screen)
+                // Four fsyncs and a rename: off the async workers.
+                blocking(|| park::write(&self.sessions_dir(), &file, generation, &bytes, &screen))
                     .map_err(|e| e.to_string())
             }
             Ok(Some(Err(err))) | Err(err) => Err(err.to_string()),
@@ -457,6 +493,7 @@ impl Registry {
         // A failure drops the child, which tokio reaps when it exits.
         let master = Arc::new(unsafe { AsyncFd::register(pty.master) }.map_err(internal)?);
         let (input, input_rx) = InputQueue::new(limits.input_queue as usize);
+        let created = Instant::now();
         let session = Session {
             id: uuid::Uuid::new_v4().to_string(),
             label,
@@ -475,6 +512,10 @@ impl Registry {
             removed: false,
             announced: Default::default(),
             park_lock: Default::default(),
+            // Created is changed: parked within `quiet` even if the
+            // program never writes.
+            unparked: Some((created, created)),
+            park_due: Arc::new(Notify::new()),
             write_chain: None,
             last_generation: 0,
             body: Body::Live(Box::new(Live {
@@ -492,6 +533,7 @@ impl Registry {
         };
         let id = session.id.clone();
         let snapshot = session.to_proto(false);
+        let due = session.park_due.clone();
         let shared = Arc::new(Mutex::new(session));
         self.state
             .lock()
@@ -501,6 +543,12 @@ impl Registry {
         self.emit(&Event::SessionCreated {
             session: snapshot.clone(),
         });
+        tokio::spawn(park_when_due(
+            Arc::downgrade(self),
+            Arc::downgrade(&shared),
+            due,
+            self.shutdown.clone(),
+        ));
 
         let registry = self.clone();
         let reader_session = shared.clone();
@@ -658,6 +706,51 @@ impl Registry {
         }
         park::remove(&self.sessions_dir(), id);
         self.emit(&Event::SessionRemoved { id: id.to_string() });
+    }
+}
+
+/// A running session's activity park: once its changes have been quiet
+/// for `park.quiet`, or `park.busy` after the first of them, whichever
+/// comes first. Woken by `due` at the first change after a park; ends
+/// with the session's stream, the session or the server.
+async fn park_when_due(
+    registry: Weak<Registry>,
+    session: Weak<Mutex<Session>>,
+    due: Arc<Notify>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        loop {
+            let (Some(registry), Some(shared)) = (registry.upgrade(), session.upgrade()) else {
+                return;
+            };
+            let deadline = {
+                let s = shared.lock().unwrap();
+                if s.status() != Status::Running {
+                    return;
+                }
+                let timing = registry.config.park;
+                match s.unparked {
+                    Some((first, last)) => (last + timing.quiet).min(first + timing.busy),
+                    // Parked meanwhile, by the timer or a detach.
+                    None => break,
+                }
+            };
+            if Instant::now() >= deadline {
+                registry.park(&shared).await;
+                break;
+            }
+            drop((registry, shared));
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = shutdown.cancelled() => return,
+            }
+        }
+        // The session's end notifies too, so that this task ends with it.
+        tokio::select! {
+            _ = due.notified() => {}
+            _ = shutdown.cancelled() => return,
+        }
     }
 }
 

@@ -15,6 +15,7 @@ use proto::{
 };
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::time::Instant;
 
 use crate::attach::Ending;
 use crate::park::ParkFile;
@@ -299,6 +300,12 @@ pub struct Session {
     pub announced: (String, String),
     /// Parks of this session run one at a time.
     pub park_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The first and the latest change since the last park began, if
+    /// any: output, input, a resize or a label.
+    pub unparked: Option<(Instant, Instant)>,
+    /// Wakes the session's activity park at the first change after a
+    /// park, and at the end of the stream.
+    pub park_due: Arc<Notify>,
     /// The latest `write` reply task; the next replies after it.
     pub write_chain: Option<tokio::task::JoinHandle<()>>,
     /// The last generation written, so the next is larger whatever the
@@ -396,6 +403,18 @@ impl Session {
         }
     }
 
+    /// Records a change for the activity park.
+    pub fn touch(&mut self) {
+        let now = Instant::now();
+        match &mut self.unparked {
+            Some((_, last)) => *last = now,
+            None => {
+                self.unparked = Some((now, now));
+                self.park_due.notify_one();
+            }
+        }
+    }
+
     /// The events raised since the last take.
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
@@ -411,6 +430,7 @@ impl Session {
         live.stream.append(bytes);
         self.wake.notify_waiters();
         self.flush_effects();
+        self.touch();
     }
 
     /// Writes the engine's pending answers to the PTY, applies the
@@ -533,6 +553,7 @@ impl Session {
         live.stream.add_marker(MarkerKind::Resized { cols, rows });
         self.flush_effects();
         self.wake.notify_waiters();
+        self.touch();
         true
     }
 
@@ -590,6 +611,8 @@ impl Session {
             .add_marker(MarkerKind::Exited { exit: exit.clone() });
         self.drop_transient_records();
         self.wake.notify_waiters();
+        // Ends the activity park; the stream's end has its own.
+        self.park_due.notify_one();
         Some(exit)
     }
 

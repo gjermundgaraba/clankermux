@@ -177,12 +177,19 @@ impl Task {
         let end = self.serve(resume).await;
         // Detach before the ending frame goes out, so a client that reads
         // it finds the channel free and the attachment gone.
-        let snapshot = {
+        let (snapshot, last) = {
             let mut s = self.session.lock().unwrap();
             s.attached.retain(|a| a.id != self.id);
             self.ended.store(true, Ordering::Release);
-            s.to_proto(false)
+            let last = s.attached.is_empty() && s.status() == Status::Running;
+            (s.to_proto(false), last)
         };
+        // The last detach parks: what the user left is on disk.
+        if last {
+            let registry = self.registry.clone();
+            let session = self.session.clone();
+            tokio::spawn(async move { registry.park(&session).await });
+        }
         let removed = matches!(end, Some(Ending::Closed(ClosedReason::Removed)));
         if let Some(ending) = end {
             self.send_ending(ending);

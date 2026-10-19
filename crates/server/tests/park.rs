@@ -56,6 +56,89 @@ async fn wait_parked(state: &Path, id: &str) -> PathBuf {
     panic!("session {id} was not parked");
 }
 
+/// Waits until the newest complete generation of `id` holds `needle` on
+/// its screen.
+async fn wait_parked_with(state: &Path, id: &str, needle: &str) -> PathBuf {
+    for _ in 0..1000 {
+        if let Some(path) = generations(state, id).pop()
+            && std::fs::read_to_string(path.join("screen.txt")).is_ok_and(|t| t.contains(needle))
+        {
+            return path;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("session {id} was not parked with {needle:?}");
+}
+
+/// Parks soon after a change; the timer and the stop never in a test.
+fn prompt_parks(quiet_ms: u64, busy_ms: u64) -> server::ParkTiming {
+    server::ParkTiming {
+        interval: Duration::from_secs(3600),
+        quiet: Duration::from_millis(quiet_ms),
+        busy: Duration::from_millis(busy_ms),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_change_parks_once_quiet_and_while_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let server = Server::start_with_park(fast_limits(), state.clone(), prompt_parks(200, 1000));
+    let mut c = client(&server).await;
+
+    // Input echoed once, then quiet.
+    let quiet = c
+        .create(json!({"argv": ["/bin/sh", "-c", "exec cat"]}))
+        .await;
+    c.ok(
+        "write",
+        json!({"session": quiet.id, "data": b64("typed-line\n")}),
+    )
+    .await;
+    wait_parked_with(&state, &quiet.id, "typed-line").await;
+
+    // Output every 50 ms is never quiet for 200 ms; it parks every
+    // second all the same.
+    let busy = c
+        .create(json!({"argv": ["/bin/sh", "-c",
+            "i=0; while :; do i=$((i+1)); echo tick-$i; sleep 0.05; done"]}))
+        .await;
+    let first = wait_parked(&state, &busy.id).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let newest = generations(&state, &busy.id).pop();
+        if newest.as_ref().is_some_and(|n| *n != first) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "parked once only");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(c.inspect(&busy.id).await.status, Status::Running);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_detach_parks() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let server =
+        Server::start_with_park(fast_limits(), state.clone(), prompt_parks(60_000, 60_000));
+    let mut c = client(&server).await;
+    let session = c
+        .create(json!({"argv": ["/bin/sh", "-c", "exec cat"]}))
+        .await;
+    c.open(1, json!({"session": session.id})).await;
+    c.bootstrap(1).await;
+    c.send(FrameType::Input, 1, b"detached-line\n").await;
+    c.output_until(1, b"detached-line").await;
+    assert!(
+        generations(&state, &session.id).is_empty(),
+        "no park within the quiet time"
+    );
+    c.send(FrameType::Close, 1, &[]).await;
+    assert_eq!(c.expect_closed(1).await, ClosedReason::Closed);
+    wait_parked_with(&state, &session.id, "detached-line").await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_graceful_stop_parks_and_a_restart_restores() {
     let dir = tempfile::tempdir().unwrap();
@@ -360,6 +443,7 @@ async fn the_lock_refuses_a_second_server() {
             home: dir.path().to_path_buf(),
             version: "test".into(),
             state_dir: state.clone(),
+            park: Default::default(),
         })
     };
     assert_eq!(

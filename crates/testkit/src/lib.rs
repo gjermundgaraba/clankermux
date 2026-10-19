@@ -36,15 +36,25 @@ impl Server {
     pub fn start(limits: Limits) -> Server {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
-        Server::start_in(limits, dir, state_dir)
+        Server::start_in(limits, dir, state_dir, server::ParkTiming::default())
     }
 
     /// A server on `state_dir`, which may hold a previous server's parks.
     pub fn start_with_state(limits: Limits, state_dir: PathBuf) -> Server {
-        Server::start_in(limits, tempfile::tempdir().unwrap(), state_dir)
+        Server::start_with_park(limits, state_dir, server::ParkTiming::default())
     }
 
-    fn start_in(limits: Limits, dir: tempfile::TempDir, state_dir: PathBuf) -> Server {
+    /// A server on `state_dir` that parks on `park`'s timing.
+    pub fn start_with_park(limits: Limits, state_dir: PathBuf, park: server::ParkTiming) -> Server {
+        Server::start_in(limits, tempfile::tempdir().unwrap(), state_dir, park)
+    }
+
+    fn start_in(
+        limits: Limits,
+        dir: tempfile::TempDir,
+        state_dir: PathBuf,
+        park: server::ParkTiming,
+    ) -> Server {
         let socket = dir.path().join("sock");
         let config = server::Config {
             limits,
@@ -52,6 +62,7 @@ impl Server {
             home: dir.path().to_path_buf(),
             version: "test".into(),
             state_dir,
+            park,
         };
         let (stop, stopped) = oneshot::channel();
         let (started, ready) = std::sync::mpsc::channel();

@@ -506,11 +506,14 @@ impl Connection {
         let Some(session) = self.writable(channel) else {
             return;
         };
-        let pushed = session
-            .lock()
-            .unwrap()
-            .running()
-            .map(|live| live.input.push(payload.to_vec()));
+        let pushed = {
+            let mut s = session.lock().unwrap();
+            let pushed = s.running().map(|live| live.input.push(payload.to_vec()));
+            if let Ok(Some(_)) = pushed {
+                s.touch();
+            }
+            pushed
+        };
         match pushed {
             Err((code, message)) => self.error(channel, code, message),
             Ok(None) => self.error(channel, ErrorCode::InputOverflow, "input queue full"),

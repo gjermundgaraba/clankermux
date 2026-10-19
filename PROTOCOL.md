@@ -491,12 +491,24 @@ its generation name, syncs `sessions/<id>/`, then deletes older
 generations. On start, the newest directory holding all three files is the
 session's state; the others, and any dot-named directory, are deleted.
 
-Parks happen for every running session every 5 minutes, once at the end
-of the stream for sessions with `on_exit: keep`, and on graceful stop for
-every session not being removed (a kept session's final park may still be
-pending); a stop deletes the files of sessions being removed, then sends
-SIGHUP to each running session's process group. While the server stops,
-`create`, `remove` and `OPEN` fail with `internal`.
+A running session is parked:
+
+- after a change (output, input, a resize, a label, or its creation),
+  once changes have been quiet for 2 s or 30 s after the first change
+  since its last park, whichever comes first. Its files are then at most
+  2 s behind once changes stop and 30 s behind while they continue, plus
+  the park's own time; a change during a park counts towards the next;
+- when its last attachment closes;
+- every 5 minutes.
+
+These times are the defaults; a server may be configured with others. A
+park that fails is logged and tried again at any of these. A session is
+also parked once at the end of the stream with `on_exit: keep`, and on
+graceful stop when it is not being removed (a kept session's final park
+may still be pending); a stop deletes the files of sessions being
+removed, then sends SIGHUP to each running session's process group.
+While the server stops, `create`, `remove` and `OPEN` fail with
+`internal`.
 The whole `sessions/<id>/` directory is deleted whenever the session is
 removed. On start, a `session.json` whose `session.id` is not its
 directory's name is skipped with a warning.
