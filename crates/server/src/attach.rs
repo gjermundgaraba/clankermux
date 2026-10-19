@@ -441,17 +441,23 @@ impl Task {
         let end = total.min(pending.sent + self.max_frame);
         let chunk = pending.bytes[pending.sent..end].to_vec();
         pending.sent = end;
-        self.send(FrameType::Snapshot, &chunk);
-        if end == total {
+        let last = end == total;
+        if last {
             self.snapshot = None;
-            self.send(FrameType::SnapshotEnd, &[]);
             self.note_finished();
+        }
+        self.send(FrameType::Snapshot, &chunk);
+        if last {
+            self.send(FrameType::SnapshotEnd, &[]);
         }
         true
     }
 
     /// Records that the final marker and, if bootstrapping, `SNAPSHOT_END`
-    /// have been sent.
+    /// are being sent; before they are queued, so a client that has read
+    /// them and sends `remove` finds the attachment finished. A `CLOSED`
+    /// that follows still comes after them: the task reads its close
+    /// channel only once they are queued.
     fn note_finished(&self) {
         if self.done && self.snapshot.is_none() {
             self.finished.store(true, Ordering::Release);
@@ -525,10 +531,10 @@ impl Task {
             self.done = s.status() != Status::Running && self.cursor.marker == stream.latest_seq();
         }
         let sent = !frames.is_empty();
+        self.note_finished();
         for frame in frames {
             self.writer.send(frame);
         }
-        self.note_finished();
         if sent { Pull::Sent } else { Pull::Idle }
     }
 }
