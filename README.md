@@ -72,12 +72,4 @@ const terminal = mountTerminal({
 });
 ```
 
-From npm: `pnpm add @gjermundgaraba/clankermux`. Before a version is on npm, depend on it and override it to the tarball from `just pack-web`:
-
-```yaml
-# pnpm-workspace.yaml
-overrides:
-  "@gjermundgaraba/clankermux": file:<clankermux>/web/dist-packages/gjermundgaraba-clankermux-0.1.0.tgz
-```
-
-After `just pack-web` again, reinstall in the consumer (`pnpm install --force`).
+From npm: `pnpm add @gjermundgaraba/clankermux`.
