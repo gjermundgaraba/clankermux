@@ -171,7 +171,7 @@ async fn bootstrap_stream_and_resume() {
             .await
             .expect("session_exited in time")
             .unwrap();
-        if let Event::SessionExited { session: s } = event {
+        if let Event::SessionExited { session: s } = event.event {
             assert_eq!(s.id, session.id);
             break;
         }

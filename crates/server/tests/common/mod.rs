@@ -46,7 +46,7 @@ pub struct Client {
     pub max_frame: u64,
     pub next_id: i64,
     /// Events that arrived while waiting for a reply.
-    pub events: std::collections::VecDeque<Event>,
+    pub events: std::collections::VecDeque<Numbered>,
 }
 
 impl Client {
@@ -149,6 +149,11 @@ impl Client {
     }
 
     pub async fn event(&mut self) -> Event {
+        self.numbered().await.event
+    }
+
+    /// The next event with its `seq`.
+    pub async fn numbered(&mut self) -> Numbered {
         if let Some(event) = self.events.pop_front() {
             return event;
         }

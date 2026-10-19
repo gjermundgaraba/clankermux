@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use ghostty_vt::{ProgramStatus, ProgramStatusKind, ProgramStatusState};
-use proto::StatusRecord;
+use proto::{Attention, StatusRecord};
 
 /// The records of one session. Each carries the tick of its last report;
 /// the lowest is evicted first.
@@ -13,7 +13,8 @@ pub struct Records {
     tick: u64,
 }
 
-/// What a report changed: a record set, and the ids of records dropped.
+/// What a report changed: a record set, and the ids of records dropped,
+/// by a clear when none was set and by eviction when one was.
 #[derive(Default)]
 pub struct Change {
     pub set: Option<StatusRecord>,
@@ -26,20 +27,45 @@ fn transient(record: &StatusRecord) -> bool {
     matches!(record.state.as_str(), "working" | "blocked")
 }
 
+/// Whether a record's state is one the user should see once: `done`
+/// and `error`, which carry `seen`.
+fn seeable(state: &str) -> bool {
+    matches!(state, "done" | "error")
+}
+
+/// How urgently a record wants the user, most urgent first; `None` for
+/// one that does not.
+fn urgency(record: &StatusRecord) -> Option<u8> {
+    match record.state.as_str() {
+        "blocked" => Some(0),
+        "error" if record.seen != Some(true) => Some(1),
+        "done" if record.seen != Some(true) => Some(2),
+        "working" => Some(3),
+        _ => None,
+    }
+}
+
 fn text(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
 impl Records {
-    /// Records loaded from a park file, minus the transient ones. A
-    /// restored session is never live again, so their order (which only
-    /// eviction reads) does not matter.
-    pub fn load(records: Vec<StatusRecord>) -> Self {
+    /// Records loaded from a park file, minus the transient ones, whose
+    /// ids are returned too; newest last, as the attention order needs.
+    /// A file from before `seen` has the `done` and `error` records
+    /// unseen.
+    pub fn load(records: Vec<StatusRecord>) -> (Self, Vec<String>) {
+        let (kept, dropped): (Vec<_>, Vec<_>) = records.into_iter().partition(|r| !transient(r));
+        let mut kept: Vec<StatusRecord> = kept;
+        kept.sort_by_key(|r| r.updated_at.parse::<jiff::Timestamp>().ok());
         let mut out = Records::default();
-        for record in records.into_iter().filter(|r| !transient(r)) {
+        for mut record in kept {
+            if seeable(&record.state) && record.seen.is_none() {
+                record.seen = Some(false);
+            }
             out.insert(record);
         }
-        out
+        (out, dropped.into_iter().map(|r| r.id).collect())
     }
 
     fn insert(&mut self, record: StatusRecord) {
@@ -95,6 +121,7 @@ impl Records {
             msg: text(report.message),
             progress: u8::try_from(report.progress).ok(),
             updated_at: now.into(),
+            seen: seeable(state).then_some(false),
         };
         let new = !self.by_id.contains_key(&record.id);
         self.insert(record.clone());
@@ -126,6 +153,19 @@ impl Records {
         ids
     }
 
+    /// Marks the unseen `done` and `error` records among `ids` seen, all
+    /// of them when `ids` is `None`; returns them as they are now.
+    pub fn ack(&mut self, ids: Option<&[String]>) -> Vec<StatusRecord> {
+        let mut acked = Vec::new();
+        for (id, (record, _)) in &mut self.by_id {
+            if record.seen == Some(false) && ids.is_none_or(|ids| ids.contains(id)) {
+                record.seen = Some(true);
+                acked.push(record.clone());
+            }
+        }
+        acked
+    }
+
     /// The records as reported: every key of their last report.
     pub fn all(&self) -> Vec<StatusRecord> {
         self.by_id.values().map(|(r, _)| r.clone()).collect()
@@ -136,6 +176,22 @@ impl Records {
         self.tick
     }
 
+    /// The record's `app`, else the nearest ancestor's that has one.
+    fn app(&self, record: &StatusRecord) -> Option<String> {
+        let app_of = |id: &str| self.by_id.get(id).and_then(|(r, _)| r.app.clone());
+        if record.app.is_some() {
+            return record.app.clone();
+        }
+        let mut id = record.id.as_str();
+        while let Some(cut) = id.rfind('/') {
+            id = &id[..cut];
+            if let Some(app) = app_of(id) {
+                return Some(app);
+            }
+        }
+        (!record.id.is_empty()).then(|| app_of("")).flatten()
+    }
+
     /// The records for `inspect`: `app` taken from the nearest ancestor
     /// that has one when a record lacks it.
     pub fn resolved(&self) -> Vec<StatusRecord> {
@@ -144,28 +200,46 @@ impl Records {
 
     /// `resolved`, of the records set after `tick`.
     pub fn resolved_since(&self, tick: u64) -> Vec<StatusRecord> {
-        let app_of = |id: &str| self.by_id.get(id).and_then(|(r, _)| r.app.clone());
         self.by_id
             .values()
             .filter(|(_, set)| *set > tick)
-            .map(|(record, _)| {
-                let mut out = record.clone();
-                if out.app.is_none() {
-                    let mut id = record.id.as_str();
-                    while let Some(cut) = id.rfind('/') {
-                        id = &id[..cut];
-                        if let Some(app) = app_of(id) {
-                            out.app = Some(app);
-                            break;
-                        }
-                    }
-                    if out.app.is_none() && !record.id.is_empty() {
-                        out.app = app_of("");
-                    }
-                }
-                out
+            .map(|(record, _)| StatusRecord {
+                app: self.app(record),
+                ..record.clone()
             })
             .collect()
+    }
+
+    /// The most urgent record that wants the user: `blocked`, then an
+    /// unseen `error`, then an unseen `done`, then `working`; among
+    /// those the shallowest id (the root first), then the newest report.
+    pub fn attention(&self) -> Option<Attention> {
+        let depth = |id: &str| {
+            if id.is_empty() {
+                0
+            } else {
+                id.matches('/').count() + 1
+            }
+        };
+        let (record, _) = self
+            .by_id
+            .values()
+            .filter_map(|(record, tick)| {
+                let key = (
+                    urgency(record)?,
+                    depth(&record.id),
+                    std::cmp::Reverse(*tick),
+                );
+                Some((record, key))
+            })
+            .min_by_key(|(_, key)| *key)?;
+        Some(Attention {
+            state: record.state.clone(),
+            kind: record.kind.clone(),
+            app: self.app(record),
+            msg: record.msg.clone(),
+            record: record.id.clone(),
+        })
     }
 }
 
@@ -195,6 +269,7 @@ mod tests {
             msg: None,
             progress: None,
             updated_at: updated_at.into(),
+            seen: None,
         }
     }
 
@@ -262,12 +337,79 @@ mod tests {
 
     #[test]
     fn loading_drops_transient_records() {
-        let loaded = Records::load(vec![
+        let (loaded, dropped) = Records::load(vec![
             record("c", "done", "t1"),
             record("b", "error", "t2"),
             record("a", "working", "t3"),
         ]);
         let ids: Vec<_> = loaded.all().into_iter().map(|x| x.id).collect();
         assert_eq!(ids, vec!["b".to_string(), "c".to_string()]);
+        assert_eq!(dropped, vec!["a".to_string()]);
+        assert!(loaded.all().iter().all(|r| r.seen == Some(false)));
+    }
+
+    #[test]
+    fn done_and_error_stay_unseen_until_acked_or_replaced() {
+        let mut r = Records::default();
+        let c = r.apply(report(ProgramStatusState::Done, "a", ""), 10, "t");
+        assert_eq!(c.set.unwrap().seen, Some(false));
+        let c = r.apply(report(ProgramStatusState::Working, "w", ""), 10, "t");
+        assert_eq!(c.set.unwrap().seen, None);
+        r.apply(report(ProgramStatusState::Error, "b", ""), 10, "t");
+        let acked = r.ack(Some(&["b".to_string(), "w".to_string()]));
+        assert_eq!(acked.len(), 1);
+        assert_eq!((acked[0].id.as_str(), acked[0].seen), ("b", Some(true)));
+        assert!(r.ack(Some(&["b".to_string()])).is_empty(), "once");
+        let c = r.apply(report(ProgramStatusState::Error, "b", ""), 10, "t");
+        assert_eq!(c.set.unwrap().seen, Some(false), "a new report");
+        let acked: Vec<_> = r.ack(None).into_iter().map(|x| x.id).collect();
+        assert_eq!(acked, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn attention_is_the_most_urgent_unseen_record() {
+        let mut r = Records::default();
+        assert_eq!(r.attention(), None);
+        r.apply(report(ProgramStatusState::Idle, "", "app"), 10, "t");
+        assert_eq!(r.attention(), None, "idle never counts");
+        let mut put = |state, id: &str| r.apply(report(state, id, ""), 10, "t");
+        put(ProgramStatusState::Working, "w");
+        put(ProgramStatusState::Done, "d1");
+        put(ProgramStatusState::Done, "d2");
+        put(ProgramStatusState::Error, "x/child");
+        put(ProgramStatusState::Error, "x");
+        let attention = |r: &Records| r.attention().map(|a| (a.state, a.record));
+        assert_eq!(
+            attention(&r),
+            Some(("error".into(), "x".into())),
+            "a parent before its newer child"
+        );
+        let mut blocked = report(ProgramStatusState::Blocked, "b/c", "");
+        blocked.kind = ProgramStatusKind::Question;
+        blocked.message = "Go?".into();
+        r.apply(blocked, 10, "t");
+        let a = r.attention().unwrap();
+        assert_eq!(
+            (
+                a.state.as_str(),
+                a.kind.as_deref(),
+                a.msg.as_deref(),
+                a.app.as_deref(),
+                a.record.as_str()
+            ),
+            ("blocked", Some("question"), Some("Go?"), Some("app"), "b/c"),
+            "blocked first, its app from the root"
+        );
+        r.apply(report(ProgramStatusState::Clear, "b", ""), 10, "t");
+        r.ack(Some(&["x".to_string(), "x/child".to_string()]));
+        assert_eq!(
+            attention(&r),
+            Some(("done".into(), "d2".into())),
+            "the newest done"
+        );
+        r.ack(None);
+        assert_eq!(attention(&r), Some(("working".into(), "w".into())));
+        r.apply(report(ProgramStatusState::Clear, "w", ""), 10, "t");
+        assert_eq!(attention(&r), None);
     }
 }

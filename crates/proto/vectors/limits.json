@@ -11,5 +11,6 @@
   "records": 200,
   "page": 32,
   "hello_timeout": 10000,
-  "remove_grace": 10000
+  "remove_grace": 10000,
+  "events": 4096
 }

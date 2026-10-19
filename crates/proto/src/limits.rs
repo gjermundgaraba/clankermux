@@ -18,6 +18,7 @@ pub struct Limits {
     pub page: u64,
     pub hello_timeout: u64,
     pub remove_grace: u64,
+    pub events: u64,
 }
 
 impl Default for Limits {
@@ -36,6 +37,7 @@ impl Default for Limits {
             page: 32,
             hello_timeout: 10_000,
             remove_grace: 10_000,
+            events: 4096,
         }
     }
 }

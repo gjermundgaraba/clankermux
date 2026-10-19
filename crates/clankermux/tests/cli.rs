@@ -870,3 +870,79 @@ async fn waits_exit_with_the_child_status_a_timeout_or_an_interrupt() {
     assert_eq!(output.status.code(), Some(130));
     assert!(String::from_utf8_lossy(&output.stderr).contains("cancelled"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ack_marks_records_seen_and_list_shows_attention() {
+    let server = start();
+    let conn = connect(&server).await;
+    let socket = server.socket.to_str().unwrap();
+    let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD
+        .encode("\x1b]7501;state=done:id=a\x1b\\\x1b]7501;state=error:id=b\x1b\\\n");
+    conn.request("send", json!({"session": session.id, "data": data}))
+        .await
+        .unwrap();
+    let attention = |s: &Session| s.attention.as_ref().map(|a| a.record.clone());
+    wait_session(&conn, &session.id, |s| attention(s).as_deref() == Some("b")).await;
+    let (code, out, _) = run_status(&["--socket", socket, "list"], &[]).await;
+    assert_eq!(code, 0);
+    assert!(out.contains(" error "), "{out}");
+
+    let (code, _, err) = run_status(&["--socket", socket, "ack", &session.id, "b"], &[]).await;
+    assert_eq!(code, 0, "{err}");
+    wait_session(&conn, &session.id, |s| attention(s).as_deref() == Some("a")).await;
+    let (code, out, _) = run_status(&["--socket", socket, "--json", "ack", &session.id], &[]).await;
+    assert_eq!(code, 0);
+    let acked: Acked = serde_json::from_str(&out).unwrap();
+    assert_eq!(acked.record_ids, ["a"]);
+    let (_, out, _) = run_status(&["--socket", socket, "inspect", &session.id], &[]).await;
+    assert_eq!(out.matches("\"seen\": true").count(), 2, "{out}");
+    let (_, out, _) = run_status(&["--socket", socket, "list"], &[]).await;
+    assert!(!out.contains(" error ") && !out.contains(" done "), "{out}");
+}
+
+/// The first line `events` prints with `args`, and its stderr so far.
+async fn first_event_line(socket: &str, args: &[&str]) -> (String, String) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
+        .args(["--socket", socket, "--json", "events"])
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .expect("a line within 10 s")
+        .unwrap()
+        .unwrap();
+    child.kill().await.unwrap();
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .await
+        .unwrap();
+    (line, err)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn events_after_a_cursor_replay_with_their_seq() {
+    let server = start();
+    let conn = connect(&server).await;
+    let socket = server.socket.to_str().unwrap();
+    let session = create(&conn, json!({"argv": ["/bin/cat"], "label": "first"})).await;
+    let (line, _) = first_event_line(socket, &["--after", "0"]).await;
+    let event: Numbered = serde_json::from_str(&line).unwrap();
+    assert_eq!(event.seq, 1);
+    assert!(matches!(event.event, Event::SessionCreated { session: s } if s.id == session.id));
+    // Another incarnation's cursor: the sessions first, as without one.
+    let (line, err) = first_event_line(socket, &["--after", "0", "--incarnation", "gone"]).await;
+    assert_eq!(line, "[", "{err}");
+    assert!(err.contains("are gone"), "{err}");
+}

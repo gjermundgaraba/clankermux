@@ -375,6 +375,7 @@ mod tests {
             marker: 0,
             attachments: 1,
             program_status: None,
+            attention: None,
         }
     }
 

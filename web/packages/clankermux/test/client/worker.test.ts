@@ -322,6 +322,23 @@ test("a program's title and working directory reach the page as they change", as
   );
 });
 
+test("the attached session's events reach the page, with attention on its session", async () => {
+  const worker = start("s");
+  const server = await socket(0);
+  await server.serve([session("s"), session("t")]);
+  const bell = { seq: 3, event: "bell", id: "s" };
+  server.push(FrameType.Event, 0, { seq: 2, event: "bell", id: "t" });
+  server.push(FrameType.Event, 0, bell);
+  await vi.waitFor(() => expect(worker.posted.at(-1)).toEqual({ type: "event", event: bell }));
+  expect(worker.posted.filter((m) => m.type === "event")).toHaveLength(1);
+  const attention = { state: "blocked", kind: "question", record: "" };
+  const changed = { ...session("s"), attention };
+  server.push(FrameType.Event, 0, { seq: 4, event: "session_changed", session: changed });
+  await vi.waitFor(() =>
+    expect(worker.posted.at(-1)).toEqual({ type: "sessions", sessions: [changed, session("t")], current: "s" }),
+  );
+});
+
 test("the link: an exited or refused session ends it, a server stopping is retried", async () => {
   const worker = start("old");
   const server = await socket(0);

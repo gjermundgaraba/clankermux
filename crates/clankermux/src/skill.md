@@ -29,7 +29,7 @@ the human-readable listing.
 
 ## Commands
 
-    clankermux list                          # every session, one line each
+    clankermux list                          # every session, one line each, with what needs attention
     clankermux --json list                   # the same as JSON
     clankermux create --label build -- make  # start a session; prints its id
     clankermux create --keep -- ./test.sh    # keep it listed after it exits
@@ -52,7 +52,9 @@ the human-readable listing.
     clankermux signal build INT              # send a signal by name
     clankermux end build                     # hang up its processes
     clankermux remove build                  # delete an exited session
-    clankermux events                        # session events as JSON lines
+    clankermux ack build                     # mark its done and error reports seen
+    clankermux events                        # session events as JSON lines, each with its seq
+    clankermux events --after 41             # the events after seq 41, then the live ones
     clankermux attach build                  # attach this terminal (people, not agents)
 
 Inside a session, leave the session out: `clankermux label building`.
@@ -67,6 +69,16 @@ also matches the echo of `echo done`). Ctrl-C cancels a wait.
 `send` with one argument types it into the session you are in; when that
 argument names a session, it refuses: give both SESSION and TEXT. Outside
 a session, or with `--connect` or `--ssh`, name the session.
+
+## Program status
+
+A program reports its status with OSC 7501: `working`, `blocked` (it
+needs you), `done`, `error` or `idle`, for itself or for named parts of
+its work. `inspect` shows the reports. `done` and `error` reports carry
+`seen`, false until `ack` marks them seen. A session's `attention` is its
+most urgent report that wants someone: `blocked`, then an unseen `error`,
+then an unseen `done`, then `working`. `list` prints it after the status.
+Ack what you have dealt with; leave others' reports alone unless asked.
 
 ## Exit codes
 

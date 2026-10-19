@@ -230,6 +230,15 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
         msg: Some(worst(2048)),
         progress: Some(100),
         updated_at: "2026-10-18T16:00:00.123456789Z".into(),
+        // Only `done` and `error` carry it; here for the bytes.
+        seen: Some(false),
+    };
+    let attention = Attention {
+        state: "blocked".into(),
+        kind: Some("permission".into()),
+        app: Some(worst(32)),
+        msg: Some(worst(2048)),
+        record: worst(128),
     };
     let session = |records: bool| Session {
         id: "a8098c1a-f86e-11da-bd1a-00112444be1e".into(),
@@ -252,6 +261,7 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
         marker: u64::MAX,
         attachments: u32::MAX,
         program_status: records.then(|| vec![record.clone(); limits.records as usize]),
+        attention: Some(attention.clone()),
     };
     let reply = |result: serde_json::Value| {
         serde_json::to_vec(&Reply {

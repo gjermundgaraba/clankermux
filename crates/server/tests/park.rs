@@ -455,9 +455,9 @@ async fn program_status_records_follow_the_protocol() {
     c.ok("send", report("state=working:app=cargo:progress=40"))
         .await;
     let record = event_where(&mut c, |e| match e {
-        Event::ProgramStatusChanged { id: sid, record } if *sid == session.id => {
-            Some(record.clone())
-        }
+        Event::ProgramStatusChanged {
+            id: sid, record, ..
+        } if *sid == session.id => Some(record.clone()),
         _ => None,
     })
     .await;
@@ -595,6 +595,7 @@ async fn loading_keeps_the_newest_complete_generation_only() {
                     msg: None,
                     progress: None,
                     updated_at: "x".into(),
+                    seen: None,
                 },
                 StatusRecord {
                     id: "k".into(),
@@ -605,8 +606,10 @@ async fn loading_keeps_the_newest_complete_generation_only() {
                     msg: None,
                     progress: None,
                     updated_at: "x".into(),
+                    seen: None,
                 },
             ]),
+            attention: None,
         },
     };
     let write = |generation: &str, files: &[&str]| {
@@ -736,6 +739,7 @@ async fn a_park_naming_another_session_is_skipped() {
             marker: 0,
             attachments: 0,
             program_status: None,
+            attention: None,
         },
     };
     std::fs::write(dir.join("session.json"), serde_json::to_vec(&file).unwrap()).unwrap();

@@ -178,6 +178,23 @@ fn read_generation(dir: &Path) -> io::Result<Loaded> {
     })
 }
 
+/// Replaces the records in the `session.json` of the generation that
+/// holds `snapshot`, by a rename, keeping the rest of the file.
+pub fn rewrite_records(snapshot: &Path, records: Vec<proto::StatusRecord>) -> io::Result<()> {
+    let dir = snapshot
+        .parent()
+        .ok_or_else(|| io::Error::other("no generation directory"))?;
+    let path = dir.join(FILES[0]);
+    let mut file: ParkFile = serde_json::from_slice(&fs::read(&path)?)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    file.session.program_status = Some(records);
+    let temp = dir.join(format!(".{}", FILES[0]));
+    let _ = fs::remove_file(&temp);
+    write_file(&temp, &serde_json::to_vec(&file)?)?;
+    fs::rename(&temp, &path)?;
+    sync_dir(dir)
+}
+
 /// Deletes everything parked for `id`.
 pub fn remove(sessions: &Path, id: &str) {
     let _ = fs::remove_dir_all(sessions.join(id));

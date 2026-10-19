@@ -26,6 +26,7 @@ export interface Limits {
   page: number;
   hello_timeout: number;
   remove_grace: number;
+  events: number;
 }
 
 export interface Welcome {
@@ -85,6 +86,18 @@ export interface StatusRecord {
   msg?: string;
   progress?: number;
   updated_at: string;
+  /** On `done` and `error` records only: false until `ack`. */
+  seen?: boolean;
+}
+
+/** `Session.attention`: the most urgent record that wants the user. */
+export interface Attention {
+  state: string;
+  kind?: string;
+  app?: string;
+  msg?: string;
+  /** The record's id. */
+  record: string;
 }
 
 export interface Session {
@@ -106,11 +119,28 @@ export interface Session {
   marker: number;
   attachments: number;
   program_status?: StatusRecord[];
+  attention?: Attention;
 }
 
 export interface Page {
   sessions: Session[];
   next?: string;
+}
+
+/** `subscribe`: `after` and `incarnation` together replay the events after
+ * `after`. */
+export interface SubscribeParams {
+  after?: number;
+  incarnation?: string;
+}
+
+/** The `subscribe` reply: the first page without `after`, `gap` with it. */
+export interface Subscribed {
+  sessions?: Session[];
+  next?: string;
+  oldest: number;
+  latest: number;
+  gap?: boolean;
 }
 
 export interface Read {
@@ -222,6 +252,15 @@ export interface Cancelled {
   cancelled: boolean;
 }
 
+export interface AckParams {
+  session: string;
+  record_ids?: string[];
+}
+
+export interface Acked {
+  record_ids: string[];
+}
+
 export interface CreateParams {
   label?: string;
   argv?: string[];
@@ -232,13 +271,26 @@ export interface CreateParams {
   on_exit?: OnExit;
 }
 
-export type Event =
+export type StatusReason = "report" | "clear" | "prompt" | "exit" | "restore" | "evicted" | "ack";
+
+export type ProgressState = "remove" | "set" | "error" | "indeterminate" | "pause";
+
+/** `EVENT`: `seq` counts from 1 per server incarnation. */
+export type Event = { seq: number } & (
   | { event: "session_created"; session: Session }
   | { event: "session_changed"; session: Session }
   | { event: "session_exited"; session: Session }
   | { event: "session_removed"; id: string }
-  | { event: "program_status_changed"; id: string; record: StatusRecord }
-  | { event: "program_status_removed"; id: string; record_ids: string[] };
+  | { event: "program_status_changed"; id: string; record: StatusRecord; reason: StatusReason }
+  | { event: "program_status_removed"; id: string; record_ids: string[]; reason: StatusReason }
+  | { event: "bell"; id: string }
+  | { event: "notification"; id: string; title: string; body: string }
+  | { event: "progress"; id: string; state: ProgressState; progress?: number }
+  | { event: "command_started"; id: string; offset: number }
+  | { event: "command_ended"; id: string; offset: number; exit?: number }
+  | { event: "attachment_opened"; id: string; channel: number; client: Peer; read_only: boolean }
+  | { event: "attachment_closed"; id: string; channel: number; reason: string }
+);
 
 export type Scheme = "light" | "dark";
 

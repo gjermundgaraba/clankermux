@@ -175,13 +175,12 @@ pub fn dispatch(
             Err(fail) => reply(writer, id, Err(fail)),
         },
         "list" => match params::<proto::ListParams>(request.params) {
-            Ok(p) => registry.reply_page(writer, id, p.after.as_deref(), false),
+            Ok(p) => registry.reply_page(writer, id, p.after.as_deref()),
             Err(fail) => reply(writer, id, Err(fail)),
         },
         "subscribe" => match params::<proto::SubscribeParams>(request.params) {
-            Ok(proto::SubscribeParams {}) => {
-                let first = !std::mem::replace(subscribed, true);
-                registry.reply_page(writer, id, None, first);
+            Ok(p) => {
+                *subscribed |= registry.subscribe(writer, id, p, !*subscribed);
             }
             Err(fail) => reply(writer, id, Err(fail)),
         },
@@ -372,6 +371,20 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
             let p: proto::SessionParams = params(p)?;
             registry.remove(&p.session)?;
             Ok(json!({}))
+        }
+        "ack" => {
+            let p: proto::AckParams = params(p)?;
+            let session = registry.get(&p.session)?;
+            let (record_ids, events) = {
+                let mut s = session.lock().unwrap();
+                let record_ids = s.ack(p.record_ids.as_deref());
+                (record_ids, s.take_events())
+            };
+            registry.emit_all(events);
+            if !record_ids.is_empty() {
+                registry.records_changed(&session);
+            }
+            Ok(json!(proto::Acked { record_ids }))
         }
         "label" => {
             let p: proto::LabelParams = params(p)?;

@@ -119,6 +119,8 @@ export type ToPage =
   | { type: "done"; id: number; session?: Session; error?: Failure }
   | { type: "frame"; frame: Frame }
   | { type: "sessions"; sessions: Session[]; current: string | undefined }
+  /** An event that carries the attached session's `id`. */
+  | { type: "event"; event: Event }
   | { type: "clipboard"; text: string }
   /** The selection's text, or undefined once there is none; `copy`: the
    * answer to a release, so the text (if any) goes to the clipboard. */
@@ -325,12 +327,14 @@ class Client {
       case "session_changed":
       case "session_exited":
         this.sessions.set(event.session.id, event.session);
-        break;
+        this.postSessions();
+        return;
       case "session_removed":
         this.sessions.delete(event.id);
+        this.postSessions();
         break;
     }
-    this.postSessions();
+    if (event.id === this.session) this.post({ type: "event", event });
   }
 
   private postSessions(): void {

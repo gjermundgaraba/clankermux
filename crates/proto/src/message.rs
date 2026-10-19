@@ -125,6 +125,23 @@ pub struct StatusRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<u8>,
     pub updated_at: String,
+    /// On `done` and `error` records only: false until `ack`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen: Option<bool>,
+}
+
+/// `Session.attention`: the most urgent record that wants the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attention {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg: Option<String>,
+    /// The record's id.
+    pub record: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +168,8 @@ pub struct Session {
     pub attachments: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_status: Option<Vec<StatusRecord>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<Attention>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,10 +222,31 @@ pub struct ListParams {
     pub after: Option<String>,
 }
 
-/// `subscribe` takes no parameters: `{}`.
+/// `subscribe`: `after` and `incarnation` together replay the events
+/// after `after`; neither is the first page.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SubscribeParams {}
+pub struct SubscribeParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
+}
+
+/// The `subscribe` reply: the first page without `after`, `gap` with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subscribed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<Vec<Session>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    /// The `seq` of the oldest event retained, `latest + 1` when none is.
+    pub oldest: u64,
+    /// The `seq` of the latest event, 0 before the first.
+    pub latest: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap: Option<bool>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -396,15 +436,116 @@ pub struct Cancelled {
     pub cancelled: bool,
 }
 
+/// `ack`: every `done` and `error` record when `record_ids` is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AckParams {
+    pub session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_ids: Option<Vec<String>>,
+}
+
+/// The `ack` reply: the records it marked seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Acked {
+    pub record_ids: Vec<String>,
+}
+
+/// Why a program status record was set or removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusReason {
+    Report,
+    Clear,
+    Prompt,
+    Exit,
+    Restore,
+    Evicted,
+    Ack,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
-    SessionCreated { session: Session },
-    SessionChanged { session: Session },
-    SessionExited { session: Session },
-    SessionRemoved { id: String },
-    ProgramStatusChanged { id: String, record: StatusRecord },
-    ProgramStatusRemoved { id: String, record_ids: Vec<String> },
+    SessionCreated {
+        session: Session,
+    },
+    SessionChanged {
+        session: Session,
+    },
+    SessionExited {
+        session: Session,
+    },
+    SessionRemoved {
+        id: String,
+    },
+    ProgramStatusChanged {
+        id: String,
+        record: StatusRecord,
+        reason: StatusReason,
+    },
+    ProgramStatusRemoved {
+        id: String,
+        record_ids: Vec<String>,
+        reason: StatusReason,
+    },
+    Bell {
+        id: String,
+    },
+    /// OSC 9 or OSC 777.
+    Notification {
+        id: String,
+        title: String,
+        body: String,
+    },
+    /// OSC 9;4.
+    Progress {
+        id: String,
+        state: ProgressState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<u8>,
+    },
+    /// OSC 133 `C`.
+    CommandStarted {
+        id: String,
+        offset: u64,
+    },
+    /// OSC 133 `D`.
+    CommandEnded {
+        id: String,
+        offset: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit: Option<i32>,
+    },
+    AttachmentOpened {
+        id: String,
+        channel: u32,
+        client: Peer,
+        read_only: bool,
+    },
+    AttachmentClosed {
+        id: String,
+        channel: u32,
+        reason: String,
+    },
+}
+
+/// `EVENT`: an event and its number, from 1 per incarnation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Numbered {
+    pub seq: u64,
+    #[serde(flatten)]
+    pub event: Event,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressState {
+    Remove,
+    Set,
+    Error,
+    Indeterminate,
+    Pause,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

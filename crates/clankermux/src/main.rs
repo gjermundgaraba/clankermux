@@ -13,9 +13,10 @@ use clap::{Args, Parser, Subcommand};
 use client::connection::hello;
 use client::{Connection, Endpoint, Error};
 use proto::{
-    CancelParams, CreateParams, CursorParams, LabelParams, ListParams, OnExit, OutputMatch, Page,
-    Read, ReadParams, ResizeParams, SendParams, SendWait, Sent, Session, SessionParams,
-    SignalParams, StatusMatch, Until, WaitParams, WaitReason, Waited,
+    AckParams, Acked, CancelParams, CreateParams, CursorParams, LabelParams, ListParams, OnExit,
+    OutputMatch, Page, Read, ReadParams, ResizeParams, SendParams, SendWait, Sent, Session,
+    SessionParams, SignalParams, StatusMatch, SubscribeParams, Subscribed, Until, WaitParams,
+    WaitReason, Waited,
 };
 use serde::Serialize;
 
@@ -193,8 +194,26 @@ enum Command {
         #[command(flatten)]
         wait: WaitArgs,
     },
-    /// Print session events as JSON lines until interrupted.
-    Events,
+    /// Mark the session's `done` and `error` records seen: those named,
+    /// or all of them.
+    Ack {
+        /// The session, `$CLANKERMUX_SESSION` when left out, then the
+        /// record ids.
+        #[arg(value_name = "[SESSION [ID...]]")]
+        args: Vec<String>,
+    },
+    /// Print the sessions, then their events as JSON lines, each with its
+    /// `seq`, until interrupted.
+    Events {
+        /// Start after this event, replaying the ones the server kept;
+        /// when it kept too few the sessions are printed first, as without.
+        #[arg(long, value_name = "SEQ")]
+        after: Option<u64>,
+        /// The server incarnation `--after` counts in; the connected
+        /// server's by default.
+        #[arg(long, value_name = "ID", requires = "after")]
+        incarnation: Option<String>,
+    },
     /// The guide for agents.
     Skill {
         #[command(subcommand)]
@@ -492,12 +511,22 @@ fn session_line(s: &Session) {
         Some(proto::Exit::Signal { signal }) => format!(" {signal}"),
         None => String::new(),
     };
+    let attention = match &s.attention {
+        Some(proto::Attention {
+            state,
+            kind: Some(kind),
+            ..
+        }) => format!("{state}:{kind}"),
+        Some(attention) => attention.state.clone(),
+        None => String::new(),
+    };
     emit(&format!(
-        "{:<6} {:<12} {:<8}{:<9} {:>3}x{:<3} {} {}\n",
+        "{:<6} {:<12} {:<8}{:<9} {:<16} {:>3}x{:<3} {} {}\n",
         short_id(&s.id),
         s.label,
         s.status.to_string(),
         exit,
+        attention,
         s.cols,
         s.rows,
         s.title,
@@ -1242,13 +1271,51 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             .await?;
             return Ok(report_wait(json, &reply, &waited));
         }
-        Command::Events => {
+        Command::Ack { args } => {
+            let mut args = args.into_iter();
+            let session = resolve(&conn, here, args.next()).await?;
+            let ids: Vec<String> = args.collect();
+            let acked: Acked = conn
+                .call(
+                    "ack",
+                    AckParams {
+                        session,
+                        record_ids: (!ids.is_empty()).then_some(ids),
+                    },
+                )
+                .await?;
+            print(json, &acked, |_| {});
+        }
+        Command::Events { after, incarnation } => {
             let mut events = conn.events();
-            let page: Page = conn.call("subscribe", ListParams::default()).await?;
-            let sessions = following_pages(&conn, page).await?;
-            print(json, &sessions, |sessions| {
-                sessions.iter().for_each(session_line)
-            });
+            let params = SubscribeParams {
+                after,
+                incarnation: after
+                    .map(|_| incarnation.unwrap_or_else(|| conn.welcome.incarnation.clone())),
+            };
+            let subscribed: Subscribed = conn.call("subscribe", params).await?;
+            let sessions = match subscribed.sessions {
+                Some(sessions) => {
+                    let page = Page {
+                        sessions,
+                        next: subscribed.next,
+                    };
+                    Some(following_pages(&conn, page).await?)
+                }
+                None if subscribed.gap == Some(true) => {
+                    eprintln!(
+                        "clankermux: events after {} are gone; the sessions follow",
+                        after.unwrap_or_default()
+                    );
+                    Some(all_sessions(&conn).await?)
+                }
+                None => None,
+            };
+            if let Some(sessions) = sessions {
+                print(json, &sessions, |sessions| {
+                    sessions.iter().for_each(session_line)
+                });
+            }
             loop {
                 tokio::select! {
                     event = events.recv() => match event {

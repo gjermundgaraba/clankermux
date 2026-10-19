@@ -82,6 +82,7 @@ pub fn open(
     channel: u32,
     open: Open,
     session: Shared,
+    client: proto::Peer,
 ) -> Handle {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let (close_tx, close_rx) = mpsc::unbounded_channel();
@@ -102,6 +103,13 @@ pub fn open(
             close: close_tx.downgrade(),
             finished: finished.clone(),
         });
+        let opened = Event::AttachmentOpened {
+            id: s.id.clone(),
+            channel,
+            client,
+            read_only: open.read_only,
+        };
+        s.events.push(opened);
         (s.take_events(), s.to_proto(false))
     };
     registry.emit_session(events, Some(snapshot));
@@ -191,6 +199,11 @@ impl Task {
             tokio::spawn(async move { registry.park(&session).await });
         }
         let removed = matches!(end, Some(Ending::Closed(ClosedReason::Removed)));
+        let reason = match &end {
+            Some(Ending::Closed(reason)) => reason.to_string(),
+            Some(Ending::Error(code, _)) => code.to_string(),
+            None => "disconnected".into(),
+        };
         if let Some(ending) = end {
             self.send_ending(ending);
         }
@@ -204,6 +217,11 @@ impl Task {
                 self.send_ending(ending);
             }
         }
+        self.registry.emit(&Event::AttachmentClosed {
+            id: snapshot.id.clone(),
+            channel: self.channel,
+            reason,
+        });
         if !removed {
             self.registry
                 .emit(&Event::SessionChanged { session: snapshot });

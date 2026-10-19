@@ -1,6 +1,6 @@
 //! All sessions and the subscribers to their events.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use proto::{
-    ClosedReason, ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status,
-    encode_json_frame,
+    ClosedReason, ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status, StatusReason,
+    SubscribeParams, Subscribed, encode_json_frame,
 };
 use rustix::process::Signal;
 use tokio::io::unix::AsyncFd;
@@ -99,6 +99,27 @@ pub struct Registry {
 struct State {
     sessions: BTreeMap<String, Shared>,
     subscribers: Vec<Writer>,
+    /// The `seq` of the latest event.
+    seq: u64,
+    /// The latest events as sent, oldest first, for `subscribe {after}`.
+    retained: VecDeque<(u64, Vec<u8>)>,
+    retained_bytes: usize,
+}
+
+impl State {
+    /// `oldest` and `latest` of the `subscribe` reply.
+    fn cursor(&self) -> (u64, u64) {
+        let oldest = self.retained.front().map_or(self.seq + 1, |(seq, _)| *seq);
+        (oldest, self.seq)
+    }
+}
+
+/// `EVENT`: the event and its `seq`.
+#[derive(serde::Serialize)]
+struct Numbered<'a> {
+    seq: u64,
+    #[serde(flatten)]
+    event: &'a Event,
 }
 
 impl Registry {
@@ -195,6 +216,7 @@ impl Registry {
         } = loaded;
         let info = file.session;
         let limits = &self.config.limits;
+        let (records, dropped) = Records::load(info.program_status.unwrap_or_default());
         let session = Session {
             id: info.id.clone(),
             label: info.label,
@@ -208,10 +230,11 @@ impl Registry {
             text_limit: limits.text as usize,
             records_limit: limits.records as usize,
             attached: Vec::new(),
-            records: Records::load(info.program_status.unwrap_or_default()),
+            records,
             events: Vec::new(),
             removed: false,
             announced: Default::default(),
+            last_bell: None,
             park_lock: Default::default(),
             unparked: None,
             parked_at: None,
@@ -235,7 +258,14 @@ impl Registry {
             .lock()
             .unwrap()
             .sessions
-            .insert(info.id, Arc::new(Mutex::new(session)));
+            .insert(info.id.clone(), Arc::new(Mutex::new(session)));
+        if !dropped.is_empty() {
+            self.emit(&Event::ProgramStatusRemoved {
+                id: info.id,
+                record_ids: dropped,
+                reason: StatusReason::Restore,
+            });
+        }
     }
 
     /// Parks a live session (the timer, a change, the last detach and
@@ -357,16 +387,79 @@ impl Registry {
             .ok_or_else(|| (ErrorCode::NoSuchSession, format!("no session {id}")))
     }
 
-    /// Answers a `list` or `subscribe` with a page under the state lock,
-    /// so no event raised after the page is queued before it; a
-    /// `subscribe` then registers the connection for events.
-    pub fn reply_page(&self, writer: &Writer, id: i64, after: Option<&str>, subscribe: bool) {
-        let mut state = self.state.lock().unwrap();
+    /// Answers a `list` with a page under the state lock, so no event
+    /// raised after the page is queued before it.
+    pub fn reply_page(&self, writer: &Writer, id: i64, after: Option<&str>) {
+        let state = self.state.lock().unwrap();
         let page = self.page_of(&state, after);
         reply(writer, id, Ok(serde_json::json!(page)));
-        if subscribe {
-            state.subscribers.push(writer.clone());
+    }
+
+    /// Answers a `subscribe` under the state lock and, on the
+    /// connection's first (`first`), registers it for events: without
+    /// `after` the reply holds the first page, with it the retained events
+    /// after `after` follow the reply, unless there is a gap. Either way
+    /// every later event follows them. Returns whether it registered.
+    pub fn subscribe(
+        &self,
+        writer: &Writer,
+        id: i64,
+        params: SubscribeParams,
+        first: bool,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let (oldest, latest) = state.cursor();
+        let (result, replay) = match (params.after, params.incarnation) {
+            (None, None) => {
+                let page = self.page_of(&state, None);
+                let subscribed = Subscribed {
+                    sessions: Some(page.sessions),
+                    next: page.next,
+                    oldest,
+                    latest,
+                    gap: None,
+                };
+                (Ok(subscribed), None)
+            }
+            (Some(after), Some(incarnation)) => {
+                let same = incarnation == self.incarnation;
+                if !first {
+                    (
+                        Err((ErrorCode::InvalidRequest, "already subscribed".into())),
+                        None,
+                    )
+                } else if same && after > latest {
+                    let message = format!("after {after} is above the latest event, {latest}");
+                    (Err((ErrorCode::InvalidRequest, message)), None)
+                } else {
+                    let gap = !same || after + 1 < oldest;
+                    let subscribed = Subscribed {
+                        sessions: None,
+                        next: None,
+                        oldest,
+                        latest,
+                        gap: Some(gap),
+                    };
+                    (Ok(subscribed), (!gap).then_some(after))
+                }
+            }
+            _ => {
+                let message = "after and incarnation go together".into();
+                (Err((ErrorCode::InvalidRequest, message)), None)
+            }
+        };
+        let ok = result.is_ok();
+        reply(writer, id, result.map(|r| serde_json::json!(r)));
+        if !ok || !first {
+            return false;
         }
+        if let Some(after) = replay {
+            for (_, bytes) in state.retained.iter().filter(|(seq, _)| *seq > after) {
+                writer.send(bytes.clone());
+            }
+        }
+        state.subscribers.push(writer.clone());
+        true
     }
 
     /// Up to `limits.page` sessions after `after`, fewer when the page
@@ -402,15 +495,28 @@ impl Registry {
         Page { sessions, next }
     }
 
-    /// Queues `event` for every subscriber under the state lock, so it
-    /// follows any page replied before it.
+    /// Numbers `event`, retains it, and queues it for every subscriber
+    /// under the state lock, so it follows any page replied before it.
+    /// The retained events are at most `limits.events`, and at most
+    /// `max_frame` bytes, so a replay stays well within what a connection
+    /// may queue.
     pub fn emit(&self, event: &Event) {
-        let bytes = encode_json_frame(FrameType::Event, 0, event);
-        self.state
-            .lock()
-            .unwrap()
-            .subscribers
-            .retain(|w| w.send(bytes.clone()));
+        let mut state = self.state.lock().unwrap();
+        state.seq += 1;
+        let seq = state.seq;
+        let bytes = encode_json_frame(FrameType::Event, 0, &Numbered { seq, event });
+        state.subscribers.retain(|w| w.send(bytes.clone()));
+        state.retained_bytes += bytes.len();
+        state.retained.push_back((seq, bytes));
+        let limits = &self.config.limits;
+        while state.retained.len() as u64 > limits.events
+            || state.retained_bytes as u64 > limits.max_frame
+        {
+            let Some((_, dropped)) = state.retained.pop_front() else {
+                break;
+            };
+            state.retained_bytes -= dropped.len();
+        }
     }
 
     pub fn emit_all(&self, events: Vec<Event>) {
@@ -533,6 +639,7 @@ impl Registry {
             events: Vec::new(),
             removed: false,
             announced: Default::default(),
+            last_bell: None,
             park_lock: Default::default(),
             // Created is changed: parked within `quiet` even if the
             // program never writes.
@@ -674,6 +781,32 @@ impl Registry {
             park::remove(&self.sessions_dir(), &id);
             self.remove_after_grace(id);
         } else {
+            let registry = self.clone();
+            let session = session.clone();
+            tokio::spawn(async move { registry.park(&session).await });
+        }
+    }
+
+    /// `ack` changed a session's records: they reach its files with its
+    /// next park when it runs, with a park now when it ended and is
+    /// kept, and at once for a session loaded from a park file, whose
+    /// `session.json` alone changes.
+    pub fn records_changed(self: &Arc<Self>, session: &Shared) {
+        let mut s = session.lock().unwrap();
+        if s.gone() || self.is_stopping() {
+            return;
+        }
+        if let Some(parked) = s.parked() {
+            // Under the session lock, so a removal deletes the files after
+            // this.
+            let records = s.records.all();
+            if let Err(err) = blocking(|| park::rewrite_records(&parked.snapshot_path, records)) {
+                tracing::warn!(session = s.id, error = %err, "records not saved");
+            }
+        } else if s.status() == Status::Running {
+            s.touch();
+        } else {
+            drop(s);
             let registry = self.clone();
             let session = session.clone();
             tokio::spawn(async move { registry.park(&session).await });

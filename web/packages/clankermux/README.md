@@ -60,7 +60,13 @@ Verified in headless Chrome on macOS through CDP (`Input.imeSetComposition`, `In
 
 ## `onSessions`
 
-`onSessions(sessions, current)` reports every session on the server, and which one the page shows, at each change: a session created, exited or removed, and a `session_changed`, which the server sends when a session's label, size, attachments, title or working directory changes. The title is the program's (OSC 0 or 2), the working directory the one it reports (OSC 7, as a path), each empty until set, and both cleared by a full reset. A status line takes them from the session whose `id` is `current`; the `session` of a `connected` link is the one `ATTACHED` described, and does not follow these changes.
+`onSessions(sessions, current)` reports every session on the server, and which one the page shows, at each change: a session created, exited or removed, and a `session_changed`, which the server sends when a session's label, size, attachments, title, working directory or attention changes. The title is the program's (OSC 0 or 2), the working directory the one it reports (OSC 7, as a path), each empty until set, and both cleared by a full reset. A status line takes them from the session whose `id` is `current`; the `session` of a `connected` link is the one `ATTACHED` described, and does not follow these changes.
+
+A session's `attention`, when present, is the program status record that most wants the user (`{state, kind?, app?, msg?, record}`: `blocked`, then an unseen `error`, then an unseen `done`, then `working`), so a badge needs no request per session; a `session_changed` follows each change of it.
+
+## `onEvent` (provisional)
+
+`onEvent(event)` reports each server event that carries the attached session's `id`: `bell`, `notification`, `progress`, `command_started`, `command_ended`, `attachment_opened`, `attachment_closed`, `program_status_changed`, `program_status_removed` and `session_removed`, as PROTOCOL.md describes them, `seq` included. The events that carry a whole session reach `onSessions` instead. It is provisional: when the connection and the mounted terminal become separate objects, events move to the connection's object.
 
 ## `onLink`
 

@@ -158,6 +158,15 @@ async fn session_lifecycle() {
     let data = b64("\x1bc\n");
     c.ok("send", json!({"session": session.id, "data": data}))
         .await;
+    // The reset removes any progress report too.
+    assert!(matches!(
+        events.event().await,
+        Event::Progress {
+            state: ProgressState::Remove,
+            progress: None,
+            ..
+        }
+    ));
     assert!(
         matches!(events.event().await, Event::SessionChanged { session: s } if s.title.is_empty() && s.pwd.is_empty())
     );

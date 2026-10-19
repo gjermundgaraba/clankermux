@@ -1,7 +1,7 @@
 /** The page side of a terminal: canvas, keyboard, paste and resize, with
  * the engine in a worker running `runWorker`. */
 import type { CellPoint } from "../engine/index.ts";
-import type { OnExit, Scheme, Session, Size } from "../proto/index.ts";
+import type { Event, OnExit, Scheme, Session, Size } from "../proto/index.ts";
 import { CanvasRenderer, type Metrics } from "../renderer/index.ts";
 
 import { ClientError } from "./connection.ts";
@@ -50,6 +50,12 @@ export interface MountOptions {
    * history (and growing with output meanwhile), 0 when it shows the
    * live screen again. The canvas draws a mark at its right edge too. */
   onScroll?: (rows: number) => void;
+  /** Provisional, until the connection and the terminal are split: each
+   * event that carries the attached session's `id` (`bell`,
+   * `notification`, `progress`, `command_started`, `command_ended`,
+   * `attachment_opened`, `attachment_closed`, the `program_status_*`
+   * ones, `session_removed`). The others reach `onSessions`. */
+  onEvent?: (event: Event) => void;
 }
 
 export interface CreateOptions {
@@ -240,6 +246,9 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
       }
       case "sessions":
         options.onSessions?.(message.sessions, message.current);
+        break;
+      case "event":
+        options.onEvent?.(message.event);
         break;
       case "clipboard":
         navigator.clipboard?.writeText(message.text).catch(() => {});

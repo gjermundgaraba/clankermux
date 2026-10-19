@@ -8,11 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ghostty_vt::{
-    ColorKind, ColorScheme, Handler, ProgramStatus, Rgb, SemanticPromptKind, SizeReport, Terminal,
-    color_scheme_report, formatter, snapshot,
+    ColorKind, ColorScheme, Handler, ProgramStatus, ProgressState, Rgb, SemanticPromptKind,
+    SizeReport, Terminal, color_scheme_report, formatter, snapshot,
 };
 use proto::{
-    ClosedReason, ErrorCode, Event, Exit, OnExit, Profile, Scheme, Size, Status, Viewport,
+    Attention, ClosedReason, ErrorCode, Event, Exit, OnExit, Profile, Scheme, Size, Status,
+    StatusReason, Viewport,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -36,6 +37,9 @@ pub const COALESCE: Duration = Duration::from_millis(25);
 /// exceeded, for a bootstrap and for a park.
 pub const SNAPSHOT_RETRY: Duration = Duration::from_secs(5);
 
+/// Bells within this long of the last one announced are not announced.
+pub const BELL_COALESCE: Duration = Duration::from_millis(100);
+
 /// Effects the engine raises while parsing, collected under the session
 /// lock and drained by the caller of `vt_write`.
 #[derive(Default)]
@@ -46,14 +50,26 @@ pub struct Effects {
     pub scheme: Option<ColorScheme>,
     pub bg: Option<Rgb>,
     pub size: SizeReport,
-    /// OSC 7501 reports and OSC 133 `A` prompt starts, in stream order.
-    pub status: Vec<StatusEvent>,
+    /// The stream offset just after the bytes being parsed, which the
+    /// notices raised meanwhile carry.
+    pub offset: u64,
+    /// Program status reports and the program's other signals, in stream
+    /// order, each with `offset` as it was raised.
+    pub notices: Vec<(u64, Notice)>,
 }
 
-pub enum StatusEvent {
+pub enum Notice {
+    /// OSC 7501.
     Report(ProgramStatus),
-    /// Transient records are dropped.
+    /// OSC 133 `A`: transient records are dropped.
     PromptStart,
+    /// OSC 133 `C`.
+    CommandStarted,
+    /// OSC 133 `D`.
+    CommandEnded(Option<i32>),
+    Bell,
+    Notification(String, String),
+    Progress(ProgressState, i8),
 }
 
 impl Effects {
@@ -100,14 +116,47 @@ impl Handler for Effects {
     }
 
     fn program_status(&mut self, report: ProgramStatus) {
-        self.status.push(StatusEvent::Report(report));
+        self.notices.push((self.offset, Notice::Report(report)));
     }
 
     fn semantic_prompt(&mut self, kind: SemanticPromptKind) {
-        if kind == SemanticPromptKind::PromptStart {
-            self.status.push(StatusEvent::PromptStart);
-        }
+        let notice = match kind {
+            SemanticPromptKind::PromptStart => Notice::PromptStart,
+            SemanticPromptKind::OutputStart => Notice::CommandStarted,
+            _ => return,
+        };
+        self.notices.push((self.offset, notice));
     }
+
+    fn command_end(&mut self, exit: Option<i32>) {
+        self.notices.push((self.offset, Notice::CommandEnded(exit)));
+    }
+
+    fn bell(&mut self) {
+        self.notices.push((self.offset, Notice::Bell));
+    }
+
+    fn desktop_notification(&mut self, title: String, body: String) {
+        self.notices
+            .push((self.offset, Notice::Notification(title, body)));
+    }
+
+    fn progress_report(&mut self, state: ProgressState, progress: i8) {
+        self.notices
+            .push((self.offset, Notice::Progress(state, progress)));
+    }
+}
+
+/// Where `bytes` is cut so that each sequence that raises a notice ends
+/// a piece: after every BEL and every ST (`ESC \`). The ends, the last
+/// at `bytes.len()`. An ST split across two reads is not cut: the engine
+/// ends the sequence at its ESC, in the first.
+fn pieces(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    let cuts = (0..bytes.len())
+        .filter(move |&i| bytes[i] == 0x07 || (bytes[i] == b'\\' && i > 0 && bytes[i - 1] == 0x1b));
+    cuts.map(|i| i + 1)
+        .filter(move |&end| end < bytes.len())
+        .chain(std::iter::once(bytes.len()))
 }
 
 /// Relative luminance per WCAG, 0 for black and 1 for white.
@@ -227,8 +276,7 @@ pub struct Live {
     /// The latest coalesced report, waiting for the timer.
     pub pending: Option<Viewport>,
     pub timer_running: bool,
-    /// The stream offsets after the outputs that held an OSC 133 `A`,
-    /// within the ring.
+    /// The stream offsets just after each OSC 133 `A`, within the ring.
     pub prompts: VecDeque<u64>,
     /// When the program last wrote.
     pub last_output: Instant,
@@ -305,8 +353,10 @@ pub struct Session {
     /// finish. A park in flight deletes what it wrote; a stop deletes the
     /// files rather than parking.
     pub removed: bool,
-    /// The title and pwd last announced by `session_changed`.
-    pub announced: (String, String),
+    /// The title, pwd and attention last announced by `session_changed`.
+    pub announced: (String, String, Option<Attention>),
+    /// When the last bell was announced.
+    pub last_bell: Option<Instant>,
     /// Parks of this session run one at a time.
     pub park_lock: Arc<tokio::sync::Mutex<()>>,
     /// The first and the latest change since the last park began, if
@@ -411,6 +461,7 @@ impl Session {
             marker,
             attachments: self.attached.len() as u32,
             program_status: with_records.then(|| self.records.resolved()),
+            attention: self.records.attention(),
         }
     }
 
@@ -432,12 +483,19 @@ impl Session {
     }
 
     /// Feeds PTY bytes to the engine and the stream; the events this
-    /// raises wait in `events`.
+    /// raises wait in `events`. The engine takes them in pieces so that
+    /// each notice carries the offset just after its sequence.
     pub fn output(&mut self, bytes: &[u8]) {
         let Body::Live(live) = &mut self.body else {
             return;
         };
-        live.term.vt_write(bytes);
+        let base = live.stream.offset();
+        let mut start = 0;
+        for end in pieces(bytes) {
+            live.term.handler_mut().offset = base + end as u64;
+            live.term.vt_write(&bytes[start..end]);
+            start = end;
+        }
         live.stream.append(bytes);
         live.last_output = Instant::now();
         self.flush_effects();
@@ -447,67 +505,147 @@ impl Session {
     }
 
     /// Writes the engine's pending answers to the PTY, applies the
-    /// program status reports, and queues `session_changed` when title or
-    /// pwd changed.
+    /// program status reports, turns the program's other signals into
+    /// events, and queues `session_changed` when title, pwd or attention
+    /// changed.
     pub fn flush_effects(&mut self) {
         let Body::Live(live) = &mut self.body else {
             return;
         };
         let effects = live.term.handler_mut();
         let answers = std::mem::take(&mut effects.pty_output);
-        let status = std::mem::take(&mut effects.status);
-        let changed = std::mem::take(&mut effects.changed);
+        let notices = std::mem::take(&mut effects.notices);
+        let mut changed = std::mem::take(&mut effects.changed);
         if !answers.is_empty() && live.input.push(answers).is_none() {
             tracing::warn!(session = self.id, "input queue full; query answers dropped");
         }
         let now = now();
-        for event in status {
-            let change = match event {
-                StatusEvent::Report(report) => self.records.apply(report, self.records_limit, &now),
-                StatusEvent::PromptStart => {
+        let id = self.id.clone();
+        for (offset, notice) in notices {
+            let event = match notice {
+                Notice::Report(report) => {
+                    let change = self.records.apply(report, self.records_limit, &now);
+                    let reason = if change.set.is_some() {
+                        StatusReason::Evicted
+                    } else {
+                        StatusReason::Clear
+                    };
+                    if let Some(record) = change.set {
+                        self.events.push(Event::ProgramStatusChanged {
+                            id: id.clone(),
+                            record,
+                            reason: StatusReason::Report,
+                        });
+                    }
+                    if !change.removed.is_empty() {
+                        self.events.push(Event::ProgramStatusRemoved {
+                            id: id.clone(),
+                            record_ids: change.removed,
+                            reason,
+                        });
+                    }
+                    changed = true;
+                    continue;
+                }
+                Notice::PromptStart => {
                     if let Body::Live(live) = &mut self.body {
                         let start = live.stream.retained_start();
                         live.prompts.retain(|&o| o >= start);
                         if live.prompts.len() >= PROMPTS {
                             live.prompts.pop_front();
                         }
-                        live.prompts.push_back(live.stream.offset());
+                        live.prompts.push_back(offset);
                     }
-                    self.drop_transient_records();
+                    changed |= self.drop_transient_records(StatusReason::Prompt);
                     continue;
                 }
+                Notice::CommandStarted => Event::CommandStarted {
+                    id: id.clone(),
+                    offset,
+                },
+                Notice::CommandEnded(exit) => Event::CommandEnded {
+                    id: id.clone(),
+                    offset,
+                    exit,
+                },
+                Notice::Bell => {
+                    let at = Instant::now();
+                    if self
+                        .last_bell
+                        .is_some_and(|last| at.duration_since(last) < BELL_COALESCE)
+                    {
+                        continue;
+                    }
+                    self.last_bell = Some(at);
+                    Event::Bell { id: id.clone() }
+                }
+                Notice::Notification(title, body) => Event::Notification {
+                    id: id.clone(),
+                    title: truncate(title, self.text_limit),
+                    body: truncate(body, self.text_limit),
+                },
+                Notice::Progress(state, progress) => Event::Progress {
+                    id: id.clone(),
+                    state: match state {
+                        ProgressState::Remove => proto::ProgressState::Remove,
+                        ProgressState::Set => proto::ProgressState::Set,
+                        ProgressState::Error => proto::ProgressState::Error,
+                        ProgressState::Indeterminate => proto::ProgressState::Indeterminate,
+                        ProgressState::Pause => proto::ProgressState::Pause,
+                    },
+                    progress: u8::try_from(progress).ok(),
+                },
             };
-            if let Some(record) = change.set {
-                self.events.push(Event::ProgramStatusChanged {
-                    id: self.id.clone(),
-                    record,
-                });
-            }
-            if !change.removed.is_empty() {
-                self.events.push(Event::ProgramStatusRemoved {
-                    id: self.id.clone(),
-                    record_ids: change.removed,
-                });
-            }
+            self.events.push(event);
         }
         if changed {
-            let session = self.to_proto(false);
-            let identity = (session.title.clone(), session.pwd.clone());
-            if identity != self.announced {
-                self.announced = identity;
-                self.events.push(Event::SessionChanged { session });
-            }
+            self.announce();
         }
     }
 
-    fn drop_transient_records(&mut self) {
+    /// Queues `session_changed` when the title, pwd or attention differs
+    /// from what was last announced.
+    pub fn announce(&mut self) {
+        let session = self.to_proto(false);
+        let announced = (
+            session.title.clone(),
+            session.pwd.clone(),
+            session.attention.clone(),
+        );
+        if announced != self.announced {
+            self.announced = announced;
+            self.events.push(Event::SessionChanged { session });
+        }
+    }
+
+    /// Drops the transient records; whether there were any.
+    fn drop_transient_records(&mut self, reason: StatusReason) -> bool {
         let removed = self.records.drop_transient();
-        if !removed.is_empty() {
-            self.events.push(Event::ProgramStatusRemoved {
+        if removed.is_empty() {
+            return false;
+        }
+        self.events.push(Event::ProgramStatusRemoved {
+            id: self.id.clone(),
+            record_ids: removed,
+            reason,
+        });
+        true
+    }
+
+    /// `ack`: marks the records seen and queues their events; returns
+    /// their ids.
+    pub fn ack(&mut self, ids: Option<&[String]>) -> Vec<String> {
+        let acked = self.records.ack(ids);
+        let record_ids = acked.iter().map(|r| r.id.clone()).collect();
+        for record in acked {
+            self.events.push(Event::ProgramStatusChanged {
                 id: self.id.clone(),
-                record_ids: removed,
+                record,
+                reason: StatusReason::Ack,
             });
         }
+        self.announce();
+        record_ids
     }
 
     pub fn size(&self) -> Size {
@@ -630,7 +768,10 @@ impl Session {
         self.exited_at = Some(now());
         live.stream
             .add_marker(MarkerKind::Exited { exit: exit.clone() });
-        self.drop_transient_records();
+        // `session_exited` carries the new attention.
+        self.drop_transient_records(StatusReason::Exit);
+        let session = self.to_proto(false);
+        self.announced = (session.title, session.pwd, session.attention);
         self.wake.notify_waiters();
         // Wakes the activity park to see the end and return; a kept
         // session's last park is `Registry::ended`'s.

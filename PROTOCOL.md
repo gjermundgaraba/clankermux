@@ -124,7 +124,8 @@ processed and answered.
 | `send`      | `session, text? \| keys? \| data?, paste?, wait?`    | Sent                    |
 | `wait`      | `session, until, after?, timeout_ms?`               | Waited                  |
 | `cancel`    | `id`                                                | `{cancelled}`           |
-| `subscribe` |                                                     | Page                    |
+| `subscribe` | `after?, incarnation?`                              | Subscribed              |
+| `ack`       | `session, record_ids?`                              | `{record_ids}`          |
 
 - `create`: `argv` defaults to the user's login shell, `cwd` to the server
   user's home directory, `cols` to 80, `rows` to 24, `on_exit` to `remove`.
@@ -148,10 +149,11 @@ processed and answered.
   coalescing (see Size). A side left out keeps the session's; one of
   `cols` and `rows` is required. Fails with `not_running` unless `status`
   is `running`.
-- `list` and `subscribe` return a Page: `{sessions: Session[], next?}`.
-  Sessions are ordered by `id`; at most `limits.page` per reply; `next` is
-  the last id when more remain, to pass as `after`. Sessions carry no
-  program status records; use `inspect` once per session.
+- `list` returns a Page: `{sessions: Session[], next?}`. Sessions are
+  ordered by `id`; at most `limits.page` per reply; `next` is the last id
+  when more remain, to pass as `after`. Sessions carry no program status
+  records, only their `attention`; use `inspect` once per session for the
+  records.
 - `read`: `scrollback` is a line count, default 0. `text` is the last
   `scrollback` history lines followed by the screen, one logical line per
   newline, with soft-wrapped rows joined and trailing blanks trimmed. The
@@ -213,10 +215,31 @@ processed and answered.
   `cancel` replies `{cancelled: true}`. After that reply the cancelled
   request sends nothing more. An `id` that is not pending replies
   `{cancelled: false}`.
-- `subscribe` takes `{}` as `params`. It starts `EVENT` frames on this
-  connection and returns the first page of current sessions. Events are
-  sent only for changes after the moment of subscription; later pages
-  come from `list`.
+- `subscribe` starts `EVENT` frames on this connection. Its reply,
+  Subscribed, has `oldest`, the `seq` of the oldest event the server
+  retains (`latest + 1` when it retains none), and `latest`, the `seq`
+  of the latest event (0 before the first). With `{}` as `params` the
+  reply also holds the first page of current sessions, as `sessions` and
+  `next?` of a Page, and events are sent only for changes after the
+  moment of subscription; later pages come from `list`. With `after` and
+  `incarnation`, required together, the reply holds `gap` instead, and
+  the retained events with `seq` above `after` follow it, in order,
+  before any later event. `after` is the `seq` of the last event the
+  client applied, or `latest` of a reply; `incarnation` the `WELCOME`'s
+  it was counted in. `gap` is true when `incarnation` is not the
+  server's (`seq` counts from 1 again on every start) or when events
+  after `after` are no longer retained (`after + 1 < oldest`); then no
+  event is replayed, later ones follow as usual, and the client pages
+  `list` again for the current state. An `after` above
+  `latest` with the server's `incarnation` is `invalid_request`. A
+  connection subscribes once: a later `subscribe` with `{}` returns a
+  page and changes nothing, one with `after` is `invalid_request`.
+- `ack` marks `done` and `error` records of the session seen: those
+  named by `record_ids`, every one when it is absent. The reply lists the
+  records it marked; ids that name no such record, or one already seen,
+  are left out. Each marked record gets `program_status_changed` with
+  `reason: ack`. Works for every status; the marks are saved as described
+  under Persisted state.
 
 Sent
 
@@ -280,6 +303,7 @@ Read
 | `marker`         | int      | Sequence number of the latest marker, 0 if none         |
 | `attachments`    | int      | Open attachments                                        |
 | `program_status` | Record[] | Only in `inspect`; see Program status                   |
+| `attention`      | object?  | The record that most wants the user; see Program status |
 
 `restored` means the session was running when a previous server
 incarnation stopped. It has a screen but no process and no exit.
@@ -290,18 +314,45 @@ reported by the program.
 
 ### Events
 
-`EVENT` is `{event, ...}`.
+`EVENT` is `{seq, event, ...}`. `seq` numbers the events of a server
+incarnation from 1, across sessions, in the order every subscriber gets
+them. The server retains the latest `limits.events` events in memory for
+`subscribe {after}`, fewer when they would exceed `limits.max_frame`
+bytes as frames.
 
-| Event                    | Fields           | When                                            |
-| ------------------------ | ---------------- | ----------------------------------------------- |
-| `session_created`        | `session`        |                                                 |
-| `session_changed`        | `session`        | Label, size, title, pwd or `attachments` changed |
-| `session_exited`         | `session`        | The stream ended; `exit` is set                 |
-| `session_removed`        | `id`             | Removed by request, or by `on_exit: remove`     |
-| `program_status_changed` | `id, record`     | One record was set; see Program status          |
-| `program_status_removed` | `id, record_ids` | Records were dropped or cleared                 |
+| Event                    | Fields                             | When                                            |
+| ------------------------ | ---------------------------------- | ----------------------------------------------- |
+| `session_created`        | `session`                          |                                                 |
+| `session_changed`        | `session`                          | Label, size, title, pwd, `attachments` or `attention` changed |
+| `session_exited`         | `session`                          | The stream ended; `exit` is set                 |
+| `session_removed`        | `id`                               | Removed by request, or by `on_exit: remove`     |
+| `program_status_changed` | `id, record, reason`               | One record was set; see Program status          |
+| `program_status_removed` | `id, record_ids, reason`           | Records were dropped or cleared                 |
+| `bell`                   | `id`                               | BEL, at most one per session per 100 ms         |
+| `notification`           | `id, title, body`                  | OSC 9 or OSC 777 `notify`; `title` empty when the sequence has none |
+| `progress`               | `id, state, progress?`             | OSC 9;4                                         |
+| `command_started`        | `id, offset`                       | OSC 133 `C`: the command's output starts        |
+| `command_ended`          | `id, offset, exit?`                | OSC 133 `D`, with the exit code the shell sent  |
+| `attachment_opened`      | `id, channel, client, read_only`   | An `OPEN` attached                              |
+| `attachment_closed`      | `id, channel, reason`              | The attachment ended                            |
 
 `id` is the session id in every event that carries it.
+
+- `notification`: `title` and `body` are at most `limits.text` bytes each,
+  truncated, and are untrusted text from the program. OSC 99 (kitty) is
+  not reported: the engine does not parse it.
+- `progress`: `state` is `remove`, `set`, `error`, `indeterminate` or
+  `pause`, as the program sent it; `progress` is 0 to 100 when it sent
+  one. A full reset (RIS) sends `progress {state: remove}`.
+- `command_started` and `command_ended`: `offset` is the stream offset
+  just after the sequence's terminator (BEL or ST; for an ST split across
+  two reads of the PTY, just after its ESC).
+- `attachment_opened`: `channel` is the attachment's channel on its own
+  connection, `client` the connection's `HELLO.client`.
+- `attachment_closed`: `reason` is the `CLOSED` reason (`closed`,
+  `removed`, `stopping`) when the attachment got one, the error code when
+  an `ERROR` ended it, and `disconnected` when its connection closed.
+  For a removed session it may follow `session_removed`.
 
 ### Program status
 
@@ -316,7 +367,8 @@ kept per session; beyond that the least recently updated is evicted. The
 default keeps an `inspect` reply under the default `max_frame` with every
 record at the protocol's maxima and worst-case JSON escaping. The server
 relies on the engine's program-status and semantic-prompt effects, both on
-upstream `main` as of 2026-10-18.
+upstream `main` as of 2026-10-18, and on its bell, desktop-notification
+and progress-report effects for the events of the same names.
 
 | Field        | Type    |
 | ------------ | ------- |
@@ -328,6 +380,27 @@ upstream `main` as of 2026-10-18.
 | `msg`        | string? |
 | `progress`   | int?    |
 | `updated_at` | string  |
+| `seen`       | bool?   |
+
+`seen` is on `done` and `error` records only: false when reported, true
+once `ack` marked it. A new report on the id replaces the record, so it is
+unseen again. Records keep `seen` through a park and a load.
+
+`reason` in `program_status_changed` is `report` (the program reported
+the record) or `ack`. In `program_status_removed` it is `clear` (a
+`clear` report, or a full reset), `prompt` (an OSC 133 `A`), `exit` (the
+stream ended), `restore` (loaded from a park file, at the start of a
+server, so only a `subscribe {after}` of the new incarnation sees it) or
+`evicted` (over `limits.records`).
+
+`attention` is the most urgent record that wants the user, absent when
+none does: a `blocked` record, then an unseen `error`, then an unseen
+`done`, then `working`; `idle` and seen records never count. Among
+records of one state the shallowest id wins (the root first), then the
+latest report. It is `{state, kind?, app?, msg?, record}`, `record` the
+record's id and `app` resolved as `inspect` resolves it. It is in every
+Session, and `session_changed` is sent when it changes, except at the end
+of the stream, when `session_exited` carries it.
 
 ## Attach
 
@@ -597,7 +670,7 @@ the park time as Unix epoch milliseconds, mode 0700, files 0600:
 
 | File                | Contents                                                     |
 | ------------------- | ------------------------------------------------------------ |
-| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines}`: the `inspect` object (`attachments: 0`, no `pid`, `program_status` as reported with no inherited `app`) and how many leading lines of `screen.txt` are history |
+| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines}`: the `inspect` object (`attachments: 0`, no `pid`, `program_status` as reported with no inherited `app`, with `seen`) and how many leading lines of `screen.txt` are history |
 | `snapshot.ghostsnp` | The snapshot bytes                                           |
 | `screen.txt`        | The `read` text with all retained history, at `parked_at`   |
 
@@ -628,6 +701,12 @@ may still be pending); a stop deletes the files of sessions being
 removed, then sends SIGHUP to each running session's process group.
 While the server stops, `create`, `remove` and `OPEN` fail with
 `internal`.
+An `ack` that marks a record of a running session counts as a change; of
+an exited, kept session it parks the session once more; of a session
+loaded from a park file it replaces `session.json` in the newest
+generation, writing `.session.json` there, syncing it, renaming it over
+`session.json` and syncing the directory. A `session.json` without
+`seen` loads its `done` and `error` records unseen.
 The whole `sessions/<id>/` directory is deleted whenever the session is
 removed. On start, a `session.json` whose `session.id` is not its
 directory's name is skipped with a warning.
@@ -689,6 +768,7 @@ sessions when more would not fit (`next` still names the last one sent).
 | `page`         | 32         | Sessions per `list` or `subscribe` reply      |
 | `hello_timeout`| 10000      | Milliseconds allowed for `HELLO`              |
 | `remove_grace` | 10000      | Milliseconds before `on_exit: remove` removes |
+| `events`       | 4096       | Events retained for `subscribe {after}`       |
 
 ## Errors
 
@@ -701,7 +781,7 @@ an attachment channel it ends the attachment, except `read_only`,
 | ------------------ | --------------------------------------------------------- |
 | `protocol_error`   | A connection error under Framing; the connection closes   |
 | `version_mismatch` | `HELLO.version` is not 1; the connection closes           |
-| `invalid_request`  | Malformed payload, a field the protocol does not define, unknown method, or a resume marker above the session's latest |
+| `invalid_request`  | Malformed payload, a field the protocol does not define, unknown method, a resume marker above the session's latest, or a `subscribe` `after` above the latest event |
 | `limit_exceeded`   | `label` or `text` exceeded, or a snapshot failed          |
 | `no_such_session`  |                                                           |
 | `not_running`      | `status` is not `running`, or the stream has ended; for a wait, nothing matched before the stream ended |

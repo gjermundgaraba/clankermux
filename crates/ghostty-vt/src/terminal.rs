@@ -77,6 +77,16 @@ pub struct ProgramStatus {
     pub message: String,
 }
 
+/// An OSC 9;4 report's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressState {
+    Remove,
+    Set,
+    Error,
+    Indeterminate,
+    Pause,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticPromptKind {
     PromptStart,
@@ -86,8 +96,8 @@ pub enum SemanticPromptKind {
 }
 
 /// Effects raised by the engine while it parses, the ones clankermux
-/// acts on; the rest (clipboard, bell, resize requests) are left unset
-/// at the engine, which ignores them. Every method has a default that
+/// acts on; the rest (clipboard, resize requests) are left unset at the
+/// engine, which ignores them. Every method has a default that
 /// ignores the effect. The engine calls these from `extern "C"`
 /// trampolines, so a panic in a handler aborts the process.
 pub trait Handler: Send + 'static {
@@ -96,6 +106,15 @@ pub trait Handler: Send + 'static {
     fn write_pty(&mut self, _data: &[u8]) {}
     fn program_status(&mut self, _report: ProgramStatus) {}
     fn semantic_prompt(&mut self, _kind: SemanticPromptKind) {}
+    /// OSC 133 `D`, after `semantic_prompt` with `CommandEnd`: the exit
+    /// code, when the shell reported one.
+    fn command_end(&mut self, _exit: Option<i32>) {}
+    /// BEL.
+    fn bell(&mut self) {}
+    /// OSC 9 or OSC 777; the title is empty when the sequence has none.
+    fn desktop_notification(&mut self, _title: String, _body: String) {}
+    /// OSC 9;4; the percentage is -1 when absent.
+    fn progress_report(&mut self, _state: ProgressState, _progress: i8) {}
     /// Answer to CSI ? 996 n; `None` leaves the query unanswered.
     fn color_scheme(&mut self) -> Option<ColorScheme> {
         None
@@ -267,8 +286,17 @@ impl<H: Handler> Terminal<H> {
             handler,
             xtversion: Vec::new(),
         }));
-        let callbacks: [(sys::GhosttyTerminalOption, *const c_void); 9] = [
+        let callbacks: [(sys::GhosttyTerminalOption, *const c_void); 12] = [
             (sys::GHOSTTY_TERMINAL_OPT_WRITE_PTY, cb::write_pty::<H> as _),
+            (sys::GHOSTTY_TERMINAL_OPT_BELL, cb::bell::<H> as _),
+            (
+                sys::GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION,
+                cb::desktop_notification::<H> as _,
+            ),
+            (
+                sys::GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT,
+                cb::progress_report::<H> as _,
+            ),
             (
                 sys::GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS,
                 cb::program_status::<H> as _,
@@ -481,7 +509,48 @@ mod cb {
             sys::GHOSTTY_SEMANTIC_PROMPT_COMMAND_END => SemanticPromptKind::CommandEnd,
             _ => return,
         };
-        unsafe { slot::<H>(ud) }.handler.semantic_prompt(kind);
+        let handler = &mut unsafe { slot::<H>(ud) }.handler;
+        handler.semantic_prompt(kind);
+        if kind == SemanticPromptKind::CommandEnd {
+            handler.command_end(e.has_exit_code.then_some(e.exit_code));
+        }
+    }
+
+    pub(super) unsafe extern "C" fn bell<H: Handler>(_t: sys::GhosttyTerminal, ud: *mut c_void) {
+        unsafe { slot::<H>(ud) }.handler.bell();
+    }
+
+    pub(super) unsafe extern "C" fn desktop_notification<H: Handler>(
+        _t: sys::GhosttyTerminal,
+        ud: *mut c_void,
+        notification: *const sys::GhosttyTerminalDesktopNotification,
+    ) {
+        // SAFETY: the notification and its strings are valid for this call.
+        let n = unsafe { &*notification };
+        let (title, body) = unsafe { (string(&n.title), string(&n.body)) };
+        unsafe { slot::<H>(ud) }
+            .handler
+            .desktop_notification(title, body);
+    }
+
+    pub(super) unsafe extern "C" fn progress_report<H: Handler>(
+        _t: sys::GhosttyTerminal,
+        ud: *mut c_void,
+        report: *const sys::GhosttyTerminalProgressReport,
+    ) {
+        // SAFETY: report is valid for this call.
+        let r = unsafe { &*report };
+        let state = match r.state {
+            sys::GHOSTTY_TERMINAL_PROGRESS_STATE_REMOVE => ProgressState::Remove,
+            sys::GHOSTTY_TERMINAL_PROGRESS_STATE_SET => ProgressState::Set,
+            sys::GHOSTTY_TERMINAL_PROGRESS_STATE_ERROR => ProgressState::Error,
+            sys::GHOSTTY_TERMINAL_PROGRESS_STATE_INDETERMINATE => ProgressState::Indeterminate,
+            sys::GHOSTTY_TERMINAL_PROGRESS_STATE_PAUSE => ProgressState::Pause,
+            _ => return,
+        };
+        unsafe { slot::<H>(ud) }
+            .handler
+            .progress_report(state, r.progress);
     }
 
     pub(super) unsafe extern "C" fn color_scheme<H: Handler>(

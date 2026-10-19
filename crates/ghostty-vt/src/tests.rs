@@ -238,6 +238,10 @@ struct Recorder {
     statuses: Vec<ProgramStatus>,
     prompts: Vec<SemanticPromptKind>,
     titles: usize,
+    exits: Vec<Option<i32>>,
+    bells: usize,
+    notifications: Vec<(String, String)>,
+    progress: Vec<(ProgressState, i8)>,
 }
 
 struct Shared(Arc<Mutex<Recorder>>);
@@ -265,6 +269,18 @@ impl Handler for Shared {
     }
     fn title_changed(&mut self) {
         self.0.lock().unwrap().titles += 1;
+    }
+    fn command_end(&mut self, exit: Option<i32>) {
+        self.0.lock().unwrap().exits.push(exit);
+    }
+    fn bell(&mut self) {
+        self.0.lock().unwrap().bells += 1;
+    }
+    fn desktop_notification(&mut self, title: String, body: String) {
+        self.0.lock().unwrap().notifications.push((title, body));
+    }
+    fn progress_report(&mut self, state: ProgressState, progress: i8) {
+        self.0.lock().unwrap().progress.push((state, progress));
     }
 }
 
@@ -315,6 +331,28 @@ fn effects_reach_the_handler() {
     term.vt_write(b"\x1b]2;new title\x07");
     assert_eq!(rec.lock().unwrap().titles, 1);
     assert_eq!(term.title(), "new title");
+
+    term.vt_write(b"\x1b]133;D;3\x07\x1b]133;D\x07");
+    assert_eq!(rec.lock().unwrap().exits, [Some(3), None]);
+    term.vt_write(b"\x07\x07");
+    assert_eq!(rec.lock().unwrap().bells, 2);
+    term.vt_write(b"\x1b]9;plain\x07\x1b]777;notify;Title;Body\x07");
+    assert_eq!(
+        rec.lock().unwrap().notifications,
+        [
+            (String::new(), "plain".to_string()),
+            ("Title".to_string(), "Body".to_string())
+        ]
+    );
+    term.vt_write(b"\x1b]9;4;1;40\x07\x1b]9;4;3\x07\x1b]9;4;0\x07");
+    assert_eq!(
+        rec.lock().unwrap().progress,
+        [
+            (ProgressState::Set, 40),
+            (ProgressState::Indeterminate, -1),
+            (ProgressState::Remove, -1)
+        ]
+    );
 }
 
 #[test]

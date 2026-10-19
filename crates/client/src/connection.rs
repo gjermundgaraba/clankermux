@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use proto::{
-    ClientPeer, ErrorMessage, Event, FrameDecoder, FrameType, Header, Hello, Limits, Open, Welcome,
-    encode_frame, encode_json_frame,
+    ClientPeer, ErrorMessage, FrameDecoder, FrameType, Header, Hello, Limits, Numbered, Open,
+    Welcome, encode_frame, encode_json_frame,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -79,7 +79,7 @@ impl Frame {
 struct Routes {
     pending: HashMap<i64, oneshot::Sender<Result<Value, ErrorMessage>>>,
     channels: HashMap<u32, mpsc::UnboundedSender<Frame>>,
-    events: Option<mpsc::UnboundedSender<Event>>,
+    events: Option<mpsc::UnboundedSender<Numbered>>,
     /// Set once the reader ended.
     closed: Option<Ended>,
 }
@@ -282,7 +282,7 @@ impl Connection {
 
     /// The sink for `EVENT` frames; `subscribe` must be requested too.
     /// The receiver ends when the connection does.
-    pub fn events(&self) -> mpsc::UnboundedReceiver<Event> {
+    pub fn events(&self) -> mpsc::UnboundedReceiver<Numbered> {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut routes = self.routes.lock().unwrap();
         if routes.closed.is_none() {
@@ -377,7 +377,7 @@ fn route(routes: &Mutex<Routes>, frame: Frame) -> Result<(), Ended> {
             }
         }
         FrameType::Event => {
-            let event: Event = frame.json().map_err(lost)?;
+            let event: Numbered = frame.json().map_err(lost)?;
             if let Some(tx) = &routes.events
                 && tx.send(event).is_err()
             {

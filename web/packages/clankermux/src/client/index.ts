@@ -7,4 +7,4 @@ export type { ClipboardWrite } from "./osc52.ts";
 export { mountTerminal } from "./mount.ts";
 export type { Colors, CreateOptions, MountOptions, MountedTerminal } from "./mount.ts";
 export type { Link, LinkEnd } from "./worker.ts";
-export type { ErrorCode, Exit, OnExit, Scheme, Session } from "../proto/index.ts";
+export type { Attention, ErrorCode, Event, Exit, OnExit, Scheme, Session, StatusRecord } from "../proto/index.ts";
