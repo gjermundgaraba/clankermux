@@ -427,6 +427,16 @@ terminal, sets the PTY size, emits a mode 2048 report if enabled, and
 appends `RESIZED` to the stream. A report applied at once discards pending
 coalesced reports. Resize requests from the program (CSI 8 t) are ignored.
 
+Since the latest report wins, a client with a person in front of it
+reports only while it is in use, so the session takes the size of the
+client being looked at. The web client (`mountTerminal`) reports, in
+`OPEN` and `VIEWPORT`, only while its page is visible and its window has
+the focus (`document.visibilityState` and `document.hasFocus()`), and
+reports again as soon as it is shown or focused, whether or not its size
+changed. A hidden or unfocused web client sends `OPEN` without `viewport`
+or `profile` and no `VIEWPORT`; its terminal follows the session's size
+through `RESIZED` like any other.
+
 A report carries a size and may carry a `profile` and a cell size; what
 it omits is unchanged (`set_size` carries neither). The session's profile
 and cell size are those of the latest reports that carried them. They

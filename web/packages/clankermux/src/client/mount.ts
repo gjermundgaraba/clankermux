@@ -66,7 +66,8 @@ export interface MountedTerminal {
   /** Removes the attached session, which must be `exited` or `restored`
    * (else `running`); the link ends with `removed`. */
   remove(): Promise<void>;
-  /** Reports the container's size, the colours and the scheme again. */
+  /** Reports the container's size, the colours and the scheme again;
+   * to the session only while the page is visible and focused. */
   report(): void;
   paste(text: string): void;
   /** Removes the listeners and terminates the worker, which ends its
@@ -221,10 +222,19 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
     reported = JSON.stringify(current);
     return current;
   };
-  const report = () => send({ type: "viewport", size: viewport(), profile: profile() });
+  /** Whether the user is looking at this page: it is visible and its
+   * window has the focus. Only then does the session get its size, so
+   * of several clients the one in use sets it. */
+  const active = () => document.visibilityState === "visible" && document.hasFocus();
+  const report = () => send({ type: "viewport", size: viewport(), profile: profile(), active: active() });
   const resizes = new ResizeObserver(report);
   resizes.observe(container);
   light.addEventListener("change", report, { signal });
+  // Shown or focused: the session takes this page's size again; hidden or
+  // blurred: the worker stops reporting.
+  document.addEventListener("visibilitychange", report, { signal });
+  window.addEventListener("focus", report, { signal });
+  window.addEventListener("blur", report, { signal });
   // A page pins its scheme (and its colours with it) with an attribute or
   // a class on the canvas or an ancestor, which no event announces.
   const restyles = new MutationObserver(() => {
@@ -254,6 +264,7 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
     url: options.url,
     viewport: viewport(),
     profile: profile(),
+    active: active(),
     session: options.session,
   });
 

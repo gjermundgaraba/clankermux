@@ -140,7 +140,7 @@ function bootstrap(socket: FakeSocket, channel: number, s: Session): void {
 }
 
 /** A worker started as `mountTerminal` starts it, and what it posted. */
-function start(attach?: string) {
+function start(attach?: string, active = true) {
   const posted: ToPage[] = [];
   const port = {
     postMessage: (message: ToPage) => posted.push(message),
@@ -154,6 +154,7 @@ function start(attach?: string) {
     url: "wss://127.0.0.1:7438/",
     viewport: { cols: 80, rows: 24 },
     profile: {},
+    active,
     session: attach,
   });
   return {
@@ -270,6 +271,28 @@ test("the link: connected to a session, its exit, then removed for good", async 
       { state: "ended", reason: "removed", retry: false },
     ]),
   );
+});
+
+test("only a page in use reports its size: OPEN and VIEWPORT carry none until it is active", async () => {
+  const worker = start("s", false);
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const channel = await server.opened("s");
+  expect(server.bodies(FrameType.Open).at(-1)!.body).toEqual({ session: "s" });
+  bootstrap(server, channel, session("s"));
+  await vi.waitFor(() => expect(worker.links()).toContainEqual({ state: "connected", session: session("s") }));
+
+  const size = { cols: 100, rows: 30 };
+  worker.send({ type: "viewport", size, profile: { scheme: "dark" }, active: false });
+  expect(server.bodies(FrameType.Viewport)).toEqual([]);
+  // Focused again with the same size: reported, to take the size back.
+  worker.send({ type: "viewport", size, profile: { scheme: "dark" }, active: true });
+  expect(server.bodies(FrameType.Viewport)).toEqual([{ channel, body: { ...size, profile: { scheme: "dark" } } }]);
+  // A size made while blurred is the one `create` asks for.
+  worker.send({ type: "viewport", size: { cols: 50, rows: 10 }, profile: {}, active: false });
+  expect(server.bodies(FrameType.Viewport)).toHaveLength(1);
+  worker.send({ type: "create", id: 1 });
+  expect((await server.request("create")).params).toEqual({ cols: 50, rows: 10 });
 });
 
 test("a program's title and working directory reach the page as they change", async () => {

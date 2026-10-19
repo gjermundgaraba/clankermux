@@ -71,7 +71,16 @@ export interface Failure {
 
 /** Messages from the page to the worker. */
 export type ToWorker =
-  | { type: "init"; wasm: string; url: string; viewport: Size; profile: Profile; session: string | undefined }
+  /** `active`: the user is looking at the page (below). */
+  | {
+      type: "init";
+      wasm: string;
+      url: string;
+      viewport: Size;
+      profile: Profile;
+      active: boolean;
+      session: string | undefined;
+    }
   | { type: "attach"; session: string }
   /** Each request is answered by a `done` with its `id`. */
   | { type: "create"; id: number; onExit?: OnExit }
@@ -79,7 +88,10 @@ export type ToWorker =
   | { type: "remove"; id: number }
   | { type: "key"; input: KeyInput }
   | { type: "paste"; text: string }
-  | { type: "viewport"; size: Size; profile: Profile }
+  /** The page's size and profile. Only an `active` page, one the user is
+   * looking at, reports them to the session: the server applies the
+   * latest report, so the session takes the size of the page in use. */
+  | { type: "viewport"; size: Size; profile: Profile; active: boolean }
   /** The page lost its drawing: send the whole screen again. */
   | { type: "repaint" };
 
@@ -143,6 +155,8 @@ class Client {
   private url = "";
   private viewport!: Size;
   private profile!: Profile;
+  /** The page is in use; only then are its size and profile reported. */
+  private active = false;
   private conn: Connection | undefined;
   private attachment: Attachment | undefined;
   private channel = 0;
@@ -190,6 +204,7 @@ class Client {
     this.url = message.url;
     this.viewport = message.viewport;
     this.profile = message.profile;
+    this.active = message.active;
     this.session = message.session;
     this.post({ type: "status", text: "loading engine" });
     try {
@@ -294,10 +309,10 @@ class Client {
     const attachment = this.attachment;
     attachment.openOn(conn.welcome);
     const channel = ++this.channel;
+    // An OPEN with a viewport or profile is a report applied at once.
     const open = {
       session: this.session,
-      viewport: this.viewport,
-      profile: this.profile,
+      ...(this.active && { viewport: this.viewport, profile: this.profile }),
       resume: attachment.resume(),
     };
     try {
@@ -576,13 +591,19 @@ class Client {
     this.input(this.engine.encodePaste(text, term.mode(2004)), true);
   }
 
-  setViewport(size: Size, profile: Profile): void {
+  /** Keeps the page's size (for `create`) and colours (for the local
+   * terminal), and reports them to the session while the page is active.
+   * A report repeats the last one when the page becomes active again, so
+   * the session takes its size back from another client. */
+  setViewport(size: Size, profile: Profile, active: boolean): void {
     this.viewport = size;
     this.profile = profile;
+    this.active = active;
     const attachment = this.attachment;
     if (!this.conn || !attachment || attachment.ended()) return;
     this.applyProfile(attachment.term());
     this.paint();
+    if (!active) return;
     try {
       this.conn.sendJson(FrameType.Viewport, this.channel, { ...size, profile });
     } catch {
@@ -627,7 +648,7 @@ export function runWorker(port: WorkerPort): void {
         client.paste(message.text);
         break;
       case "viewport":
-        client.setViewport(message.size, message.profile);
+        client.setViewport(message.size, message.profile, message.active);
         break;
       case "repaint":
         client.repaint();

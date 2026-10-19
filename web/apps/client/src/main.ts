@@ -60,10 +60,13 @@ function showSessions(sessions: Session[], current: string | undefined): void {
       return new Option(text, s.id, s.id === current, s.id === current);
     }),
   );
-  // The status line: `sessions` follows the program's title (OSC 0/2) and
-  // working directory (OSC 7) as they change.
+  // The status line: `sessions` follows the program's title (OSC 0/2),
+  // working directory (OSC 7) and the session's size as they change. The
+  // size is the one of the page last visible and focused.
   const attached = sessions.find((s) => s.id === current);
-  where.textContent = attached ? [attached.title, attached.pwd].filter(Boolean).join(" \u2014 ") : "";
+  where.textContent = attached
+    ? [attached.title, attached.pwd, `${attached.cols}\u00d7${attached.rows}`].filter(Boolean).join(" \u2014 ")
+    : "";
 }
 
 sessionsSelect.onchange = () => {
