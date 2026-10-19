@@ -242,6 +242,7 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
         origin,
         tls_cert,
         tls_key,
+        park_timing,
     } = carriers;
     let origins = origin
         .iter()
@@ -265,7 +266,11 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
     };
     // The state lock comes first: a second server learns of the first
     // before any tailnet work.
-    let registry = server::Registry::new(server::default_config())?;
+    let mut config = server::default_config();
+    if let Some(park) = park_timing {
+        config.park = park;
+    }
+    let registry = server::Registry::new(config)?;
     // One status request serves every carrier that needs the tailnet.
     let needs_tailnet = tcp.is_some()
         || matches!(ws_bind, Some(WsBind::Port(_)))
@@ -373,6 +378,35 @@ struct Carriers {
     /// Private key PEM.
     #[arg(long, value_name = "PATH", requires = "ws", requires = "tls_cert")]
     tls_key: Option<PathBuf>,
+    /// When running sessions are parked, in seconds (fractions allowed),
+    /// for tests: every session every INTERVAL, and a session that
+    /// changed once it has been quiet for QUIET or BUSY after its first
+    /// change, whichever comes first. Also on the last detach and on
+    /// stop. [default: 300,2,30]
+    #[arg(long, value_name = "INTERVAL,QUIET,BUSY", value_parser = parse_park_timing)]
+    park_timing: Option<server::ParkTiming>,
+}
+
+fn parse_park_timing(spec: &str) -> Result<server::ParkTiming, String> {
+    let seconds: Vec<std::time::Duration> = spec
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<f64>()
+                .ok()
+                .and_then(|s| std::time::Duration::try_from_secs_f64(s).ok())
+                .filter(|d| !d.is_zero())
+                .ok_or_else(|| format!("{s:?} is not a positive number of seconds"))
+        })
+        .collect::<Result<_, _>>()?;
+    match seconds[..] {
+        [interval, quiet, busy] => Ok(server::ParkTiming {
+            interval,
+            quiet,
+            busy,
+        }),
+        _ => Err("three durations are needed: INTERVAL,QUIET,BUSY".into()),
+    }
 }
 
 /// What `--ws` names: a port on the tailnet address, or a loopback address.

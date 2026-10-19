@@ -448,3 +448,81 @@ async fn write_sends_one_request_even_for_empty_text() {
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("not_running"));
 }
+
+/// `clankermux serve` as a process on `dir`'s socket and state, parking
+/// soon after a change.
+fn serve(dir: &std::path::Path) -> Child {
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
+        .arg("--socket")
+        .arg(dir.join("sock"))
+        .args(["serve", "--park-timing", "3600,0.2,1"])
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap()
+}
+
+/// Connects once the server at `dir` answers.
+async fn connect_when_up(dir: &std::path::Path) -> Connection {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match Connection::connect_unix(&dir.join("sock"), hello("test", Some(ghostty_vt::ENGINE)))
+            .await
+        {
+            Ok(conn) => return conn,
+            Err(err) => assert!(tokio::time::Instant::now() < deadline, "{err}"),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_killed_server_restores_what_was_parked_after_a_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut first = serve(dir.path());
+    let conn = connect_when_up(dir.path()).await;
+    let session = create(&conn, json!({"argv": ["/bin/sh", "-c", "exec cat"]})).await;
+    conn.request(
+        "write",
+        json!({"session": session.id, "data": "YmVmb3JlLXRoZS1raWxsCg=="}),
+    )
+    .await
+    .unwrap();
+    // A park holding the line, not merely one from before the write.
+    let parks = dir
+        .path()
+        .join("state/clankermux/sessions")
+        .join(&session.id);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let parked = std::fs::read_dir(&parks)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .any(|e| {
+                std::fs::read_to_string(e.path().join("screen.txt"))
+                    .is_ok_and(|t| t.contains("before-the-kill"))
+            });
+        if parked {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never parked");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(conn);
+    // SIGKILL: no stop, no park on the way down, as at a power-off.
+    first.kill().await.unwrap();
+
+    let _second = serve(dir.path());
+    let conn = connect_when_up(dir.path()).await;
+    let restored = inspect(&conn, &session.id).await;
+    assert_eq!(restored.status, Status::Restored);
+    let read: Read = conn
+        .call("read", json!({"session": session.id}))
+        .await
+        .unwrap();
+    assert!(read.text.contains("before-the-kill"), "{}", read.text);
+}

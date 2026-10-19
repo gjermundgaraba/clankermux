@@ -21,6 +21,17 @@ A terminal multiplexer server with CLI and browser clients; the wire protocol is
 | `cd web/apps/client && pnpm build && pnpm serve` | demo page on `http://127.0.0.1:8787/?ws=wss://127.0.0.1:7438/`; after `just check`, which installs `web/` and builds the wasm |
 | `target/release/clankermux --socket target/dev/sock create` | a session on the dev server |
 
+## Parks
+
+`serve` writes each running session's screen, scrollback and state under `$XDG_STATE_HOME/clankermux/sessions/` (PROTOCOL.md, "Persisted state"):
+
+- within 2 s of its output (or input, a resize, a label) stopping, and at least every 30 s while it continues;
+- when its last attachment closes;
+- every 5 minutes;
+- on SIGTERM, SIGINT or SIGHUP, before it exits.
+
+A server that dies without a signal (SIGKILL, a machine powered off) starts again with each session `restored` as of its last park. `serve --park-timing INTERVAL,QUIET,BUSY` sets the three times in seconds, fractions allowed (default `300,2,30`), so that a test can kill a server soon after typing and find the line parked: `clankermux serve --park-timing 300,0.2,1`.
+
 ## Release
 
 1. Bump `version` in `crates/clankermux/Cargo.toml` and `web/packages/clankermux/package.json` (`scripts/version.sh` checks they agree), push `main` and wait for `check.yml`.
