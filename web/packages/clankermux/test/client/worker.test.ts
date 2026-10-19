@@ -158,6 +158,7 @@ function start(attach?: string) {
   });
   return {
     send,
+    posted,
     links: () => posted.flatMap((m) => (m.type === "link" ? [m.link] : [])),
     async done(id: number) {
       let found: Extract<ToPage, { type: "done" }> | undefined;
@@ -268,6 +269,17 @@ test("the link: connected to a session, its exit, then removed for good", async 
       { state: "ended", reason: "exited", exit: { code: 3 }, retry: false },
       { state: "ended", reason: "removed", retry: false },
     ]),
+  );
+});
+
+test("a program's title and working directory reach the page as they change", async () => {
+  const worker = start("s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const changed = { ...session("s"), title: "vim notes.md", pwd: "/tmp/work" };
+  server.push(FrameType.Event, 0, { event: "session_changed", session: changed });
+  await vi.waitFor(() =>
+    expect(worker.posted.at(-1)).toEqual({ type: "sessions", sessions: [changed], current: "s" }),
   );
 });
 

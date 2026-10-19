@@ -64,6 +64,12 @@
       #link {
         opacity: 0.6;
       }
+      #where {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        min-width: 0;
+      }
       #terminal {
         flex: 1;
         min-height: 0;
@@ -83,6 +89,7 @@
       <button id="new">New session</button>
       <button id="end" title="Hang up the session's processes">End</button>
       <button id="remove" title="Remove an exited or restored session">Remove</button>
+      <span id="where" title="The session's title and working directory"></span>
       <select id="scheme" aria-label="Colour scheme">
         <option value="">auto</option>
         <option value="light">light</option>

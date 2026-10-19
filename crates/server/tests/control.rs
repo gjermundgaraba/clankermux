@@ -139,20 +139,27 @@ async fn session_lifecycle() {
     assert!(
         matches!(events.event().await, Event::SessionChanged { session: s } if (s.cols, s.rows, s.marker) == (40, 12, 1))
     );
-    // A title set by the program is announced, and so is its clearing
-    // by a full reset (RIS), which the engine reports separately.
-    // `cat` passes a line on once it is complete.
+    // A title (OSC 2) and a working directory (OSC 7) set by the program
+    // are announced, and so is their clearing by a full reset (RIS),
+    // which the engine reports separately. `cat` passes a line on once it
+    // is complete.
     let data = b64("\x1b]2;titled\x07\n");
     c.ok("write", json!({"session": session.id, "data": data}))
         .await;
     assert!(
         matches!(events.event().await, Event::SessionChanged { session: s } if s.title == "titled")
     );
+    let data = b64("\x1b]7;file://host/tmp/work\x07\n");
+    c.ok("write", json!({"session": session.id, "data": data}))
+        .await;
+    assert!(
+        matches!(events.event().await, Event::SessionChanged { session: s } if s.title == "titled" && s.pwd == "/tmp/work")
+    );
     let data = b64("\x1bc\n");
     c.ok("write", json!({"session": session.id, "data": data}))
         .await;
     assert!(
-        matches!(events.event().await, Event::SessionChanged { session: s } if s.title.is_empty())
+        matches!(events.event().await, Event::SessionChanged { session: s } if s.title.is_empty() && s.pwd.is_empty())
     );
     c.ok(
         "set_size",

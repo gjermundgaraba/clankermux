@@ -10,6 +10,7 @@ const removeButton = document.getElementById("remove") as HTMLButtonElement;
 const schemeSelect = document.getElementById("scheme") as HTMLSelectElement;
 const status = document.getElementById("status") as HTMLElement;
 const linkText = document.getElementById("link") as HTMLElement;
+const where = document.getElementById("where") as HTMLElement;
 
 const params = new URLSearchParams(location.search);
 // The server's default WebSocket port on the host the page came from;
@@ -59,6 +60,10 @@ function showSessions(sessions: Session[], current: string | undefined): void {
       return new Option(text, s.id, s.id === current, s.id === current);
     }),
   );
+  // The status line: `sessions` follows the program's title (OSC 0/2) and
+  // working directory (OSC 7) as they change.
+  const attached = sessions.find((s) => s.id === current);
+  where.textContent = attached ? [attached.title, attached.pwd].filter(Boolean).join(" \u2014 ") : "";
 }
 
 sessionsSelect.onchange = () => {
