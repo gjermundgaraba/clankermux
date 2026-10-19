@@ -199,14 +199,29 @@ fn limit_defaults_match_vector() {
 }
 
 #[test]
-fn unknown_fields_are_ignored_and_params_required() {
+fn client_payloads_refuse_unknown_fields_and_server_payloads_ignore_them() {
+    assert!(
+        serde_json::from_str::<Hello>(
+            r#"{"version":1,"client":{"name":"x","version":"0"},"future":true}"#
+        )
+        .is_err()
+    );
     let hello: Hello =
-        serde_json::from_str(r#"{"version":1,"client":{"name":"x","version":"0"},"future":true}"#)
-            .unwrap();
+        serde_json::from_str(r#"{"version":1,"client":{"name":"x","version":"0"}}"#).unwrap();
     assert_eq!(hello.capabilities, Vec::<String>::new());
     assert!(serde_json::from_str::<Request>(r#"{"id":-1,"method":"list"}"#).is_err());
+    assert!(
+        serde_json::from_str::<Request>(r#"{"id":-1,"method":"list","params":{},"x":0}"#).is_err()
+    );
     let request: Request =
         serde_json::from_str(r#"{"id":-1,"method":"list","params":{}}"#).unwrap();
     assert_eq!(request.id, -1);
     assert!(serde_json::from_value::<ListParams>(request.params).is_ok());
+    assert!(serde_json::from_str::<Viewport>(r#"{"cols":1,"rows":1,"x":0}"#).is_err());
+    assert!(serde_json::from_str::<Open>(r#"{"session":"s","profile":{"x":0}}"#).is_err());
+
+    let reply: Reply = serde_json::from_str(r#"{"id":1,"result":{},"future":true}"#).unwrap();
+    assert_eq!(reply.id, 1);
+    let gap: Gap = serde_json::from_str(r#"{"from":1,"to":2,"future":true}"#).unwrap();
+    assert_eq!(gap.to, 2);
 }

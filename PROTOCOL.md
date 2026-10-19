@@ -8,7 +8,12 @@ terminal. The server is the only writer to a PTY.
 ## Conventions
 
 - Integers in frame headers and raw payloads are unsigned little-endian.
-- JSON payloads are UTF-8 objects. Unknown fields are ignored.
+- JSON payloads are UTF-8 objects. Strict in, open out: a payload a
+  client sends (`HELLO`, `REQUEST` and every method's `params`, `OPEN`,
+  `VIEWPORT`, and the objects inside them) holds only the fields this
+  document defines, and the server refuses any other with
+  `invalid_request`. A payload the server sends may gain fields; a client
+  ignores the ones it does not know.
 - `base64` fields are standard base64 with padding.
 - Byte sizes are in bytes. `MiB` is 1,048,576 bytes. Durations in JSON
   are integer milliseconds.
@@ -66,7 +71,10 @@ than `OPEN` on a channel that is not in use is dropped.
 
 The client sends `HELLO` within `limits.hello_timeout` of connecting, else
 the server closes the connection. The server answers `WELCOME`, or `ERROR
-version_mismatch` and then closes the connection.
+version_mismatch` and then closes the connection. A `HELLO` that is not a
+JSON object is a `protocol_error`; one of version 1 with a field missing,
+mistyped or undefined gets `ERROR invalid_request` without `id`, and the
+connection closes.
 
 `HELLO`
 
@@ -140,9 +148,10 @@ the order the server produced them.
   Works for every status.
 - `send`: `data` is base64. Replies after the bytes are written to the PTY
   as one unit. Fails with `not_running` unless `status` is `running`.
-- `subscribe` starts `EVENT` frames on this connection and returns the
-  first page of current sessions. Events are sent only for changes after
-  the moment of subscription; later pages come from `list`.
+- `subscribe` takes `{}` as `params`. It starts `EVENT` frames on this
+  connection and returns the first page of current sessions. Events are
+  sent only for changes after the moment of subscription; later pages
+  come from `list`.
 
 Read
 
@@ -596,7 +605,7 @@ an attachment channel it ends the attachment, except `read_only`,
 | ------------------ | --------------------------------------------------------- |
 | `protocol_error`   | A connection error under Framing; the connection closes   |
 | `version_mismatch` | `HELLO.version` is not 1; the connection closes           |
-| `invalid_request`  | Malformed payload, unknown method, or a resume marker above the session's latest |
+| `invalid_request`  | Malformed payload, a field the protocol does not define, unknown method, or a resume marker above the session's latest |
 | `limit_exceeded`   | `label` or `text` exceeded, or a snapshot failed          |
 | `no_such_session`  |                                                           |
 | `not_running`      | `status` is not `running`, or the stream has ended        |

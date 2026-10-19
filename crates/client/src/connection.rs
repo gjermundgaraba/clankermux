@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use proto::{
-    ErrorMessage, Event, FrameDecoder, FrameType, Header, Hello, Limits, Open, Peer, Welcome,
+    ClientPeer, ErrorMessage, Event, FrameDecoder, FrameType, Header, Hello, Limits, Open, Welcome,
     encode_frame, encode_json_frame,
 };
 use serde::Serialize;
@@ -120,7 +120,7 @@ pub struct Connection {
 pub fn hello(name: &str, engine: Option<&str>) -> Hello {
     Hello {
         version: proto::VERSION,
-        client: Peer {
+        client: ClientPeer {
             name: name.into(),
             version: env!("CARGO_PKG_VERSION").into(),
         },

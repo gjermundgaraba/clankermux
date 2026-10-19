@@ -1,5 +1,6 @@
-//! JSON payloads. Unknown fields are ignored on receipt; optional fields
-//! are omitted when absent.
+//! JSON payloads. What a client sends refuses unknown fields; what the
+//! server sends may grow, and unknown fields are ignored on receipt.
+//! Optional fields are omitted when absent.
 
 use std::collections::BTreeMap;
 
@@ -8,16 +9,26 @@ use serde_json::Value;
 
 use crate::Limits;
 
+/// `WELCOME.server`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peer {
     pub name: String,
     pub version: String,
 }
 
+/// `HELLO.client`: a `Peer` as the client sends it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientPeer {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Hello {
     pub version: u32,
-    pub client: Peer,
+    pub client: ClientPeer,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
     #[serde(default)]
@@ -35,6 +46,7 @@ pub struct Welcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Request {
     pub id: i64,
     pub method: String,
@@ -165,6 +177,7 @@ pub struct Read {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -183,23 +196,32 @@ pub struct CreateParams {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
 }
 
+/// `subscribe` takes no parameters: `{}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubscribeParams {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionParams {
     pub session: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignalParams {
     pub session: String,
     pub signal: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LabelParams {
     pub session: String,
     pub label: String,
@@ -207,6 +229,7 @@ pub struct LabelParams {
 
 /// `resize`: a side left out keeps the session's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResizeParams {
     pub session: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,6 +239,7 @@ pub struct ResizeParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadParams {
     pub session: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +247,7 @@ pub struct ReadParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SendParams {
     pub session: String,
     /// Base64.
@@ -241,6 +266,7 @@ pub enum Event {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fg: Option<String>,
@@ -261,6 +287,7 @@ pub enum Scheme {
 
 /// `OPEN.viewport`: the terminal size in cells and, optionally, pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Size {
     pub cols: u16,
     pub rows: u16,
@@ -270,16 +297,56 @@ pub struct Size {
     pub cell_height: Option<u32>,
 }
 
-/// The `VIEWPORT` payload.
+/// The `VIEWPORT` payload: a size and a profile in one flat object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ViewportWire", into = "ViewportWire")]
 pub struct Viewport {
-    #[serde(flatten)]
     pub size: Size,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
 }
 
+/// `Viewport` on the wire: `flatten` would not refuse unknown fields.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ViewportWire {
+    cols: u16,
+    rows: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cell_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cell_height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<Profile>,
+}
+
+impl From<ViewportWire> for Viewport {
+    fn from(w: ViewportWire) -> Self {
+        Viewport {
+            size: Size {
+                cols: w.cols,
+                rows: w.rows,
+                cell_width: w.cell_width,
+                cell_height: w.cell_height,
+            },
+            profile: w.profile,
+        }
+    }
+}
+
+impl From<Viewport> for ViewportWire {
+    fn from(v: Viewport) -> Self {
+        ViewportWire {
+            cols: v.size.cols,
+            rows: v.size.rows,
+            cell_width: v.size.cell_width,
+            cell_height: v.size.cell_height,
+            profile: v.profile,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Resume {
     pub incarnation: String,
     pub offset: u64,
@@ -287,6 +354,7 @@ pub struct Resume {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Open {
     pub session: String,
     #[serde(default)]

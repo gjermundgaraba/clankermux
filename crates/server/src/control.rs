@@ -70,10 +70,13 @@ pub fn dispatch(
             Ok(p) => registry.reply_page(writer, id, p.after.as_deref(), false),
             Err(fail) => reply(writer, id, Err(fail)),
         },
-        "subscribe" => {
-            let first = !std::mem::replace(subscribed, true);
-            registry.reply_page(writer, id, None, first);
-        }
+        "subscribe" => match params::<proto::SubscribeParams>(request.params) {
+            Ok(proto::SubscribeParams {}) => {
+                let first = !std::mem::replace(subscribed, true);
+                registry.reply_page(writer, id, None, first);
+            }
+            Err(fail) => reply(writer, id, Err(fail)),
+        },
         _ => reply(writer, id, handle(registry, request)),
     }
 }

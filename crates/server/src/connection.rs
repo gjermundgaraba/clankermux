@@ -352,9 +352,12 @@ impl Connection {
             );
             return false;
         }
-        let Ok(hello) = serde_json::from_value::<Hello>(raw) else {
-            self.fatal(ErrorCode::ProtocolError, "malformed HELLO");
-            return false;
+        let hello = match serde_json::from_value::<Hello>(raw) {
+            Ok(hello) => hello,
+            Err(err) => {
+                self.fatal(ErrorCode::InvalidRequest, format!("bad HELLO: {err}"));
+                return false;
+            }
         };
         self.hello = Some(hello);
         self.writer.send_json(
