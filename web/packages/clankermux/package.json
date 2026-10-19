@@ -1,0 +1,59 @@
+{
+  "name": "@gjermundgaraba/clankermux",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gjermundgaraba/clankermux.git",
+    "directory": "web/packages/clankermux"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/client/index.ts",
+    "./worker": "./src/client/worker.ts",
+    "./proto": "./src/proto/index.ts",
+    "./engine": "./src/engine/index.ts",
+    "./renderer": "./src/renderer/index.ts",
+    "./ghostty-vt.wasm": "./ghostty-vt.wasm"
+  },
+  "files": [
+    "dist",
+    "ghostty-vt.wasm"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "exports": {
+      ".": {
+        "types": "./dist/client/index.d.ts",
+        "default": "./dist/client/index.js"
+      },
+      "./worker": {
+        "types": "./dist/client/worker.d.ts",
+        "default": "./dist/client/worker.js"
+      },
+      "./proto": {
+        "types": "./dist/proto/index.d.ts",
+        "default": "./dist/proto/index.js"
+      },
+      "./engine": {
+        "types": "./dist/engine/index.d.ts",
+        "default": "./dist/engine/index.js"
+      },
+      "./renderer": {
+        "types": "./dist/renderer/index.d.ts",
+        "default": "./dist/renderer/index.js"
+      },
+      "./ghostty-vt.wasm": "./ghostty-vt.wasm"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "devDependencies": {
+    "ws": "^8.18.0",
+    "@types/ws": "^8.18.0"
+  }
+}

@@ -8,7 +8,7 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const dist = `${root}dist/`;
 mkdirSync(dist, { recursive: true });
 copyFileSync(`${root}index.html`, `${dist}index.html`);
-copyFileSync(fileURLToPath(import.meta.resolve("@clankermux/engine/ghostty-vt.wasm")), `${dist}ghostty-vt.wasm`);
+copyFileSync(fileURLToPath(import.meta.resolve("@gjermundgaraba/clankermux/ghostty-vt.wasm")), `${dist}ghostty-vt.wasm`);
 
 const options = {
   entryPoints: [`${root}src/main.ts`, `${root}src/worker.ts`],

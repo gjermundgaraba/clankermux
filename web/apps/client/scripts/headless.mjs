@@ -9,7 +9,7 @@ import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { connect } from "node:net";
 
-import { FrameType, StreamFramer, encodeFrame, parseFrame } from "../../../packages/proto/src/index.ts";
+import { FrameType, StreamFramer, encodeFrame, parseFrame } from "../../../packages/clankermux/src/proto/index.ts";
 
 const [url, socket, session, shot] = process.argv.slice(2);
 if (!url || !socket || !session || !shot) {

@@ -19,7 +19,7 @@ wasm:
 
 # Snapshot fixtures encoded by the native engine for the cross-engine test.
 fixtures:
-    cargo run --quiet -p ghostty-vt --example encode-fixture -- web/packages/engine/test/fixtures
+    cargo run --quiet -p ghostty-vt --example encode-fixture -- web/packages/clankermux/test/engine/fixtures
 
 # Regenerate the committed bindings.
 bindings:
@@ -29,7 +29,7 @@ bindings:
 pin sha:
     scripts/pin.sh {{sha}}
 
-# Build and pack the npm packages into web/dist-packages.
+# Build and pack the npm package into web/dist-packages.
 pack-web: wasm
     scripts/pack-web.sh
 

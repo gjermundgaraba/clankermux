@@ -1,6 +1,5 @@
 /** The page: the session bar around a mounted terminal. */
-import { mountTerminal } from "@clankermux/client";
-import type { Session } from "@clankermux/proto";
+import { type Session, mountTerminal } from "@gjermundgaraba/clankermux";
 
 const canvas = document.getElementById("screen") as HTMLCanvasElement;
 const container = document.getElementById("terminal") as HTMLElement;

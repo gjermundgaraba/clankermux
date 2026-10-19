@@ -3,10 +3,10 @@ node_modules
 .zig-cache
 zig-out
 zig-pkg
-web/packages/engine/ghostty-vt.wasm
-web/packages/engine/test/fixtures
+web/packages/clankermux/ghostty-vt.wasm
+web/packages/clankermux/test/engine/fixtures
 web/apps/client/dist
 proptest-regressions/
 *.proptest-regressions
 web/dist-packages
-web/packages/*/dist
+web/packages/clankermux/dist

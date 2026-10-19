@@ -178,31 +178,15 @@ importers:
 
   apps/client:
     dependencies:
-      '@clankermux/client':
+      '@gjermundgaraba/clankermux':
         specifier: workspace:*
-        version: link:../../packages/client
-      '@clankermux/engine':
-        specifier: workspace:*
-        version: link:../../packages/engine
-      '@clankermux/proto':
-        specifier: workspace:*
-        version: link:../../packages/proto
+        version: link:../../packages/clankermux
     devDependencies:
       esbuild:
         specifier: ^0.28.0
         version: 0.28.2
 
-  packages/client:
-    dependencies:
-      '@clankermux/engine':
-        specifier: workspace:*
-        version: link:../engine
-      '@clankermux/proto':
-        specifier: workspace:*
-        version: link:../proto
-      '@clankermux/renderer':
-        specifier: workspace:*
-        version: link:../renderer
+  packages/clankermux:
     devDependencies:
       '@types/ws':
         specifier: ^8.18.0
@@ -210,16 +194,6 @@ importers:
       ws:
         specifier: ^8.18.0
         version: 8.22.0
-
-  packages/engine: {}
-
-  packages/proto: {}
-
-  packages/renderer:
-    dependencies:
-      '@clankermux/engine':
-        specifier: workspace:*
-        version: link:../engine
 
 packages:
 

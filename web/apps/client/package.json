@@ -9,9 +9,7 @@
     "serve": "node scripts/serve.mjs"
   },
   "dependencies": {
-    "@clankermux/client": "workspace:*",
-    "@clankermux/engine": "workspace:*",
-    "@clankermux/proto": "workspace:*"
+    "@gjermundgaraba/clankermux": "workspace:*"
   },
   "devDependencies": {
     "esbuild": "^0.28.0"

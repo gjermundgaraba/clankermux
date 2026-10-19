@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build ghostty-vt.wasm from the vendored tree into web/packages/engine.
+# Build ghostty-vt.wasm from the vendored tree into web/packages/clankermux.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out="$root/target/wasm"
@@ -8,4 +8,4 @@ version=$(tr -d '\n' < "$root/vendor/libghostty-vt/VERSION")
     "-Dversion-string=$version" "-Dlib-version-string=$version" \
     --prefix "$out" --cache-dir "$root/target/zig-cache" \
     --build-file "$root/vendor/libghostty-vt/build.zig"
-cp "$out/bin/ghostty-vt.wasm" "$root/web/packages/engine/ghostty-vt.wasm"
+cp "$out/bin/ghostty-vt.wasm" "$root/web/packages/clankermux/ghostty-vt.wasm"
