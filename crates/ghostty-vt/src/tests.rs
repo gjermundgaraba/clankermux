@@ -369,3 +369,85 @@ fn the_engine_id_names_the_linked_build() {
     let built = std::str::from_utf8(bytes).unwrap();
     assert_eq!(ENGINE, format!("ghostty-vt@{built}"));
 }
+
+mod keys {
+    use crate::Terminal;
+    use crate::keys::{KeyEncoder, KeyPress, encode_paste};
+
+    fn press(term: &Terminal, name: &str) -> Vec<u8> {
+        let key = KeyPress::parse(name).unwrap_or_else(|| panic!("{name}"));
+        KeyEncoder::new().unwrap().encode(term, &key).unwrap()
+    }
+
+    #[test]
+    fn keys_follow_the_cursor_keys_mode() {
+        let mut term = Terminal::new(80, 24).unwrap();
+        assert_eq!(press(&term, "up"), b"\x1b[A");
+        term.vt_write(b"\x1b[?1h");
+        assert_eq!(press(&term, "up"), b"\x1bOA");
+        assert_eq!(press(&term, "LEFT"), b"\x1bOD");
+        term.vt_write(b"\x1b[?1l");
+        assert_eq!(press(&term, "up"), b"\x1b[A");
+    }
+
+    #[test]
+    fn keys_follow_the_kitty_keyboard_flags() {
+        let mut term = Terminal::new(80, 24).unwrap();
+        assert_eq!(press(&term, "ctrl+c"), b"\x03");
+        // Disambiguate escape codes.
+        term.vt_write(b"\x1b[>1u");
+        assert_eq!(press(&term, "ctrl+c"), b"\x1b[99;5u");
+        assert_eq!(press(&term, "esc"), b"\x1b[27u");
+        term.vt_write(b"\x1b[<u");
+        assert_eq!(press(&term, "esc"), b"\x1b");
+    }
+
+    #[test]
+    fn names_modifiers_and_characters() {
+        let term = Terminal::new(80, 24).unwrap();
+        for (name, bytes) in [
+            ("enter", &b"\r"[..]),
+            ("tab", b"\t"),
+            ("shift+tab", b"\x1b[Z"),
+            ("backspace", b"\x7f"),
+            ("esc", b"\x1b"),
+            ("space", b" "),
+            ("f5", b"\x1b[15~"),
+            ("ctrl+a", b"\x01"),
+            ("alt+x", b"\x1bx"),
+            ("x", b"x"),
+            ("X", b"X"),
+            ("shift+x", b"X"),
+            ("?", b"?"),
+            ("+", b"+"),
+            ("é", "é".as_bytes()),
+        ] {
+            assert_eq!(press(&term, name), bytes, "{name}");
+        }
+        for bad in [
+            "",
+            "ctrl+",
+            "hyper+a",
+            "ctrl+ctrl+a",
+            "f13",
+            "f0",
+            "enterr",
+            "ab",
+            "\n",
+        ] {
+            assert!(KeyPress::parse(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_paste_is_bracketed_only_in_mode_2004_and_never_escapes() {
+        assert_eq!(encode_paste(b"a\nb", false), b"a\rb");
+        assert_eq!(encode_paste(b"a\nb", true), b"\x1b[200~a\nb\x1b[201~");
+        let injected = encode_paste(b"x\x1b[201~y", true);
+        assert_eq!(
+            injected.iter().filter(|&&b| b == 0x1b).count(),
+            2,
+            "{injected:?}"
+        );
+    }
+}

@@ -3,6 +3,7 @@
 mod error;
 pub mod formatter;
 mod io;
+pub mod keys;
 pub mod snapshot;
 mod terminal;
 
