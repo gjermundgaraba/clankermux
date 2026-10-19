@@ -37,6 +37,9 @@ the human-readable listing.
     clankermux --json create --wait -- make test   # the same; prints {session, wait}
     clankermux inspect build                 # one session as JSON, with program status
     clankermux read build --scrollback 200   # its screen, with 200 history lines before it
+    clankermux read build --scope last_command   # the last command's output (needs shell integration)
+    clankermux read build --format html      # the screen as styled HTML (or vt)
+    clankermux tail build --follow           # its output as plain text, as it comes
     clankermux send build 'make test' --enter   # type text, then Enter
     clankermux send build --keys ctrl+c         # keys by name: enter, tab, esc, up, f5, shift+tab, alt+x
     clankermux send build --paste "$(cat notes.txt)"  # a paste, as if pasted by a person

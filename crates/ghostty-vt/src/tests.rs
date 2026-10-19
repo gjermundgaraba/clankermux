@@ -236,7 +236,7 @@ fn decoder_reports_finish_and_releases_an_unfinished_terminal() {
 struct Recorder {
     pty: Vec<u8>,
     statuses: Vec<ProgramStatus>,
-    prompts: Vec<SemanticPromptKind>,
+    prompts: Vec<SemanticPrompt>,
     titles: usize,
     exits: Vec<Option<i32>>,
     bells: usize,
@@ -253,8 +253,8 @@ impl Handler for Shared {
     fn program_status(&mut self, report: ProgramStatus) {
         self.0.lock().unwrap().statuses.push(report);
     }
-    fn semantic_prompt(&mut self, kind: SemanticPromptKind) {
-        self.0.lock().unwrap().prompts.push(kind);
+    fn semantic_prompt(&mut self, prompt: SemanticPrompt) {
+        self.0.lock().unwrap().prompts.push(prompt);
     }
     fn color_scheme(&mut self) -> Option<ColorScheme> {
         Some(ColorScheme::Dark)
@@ -322,10 +322,15 @@ fn effects_reach_the_handler() {
         assert_eq!(statuses[0].title, "Build");
     }
 
-    term.vt_write(b"\x1b]133;A\x07");
+    term.vt_write(b"\x1b]133;A\x07\x1b]133;C\x07\x1b]133;P;k=s\x07");
+    let mark = |kind, prompt| SemanticPrompt { kind, prompt };
     assert_eq!(
         rec.lock().unwrap().prompts,
-        [SemanticPromptKind::PromptStart]
+        [
+            mark(SemanticPromptKind::PromptStart, PromptKind::Primary),
+            mark(SemanticPromptKind::OutputStart, PromptKind::Primary),
+            mark(SemanticPromptKind::PromptStart, PromptKind::Secondary),
+        ]
     );
 
     term.vt_write(b"\x1b]2;new title\x07");
@@ -496,4 +501,46 @@ mod keys {
             "{injected:?}"
         );
     }
+}
+
+#[test]
+fn html_rows_and_the_alternate_screen() {
+    let mut term = Terminal::new(10, 3).unwrap();
+    term.vt_write(b"a\x1b[31mred\x1b[0m <b>&\r\nabcdefghijklm\r\n");
+    let html = formatter::format(
+        &term,
+        Options {
+            format: Format::Html,
+            unwrap: true,
+            trim: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(html).unwrap(),
+        "<div style=\"font-family: monospace; white-space: pre;\">a<div style=\"display: \
+         inline;color: var(--vt-palette-1);\">red</div> &lt;b&gt;&amp;\nabcdefghijklm</div>"
+    );
+    // The first row scrolled off; the second wrapped once.
+    assert_eq!(term.scrollback_rows(), 1);
+    let continues: Vec<bool> = (0..4).map(|y| term.row_continues(y).unwrap()).collect();
+    assert_eq!(continues, [false, false, true, false]);
+    assert_eq!(term.history_start(0).unwrap(), 1);
+    assert_eq!(term.history_start(1).unwrap(), 0);
+    assert_eq!(term.history_start(5).unwrap(), 0);
+    // A line across the top of the screen counts as the screen's.
+    let mut term = Terminal::new(10, 3).unwrap();
+    term.vt_write(b"first\r\naaaaaaaaaabbbbbbbbbbcc\r\nx");
+    assert_eq!(term.scrollback_rows(), 2);
+    assert!(term.row_continues(2).unwrap());
+    assert_eq!(term.history_start(0).unwrap(), 1);
+    assert_eq!(term.history_start(1).unwrap(), 0);
+
+    assert!(!term.alternate_screen());
+    term.vt_write(b"\x1b[?1049hALT");
+    assert!(term.alternate_screen());
+    assert_eq!(term.scrollback_rows(), 0, "the alternate screen has none");
+    term.vt_write(b"\x1b[?1049l");
+    assert!(!term.alternate_screen());
 }

@@ -23,6 +23,7 @@ export interface Limits {
   text: number;
   markers: number;
   records: number;
+  commands: number;
   page: number;
   hello_timeout: number;
   remove_grace: number;
@@ -64,6 +65,7 @@ export type ErrorCode =
   | "input_overflow"
   | "too_slow"
   | "cancelled"
+  | "scope_unavailable"
   | "internal";
 
 export interface ErrorMessage {
@@ -100,6 +102,18 @@ export interface Attention {
   record: string;
 }
 
+/**
+ * One command from its OSC 133 marks, as stream offsets: `start` at the
+ * prompt (`A`), `output` where its output begins (`C`), `end` where it
+ * ended (`D`) with the `exit` the shell reported.
+ */
+export interface Command {
+  start: number;
+  output?: number;
+  end?: number;
+  exit?: number;
+}
+
 export interface Session {
   id: string;
   label: string;
@@ -118,6 +132,7 @@ export interface Session {
   offset: number;
   marker: number;
   attachments: number;
+  command?: Command;
   program_status?: StatusRecord[];
   attention?: Attention;
 }
@@ -150,6 +165,15 @@ export interface Read {
   cursor?: { x: number; y: number };
   offset: number;
   status: Status;
+  truncated?: boolean;
+}
+
+export interface Tail {
+  text: string;
+  start_offset: number;
+  next_offset: number;
+  complete: boolean;
+  truncated?: boolean;
 }
 
 export interface ListParams {
@@ -177,9 +201,20 @@ export interface ResizeParams {
   rows?: number;
 }
 
+export type ReadFormat = "text" | "vt" | "html";
+export type ReadScope = "screen" | "history" | "alternate" | "last_command";
+
 export interface ReadParams {
   session: string;
   scrollback?: number;
+  format?: ReadFormat;
+  scope?: ReadScope;
+}
+
+export interface TailParams {
+  session: string;
+  after: number;
+  max_bytes?: number;
 }
 
 /** `send`: exactly one of `text`, `keys` and `data`. */

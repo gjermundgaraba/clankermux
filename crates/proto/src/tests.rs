@@ -171,6 +171,7 @@ fn message_vectors() {
             ("session", _) => round_trip::<Session>(name, json),
             ("page", _) => round_trip::<Page>(name, json),
             ("read", _) => round_trip::<Read>(name, json),
+            ("tail", _) => round_trip::<Tail>(name, json),
             ("subscribed", _) => round_trip::<Subscribed>(name, json),
             ("event", _) => round_trip::<Numbered>(name, json),
             ("acked", _) => round_trip::<Acked>(name, json),
@@ -181,6 +182,7 @@ fn message_vectors() {
             ("params", "label") => round_trip::<LabelParams>(name, json),
             ("params", "resize") => round_trip::<ResizeParams>(name, json),
             ("params", "read") => round_trip::<ReadParams>(name, json),
+            ("params", "tail") => round_trip::<TailParams>(name, json),
             ("params", "send") => round_trip::<SendParams>(name, json),
             ("params", "wait") => round_trip::<WaitParams>(name, json),
             ("params", "cancel") => round_trip::<CancelParams>(name, json),
@@ -228,6 +230,8 @@ fn client_payloads_refuse_unknown_fields_and_server_payloads_ignore_them() {
     assert!(serde_json::from_value::<ListParams>(request.params).is_ok());
     assert!(serde_json::from_str::<Viewport>(r#"{"cols":1,"rows":1,"x":0}"#).is_err());
     assert!(serde_json::from_str::<Open>(r#"{"session":"s","profile":{"x":0}}"#).is_err());
+    assert!(serde_json::from_str::<ReadParams>(r#"{"session":"s","scope":"all"}"#).is_err());
+    assert!(serde_json::from_str::<TailParams>(r#"{"session":"s"}"#).is_err());
 
     let reply: Reply = serde_json::from_str(r#"{"id":1,"result":{},"future":true}"#).unwrap();
     assert_eq!(reply.id, 1);

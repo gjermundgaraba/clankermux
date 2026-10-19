@@ -76,6 +76,7 @@ pub enum ErrorCode {
     InputOverflow,
     TooSlow,
     Cancelled,
+    ScopeUnavailable,
     Internal,
 }
 
@@ -144,6 +145,20 @@ pub struct Attention {
     pub record: String,
 }
 
+/// One command from its OSC 133 marks, as stream offsets: `start` at
+/// the prompt (`A`), `output` where its output begins (`C`), `end` where
+/// it ended (`D`) with the `exit` the shell reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Command {
+    pub start: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -166,6 +181,9 @@ pub struct Session {
     pub offset: u64,
     pub marker: u64,
     pub attachments: u32,
+    /// The current or last command, from OSC 133 marks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Command>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_status: Option<Vec<StatusRecord>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,6 +212,22 @@ pub struct Read {
     pub cursor: Option<Cursor>,
     pub offset: u64,
     pub status: Status,
+    /// Lines were left out: cut to fit `max_frame`, or, for
+    /// `last_command`, bytes the stream no longer holds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+}
+
+/// `tail`'s result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tail {
+    pub text: String,
+    pub start_offset: u64,
+    pub next_offset: u64,
+    pub complete: bool,
+    /// `start_offset` is above the `after` asked for.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +319,38 @@ pub struct ReadParams {
     pub session: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrollback: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<ReadFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ReadScope>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadFormat {
+    #[default]
+    Text,
+    Vt,
+    Html,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadScope {
+    #[default]
+    Screen,
+    History,
+    Alternate,
+    LastCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TailParams {
+    pub session: String,
+    pub after: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
 }
 
 /// `send`: exactly one of `text`, `keys` and `data`.
@@ -703,7 +769,14 @@ macro_rules! wire_display {
     )*};
 }
 
-wire_display!(ErrorCode, Status, ClosedReason, WaitReason);
+wire_display!(
+    ErrorCode,
+    Status,
+    ClosedReason,
+    WaitReason,
+    ReadFormat,
+    ReadScope
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

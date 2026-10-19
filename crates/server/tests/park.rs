@@ -567,6 +567,7 @@ async fn loading_keeps_the_newest_complete_generation_only() {
         engine: ghostty_vt::ENGINE.into(),
         parked_at: "2026-10-18T00:00:00Z".into(),
         history_lines: 1,
+        commands: Vec::new(),
         session: Session {
             id: id.into(),
             label: "old".into(),
@@ -585,6 +586,7 @@ async fn loading_keeps_the_newest_complete_generation_only() {
             offset: 7,
             marker: 2,
             attachments: 3,
+            command: None,
             program_status: Some(vec![
                 StatusRecord {
                     id: "".into(),
@@ -738,9 +740,11 @@ async fn a_park_naming_another_session_is_skipped() {
             offset: 0,
             marker: 0,
             attachments: 0,
+            command: None,
             program_status: None,
             attention: None,
         },
+        commands: Vec::new(),
     };
     std::fs::write(dir.join("session.json"), serde_json::to_vec(&file).unwrap()).unwrap();
     std::fs::write(dir.join("snapshot.ghostsnp"), b"GHOSTSNP").unwrap();

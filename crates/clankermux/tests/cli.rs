@@ -950,3 +950,85 @@ async fn events_after_a_cursor_replay_with_their_seq() {
     assert_eq!(line, "[", "{err}");
     assert!(err.contains("are gone"), "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_takes_a_format_and_a_scope_and_tail_follows() {
+    let server = start();
+    let socket = server.socket.to_str().unwrap();
+    let conn = connect(&server).await;
+    let session = create(
+        &conn,
+        json!({"argv": ["/bin/sh", "-c",
+            "stty -echo; printf '$ \\033]133;C\\007\\033[1mbold\\033[0m\\n\\033]133;D;0\\007'; read x; echo after"]}),
+    )
+    .await;
+    wait_session(&conn, &session.id, |s| {
+        s.command.is_some_and(|c| c.end.is_some())
+    })
+    .await;
+    let id = session.id.as_str();
+    let html = run(&["--socket", socket, "read", id, "--format", "html"], &[]).await;
+    assert!(
+        html.starts_with("<div") && html.contains(">bold</div>"),
+        "{html}"
+    );
+    let last = run(
+        &["--socket", socket, "read", id, "--scope", "last_command"],
+        &[],
+    )
+    .await;
+    assert_eq!(last, "bold\n");
+    let (code, _, stderr) = run_status(
+        &[
+            "--socket",
+            socket,
+            "read",
+            id,
+            "--scope",
+            "history",
+            "--scrollback",
+            "1",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(code, 1, "{stderr}");
+    let (code, _, _) = run_status(&["--socket", socket, "read", id, "--format", "pdf"], &[]).await;
+    assert_eq!(code, 2);
+    assert_eq!(
+        run(&["--socket", socket, "tail", id], &[]).await,
+        "$ bold\n"
+    );
+
+    // A sequence left open is nothing more to read: `tail` ends.
+    let open = create(
+        &conn,
+        json!({"argv": ["/bin/sh", "-c", "printf 'abc\\033]0;never ends'; exec sleep 30"]}),
+    )
+    .await;
+    wait_session(&conn, &open.id, |s| s.offset > 3).await;
+    let tailed = tokio::time::timeout(
+        Duration::from_secs(10),
+        run(&["--socket", socket, "tail", &open.id], &[]),
+    )
+    .await
+    .expect("tail ends");
+    assert_eq!(tailed, "abc");
+
+    let follow = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
+        .args(["--socket", socket, "tail", id, "--follow"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // It has caught up and waits; the program goes on and exits.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    conn.request("send", json!({"session": id, "data": "DQ=="}))
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(10), follow.wait_with_output())
+        .await
+        .expect("follow ends with the stream")
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "$ bold\nafter\n");
+}

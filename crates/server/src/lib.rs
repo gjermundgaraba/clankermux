@@ -1,10 +1,12 @@
 //! The clankermux server.
 
 mod attach;
+mod commands;
 mod connection;
 mod control;
 pub mod park;
 pub mod pty;
+mod read;
 mod records;
 mod registry;
 pub mod session;

@@ -19,6 +19,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::commands::Commands;
 use crate::connection::{Writer, reply};
 use crate::park;
 use crate::pty;
@@ -233,8 +234,10 @@ impl Registry {
             wake: Arc::new(Notify::new()),
             text_limit: limits.text as usize,
             records_limit: limits.records as usize,
+            commands_limit: limits.commands as usize,
             attached: Vec::new(),
             records,
+            commands: Commands::load(file.commands),
             events: Vec::new(),
             removed: false,
             announced: Default::default(),
@@ -259,8 +262,7 @@ impl Registry {
             }),
         };
         // What the clients of this incarnation are shown first.
-        let shown = session.to_proto(false);
-        session.announced = (shown.title, shown.pwd, shown.attention);
+        session.announced = crate::session::announced(&session.to_proto(false));
         self.state
             .lock()
             .unwrap()
@@ -643,8 +645,10 @@ impl Registry {
             wake: Arc::new(Notify::new()),
             text_limit: limits.text as usize,
             records_limit: limits.records as usize,
+            commands_limit: limits.commands as usize,
             attached: Vec::new(),
             records: Records::default(),
+            commands: Commands::default(),
             events: Vec::new(),
             removed: false,
             announced: Default::default(),

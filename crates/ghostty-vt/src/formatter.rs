@@ -1,4 +1,4 @@
-//! Format a terminal's active screen as plain text or VT sequences.
+//! Format a terminal's active screen as plain text, VT sequences or HTML.
 
 use std::ptr;
 
@@ -13,6 +13,8 @@ pub enum Format {
     #[default]
     Plain,
     Vt,
+    /// HTML with inline styles.
+    Html,
 }
 
 /// Formatting options. `Default` is plain text of the whole screen with
@@ -27,6 +29,9 @@ pub struct Options {
     pub cursor: bool,
     pub style: bool,
     pub hyperlink: bool,
+    /// The palette: in VT, OSC 4 sequences; in HTML, the
+    /// `--vt-palette-N` CSS variables its colours refer to.
+    pub palette: bool,
     pub modes: bool,
     pub scrolling_region: bool,
     pub keyboard: bool,
@@ -53,12 +58,13 @@ pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
         emit: match options.format {
             Format::Plain => sys::GHOSTTY_FORMATTER_FORMAT_PLAIN,
             Format::Vt => sys::GHOSTTY_FORMATTER_FORMAT_VT,
+            Format::Html => sys::GHOSTTY_FORMATTER_FORMAT_HTML,
         },
         unwrap: options.unwrap,
         trim: options.trim,
         extra: sys::GhosttyFormatterTerminalExtra {
             size: size_of::<sys::GhosttyFormatterTerminalExtra>(),
-            palette: false,
+            palette: options.palette,
             modes: options.modes,
             scrolling_region: options.scrolling_region,
             tabstops: false,

@@ -374,6 +374,7 @@ mod tests {
             offset: 0,
             marker: 0,
             attachments: 1,
+            command: None,
             program_status: None,
             attention: None,
         }

@@ -16,7 +16,7 @@ use crate::connection::{Writer, reply};
 use crate::registry::{Fail, Registry, internal};
 use crate::session::Shared;
 use crate::wait::{self, Facts, Waiter};
-use crate::{pty, session};
+use crate::{pty, read, session};
 
 /// A connection's requests that answer later and can be cancelled (a
 /// `wait`, or a `send` carrying one), by id, with what stops each. The
@@ -89,43 +89,6 @@ fn register(pending: &Pending, id: i64) -> (Claim, oneshot::Receiver<()>) {
     let serial = pending.serial;
     pending.by_id.insert(id, (serial, stop_tx));
     (Claim { id, serial }, stop)
-}
-
-/// JSON overhead allowed around `read`'s text within `max_frame`.
-const READ_REPLY_MARGIN: usize = 4096;
-
-/// The bytes `text` takes as a JSON string, without the quotes.
-fn json_len(text: &str) -> usize {
-    serde_json::to_string(text).map_or(usize::MAX, |s| s.len() - 2)
-}
-
-/// Drops the oldest lines of `text` until its JSON string fits `budget`;
-/// when not even the last line fits, its newest characters are kept.
-fn fit_json(text: &mut String, budget: usize) {
-    if json_len(text) <= budget {
-        return;
-    }
-    let mut kept = 0;
-    let mut start = text.len();
-    for line in text.split_inclusive('\n').rev() {
-        let len = json_len(line);
-        if kept + len > budget {
-            if kept == 0 {
-                for (at, ch) in line.char_indices().rev() {
-                    let len = json_len(ch.encode_utf8(&mut [0; 4]));
-                    if kept + len > budget {
-                        break;
-                    }
-                    kept += len;
-                    start = text.len() - line.len() + at;
-                }
-            }
-            break;
-        }
-        kept += len;
-        start -= line.len();
-    }
-    text.drain(..start);
 }
 
 fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
@@ -433,52 +396,8 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
             session::report_now(registry, &session, report);
             Ok(json!({}))
         }
-        "read" => {
-            let p: proto::ReadParams = params(p)?;
-            let session = registry.get(&p.session)?;
-            let s = session.lock().unwrap();
-            let mut text = s
-                .read_text(p.scrollback.unwrap_or(0) as usize)
-                .map_err(internal)?;
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            fit_json(
-                &mut text,
-                (registry.config.limits.max_frame as usize).saturating_sub(READ_REPLY_MARGIN),
-            );
-            let info = s.to_proto(false);
-            Ok(json!(proto::Read {
-                text,
-                cols: info.cols,
-                rows: info.rows,
-                cursor: s.live().map(|live| {
-                    let (x, y) = live.term.cursor();
-                    proto::Cursor { x, y }
-                }),
-                offset: info.offset,
-                status: s.status(),
-            }))
-        }
+        "read" => Ok(json!(read::read(registry, params(p)?)?)),
+        "tail" => Ok(json!(read::tail(registry, params(p)?)?)),
         other => Err((ErrorCode::InvalidRequest, format!("unknown method {other}"))),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::fit_json;
-
-    #[test]
-    fn fitting_keeps_the_newest_lines_or_the_tail_of_one() {
-        // "bb\n" is four JSON bytes: the newline escapes to two.
-        let mut text = "aaaa\nbb\ncc\n".to_string();
-        fit_json(&mut text, 8);
-        assert_eq!(text, "bb\ncc\n");
-        let mut text = "xxxxxxxxxx\n".to_string();
-        fit_json(&mut text, 4);
-        assert_eq!(text, "xx\n");
-        let mut quoted = "a\"b\n".to_string();
-        fit_json(&mut quoted, 3);
-        assert_eq!(quoted, "b\n");
     }
 }

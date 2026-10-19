@@ -49,6 +49,11 @@ impl Stream {
         self.start
     }
 
+    /// The last retained byte.
+    pub fn last_byte(&self) -> Option<u8> {
+        self.ring.back().copied()
+    }
+
     pub fn latest_seq(&self) -> u64 {
         self.latest_seq
     }
@@ -95,6 +100,13 @@ impl Stream {
     pub fn seq_at(&self, offset: u64) -> u64 {
         let later = self.markers.iter().filter(|m| m.offset > offset).count();
         self.latest_seq - later as u64
+    }
+
+    /// The retained bytes from `offset` on, or `None` when the stream
+    /// does not retain `offset`.
+    pub fn bytes_from(&self, offset: u64) -> Option<impl Iterator<Item = u8> + '_> {
+        let skip = usize::try_from(offset.checked_sub(self.start)?).ok()?;
+        (skip <= self.ring.len()).then(|| self.ring.range(skip..).copied())
     }
 
     /// Whether every marker with `seq` above `after` is still retained.

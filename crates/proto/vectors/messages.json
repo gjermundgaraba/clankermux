@@ -36,6 +36,7 @@
       "text": 2048,
       "markers": 1024,
       "records": 200,
+      "commands": 64,
       "page": 32,
       "hello_timeout": 10000,
       "remove_grace": 10000,
@@ -209,6 +210,32 @@
       "signal": "KILL"
     }
   },
+  "session/command": {
+    "id": "0f1e2d3c-0000-4000-8000-000000000001",
+    "label": "build",
+    "status": "running",
+    "argv": [
+      "/bin/zsh",
+      "-l"
+    ],
+    "cwd": "/Users/me",
+    "pid": 4242,
+    "cols": 120,
+    "rows": 40,
+    "title": "zsh",
+    "pwd": "/Users/me/src",
+    "on_exit": "remove",
+    "created_at": "2026-10-18T12:00:00Z",
+    "offset": 1024,
+    "marker": 2,
+    "attachments": 1,
+    "command": {
+      "start": 900,
+      "output": 960,
+      "end": 1000,
+      "exit": 2
+    }
+  },
   "page/with-next": {
     "sessions": [
       {
@@ -286,6 +313,27 @@
     "rows": 24,
     "offset": 0,
     "status": "restored"
+  },
+  "read/truncated": {
+    "text": "<div style=\"font-family: monospace; white-space: pre;\">file</div>",
+    "cols": 120,
+    "rows": 40,
+    "offset": 1024,
+    "status": "exited",
+    "truncated": true
+  },
+  "tail/basic": {
+    "text": "$ ls\nfile\n",
+    "start_offset": 960,
+    "next_offset": 1024,
+    "complete": true
+  },
+  "tail/truncated": {
+    "text": "file\n",
+    "start_offset": 1000,
+    "next_offset": 1024,
+    "complete": false,
+    "truncated": true
   },
   "event/session_created": {
     "seq": 1,
@@ -535,6 +583,20 @@
   },
   "params/read-screen": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001"
+  },
+  "params/read-scoped": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "format": "html",
+    "scope": "last_command"
+  },
+  "params/tail": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "after": 960,
+    "max_bytes": 65536
+  },
+  "params/tail-from": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "after": 0
   },
   "params/send": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001",

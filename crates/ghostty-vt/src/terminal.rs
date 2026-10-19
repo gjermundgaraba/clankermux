@@ -95,6 +95,24 @@ pub enum SemanticPromptKind {
     CommandEnd,
 }
 
+/// Which prompt a `PromptStart` starts (`A`, `N`, or `P` with its `k`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    Primary,
+    Right,
+    Continuation,
+    Secondary,
+}
+
+/// One OSC 133 mark, as parsed by the engine; a `CommandEnd`'s exit
+/// code comes to `Handler::command_end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticPrompt {
+    pub kind: SemanticPromptKind,
+    /// For a `PromptStart`; `Primary` for the other kinds.
+    pub prompt: PromptKind,
+}
+
 /// Effects raised by the engine while it parses, the ones clankermux
 /// acts on; the rest (clipboard, resize requests) are left unset at the
 /// engine, which ignores them. Every method has a default that
@@ -105,7 +123,7 @@ pub trait Handler: Send + 'static {
     /// reports.
     fn write_pty(&mut self, _data: &[u8]) {}
     fn program_status(&mut self, _report: ProgramStatus) {}
-    fn semantic_prompt(&mut self, _kind: SemanticPromptKind) {}
+    fn semantic_prompt(&mut self, _prompt: SemanticPrompt) {}
     /// OSC 133 `D`, after `semantic_prompt` with `CommandEnd`: the exit
     /// code, when the shell reported one.
     fn command_end(&mut self, _exit: Option<i32>) {}
@@ -206,6 +224,59 @@ impl Term {
     pub fn scrollback_rows(&self) -> usize {
         self.get(sys::GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS)
             .unwrap_or(0)
+    }
+
+    /// Whether the alternate screen is the active one.
+    pub fn alternate_screen(&self) -> bool {
+        self.get::<sys::GhosttyTerminalScreen>(sys::GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN)
+            .is_ok_and(|screen| screen == sys::GHOSTTY_TERMINAL_SCREEN_ALTERNATE)
+    }
+
+    /// Whether row `y` of the active screen, counted from the top of its
+    /// scrollback, continues the soft-wrapped row above it.
+    pub fn row_continues(&self, y: u32) -> Result<bool> {
+        let point = sys::GhosttyPoint {
+            tag: sys::GHOSTTY_POINT_TAG_SCREEN,
+            value: sys::GhosttyPointValue {
+                coordinate: sys::GhosttyPointCoordinate { x: 0, y },
+            },
+        };
+        let mut grid = sys::GhosttyGridRef {
+            size: size_of::<sys::GhosttyGridRef>(),
+            ..Default::default()
+        };
+        let mut row = sys::GhosttyRow::default();
+        let mut out = false;
+        // SAFETY: the terminal is live, the reference is used before any
+        // change, and the output type of WRAP_CONTINUATION is bool.
+        unsafe {
+            check(sys::ghostty_terminal_grid_ref(self.0, point, &mut grid))?;
+            check(sys::ghostty_grid_ref_row(&grid, &mut row))?;
+            check(sys::ghostty_row_get(
+                row,
+                sys::GHOSTTY_ROW_DATA_WRAP_CONTINUATION,
+                &mut out as *mut bool as *mut c_void,
+            ))?;
+        }
+        Ok(out)
+    }
+
+    /// The first row, counted from the top of the scrollback, of the last
+    /// `lines` logical lines of history: soft-wrapped rows count as one,
+    /// and a line the top of the screen continues is the screen's.
+    pub fn history_start(&self, lines: usize) -> Result<u32> {
+        let mut row = self.scrollback_rows() as u32;
+        while row > 0 && self.row_continues(row)? {
+            row -= 1;
+        }
+        let mut counted = 0;
+        while row > 0 && counted < lines {
+            row -= 1;
+            if !self.row_continues(row)? {
+                counted += 1;
+            }
+        }
+        Ok(row)
     }
 
     /// Current value of a DEC private mode such as 2031 or 2048.
@@ -509,8 +580,14 @@ mod cb {
             sys::GHOSTTY_SEMANTIC_PROMPT_COMMAND_END => SemanticPromptKind::CommandEnd,
             _ => return,
         };
+        let prompt = match e.prompt_kind {
+            sys::GHOSTTY_SEMANTIC_PROMPT_PROMPT_RIGHT => PromptKind::Right,
+            sys::GHOSTTY_SEMANTIC_PROMPT_PROMPT_CONTINUATION => PromptKind::Continuation,
+            sys::GHOSTTY_SEMANTIC_PROMPT_PROMPT_SECONDARY => PromptKind::Secondary,
+            _ => PromptKind::Primary,
+        };
         let handler = &mut unsafe { slot::<H>(ud) }.handler;
-        handler.semantic_prompt(kind);
+        handler.semantic_prompt(SemanticPrompt { kind, prompt });
         if kind == SemanticPromptKind::CommandEnd {
             handler.command_end(e.has_exit_code.then_some(e.exit_code));
         }

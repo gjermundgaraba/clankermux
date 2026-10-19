@@ -219,14 +219,19 @@ async fn the_programs_signals_are_events_at_their_offsets() {
     );
     // The BELs that end the sequences rang nothing.
     c.ok("send", typed(&id, "\x1b]9;after\x07")).await;
-    assert!(matches!(c.event().await, Event::Notification { body, .. } if body == "after"));
+    let after = event_where(&mut c, |e| match e {
+        Event::SessionChanged { .. } => None,
+        e => Some(e.clone()),
+    })
+    .await;
+    assert!(matches!(after, Event::Notification { body, .. } if body == "after"));
 
     c.ok("signal", json!({"session": id, "signal": "KILL"}))
         .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_st_split_across_two_reads_ends_the_sequence_at_its_esc() {
+async fn an_st_split_across_two_reads_ends_the_sequence_after_it() {
     let server = start(fast_limits());
     let mut c = client(&server).await;
     c.ok("subscribe", json!({})).await;
@@ -239,7 +244,9 @@ async fn an_st_split_across_two_reads_ends_the_sequence_at_its_esc() {
         _ => None,
     })
     .await;
-    assert_eq!(offset, b"ab\x1b]133;C\x1b".len() as u64);
+    // The engine ends the sequence at the ESC; the server holds what it
+    // raised until it sees the `\`.
+    assert_eq!(offset, b"ab\x1b]133;C\x1b\\".len() as u64);
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
 }

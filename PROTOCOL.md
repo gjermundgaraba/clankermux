@@ -120,7 +120,8 @@ processed and answered.
 | `remove`    | `session`                                           | `{}`                    |
 | `label`     | `session, label`                                    | Session                 |
 | `resize`    | `session, cols?, rows?`                             | `{}`                    |
-| `read`      | `session, scrollback?`                              | Read                    |
+| `read`      | `session, scrollback?, format?, scope?`             | Read                    |
+| `tail`      | `session, after, max_bytes?`                        | Tail                    |
 | `send`      | `session, text? \| keys? \| data?, paste?, wait?`    | Sent                    |
 | `wait`      | `session, until, after?, timeout_ms?`               | Waited                  |
 | `cancel`    | `id`                                                | `{cancelled}`           |
@@ -154,11 +155,75 @@ processed and answered.
   when more remain, to pass as `after`. Sessions carry no program status
   records, only their `attention`; use `inspect` once per session for the
   records.
-- `read`: `scrollback` is a line count, default 0. `text` is the last
-  `scrollback` history lines followed by the screen, one logical line per
-  newline, with soft-wrapped rows joined and trailing blanks trimmed. The
-  oldest lines are dropped to keep the reply under `limits.max_frame`.
-  Works for every status.
+- `read`: the session's terminal through the engine's formatter. `format`
+  is `text` (the default), `vt` or `html`; `scope` is `screen` (the
+  default), `history`, `alternate` or `last_command`:
+  - `screen`: the last `scrollback` lines of history (a line count,
+    default 0) followed by the screen. `scrollback` is refused with any
+    other scope.
+  - `history`: all the history the terminal keeps, then the screen.
+  - `alternate`: the alternate screen, when it is the active one; on the
+    primary screen this fails with `scope_unavailable`. `screen` and
+    `history` read the active screen, so on the alternate screen they
+    read it too (it has no history), and the primary screen's history
+    cannot be read until the program leaves it.
+  - `last_command`: the output of `Session.command` (see Commands): the
+    stream from its `output` offset to its `end`, or
+    to now while it runs, fed to a new terminal of the session's size
+    and formatted. A program that moves the cursor beyond its own output
+    or resizes meanwhile renders differently than it did. With no such
+    command, which is what a session without shell integration shows,
+    it fails with `scope_unavailable`. Bytes the stream no longer holds,
+    and all of them for a session loaded from a park file, are left out
+    and `truncated` is set.
+
+  Lines are logical: soft-wrapped rows joined, trailing blanks trimmed.
+  `text` puts a newline after each line. `vt` is the formatter's
+  control-sequence output: SGR styles and OSC 8 hyperlinks, lines
+  separated by CR LF, no modes or cursor. `html` is the formatter's HTML: one
+  `<div>` with inline styles, newlines inside it, palette colours as the
+  CSS variables `--vt-palette-0` to `--vt-palette-255`, which the page
+  defines. The oldest lines are dropped to keep the reply under
+  `limits.max_frame`, and `truncated` is set: for `text` whole lines
+  (the newest characters of a single line too long to fit), for `vt` and
+  `html` the formatting starts at a later row. Works for every status;
+  for a session loaded from a park file, `text` of `screen` and `history`
+  comes from `screen.txt`, anything else from its snapshot, which fails
+  with `engine_mismatch` when another engine wrote it.
+- `tail`: the stream as plain text from the offset `after`, from the
+  bytes the server retains (see Stream, offsets and markers). When they
+  no longer reach back to `after`, the text starts at the oldest byte
+  retained and `truncated` is set; `after` past the current offset is
+  `invalid_request`. The reply covers the stream from `start_offset` to
+  `next_offset`, which a client passes as the next `after`; `complete`
+  says there is nothing more to read now: `next_offset` is the current
+  offset, or what follows it is a sequence or character the program has
+  not finished. Otherwise the next call returns more. It ends at the first
+  boundary (outside any escape sequence or character) at or past
+  `max_bytes` stream bytes (default 65536, at least 1), so a sequence
+  across the limit is taken whole, or sooner to keep the reply under
+  `limits.max_frame`. A sequence or character still unfinished at the
+  end is left for the next call, unless the stream has ended. Works for
+  every status: an exited session keeps its stream until it is removed;
+  a session loaded from a park file has none, so `text` is empty and
+  `start_offset` and `next_offset` are its `offset`. The filter:
+  - the bytes are UTF-8; a byte that is not part of a valid character
+    becomes U+FFFD;
+  - at a `truncated` start, the bytes before the first LF or ESC are
+    skipped: the rest of a line, a character or a sequence's payload
+    cut by the ring;
+  - removed: escape sequences, which are ESC followed by intermediates
+    (0x20 to 0x2F) and a final byte (0x30 to 0x7E); CSI (`ESC [`) up to
+    its final byte (0x40 to 0x7E), where LF, CR and TAB are carried out,
+    other C0 controls dropped, and any other byte ends it and is
+    dropped; OSC, DCS, SOS, PM and APC (`ESC ]`, `P`, `X`, `^`, `_`) up
+    to BEL or ST (`ESC \`); CAN and SUB end any of them;
+  - removed: C0 controls but LF, CR and TAB, DEL, and C1 controls
+    (U+0080 to U+009F);
+  - CR becomes LF, and an LF whose previous byte outside any sequence
+    is a CR is removed, so CR LF (with a sequence such as `ESC [ K`
+    between them or not) is one newline, and a progress line redrawn
+    after CR is a line each time; TAB is kept.
 - `send` takes exactly one of `text` (UTF-8, written as typed), `keys`
   (key names, see Keys) and `data` (base64 bytes). With `paste: true`,
   `text` or `data` is encoded as the engine encodes a paste: control
@@ -282,6 +347,17 @@ Read
 | `cursor` | object? | `{x, y}`, zero-based; absent for a session loaded from a park file |
 | `offset` | int     | Stream offset at the time of the read                              |
 | `status` | string  |                                                                    |
+| `truncated` | bool? | Present and true when lines were left out                         |
+
+Tail
+
+| Field          | Type   | Meaning                                                  |
+| -------------- | ------ | -------------------------------------------------------- |
+| `text`         | string | Plain text, by the filter above                          |
+| `start_offset` | int    | Where the text starts: `after`, or later when truncated |
+| `next_offset`  | int    | Where it ends; the next `after`                          |
+| `complete`     | bool   | `next_offset` is the current stream offset               |
+| `truncated`    | bool?  | Present and true when `start_offset` is above `after`    |
 
 ### Session
 
@@ -303,6 +379,7 @@ Read
 | `offset`         | int      | Current stream offset                                   |
 | `marker`         | int      | Sequence number of the latest marker, 0 if none         |
 | `attachments`    | int      | Open attachments                                        |
+| `command`        | object?  | The command running or the last that ran, `{start, output?, end?, exit?}`; see Commands |
 | `program_status` | Record[] | Only in `inspect`; see Program status                   |
 | `attention`      | object?  | The record that most wants the user; see Program status |
 
@@ -324,7 +401,7 @@ them. The server retains the latest `limits.events` events in memory for
 | Event                    | Fields                             | When                                            |
 | ------------------------ | ---------------------------------- | ----------------------------------------------- |
 | `session_created`        | `session`                          |                                                 |
-| `session_changed`        | `session`                          | Label, size, title, pwd, `attachments` or `attention` changed |
+| `session_changed`        | `session`                          | Label, size, title, pwd, `attachments`, `attention` or `command` changed |
 | `session_exited`         | `session`                          | The stream ended; `exit` is set                 |
 | `session_removed`        | `id`                               | Removed by request, or by `on_exit: remove`     |
 | `program_status_changed` | `id, record, reason`               | One record was set; see Program status          |
@@ -346,8 +423,8 @@ them. The server retains the latest `limits.events` events in memory for
   `pause`, as the program sent it; `progress` is 0 to 100 when it sent
   one. A full reset (RIS) sends `progress {state: remove}`.
 - `command_started` and `command_ended`: `offset` is the stream offset
-  just after the sequence's terminator (BEL or ST; for an ST split across
-  two reads of the PTY, just after its ESC).
+  just after the sequence's terminator (BEL or ST, also when an ST is
+  split across two reads of the PTY), the same as in `Session.command`.
 - `attachment_opened`: `channel` is the attachment's channel on its own
   connection, `client` the connection's `HELLO.client`.
 - `attachment_closed`: `reason` is the `CLOSED` reason (`closed`,
@@ -402,6 +479,35 @@ latest report. It is `{state, kind?, app?, msg?, record}`, `record` the
 record's id and `app` resolved as `inspect` resolves it. It is in every
 Session, and `session_changed` is sent when it changes, except at the end
 of the stream, when `session_exited` carries it.
+
+### Commands
+
+The server installs the engine's semantic-prompt effect and keeps each
+command a shell marks with OSC 133 as a range of stream offsets. A
+mark's offset is the one just past its own sequence, as in the
+`command_started` and `command_ended` events (for a sequence ended by
+ESC and a byte other than `\`, the engine acts at the ESC and the offset
+may lie further on).
+
+- A primary prompt start (`A`, or `P` with `k=i` or no `k`) starts a
+  command at `start`. When the newest command is a prompt still
+  waiting (no `output`, no `end`), it is a redraw and changes nothing;
+  when the newest ended without output (an empty command line), the new
+  prompt replaces it.
+- `C` (output start) sets `output` on a waiting prompt, or starts a
+  command with `start` and `output` there.
+- `D` (command end) sets `end`, and `exit` when the shell reports it, on
+  the newest command unless it has ended.
+- `B`, `N` (right prompt) and `P` with `k=c`, `k=s` or `k=r` (further
+  lines of a prompt) change nothing.
+
+At most `limits.commands` commands are kept per session, the oldest
+dropped first, and they persist in the park file. `Session.command` is
+the newest command with `output`: the command running, or the last that
+ran, with its `exit`, also while the shell waits at the next prompt.
+A change of it sends `session_changed`, once for all the marks in one
+read of the PTY. A session whose shell
+has no integration has no `command`.
 
 ## Attach
 
@@ -671,7 +777,7 @@ the park time as Unix epoch milliseconds, mode 0700, files 0600:
 
 | File                | Contents                                                     |
 | ------------------- | ------------------------------------------------------------ |
-| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines}`: the `inspect` object (`attachments: 0`, no `pid`, `program_status` as reported with no inherited `app`, with `seen`, oldest report first; no `attention`) and how many leading lines of `screen.txt` are history |
+| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines, commands}`: the `inspect` object (`attachments: 0`, no `pid`, `program_status` as reported with no inherited `app`, with `seen`, oldest report first; no `attention`), how many leading lines of `screen.txt` are history, and the commands kept (see Commands) |
 | `snapshot.ghostsnp` | The snapshot bytes                                           |
 | `screen.txt`        | The `read` text with all retained history, at `parked_at`   |
 
@@ -714,7 +820,9 @@ directory's name is skipped with a warning.
 
 On start, each session directory becomes a session: `status` is `exited`
 if `session.json` says so, `restored` otherwise. `read` serves
-`screen.txt`, with `scrollback` taken from its history lines. `OPEN`
+`screen.txt` for `text` of `screen` and `history`, with `scrollback`
+taken from its history lines, and decodes `snapshot.ghostsnp` for the
+rest. Stream bytes are not parked: `tail` and `last_command` have none. `OPEN`
 requires `session.json.engine` to equal the server's engine as well as the
 client's; after an engine change only `read` and `remove` work. `OPEN`
 streams `snapshot.ghostsnp` as a bootstrap with no stream frames after
@@ -766,6 +874,7 @@ sessions when more would not fit (`next` still names the last one sent).
 | `text`         | 2048       | Bytes per `cwd`, `title`, `pwd`, and `argv`   |
 | `markers`      | 1024       | Retained markers per session                  |
 | `records`      | 200        | Program status records per session            |
+| `commands`     | 64         | Commands kept per session                     |
 | `page`         | 32         | Sessions per `list` or `subscribe` reply      |
 | `hello_timeout`| 10000      | Milliseconds allowed for `HELLO`              |
 | `remove_grace` | 10000      | Milliseconds before `on_exit: remove` removes |
@@ -782,7 +891,7 @@ an attachment channel it ends the attachment, except `read_only`,
 | ------------------ | --------------------------------------------------------- |
 | `protocol_error`   | A connection error under Framing; the connection closes   |
 | `version_mismatch` | `HELLO.version` is not 1; the connection closes           |
-| `invalid_request`  | Malformed payload, a field the protocol does not define, unknown method, a resume marker above the session's latest, or a `subscribe` `after` above the latest event |
+| `invalid_request`  | Malformed payload, a field the protocol does not define, unknown method, a resume marker above the session's latest, a `subscribe` `after` above the latest event, `read` with `scrollback` and a scope other than `screen`, or `tail` from past the stream's end or with `max_bytes` 0 |
 | `limit_exceeded`   | `label` or `text` exceeded, or a snapshot failed          |
 | `no_such_session`  |                                                           |
 | `not_running`      | `status` is not `running`, or the stream has ended; for a wait, nothing matched before the stream ended |
@@ -794,6 +903,7 @@ an attachment channel it ends the attachment, except `read_only`,
 | `input_overflow`   | The frame would exceed `limits.input_queue`               |
 | `too_slow`         | Second gap during a bootstrap                             |
 | `cancelled`        | A `cancel` ended the request                              |
+| `scope_unavailable`| `read` of `alternate` off the alternate screen, or of `last_command` with no command output marked |
 | `internal`         |                                                           |
 
 ## Not in version 1

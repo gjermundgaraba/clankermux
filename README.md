@@ -44,6 +44,8 @@ A program reports its status with OSC 7501 (PROTOCOL.md, "Program status"). `lis
 
 `clankermux events` prints the sessions, then every event as a JSON line with its `seq`, which counts from 1 on each server start: session changes, program status, `bell`, `notification` (OSC 9 and 777), `progress` (OSC 9;4), `command_started` and `command_ended` (OSC 133 `C` and `D`, at their stream offsets) and attachments opening and closing. `events` first prints the server's incarnation and the latest `seq` on stderr. `events --after SEQ --incarnation ID` starts after that event, replaying the ones the server still holds (up to the latest 4096); when it holds too few, or `ID` names another server start, it says so on stderr and prints the sessions first. Without `--incarnation` it assumes the connected server's.
 
+`read` takes `--format text|vt|html` and `--scope screen|history|alternate|last_command`; `last_command` needs a shell that marks its prompts and commands with OSC 133 (shell integration), and fails without one. `tail S [--after OFFSET] [--follow]` prints the session's output stream as plain text from a stream offset (by default the oldest byte kept) up to where the stream was when it began; `--follow` instead keeps going, with a `wait` for more output at the end of each page, until the stream ends.
+
 `clankermux skill show` (or `--skill`) prints a guide for agents: what a session is, the variables above, each command with an example, the exit codes, and the rules for sessions an agent did not create.
 
 ## Parks

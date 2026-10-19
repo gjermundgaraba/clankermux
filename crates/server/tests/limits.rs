@@ -260,6 +260,12 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
         offset: u64::MAX,
         marker: u64::MAX,
         attachments: u32::MAX,
+        command: Some(Command {
+            start: u64::MAX,
+            output: Some(u64::MAX),
+            end: Some(u64::MAX),
+            exit: Some(i32::MIN),
+        }),
         program_status: records.then(|| vec![record.clone(); limits.records as usize]),
         attention: Some(attention.clone()),
     };

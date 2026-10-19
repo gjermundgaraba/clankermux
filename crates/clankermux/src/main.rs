@@ -14,11 +14,12 @@ use client::connection::hello;
 use client::{Connection, Endpoint, Error};
 use proto::{
     AckParams, Acked, CancelParams, CreateParams, CursorParams, LabelParams, ListParams, OnExit,
-    OutputMatch, Page, Read, ReadParams, ResizeParams, SendParams, SendWait, Sent, Session,
-    SessionParams, SignalParams, StatusMatch, SubscribeParams, Subscribed, Until, WaitParams,
-    WaitReason, Waited,
+    OutputMatch, Page, Read, ReadFormat, ReadParams, ReadScope, ResizeParams, SendParams, SendWait,
+    Sent, Session, SessionParams, SignalParams, StatusMatch, SubscribeParams, Subscribed, Tail,
+    TailParams, Until, WaitParams, WaitReason, Waited,
 };
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 const DETACH_KEY: &str = "C-\\";
 
@@ -154,13 +155,33 @@ enum Command {
         #[arg(value_name = "[SESSION] SIZE", num_args = 1..=2, required = true)]
         args: Vec<String>,
     },
-    /// Print the screen, with history lines before it.
+    /// Print the screen, with history lines before it, or another scope.
     Read {
         /// Id, label, or four or more characters from either end of the
         /// id; `$CLANKERMUX_SESSION` when left out.
         session: Option<String>,
-        #[arg(long, default_value_t = 0)]
-        scrollback: u32,
+        /// History lines before the screen, for scope `screen`.
+        #[arg(long)]
+        scrollback: Option<u32>,
+        /// `text`, `vt` (with control sequences) or `html`.
+        #[arg(long, value_parser = wire::<ReadFormat>)]
+        format: Option<ReadFormat>,
+        /// `screen`, `history` (all of it, then the screen), `alternate`
+        /// or `last_command` (its output, from shell integration).
+        #[arg(long, value_parser = wire::<ReadScope>)]
+        scope: Option<ReadScope>,
+    },
+    /// Print the output stream as plain text, from a stream offset.
+    Tail {
+        /// Id, label, or four or more characters from either end of the
+        /// id; `$CLANKERMUX_SESSION` when left out.
+        session: Option<String>,
+        /// The stream offset to start at; by default the oldest byte kept.
+        #[arg(long)]
+        after: Option<u64>,
+        /// Keep printing what follows until the session's stream ends.
+        #[arg(long)]
+        follow: bool,
     },
     /// Send text as typed, named keys, or stdin's bytes; optionally wait
     /// for what follows.
@@ -357,6 +378,12 @@ fn parse_env(entries: &[String]) -> Result<BTreeMap<String, String>, Error> {
                 })
         })
         .collect()
+}
+
+/// A wire name (`last_command`) as its protocol value.
+fn wire<T: DeserializeOwned>(name: &str) -> Result<T, String> {
+    serde_json::from_value(serde_json::Value::String(name.into()))
+        .map_err(|_| format!("unknown value {name:?}"))
 }
 
 /// The CLI's connections all name the engine, so any of them can attach.
@@ -975,6 +1002,103 @@ fn check_args(command: &Command) -> Result<(), Error> {
     Ok(())
 }
 
+/// `tail`, page after page up to where the stream was when it began;
+/// with `follow`, waiting at the end for more text or the stream's end,
+/// until the stream has ended and the last page is in. With `json`, each page is one line. The loss of what
+/// precedes an `after` given is reported once.
+async fn tail(
+    conn: &Connection,
+    session: String,
+    after: Option<u64>,
+    follow: bool,
+    json: bool,
+) -> Result<(), Error> {
+    let inspect = || {
+        conn.call::<_, Session>(
+            "inspect",
+            SessionParams {
+                session: session.clone(),
+            },
+        )
+    };
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let stop_at = if follow {
+        None
+    } else {
+        Some(inspect().await?.offset)
+    };
+    let warn = after.is_some();
+    let mut after = after.unwrap_or(0);
+    let mut ended = false;
+    let mut first = true;
+    loop {
+        let request = conn.call::<_, Tail>(
+            "tail",
+            TailParams {
+                session: session.clone(),
+                after,
+                max_bytes: None,
+            },
+        );
+        let page = tokio::select! {
+            page = request => page?,
+            _ = &mut ctrl_c => return Ok(()),
+        };
+        if first && warn && page.truncated {
+            eprintln!(
+                "clankermux: the stream before offset {} is no longer kept",
+                page.start_offset
+            );
+        }
+        if json {
+            // A poll that found nothing new is not a page.
+            if first || page.next_offset != page.start_offset {
+                emit(&format!("{}\n", serde_json::to_string(&page).unwrap()));
+            }
+        } else {
+            emit(&page.text);
+        }
+        first = false;
+        after = page.next_offset;
+        if stop_at.is_some_and(|end| after >= end) {
+            return Ok(());
+        }
+        if !page.complete {
+            continue;
+        }
+        if !follow || ended {
+            return Ok(());
+        }
+        // Caught up: wait for a character of text past the page, or the
+        // end of the stream, which takes one more page.
+        let wait = conn.call::<_, Waited>(
+            "wait",
+            WaitParams {
+                session: session.clone(),
+                until: Until {
+                    exited: Some(true),
+                    output: Some(OutputMatch {
+                        text: None,
+                        regex: Some("(?s).".into()),
+                    }),
+                    ..Default::default()
+                },
+                after: Some(CursorParams {
+                    offset: after,
+                    marker: 0,
+                }),
+                timeout_ms: None,
+            },
+        );
+        let waited = tokio::select! {
+            waited = wait => waited?,
+            _ = &mut ctrl_c => return Ok(()),
+        };
+        ended = waited.reason == WaitReason::Exited;
+    }
+}
+
 async fn run(cli: Cli) -> Result<i32, Fail> {
     let json = cli.json;
     if cli.skill
@@ -1178,6 +1302,8 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
         Command::Read {
             session,
             scrollback,
+            format,
+            scope,
         } => {
             let session = resolve(&conn, here, session).await?;
             let read: Read = conn
@@ -1185,11 +1311,21 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                     "read",
                     ReadParams {
                         session,
-                        scrollback: Some(scrollback),
+                        scrollback,
+                        format,
+                        scope,
                     },
                 )
                 .await?;
             print(json, &read, |read| emit(&read.text));
+        }
+        Command::Tail {
+            session,
+            after,
+            follow,
+        } => {
+            let session = resolve(&conn, here, session).await?;
+            tail(&conn, session, after, follow, json).await?;
         }
         Command::Send {
             args,

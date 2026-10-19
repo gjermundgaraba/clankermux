@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ghostty_vt::{
-    ColorKind, ColorScheme, Handler, ProgramStatus, ProgressState, Rgb, SemanticPromptKind,
-    SizeReport, Terminal, color_scheme_report, formatter, snapshot,
+    ColorKind, ColorScheme, Handler, ProgramStatus, ProgressState, PromptKind, Rgb, SemanticPrompt,
+    SemanticPromptKind, SizeReport, Terminal, color_scheme_report, formatter, snapshot,
 };
 use proto::{
     Attention, ClosedReason, ErrorCode, Event, Exit, OnExit, Profile, Scheme, Size, Status,
@@ -20,6 +20,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::attach::Ending;
+use crate::commands::Commands;
 use crate::park::ParkFile;
 use crate::records::Records;
 use crate::registry::{Fail, Registry};
@@ -56,13 +57,16 @@ pub struct Effects {
     /// Program status reports and the program's other signals, in stream
     /// order, each with `offset` as it was raised.
     pub notices: Vec<(u64, Notice)>,
+    /// Notices raised at an ESC that ended the last bytes; see
+    /// `Session::output`.
+    pub held: Vec<(u64, Notice)>,
 }
 
 pub enum Notice {
     /// OSC 7501.
     Report(ProgramStatus),
-    /// OSC 133 `A`: transient records are dropped.
-    PromptStart,
+    /// OSC 133 `A`, `N` or `P`: transient records are dropped.
+    PromptStart(PromptKind),
     /// OSC 133 `C`.
     CommandStarted,
     /// OSC 133 `D`.
@@ -119,9 +123,9 @@ impl Handler for Effects {
         self.notices.push((self.offset, Notice::Report(report)));
     }
 
-    fn semantic_prompt(&mut self, kind: SemanticPromptKind) {
-        let notice = match kind {
-            SemanticPromptKind::PromptStart => Notice::PromptStart,
+    fn semantic_prompt(&mut self, prompt: SemanticPrompt) {
+        let notice = match prompt.kind {
+            SemanticPromptKind::PromptStart => Notice::PromptStart(prompt.prompt),
             SemanticPromptKind::OutputStart => Notice::CommandStarted,
             _ => return,
         };
@@ -150,13 +154,26 @@ impl Handler for Effects {
 /// Where `bytes` is cut so that each sequence that raises a notice ends
 /// a piece: after every BEL and every ST (`ESC \`). The ends, the last
 /// at `bytes.len()`. An ST split across two reads is not cut: the engine
-/// ends the sequence at its ESC, in the first.
+/// ends the sequence at its ESC, in the first, and `Session::output`
+/// holds what it raised until it sees the `\`.
 fn pieces(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
     let cuts = (0..bytes.len())
         .filter(move |&i| bytes[i] == 0x07 || (bytes[i] == b'\\' && i > 0 && bytes[i - 1] == 0x1b));
     cuts.map(|i| i + 1)
         .filter(move |&end| end < bytes.len())
         .chain(std::iter::once(bytes.len()))
+}
+
+/// What `session_changed` announces: title, pwd, attention and command.
+pub type Announced = (String, String, Option<Attention>, Option<proto::Command>);
+
+pub fn announced(session: &proto::Session) -> Announced {
+    (
+        session.title.clone(),
+        session.pwd.clone(),
+        session.attention.clone(),
+        session.command,
+    )
 }
 
 /// Relative luminance per WCAG, 0 for black and 1 for white.
@@ -345,16 +362,20 @@ pub struct Session {
     pub text_limit: usize,
     /// `limits.records`.
     pub records_limit: usize,
+    /// `limits.commands`.
+    pub commands_limit: usize,
     pub attached: Vec<Attachment>,
     pub records: Records,
+    pub commands: Commands,
     /// Events raised under the lock, emitted by whoever releases it.
     pub events: Vec<Event>,
     /// Being removed: at once, or after the grace while attachments
     /// finish. A park in flight deletes what it wrote; a stop deletes the
     /// files rather than parking.
     pub removed: bool,
-    /// The title, pwd and attention last announced by `session_changed`.
-    pub announced: (String, String, Option<Attention>),
+    /// The title, pwd, attention and command last announced by
+    /// `session_changed`.
+    pub announced: Announced,
     /// When the last bell was announced.
     pub last_bell: Option<Instant>,
     /// Parks of this session run one at a time.
@@ -460,6 +481,7 @@ impl Session {
             offset,
             marker,
             attachments: self.attached.len() as u32,
+            command: self.commands.current(),
             program_status: with_records.then(|| self.records.resolved()),
             attention: self.records.attention(),
         }
@@ -485,16 +507,36 @@ impl Session {
     /// Feeds PTY bytes to the engine and the stream; the events this
     /// raises wait in `events`. The engine takes them in pieces so that
     /// each notice carries the offset just after its sequence.
+    /// The engine ends a sequence closed by ST at its ESC, so notices
+    /// raised by bytes that end in ESC wait for the next bytes, and are
+    /// placed after them when they begin with `\`.
     pub fn output(&mut self, bytes: &[u8]) {
         let Body::Live(live) = &mut self.body else {
             return;
         };
         let base = live.stream.offset();
+        let effects = live.term.handler_mut();
+        let after_st = u64::from(bytes.first() == Some(&b'\\'));
+        let held = std::mem::take(&mut effects.held);
+        effects.notices.extend(
+            held.into_iter()
+                .map(|(offset, notice)| (offset + after_st, notice)),
+        );
         let mut start = 0;
         for end in pieces(bytes) {
             live.term.handler_mut().offset = base + end as u64;
             live.term.vt_write(&bytes[start..end]);
             start = end;
+        }
+        if bytes.last() == Some(&0x1b) {
+            let end = base + bytes.len() as u64;
+            let effects = live.term.handler_mut();
+            let keep = effects
+                .notices
+                .iter()
+                .take_while(|(o, _)| *o != end)
+                .count();
+            effects.held = effects.notices.split_off(keep);
         }
         live.stream.append(bytes);
         live.last_output = Instant::now();
@@ -547,7 +589,12 @@ impl Session {
                     changed = true;
                     continue;
                 }
-                Notice::PromptStart => {
+                Notice::PromptStart(prompt) => {
+                    let mark = SemanticPrompt {
+                        kind: SemanticPromptKind::PromptStart,
+                        prompt,
+                    };
+                    changed |= self.mark(mark, None, offset);
                     if let Body::Live(live) = &mut self.body {
                         let start = live.stream.retained_start();
                         live.prompts.retain(|&o| o >= start);
@@ -559,15 +606,29 @@ impl Session {
                     changed |= self.drop_transient_records(StatusReason::Prompt);
                     continue;
                 }
-                Notice::CommandStarted => Event::CommandStarted {
-                    id: id.clone(),
-                    offset,
-                },
-                Notice::CommandEnded(exit) => Event::CommandEnded {
-                    id: id.clone(),
-                    offset,
-                    exit,
-                },
+                Notice::CommandStarted => {
+                    let mark = SemanticPrompt {
+                        kind: SemanticPromptKind::OutputStart,
+                        prompt: PromptKind::Primary,
+                    };
+                    changed |= self.mark(mark, None, offset);
+                    Event::CommandStarted {
+                        id: id.clone(),
+                        offset,
+                    }
+                }
+                Notice::CommandEnded(exit) => {
+                    let mark = SemanticPrompt {
+                        kind: SemanticPromptKind::CommandEnd,
+                        prompt: PromptKind::Primary,
+                    };
+                    changed |= self.mark(mark, exit, offset);
+                    Event::CommandEnded {
+                        id: id.clone(),
+                        offset,
+                        exit,
+                    }
+                }
                 Notice::Bell => {
                     let at = Instant::now();
                     if self
@@ -603,19 +664,22 @@ impl Session {
         }
     }
 
-    /// Queues `session_changed` when the title, pwd or attention differs
-    /// from what was last announced.
+    /// Queues `session_changed` when the title, pwd, attention or
+    /// command differs from what was last announced.
     pub fn announce(&mut self) {
         let session = self.to_proto(false);
-        let announced = (
-            session.title.clone(),
-            session.pwd.clone(),
-            session.attention.clone(),
-        );
+        let announced = announced(&session);
         if announced != self.announced {
             self.announced = announced;
             self.events.push(Event::SessionChanged { session });
         }
+    }
+
+    /// Applies a command mark; whether `Session.command` changed.
+    fn mark(&mut self, mark: SemanticPrompt, exit: Option<i32>, offset: u64) -> bool {
+        let before = self.commands.current();
+        self.commands.apply(mark, exit, offset, self.commands_limit)
+            && self.commands.current() != before
     }
 
     /// Drops the transient records; whether there were any.
@@ -766,12 +830,19 @@ impl Session {
             return None;
         }
         self.exited_at = Some(now());
+        // No `\\` follows: notices held at a final ESC stay there.
+        let effects = live.term.handler_mut();
+        let held = std::mem::take(&mut effects.held);
+        effects.notices.extend(held);
+        self.flush_effects();
+        let Body::Live(live) = &mut self.body else {
+            return None;
+        };
         live.stream
             .add_marker(MarkerKind::Exited { exit: exit.clone() });
         // `session_exited` carries the new attention.
         self.drop_transient_records(StatusReason::Exit);
-        let session = self.to_proto(false);
-        self.announced = (session.title, session.pwd, session.attention);
+        self.announced = announced(&self.to_proto(false));
         self.wake.notify_waiters();
         // Wakes the activity park to see the end and return; a kept
         // session's last park is `Registry::ended`'s.
@@ -811,6 +882,7 @@ impl Session {
                 ..self.to_proto(false)
             },
             history_lines: history_lines as u64,
+            commands: self.commands.all(),
         };
         Ok((file, all))
     }
