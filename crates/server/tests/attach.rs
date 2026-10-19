@@ -18,11 +18,8 @@ async fn snapshot_bootstrap_then_stream_then_close() {
     let session = c
         .create(json!({"argv": ["/bin/cat"], "cols": 20, "rows": 5}))
         .await;
-    c.ok(
-        "write",
-        json!({"session": session.id, "data": b64("one\n")}),
-    )
-    .await;
+    c.ok("send", json!({"session": session.id, "data": b64("one\n")}))
+        .await;
     let read = wait_text(&mut c, &session.id, "one\none").await;
 
     c.open(
@@ -168,7 +165,7 @@ async fn resume_when_retained_else_snapshot() {
 
     // A marker added while detached is delivered on resume.
     c.ok(
-        "set_size",
+        "resize",
         json!({"session": session.id, "cols": 30, "rows": 8}),
     )
     .await;
@@ -207,7 +204,7 @@ async fn resume_when_retained_else_snapshot() {
 
     // Push offset 0 out of the 64-byte ring.
     c.ok(
-        "write",
+        "send",
         json!({"session": session.id, "data": b64("x".repeat(100))}),
     )
     .await;
@@ -273,7 +270,7 @@ async fn viewport_reports_coalesce_and_mark_the_stream() {
     c.send_json(FrameType::Viewport, 1, &json!({"cols": 45, "rows": 11}))
         .await;
     c.ok(
-        "set_size",
+        "resize",
         json!({"session": session.id, "cols": 60, "rows": 15}),
     )
     .await;
@@ -405,9 +402,9 @@ async fn gap_when_the_client_falls_behind() {
     let boot = c.bootstrap(1).await;
     assert!(boot.stream.is_empty());
     // Read nothing until the session has produced everything and exited.
-    events.ok("write", go.clone()).await;
+    events.ok("send", go.clone()).await;
     wait_text(&mut events, &session.id, "FIRST-DONE").await;
-    events.ok("write", go).await;
+    events.ok("send", go).await;
     let exited = events.wait_exit(&session.id).await;
     let mut delivered = 0u64;
     let gap = loop {
@@ -461,7 +458,7 @@ async fn gap_during_a_bootstrap_retries_once_then_too_slow() {
     // Not reading: the remainder fills the queue to the high-water mark
     // while the burst pushes the cursor out of the ring. Output (the echo
     // of `go`, the start of the burst) is forwarded until the queue fills.
-    ctl.ok("write", go.clone()).await;
+    ctl.ok("send", go.clone()).await;
     wait_text(&mut ctl, &session.id, "SECOND-DONE").await;
     let mut delivered = 0u64;
     let gap = loop {
@@ -479,7 +476,7 @@ async fn gap_during_a_bootstrap_retries_once_then_too_slow() {
     assert!(second.attached.offset > first.attached.offset);
 
     // The same during the bootstrap that followed the gap is too_slow.
-    ctl.ok("write", go).await;
+    ctl.ok("send", go).await;
     ctl.wait_exit(&session.id).await;
     loop {
         let (header, payload) = c.recv_on(1).await;

@@ -374,7 +374,7 @@ async fn a_small_ring_turns_a_long_cut_into_a_snapshot() {
         .unwrap();
     let type_line = |text: &str| {
         let data = base64::engine::general_purpose::STANDARD.encode(format!("{text}\n"));
-        control.call::<_, serde_json::Value>("write", json!({"session": session.id, "data": data}))
+        control.call::<_, serde_json::Value>("send", json!({"session": session.id, "data": data}))
     };
     type_line("echo hello").await.unwrap();
     let bootstrapped = Arc::new(AtomicUsize::new(0));

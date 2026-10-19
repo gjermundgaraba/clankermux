@@ -213,7 +213,7 @@ impl Registry {
             unparked: None,
             parked_at: None,
             park_due: Arc::new(Notify::new()),
-            write_chain: None,
+            send_chain: None,
             last_generation: 0,
             body: Body::Parked(Parked {
                 engine: file.engine,
@@ -529,7 +529,7 @@ impl Registry {
             unparked: Some((created, created)),
             parked_at: None,
             park_due: Arc::new(Notify::new()),
-            write_chain: None,
+            send_chain: None,
             last_generation: 0,
             body: Body::Live(Box::new(Live {
                 pid: Some(pid),

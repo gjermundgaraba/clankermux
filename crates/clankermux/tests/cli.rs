@@ -33,6 +33,23 @@ async fn run(args: &[&str], env: &[(&str, String)]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+/// Runs the binary with `args` outside any session (no inherited
+/// `CLANKERMUX_*`) plus `env`; its exit code, stdout and stderr.
+async fn run_status(args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"));
+    command
+        .args(args)
+        .env_remove("CLANKERMUX_SESSION")
+        .env_remove("CLANKERMUX_SOCKET")
+        .envs(env.iter().copied());
+    let output = command.output().await.unwrap();
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
 async fn connect(server: &Server) -> Connection {
     Connection::connect_unix(&server.socket, hello("test", Some(ghostty_vt::ENGINE)))
         .await
@@ -394,7 +411,7 @@ async fn websocket_flags_need_the_websocket() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_chunks_to_the_input_queue() {
+async fn send_chunks_to_the_input_queue() {
     let server = Server::start(Limits {
         input_queue: 16,
         ..Limits::default()
@@ -406,7 +423,7 @@ async fn write_chunks_to_the_input_queue() {
         &[
             "--socket",
             server.socket.to_str().unwrap(),
-            "write",
+            "send",
             &session.id,
             text,
         ],
@@ -422,7 +439,7 @@ async fn write_chunks_to_the_input_queue() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_sends_one_request_even_for_empty_text() {
+async fn send_sends_one_request_even_for_empty_text() {
     let server = start();
     let conn = connect(&server).await;
     let session = create(
@@ -435,17 +452,14 @@ async fn write_sends_one_request_even_for_empty_text() {
         .args([
             "--socket",
             server.socket.to_str().unwrap(),
-            "write",
+            "send",
             &session.id,
             "",
         ])
         .output()
         .await
         .unwrap();
-    assert!(
-        !output.status.success(),
-        "an exited session refuses a write"
-    );
+    assert!(!output.status.success(), "an exited session refuses a send");
     assert!(String::from_utf8_lossy(&output.stderr).contains("not_running"));
 }
 
@@ -486,7 +500,7 @@ async fn a_killed_server_restores_what_was_parked_after_a_change() {
     let conn = connect_when_up(dir.path()).await;
     let session = create(&conn, json!({"argv": ["/bin/sh", "-c", "exec cat"]})).await;
     conn.request(
-        "write",
+        "send",
         json!({"session": session.id, "data": "YmVmb3JlLXRoZS1raWxsCg=="}),
     )
     .await
@@ -526,4 +540,102 @@ async fn a_killed_server_restores_what_was_parked_after_a_change() {
         .await
         .unwrap();
     assert!(read.text.contains("before-the-kill"), "{}", read.text);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_argument_resolves_by_id_label_and_either_end() {
+    let server = start();
+    let conn = connect(&server).await;
+    let alpha = create(&conn, json!({"label": "Alpha", "argv": ["/bin/cat"]})).await;
+    let twins = [
+        create(&conn, json!({"label": "twin", "argv": ["/bin/cat"]})).await,
+        create(&conn, json!({"label": "TWIN", "argv": ["/bin/cat"]})).await,
+    ];
+    let socket = server.socket.to_str().unwrap();
+    let label_of = |needle: &str| {
+        let needle = needle.to_string();
+        async move {
+            let (code, out, err) =
+                run_status(&["--socket", socket, "--json", "inspect", &needle], &[]).await;
+            assert_eq!(code, 0, "{needle}: {err}");
+            serde_json::from_str::<Session>(&out).unwrap().label
+        }
+    };
+    assert_eq!(label_of(&alpha.id).await, "Alpha");
+    assert_eq!(label_of("alpha").await, "Alpha");
+    assert_eq!(label_of(&alpha.id[..8]).await, "Alpha");
+    assert_eq!(label_of(&alpha.id[alpha.id.len() - 6..]).await, "Alpha");
+
+    // Several labels match regardless of case: exit 3, the candidates
+    // on stderr by their last six characters.
+    let (code, _, err) = run_status(&["--socket", socket, "inspect", "Twin"], &[]).await;
+    assert_eq!(code, 3, "{err}");
+    for twin in &twins {
+        assert!(err.contains(&twin.id[twin.id.len() - 6..]), "{err}");
+    }
+    assert!(!err.contains(&alpha.id[alpha.id.len() - 6..]), "{err}");
+    // None: every session is a candidate. Three characters are too few.
+    let (code, _, err) = run_status(&["--socket", socket, "end", "nosuch"], &[]).await;
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains("Alpha") && err.contains("running"), "{err}");
+    let (code, _, err) = run_status(&["--socket", socket, "end", &alpha.id[..3]], &[]).await;
+    assert_eq!(code, 3, "{err}");
+
+    // Left out: `$CLANKERMUX_SESSION`, else a usage error.
+    let (code, out, err) = run_status(
+        &["--socket", socket, "--json", "inspect"],
+        &[("CLANKERMUX_SESSION", &alpha.id)],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("Alpha"), "{out}");
+    let (code, _, err) = run_status(&["--socket", socket, "inspect"], &[]).await;
+    assert_eq!(code, 2, "{err}");
+    // `label` takes the session from there too, and the socket.
+    let (code, _, err) = run_status(
+        &["label", "renamed"],
+        &[
+            ("CLANKERMUX_SESSION", &alpha.id),
+            ("CLANKERMUX_SOCKET", socket),
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(inspect(&conn, &alpha.id).await.label, "renamed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exit_codes_tell_failure_usage_target_and_server_apart() {
+    let server = start();
+    let conn = connect(&server).await;
+    let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
+    let socket = server.socket.to_str().unwrap();
+    // The server refused: 1.
+    let (code, _, err) = run_status(&["--socket", socket, "remove", &session.id], &[]).await;
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("running"), "{err}");
+    // Usage, clap's and ours: 2.
+    let (code, _, _) = run_status(&["--socket", socket, "resize"], &[]).await;
+    assert_eq!(code, 2);
+    let (code, _, err) =
+        run_status(&["--socket", socket, "resize", &session.id, "wide"], &[]).await;
+    assert_eq!(code, 2, "{err}");
+    // No such session: 3.
+    let (code, _, err) = run_status(&["--socket", socket, "read", "nothing-here"], &[]).await;
+    assert_eq!(code, 3, "{err}");
+    // No server: 4.
+    let dead = server.dir.path().join("no-server");
+    let (code, _, err) = run_status(&["--socket", dead.to_str().unwrap(), "list"], &[]).await;
+    assert_eq!(code, 4, "{err}");
+    // `resize` keeps the side left out.
+    let (code, _, err) = run_status(&["--socket", socket, "resize", &session.id, "x30"], &[]).await;
+    assert_eq!(code, 0, "{err}");
+    let resized = wait_session(&conn, &session.id, |s| s.rows == 30).await;
+    assert_eq!(resized.cols, 80);
+    let (code, out, _) = run_status(&["--socket", socket, "list"], &[]).await;
+    assert_eq!(code, 0);
+    assert!(
+        out.starts_with(&session.id[session.id.len() - 6..]),
+        "{out}"
+    );
 }

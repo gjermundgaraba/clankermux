@@ -105,10 +105,10 @@ the order the server produced them.
 | `end`       | `session`                                           | `{}`                    |
 | `signal`    | `session, signal`                                   | `{}`                    |
 | `remove`    | `session`                                           | `{}`                    |
-| `set_label` | `session, label`                                    | Session                 |
-| `set_size`  | `session, cols, rows`                               | `{}`                    |
+| `label`     | `session, label`                                    | Session                 |
+| `resize`    | `session, cols?, rows?`                             | `{}`                    |
 | `read`      | `session, scrollback?`                              | Read                    |
-| `write`     | `session, data`                                     | `{}`                    |
+| `send`      | `session, data`                                     | `{}`                    |
 | `subscribe` |                                                     | Page                    |
 
 - `create`: `argv` defaults to the user's login shell, `cwd` to the server
@@ -125,9 +125,10 @@ the order the server produced them.
 - `remove` deletes a session whose `status` is `exited` or `restored`,
   including its files. Fails with `running` otherwise. It replies at once;
   open attachments get `CLOSED removed`.
-- `set_size` counts as a viewport report applied at once, without
-  coalescing (see Size). Fails with `not_running` unless `status` is
-  `running`.
+- `resize` counts as a viewport report applied at once, without
+  coalescing (see Size). A side left out keeps the session's; one of
+  `cols` and `rows` is required. Fails with `not_running` unless `status`
+  is `running`.
 - `list` and `subscribe` return a Page: `{sessions: Session[], next?}`.
   Sessions are ordered by `id`; at most `limits.page` per reply; `next` is
   the last id when more remain, to pass as `after`. Sessions carry no
@@ -137,7 +138,7 @@ the order the server produced them.
   newline, with soft-wrapped rows joined and trailing blanks trimmed. The
   oldest lines are dropped to keep the reply under `limits.max_frame`.
   Works for every status.
-- `write`: `data` is base64. Replies after the bytes are written to the PTY
+- `send`: `data` is base64. Replies after the bytes are written to the PTY
   as one unit. Fails with `not_running` unless `status` is `running`.
 - `subscribe` starts `EVENT` frames on this connection and returns the
   first page of current sessions. Events are sent only for changes after
@@ -247,7 +248,7 @@ is reaped. The server reads the PTY to end of file before appending
 `exit` is the reaped child's status. A child that has exited while a
 descendant keeps the PTY open leaves the session `running` with `pid`
 absent. A child that closes its PTY descriptors while running keeps the
-session `running` until it is reaped. Meanwhile `INPUT`, `write`,
+session `running` until it is reaped. Meanwhile `INPUT`, `send`,
 and viewport reports are accepted and written to the PTY, where nothing
 reads them.
 
@@ -421,7 +422,7 @@ open attachment, finished or not, gets `CLOSED removed`.
 ## Size
 
 A session has one size. Writable attachments report their viewport in `OPEN`
-and `VIEWPORT`; `set_size` is a report too. The most recent report wins. The
+and `VIEWPORT`; `resize` is a report too. The most recent report wins. The
 server coalesces `VIEWPORT` reports arriving within 25 ms, then resizes its
 terminal, sets the PTY size, emits a mode 2048 report if enabled, and
 appends `RESIZED` to the stream. A report applied at once discards pending
@@ -439,7 +440,7 @@ or `profile` and no `VIEWPORT`; its terminal follows the session's size
 through `RESIZED` like any other.
 
 A report carries a size and may carry a `profile` and a cell size; what
-it omits is unchanged (`set_size` carries neither). The session's profile
+it omits is unchanged (`resize` carries neither). The session's profile
 and cell size are those of the latest reports that carried them. They
 answer the queries below and persist while no attachment is open; a
 parked session has no process to answer, so they are not parked. When

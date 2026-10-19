@@ -308,8 +308,8 @@ pub struct Session {
     /// Wakes the session's activity park at the first change after a
     /// park, and at the end of the stream.
     pub park_due: Arc<Notify>,
-    /// The latest `write` reply task; the next replies after it.
-    pub write_chain: Option<tokio::task::JoinHandle<()>>,
+    /// The latest `send` reply task; the next replies after it.
+    pub send_chain: Option<tokio::task::JoinHandle<()>>,
     /// The last generation written, so the next is larger whatever the
     /// clock says.
     pub last_generation: u64,

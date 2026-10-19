@@ -198,7 +198,7 @@ class Client {
   /** The session attached or being attached. */
   private session: string | undefined;
   private sessions = new Map<string, Session>();
-  /** Input in order: a paste goes as `write` requests, and keys typed
+  /** Input in order: a paste goes as `send` requests, and keys typed
    * meanwhile wait behind it. `attach` starts a fresh chain; input queued
    * for an attachment that is gone is dropped, but a paste under way
    * finishes (cut short, it would leave the program inside a bracketed
@@ -642,7 +642,7 @@ class Client {
   }
 
   /** Input for the session, dropped unless attached on a live connection.
-   * Keys go as INPUT; a paste goes as `write` requests, each answered
+   * Keys go as INPUT; a paste goes as `send` requests, each answered
    * once the PTY took it, since INPUT frames are not acknowledged and a
    * paste would overflow the input queue. This tab's input is sent in
    * order, so none of it lands inside a paste. */
@@ -668,7 +668,7 @@ class Client {
           return;
         }
         for (let at = 0; at < bytes.length; at += chunk) {
-          await conn.call("write", { session, data: base64(bytes.subarray(at, at + chunk)) });
+          await conn.call("send", { session, data: base64(bytes.subarray(at, at + chunk)) });
         }
       } catch (err) {
         // A connection loss is reported through onEnd; a refused chunk

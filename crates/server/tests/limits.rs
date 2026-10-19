@@ -119,13 +119,13 @@ async fn label_and_text_are_bounded_everywhere() {
     let title = "0123456789abcdef".repeat(4);
     let pwd = format!("/{}", "p".repeat(63));
     c.ok(
-        "write",
+        "send",
         json!({"session": session.id, "data": b64(format!("\x1b]2;{title}\x07\x1b]7;file://host{pwd}\x07titled\n"))}),
     )
     .await;
     assert_eq!(
         c.err(
-            "set_label",
+            "label",
             json!({"session": session.id, "label": "123456789"})
         )
         .await,
@@ -166,7 +166,7 @@ async fn markers_bound_what_a_resume_can_find() {
     // Three resizes add three markers; only the last two are retained.
     for rows in [10, 11, 12] {
         c.ok(
-            "set_size",
+            "resize",
             json!({"session": session.id, "cols": 80, "rows": rows}),
         )
         .await;
@@ -389,7 +389,7 @@ async fn continuation_bounds_a_snapshot() {
     // attachable (the engine's continuation stays unavailable until input
     // follows the overflowed sequence).
     c.ok(
-        "write",
+        "send",
         json!({"session": session.id, "data": b64("\x07done\n")}),
     )
     .await;

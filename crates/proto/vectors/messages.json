@@ -388,14 +388,18 @@
     "session": "0f1e2d3c-0000-4000-8000-000000000001",
     "signal": "TERM"
   },
-  "params/set_label": {
+  "params/label": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001",
     "label": "deploy"
   },
-  "params/set_size": {
+  "params/resize": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001",
     "cols": 100,
     "rows": 30
+  },
+  "params/resize-cols": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "cols": 100
   },
   "params/read": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001",
@@ -404,7 +408,7 @@
   "params/read-screen": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001"
   },
-  "params/write": {
+  "params/send": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001",
     "data": "bHMK"
   }

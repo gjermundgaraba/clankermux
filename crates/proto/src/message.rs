@@ -200,16 +200,19 @@ pub struct SignalParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetLabelParams {
+pub struct LabelParams {
     pub session: String,
     pub label: String,
 }
 
+/// `resize`: a side left out keeps the session's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetSizeParams {
+pub struct ResizeParams {
     pub session: String,
-    pub cols: u16,
-    pub rows: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,7 +223,7 @@ pub struct ReadParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WriteParams {
+pub struct SendParams {
     pub session: String,
     /// Base64.
     pub data: String,

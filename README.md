@@ -21,6 +21,18 @@ A terminal multiplexer server with CLI and browser clients; the wire protocol is
 | `cd web/apps/client && pnpm build && pnpm serve` | demo page on `http://127.0.0.1:8787/?ws=wss://127.0.0.1:7438/`; after `just check`, which installs `web/` and builds the wasm |
 | `target/release/clankermux --socket target/dev/sock create` | a session on the dev server |
 
+## The command line
+
+A session argument is resolved in order: the full id; the label, ignoring case; four or more characters from the start or the end of the id. Left out, it is `$CLANKERMUX_SESSION`. `list` shows the last six characters of each id. When the argument names no session or several, the candidates go to stderr (short id, label, status) and the exit code is 3. A command's socket is `--socket`, else `$CLANKERMUX_SOCKET`, else the default; `serve` ignores `$CLANKERMUX_SOCKET`.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Done |
+| 1 | Failed: the server refused the request, or the connection broke |
+| 2 | Usage: arguments clap or the command could not use, or no session given outside a session |
+| 3 | The session argument named no session, or several |
+| 4 | The server cannot be reached |
+
 ## Parks
 
 `serve` writes each running session's screen, scrollback and state under `$XDG_STATE_HOME/clankermux/sessions/` (PROTOCOL.md, "Persisted state"):

@@ -134,15 +134,16 @@ export interface SignalParams {
   signal: string;
 }
 
-export interface SetLabelParams {
+export interface LabelParams {
   session: string;
   label: string;
 }
 
-export interface SetSizeParams {
+/** `resize`: a side left out keeps the session's. */
+export interface ResizeParams {
   session: string;
-  cols: number;
-  rows: number;
+  cols?: number;
+  rows?: number;
 }
 
 export interface ReadParams {
@@ -150,7 +151,7 @@ export interface ReadParams {
   scrollback?: number;
 }
 
-export interface WriteParams {
+export interface SendParams {
   session: string;
   /** Base64. */
   data: string;

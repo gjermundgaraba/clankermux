@@ -69,7 +69,7 @@ async fn bootstrap_stream_and_resume() {
         )
         .await
         .unwrap();
-    conn.request("write", json!({"session": session.id, "data": "b25lCg=="}))
+    conn.request("send", json!({"session": session.id, "data": "b25lCg=="}))
         .await
         .unwrap();
     // The echo is on the screen before the attach, so it comes with the

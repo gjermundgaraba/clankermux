@@ -179,7 +179,7 @@ test("bootstraps, streams, resumes and sees the exit", async () => {
   const conn = await connect();
   expect(conn.welcome.engine).toBe(ENGINE);
   const session = await conn.call<Session>("create", { argv: ["/bin/cat"], cols: 20, rows: 5 });
-  await conn.call("write", { session: session.id, data: btoa("one\n") });
+  await conn.call("send", { session: session.id, data: btoa("one\n") });
   for (const deadline = Date.now() + 5000; ; ) {
     const read = await conn.call<Read>("read", { session: session.id });
     if (read.text.includes("one\none")) break;

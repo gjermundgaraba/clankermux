@@ -54,7 +54,7 @@ fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
         .map_err(|e| (ErrorCode::InvalidRequest, format!("bad params: {e}")))
 }
 
-/// Answers `request` on `writer`: `write` from a task once the PTY took
+/// Answers `request` on `writer`: `send` from a task once the PTY took
 /// the bytes, `list` and `subscribe` from the registry under its lock,
 /// the rest at once.
 pub fn dispatch(
@@ -65,7 +65,7 @@ pub fn dispatch(
 ) {
     let id = request.id;
     match request.method.as_str() {
-        "write" => write(registry, writer, id, request.params),
+        "send" => send(registry, writer, id, request.params),
         "list" => match params::<proto::ListParams>(request.params) {
             Ok(p) => registry.reply_page(writer, id, p.after.as_deref(), false),
             Err(fail) => reply(writer, id, Err(fail)),
@@ -78,13 +78,13 @@ pub fn dispatch(
     }
 }
 
-/// `write`: answered once the PTY took the bytes, meanwhile the
+/// `send`: answered once the PTY took the bytes, meanwhile the
 /// connection reads on. The reply task is chained on the session's
 /// previous one under the session lock, as the bytes are queued, so the
 /// replies come in queue order; a failure is answered at once.
-fn write(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
+fn send(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
     let started = (|| {
-        let p: proto::WriteParams = params(p)?;
+        let p: proto::SendParams = params(p)?;
         let data = base64::engine::general_purpose::STANDARD
             .decode(&p.data)
             .map_err(|e| {
@@ -101,9 +101,9 @@ fn write(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
             .push(data)
             .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?;
         s.touch();
-        let previous = s.write_chain.take();
+        let previous = s.send_chain.take();
         let writer = writer.clone();
-        s.write_chain = Some(tokio::spawn(async move {
+        s.send_chain = Some(tokio::spawn(async move {
             if let Some(previous) = previous {
                 let _ = previous.await;
             }
@@ -120,7 +120,7 @@ fn write(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
     }
 }
 
-/// Handles one request but `write`, `list` and `subscribe`.
+/// Handles one request but `send`, `list` and `subscribe`.
 fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
     let p = request.params;
     match request.method.as_str() {
@@ -159,8 +159,8 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
             registry.remove(&p.session)?;
             Ok(json!({}))
         }
-        "set_label" => {
-            let p: proto::SetLabelParams = params(p)?;
+        "label" => {
+            let p: proto::LabelParams = params(p)?;
             if p.label.len() > registry.config.limits.label as usize {
                 return Err((ErrorCode::LimitExceeded, "label too long".into()));
             }
@@ -176,17 +176,29 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
             });
             Ok(json!(out))
         }
-        "set_size" => {
-            let p: proto::SetSizeParams = params(p)?;
+        "resize" => {
+            let p: proto::ResizeParams = params(p)?;
+            if p.cols.is_none() && p.rows.is_none() {
+                return Err((ErrorCode::InvalidRequest, "cols or rows is needed".into()));
+            }
+            if p.cols == Some(0) || p.rows == Some(0) {
+                return Err((
+                    ErrorCode::InvalidRequest,
+                    "cols and rows must be at least 1".into(),
+                ));
+            }
+            let session = registry.get(&p.session)?;
+            let current = {
+                let s = session.lock().unwrap();
+                s.running()?;
+                s.size()
+            };
             let size = Size {
-                cols: p.cols,
-                rows: p.rows,
+                cols: p.cols.unwrap_or(current.cols),
+                rows: p.rows.unwrap_or(current.rows),
                 cell_width: None,
                 cell_height: None,
             };
-            session::check_size(&size)?;
-            let session = registry.get(&p.session)?;
-            session.lock().unwrap().running()?;
             let report = Viewport {
                 size,
                 profile: None,

@@ -106,7 +106,7 @@ async fn tick(
     let mut previous = start;
     for tick in 0.. {
         c.ok(
-            "write",
+            "send",
             json!({"session": id, "data": b64(format!("tick-{tick}\n"))}),
         )
         .await;
@@ -139,7 +139,7 @@ async fn a_change_parks_once_quiet_and_while_busy() {
         .create(json!({"argv": ["/bin/sh", "-c", "exec cat"]}))
         .await;
     c.ok(
-        "write",
+        "send",
         json!({"session": quiet.id, "data": b64("typed-line\n")}),
     )
     .await;
@@ -300,13 +300,13 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
     assert_eq!(read.status, Status::Restored);
     assert!(read.cursor.is_none(), "no cursor from a park file");
     assert_eq!(
-        c.err("write", json!({"session": session.id, "data": "aGk="}))
+        c.err("send", json!({"session": session.id, "data": "aGk="}))
             .await,
         ErrorCode::NotRunning
     );
     assert_eq!(
         c.err(
-            "set_size",
+            "resize",
             json!({"session": session.id, "cols": 1, "rows": 1})
         )
         .await,
@@ -415,7 +415,7 @@ async fn a_stop_parks_an_exited_session_whose_final_park_is_waiting() {
         .clone();
     let held = park_lock.lock().await;
     // Not before: the exit's park could finish before the lock is held.
-    c.ok("write", json!({"session": session.id, "data": b64("go\n")}))
+    c.ok("send", json!({"session": session.id, "data": b64("go\n")}))
         .await;
     assert_eq!(
         c.wait_exit(&session.id).await.exit,
@@ -452,7 +452,7 @@ async fn program_status_records_follow_the_protocol() {
     let id = session.id.clone();
     let report = |body: &str| json!({"session": id, "data": b64(format!("printf '\\033]7501;{body}\\033\\\\'\n"))});
 
-    c.ok("write", report("state=working:app=cargo:progress=40"))
+    c.ok("send", report("state=working:app=cargo:progress=40"))
         .await;
     let record = event_where(&mut c, |e| match e {
         Event::ProgramStatusChanged { id: sid, record } if *sid == session.id => {
@@ -469,7 +469,7 @@ async fn program_status_records_follow_the_protocol() {
     assert!(record.title.is_none() && record.msg.is_none() && record.kind.is_none());
 
     c.ok(
-        "write",
+        "send",
         report("state=blocked:kind=permission:id=deploy/us:msg=QXBwbHk/"),
     )
     .await;
@@ -498,7 +498,7 @@ async fn program_status_records_follow_the_protocol() {
     );
 
     // A third record evicts the least recently updated one.
-    c.ok("write", report("state=done:id=third")).await;
+    c.ok("send", report("state=done:id=third")).await;
     let removed = event_where(&mut c, |e| match e {
         Event::ProgramStatusRemoved { record_ids, .. } => Some(record_ids.clone()),
         _ => None,
@@ -508,7 +508,7 @@ async fn program_status_records_follow_the_protocol() {
 
     // A prompt start drops the blocked record, not the done one.
     c.ok(
-        "write",
+        "send",
         json!({"session": session.id, "data": b64("printf '\\033]133;A\\033\\\\'\n")}),
     )
     .await;
@@ -520,7 +520,7 @@ async fn program_status_records_follow_the_protocol() {
     assert_eq!(removed, vec!["deploy/us".to_string()]);
 
     // Clear with no id removes everything.
-    c.ok("write", report("state=clear")).await;
+    c.ok("send", report("state=clear")).await;
     let removed = event_where(&mut c, |e| match e {
         Event::ProgramStatusRemoved { record_ids, .. } => Some(record_ids.clone()),
         _ => None,

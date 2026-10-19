@@ -118,7 +118,7 @@ async fn session_lifecycle() {
     );
 
     let data = b64("hello\n");
-    c.ok("write", json!({"session": session.id, "data": data}))
+    c.ok("send", json!({"session": session.id, "data": data}))
         .await;
     let read = wait_text(&mut c, &session.id, "hello\nhello").await;
     assert_eq!(read.text, "hello\nhello\n", "echo and cat's copy");
@@ -132,7 +132,7 @@ async fn session_lifecycle() {
     assert_eq!(inspected.program_status, Some(vec![]));
 
     c.ok(
-        "set_size",
+        "resize",
         json!({"session": session.id, "cols": 40, "rows": 12}),
     )
     .await;
@@ -144,31 +144,31 @@ async fn session_lifecycle() {
     // which the engine reports separately. `cat` passes a line on once it
     // is complete.
     let data = b64("\x1b]2;titled\x07\n");
-    c.ok("write", json!({"session": session.id, "data": data}))
+    c.ok("send", json!({"session": session.id, "data": data}))
         .await;
     assert!(
         matches!(events.event().await, Event::SessionChanged { session: s } if s.title == "titled")
     );
     let data = b64("\x1b]7;file://host/tmp/work\x07\n");
-    c.ok("write", json!({"session": session.id, "data": data}))
+    c.ok("send", json!({"session": session.id, "data": data}))
         .await;
     assert!(
         matches!(events.event().await, Event::SessionChanged { session: s } if s.title == "titled" && s.pwd == "/tmp/work")
     );
     let data = b64("\x1bc\n");
-    c.ok("write", json!({"session": session.id, "data": data}))
+    c.ok("send", json!({"session": session.id, "data": data}))
         .await;
     assert!(
         matches!(events.event().await, Event::SessionChanged { session: s } if s.title.is_empty() && s.pwd.is_empty())
     );
     c.ok(
-        "set_size",
+        "resize",
         json!({"session": session.id, "cols": 40, "rows": 12}),
     )
     .await;
 
     let relabelled: Session = serde_json::from_value(
-        c.ok("set_label", json!({"session": session.id, "label": "new"}))
+        c.ok("label", json!({"session": session.id, "label": "new"}))
             .await,
     )
     .unwrap();
@@ -178,7 +178,7 @@ async fn session_lifecycle() {
     );
     assert_eq!(
         c.err(
-            "set_label",
+            "label",
             json!({"session": session.id, "label": "x".repeat(257)})
         )
         .await,
@@ -208,7 +208,7 @@ async fn session_lifecycle() {
     assert!(exited.pid.is_none());
 
     assert_eq!(
-        c.err("write", json!({"session": session.id, "data": ""}))
+        c.err("send", json!({"session": session.id, "data": ""}))
             .await,
         ErrorCode::NotRunning
     );
@@ -218,7 +218,7 @@ async fn session_lifecycle() {
     );
     assert_eq!(
         c.err(
-            "set_size",
+            "resize",
             json!({"session": session.id, "cols": 1, "rows": 1})
         )
         .await,
@@ -492,7 +492,7 @@ async fn write_replies_come_in_request_order() {
         let mut pipelined = Vec::new();
         for id in 1..=4 {
             let data = b64([b'0' + id as u8]);
-            let request = json!({"id": id, "method": "write",
+            let request = json!({"id": id, "method": "send",
                 "params": {"session": session.id, "data": data}});
             pipelined.extend(encode_frame(
                 FrameType::Request,
@@ -549,7 +549,7 @@ async fn signals_by_name_and_sizes_are_validated() {
     let session = c.create(json!({"argv": ["/bin/sleep", "5"]})).await;
     assert_eq!(
         c.err(
-            "set_size",
+            "resize",
             json!({"session": session.id, "cols": 0, "rows": 1})
         )
         .await,
@@ -642,7 +642,7 @@ async fn a_connection_that_stops_reading_is_closed() {
     let session = c.create(json!({"argv": ["/bin/cat"]})).await;
     let label = "x".repeat(200);
     for _ in 0..2000 {
-        c.ok("set_label", json!({"session": session.id, "label": label}))
+        c.ok("label", json!({"session": session.id, "label": label}))
             .await;
     }
     // The idle subscriber reads what the socket buffered, then end of file.
