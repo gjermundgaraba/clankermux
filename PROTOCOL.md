@@ -191,7 +191,9 @@ processed and answered.
     request and the last output.
 
   When several hold at once, the first of `output`, `prompt`, `status`,
-  `exited` and `quiet_ms` wins.
+  `exited` and `quiet_ms` wins. Records do not change once the stream has
+  ended, so a wait on `status` alone there that does not already hold
+  ends only with `timeout_ms` or `cancel`.
   `timeout_ms` (none: no limit) ends the wait with reason `timeout`, a
   result, not an error. Fails with `no_such_session`, also when the
   session is removed while waiting, and with `not_running` when the

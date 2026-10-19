@@ -315,9 +315,13 @@ async fn cancel_ends_a_wait_and_its_reply_comes_last() {
                  "wait": {"until": {"output": {"text": "never"}}}}}),
     )
     .await;
-    // Other requests are served meanwhile.
+    // Other requests are served meanwhile, a send to the same session
+    // too.
     c.list().await;
     c.inspect(&s.id).await;
+    let sent: Sent =
+        serde_json::from_value(c.ok("send", json!({"session": s.id, "text": "z"})).await).unwrap();
+    assert!(sent.wait.is_none());
     for (cancel, target) in [(200, 100), (201, 101)] {
         c.send_json(
             FrameType::Request,

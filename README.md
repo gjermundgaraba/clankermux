@@ -36,7 +36,7 @@ A session argument is resolved in order: the full id; the label, ignoring case; 
 | 4 | The server cannot be reached |
 | 124 | A wait timed out |
 | 130 | A wait was cancelled with Ctrl-C |
-| child's | A wait that ended with the session's exit (`wait --exit`, `create --wait`): its code, or 128 plus the signal's number |
+| child's | A wait that ended with the session's exit (`wait --exit`, `create --wait`): its code, or 128 plus the signal's number; 1 for a `restored` session, which has none |
 
 `send` writes text as typed (`--enter` presses Enter after it), named keys (`--keys ctrl+c up enter`, encoded as the program's modes expect), a paste (`--paste`) or stdin's bytes (`--bytes`). `wait` waits for the session to exit, its output to match a regex, a program status, the next prompt or a quiet spell, with `--timeout`; `send` takes the same flags (`--wait-match` and so on), and its wait starts before the bytes are written. `create --wait` runs a program to its end.
 
