@@ -464,9 +464,10 @@ fn serve(dir: &std::path::Path) -> Child {
         .unwrap()
 }
 
-/// Connects once the server at `dir` answers.
+/// Connects once the server at `dir` answers; a process start can take
+/// seconds on a loaded machine.
 async fn connect_when_up(dir: &std::path::Path) -> Connection {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         match Connection::connect_unix(&dir.join("sock"), hello("test", Some(ghostty_vt::ENGINE)))
             .await

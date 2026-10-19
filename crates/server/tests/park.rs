@@ -97,22 +97,31 @@ async fn a_change_parks_once_quiet_and_while_busy() {
     .await;
     wait_parked_with(&state, &quiet.id, "typed-line").await;
 
-    // Output every 50 ms is never quiet for 200 ms; it parks every
-    // second all the same.
+    // A line every 50 ms is never quiet for 200 ms; it parks every
+    // second all the same. The test writes the lines itself: a loop of
+    // processes would load the machine the other tests share.
     let busy = c
-        .create(json!({"argv": ["/bin/sh", "-c",
-            "i=0; while :; do i=$((i+1)); echo tick-$i; sleep 0.05; done"]}))
+        .create(json!({"argv": ["/bin/sh", "-c", "exec cat"]}))
         .await;
-    let first = wait_parked(&state, &busy.id).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let newest = generations(&state, &busy.id).pop();
-        if newest.as_ref().is_some_and(|n| *n != first) {
+    let mut parked = Vec::new();
+    for tick in 0..200 {
+        c.ok(
+            "write",
+            json!({"session": busy.id, "data": b64(format!("tick-{tick}\n"))}),
+        )
+        .await;
+        if let Some(newest) = generations(&state, &busy.id).pop()
+            && parked.last() != Some(&newest)
+        {
+            parked.push(newest);
+        }
+        if parked.len() == 3 {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "parked once only");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // The first may be the park of its creation; two more came while busy.
+    assert_eq!(parked.len(), 3, "{parked:?}");
     assert_eq!(c.inspect(&busy.id).await.status, Status::Running);
 }
 
@@ -135,7 +144,17 @@ async fn the_last_detach_parks() {
         "no park within the quiet time"
     );
     c.send(FrameType::Close, 1, &[]).await;
-    assert_eq!(c.expect_closed(1).await, ClosedReason::Closed);
+    // The echo matched; cat's own copy of the line may still be on its
+    // way ahead of `CLOSED`.
+    loop {
+        let (header, payload) = c.recv_on(1).await;
+        if header.frame_type == FrameType::Closed {
+            let closed: Closed = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(closed.reason, ClosedReason::Closed);
+            break;
+        }
+        assert_eq!(header.frame_type, FrameType::Output);
+    }
     wait_parked_with(&state, &session.id, "detached-line").await;
 }
 
