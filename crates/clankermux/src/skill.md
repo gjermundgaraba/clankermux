@@ -57,8 +57,15 @@ the human-readable listing.
 Inside a session, leave the session out: `clankermux label building`.
 
 A wait given with `send` starts before the text is written, so it cannot
-miss a quick answer. `--match` sees the output as plain text, without
-colours or other escape sequences. Ctrl-C cancels a wait.
+miss a quick answer; its `--status` counts only a status set after the
+send. `--match` sees the output as plain text, without colours or other
+escape sequences, and that includes the terminal's echo of what you
+typed: match on what only the program prints (`--match 'error|done'`
+also matches the echo of `echo done`). Ctrl-C cancels a wait.
+
+`send` with one argument types it into the session you are in; when that
+argument names a session, it refuses: give both SESSION and TEXT. Outside
+a session, or with `--connect` or `--ssh`, name the session.
 
 ## Exit codes
 

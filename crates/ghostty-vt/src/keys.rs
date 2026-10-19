@@ -42,6 +42,10 @@ pub struct KeyPress {
     pub mods: Mods,
     text: String,
     unshifted: Option<char>,
+    /// Shift made the text (`A`, `?`): consumed, as a keyboard reports
+    /// it, so the kitty protocol sends the text rather than shift and the
+    /// key.
+    shift_consumed: bool,
 }
 
 /// Named keys that produce no text, and their aliases.
@@ -142,6 +146,7 @@ impl KeyPress {
                 mods,
                 text: String::new(),
                 unshifted: None,
+                shift_consumed: false,
             });
         }
         if lower == "space" {
@@ -157,6 +162,7 @@ impl KeyPress {
                 mods,
                 text: String::new(),
                 unshifted: None,
+                shift_consumed: false,
             });
         }
         let mut chars = key.chars();
@@ -194,6 +200,7 @@ impl KeyPress {
             mods,
             text: c.to_string(),
             unshifted: Some(c),
+            shift_consumed: false,
         })
     }
 
@@ -203,6 +210,7 @@ impl KeyPress {
             mods,
             text: text.to_string(),
             unshifted: Some(unshifted),
+            shift_consumed: mods.shift && text != unshifted,
         }
     }
 }
@@ -250,7 +258,12 @@ impl KeyEncoder {
             sys::ghostty_key_event_set_action(self.event, sys::GHOSTTY_KEY_ACTION_PRESS);
             sys::ghostty_key_event_set_key(self.event, key.key);
             sys::ghostty_key_event_set_mods(self.event, key.mods.raw());
-            sys::ghostty_key_event_set_consumed_mods(self.event, 0);
+            let consumed = if key.shift_consumed {
+                sys::GHOSTTY_MODS_SHIFT as sys::GhosttyMods
+            } else {
+                0
+            };
+            sys::ghostty_key_event_set_consumed_mods(self.event, consumed);
             sys::ghostty_key_event_set_composing(self.event, false);
             let text = if key.text.is_empty() {
                 ptr::null()
@@ -302,7 +315,7 @@ impl Drop for KeyEncoder {
 /// spaces, and the whole is bracketed when `bracketed` (mode 2004 is
 /// set), else its newlines become carriage returns. The encoding the
 /// engine gives a paste from a person.
-pub fn encode_paste(data: &[u8], bracketed: bool) -> Vec<u8> {
+pub fn encode_paste(data: &[u8], bracketed: bool) -> Result<Vec<u8>> {
     let mut input = data.to_vec();
     let mut out = vec![0u8; data.len() + 16];
     loop {
@@ -322,15 +335,14 @@ pub fn encode_paste(data: &[u8], bracketed: bool) -> Vec<u8> {
         match check(result) {
             Ok(()) => {
                 out.truncate(written);
-                return out;
+                return Ok(out);
             }
             Err(Error::OutOfSpace) if written > out.len() => {
                 // The input was changed in place; start from a fresh copy.
                 input = data.to_vec();
                 out.resize(written, 0);
             }
-            // Only space can run out.
-            Err(_) => return Vec::new(),
+            Err(err) => return Err(err),
         }
     }
 }

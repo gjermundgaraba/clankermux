@@ -581,10 +581,14 @@ async fn a_session_argument_resolves_by_id_label_and_either_end() {
     let (code, _, err) = run_status(&["--socket", socket, "end", &alpha.id[..3]], &[]).await;
     assert_eq!(code, 3, "{err}");
 
-    // Left out: `$CLANKERMUX_SESSION`, else a usage error.
+    // Left out: `$CLANKERMUX_SESSION` of the server in
+    // `$CLANKERMUX_SOCKET`, else a usage error.
     let (code, out, err) = run_status(
         &["--socket", socket, "--json", "inspect"],
-        &[("CLANKERMUX_SESSION", &alpha.id)],
+        &[
+            ("CLANKERMUX_SESSION", &alpha.id),
+            ("CLANKERMUX_SOCKET", socket),
+        ],
     )
     .await;
     assert_eq!(code, 0, "{err}");
@@ -638,6 +642,49 @@ async fn exit_codes_tell_failure_usage_target_and_server_apart() {
         out.starts_with(&session.id[session.id.len() - 6..]),
         "{out}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_is_checked_first_and_the_session_default_is_its_server_s() {
+    let server = start();
+    let conn = connect(&server).await;
+    let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
+    conn.call::<_, serde_json::Value>("label", json!({"session": session.id, "label": "build"}))
+        .await
+        .unwrap();
+    let socket = server.socket.to_str().unwrap();
+    // Usage before the connection: 2, server or not.
+    let dead = server.dir.path().join("no-server");
+    let dead = dead.to_str().unwrap();
+    for args in [
+        &["resize", "build", "wide"][..],
+        &["wait", "build"],
+        &["send", "build", "--keys", "esc", "nokey"],
+        &["send", "build", "text", "--bytes"],
+    ] {
+        let (code, _, err) = run_status(&[&["--socket", dead], args].concat(), &[]).await;
+        assert_eq!(code, 2, "{args:?}: {err}");
+    }
+    // Inside the session, one argument is TEXT, unless it names a session.
+    let inside = [
+        ("CLANKERMUX_SESSION", session.id.as_str()),
+        ("CLANKERMUX_SOCKET", socket),
+    ];
+    let (code, _, err) = run_status(&["send", "build", "--enter"], &inside).await;
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("names a session"), "{err}");
+    let (code, _, err) = run_status(&["send", "hello", "--enter"], &inside).await;
+    assert_eq!(code, 0, "{err}");
+    // `$CLANKERMUX_SESSION` is not a session of another server.
+    let elsewhere = [
+        ("CLANKERMUX_SESSION", session.id.as_str()),
+        ("CLANKERMUX_SOCKET", dead),
+    ];
+    let (code, _, err) = run_status(&["--socket", socket, "inspect"], &elsewhere).await;
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("not of this one"), "{err}");
+    let (code, _, err) = run_status(&["--socket", socket, "inspect"], &inside).await;
+    assert_eq!(code, 0, "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -14,8 +14,12 @@ use crate::session::{Body, Session, Shared};
 const STATES: [&str; 5] = ["idle", "working", "done", "blocked", "error"];
 
 /// Plain text kept for an output match: older text is dropped half at a
-/// time, so a match longer than half this is not found.
-const MAX_PLAIN: usize = 1024 * 1024;
+/// time.
+const MAX_PLAIN: usize = 256 * 1024;
+
+/// How far before new text a regex is searched: a match is found when it
+/// starts at most this far before the text that completes it.
+const REGEX_REACH: usize = 64 * 1024;
 
 /// What `until.output` looks for.
 enum Needle {
@@ -143,6 +147,8 @@ struct Plain {
     runs: Vec<(usize, u64)>,
     /// The stream offset after the last byte kept.
     next_kept: Option<u64>,
+    /// The stream offset after the last byte pushed.
+    next_seen: Option<u64>,
     /// Where a text needle is searched for next.
     searched: usize,
 }
@@ -154,11 +160,17 @@ impl Plain {
             bytes: Vec::new(),
             runs: Vec::new(),
             next_kept: None,
+            next_seen: None,
             searched: 0,
         }
     }
 
     fn push(&mut self, offset: u64, chunk: &[u8]) {
+        if self.next_seen.is_some_and(|next| next != offset) {
+            // Bytes were lost: whatever sequence was open is gone too.
+            self.vt = Vt::Ground;
+        }
+        self.next_seen = Some(offset + chunk.len() as u64);
         for (i, &b) in chunk.iter().enumerate() {
             let keep = self.step(b);
             if keep {
@@ -170,6 +182,10 @@ impl Plain {
                 self.next_kept = Some(at + 1);
             }
         }
+    }
+
+    /// Drops the older half once over `MAX_PLAIN`.
+    fn trim(&mut self) {
         if self.bytes.len() > MAX_PLAIN {
             self.drop_front(self.bytes.len() - MAX_PLAIN / 2);
         }
@@ -238,8 +254,9 @@ impl Plain {
         offset + (index - start) as u64
     }
 
-    /// The first match from where the last search left off.
-    fn find(&mut self, needle: &Needle) -> Option<(usize, usize)> {
+    /// The first match from where the last search left off; a regex from
+    /// `REGEX_REACH` before `new`, where the text not yet searched starts.
+    fn find(&mut self, needle: &Needle, new: usize) -> Option<(usize, usize)> {
         match needle {
             Needle::Text(text) => {
                 let found = self.bytes[self.searched..]
@@ -249,7 +266,9 @@ impl Plain {
                 self.searched = (self.bytes.len() + 1).saturating_sub(text.len());
                 found
             }
-            Needle::Regex(regex) => regex.find(&self.bytes).map(|m| (m.start(), m.end())),
+            Needle::Regex(regex) => regex
+                .find_at(&self.bytes, new.saturating_sub(REGEX_REACH))
+                .map(|m| (m.start(), m.end())),
         }
     }
 }
@@ -258,6 +277,8 @@ impl Plain {
 pub struct Waiter {
     facts: Facts,
     after: StreamCursor,
+    /// Program status counts the records set after this tick.
+    status_since: u64,
     /// The next stream byte to scan for `output`.
     scanned: u64,
     plain: Plain,
@@ -272,19 +293,61 @@ pub enum Check {
 }
 
 impl Waiter {
+    /// A `wait` from `after`: a fact that already holds there fires.
     pub fn new(facts: Facts, after: StreamCursor) -> Self {
         Waiter {
             facts,
             after,
+            status_since: 0,
             scanned: after.offset,
             plain: Plain::new(),
             started: Instant::now(),
         }
     }
 
-    /// Checks the facts against the session, in stream order: output,
-    /// prompt, program status, the end of the stream, quiet.
-    pub fn check(&mut self, s: &Session) -> Result<Check, Fail> {
+    /// A `send`'s wait, from the session's cursor now: program status
+    /// counts only records set from now on, since one already in a state
+    /// is the previous turn's.
+    pub fn for_send(facts: Facts, s: &Session) -> Self {
+        Waiter {
+            status_since: s.records.tick(),
+            ..Waiter::new(facts, cursor_of(s))
+        }
+    }
+
+    /// Under the session lock: the stream bytes not yet scanned for
+    /// `output`, from where they start. Bytes the ring no longer holds
+    /// are skipped.
+    fn unscanned(&mut self, s: &Session) -> Option<(u64, Vec<u8>)> {
+        self.facts.output.as_ref()?;
+        let Body::Live(live) = &s.body else {
+            return None;
+        };
+        self.scanned = self.scanned.max(live.stream.retained_start());
+        let chunk = live.stream.read(self.scanned, usize::MAX)?;
+        let at = self.scanned;
+        self.scanned += chunk.len() as u64;
+        Some((at, chunk))
+    }
+
+    /// Outside the lock: strips and searches the new bytes.
+    fn scan(&mut self, new: Option<(u64, Vec<u8>)>) -> Option<(usize, usize)> {
+        let needle = self.facts.output.as_ref()?;
+        let before = self.plain.bytes.len();
+        if let Some((at, chunk)) = new {
+            self.plain.push(at, &chunk);
+        }
+        let found = self.plain.find(needle, before);
+        if found.is_none() {
+            self.plain.trim();
+        }
+        found
+    }
+
+    /// Checks the facts against the session, in stream order: output
+    /// (`found` by `scan`), prompt, program status, the end of the stream,
+    /// quiet.
+    fn check(&mut self, s: &Session, found: Option<(usize, usize)>) -> Result<Check, Fail> {
         if s.removed {
             return Err((ErrorCode::NoSuchSession, format!("no session {}", s.id)));
         }
@@ -299,29 +362,20 @@ impl Waiter {
             Body::Live(live) => Some(live),
             Body::Parked(_) => None,
         };
-        if let (Some(needle), Some(live)) = (&self.facts.output, live) {
-            let stream = &live.stream;
-            // Bytes the ring no longer holds were never seen.
-            self.scanned = self.scanned.max(stream.retained_start());
-            if let Some(chunk) = stream.read(self.scanned, usize::MAX) {
-                self.plain.push(self.scanned, &chunk);
-                self.scanned += chunk.len() as u64;
-            }
-            if let Some((start, end)) = self.plain.find(needle) {
-                let offset = self.plain.offset_of(start);
-                let after = if end > start {
-                    self.plain.offset_of(end - 1) + 1
-                } else {
-                    offset
-                };
-                return Ok(Check::Fired(Box::new(Waited {
-                    matched: Some(Match {
-                        text: String::from_utf8_lossy(&self.plain.bytes[start..end]).into_owned(),
-                        offset,
-                    }),
-                    ..fired(WaitReason::Matched, at(s, after))
-                })));
-            }
+        if let Some((start, end)) = found {
+            let offset = self.plain.offset_of(start);
+            let after = if end > start {
+                self.plain.offset_of(end - 1) + 1
+            } else {
+                offset
+            };
+            return Ok(Check::Fired(Box::new(Waited {
+                matched: Some(Match {
+                    text: String::from_utf8_lossy(&self.plain.bytes[start..end]).into_owned(),
+                    offset,
+                }),
+                ..fired(WaitReason::Matched, at(s, after))
+            })));
         }
         if self.facts.prompt
             && let Some(live) = live
@@ -335,7 +389,7 @@ impl Waiter {
         if let Some((states, id)) = &self.facts.status
             && let Some(record) = s
                 .records
-                .resolved()
+                .resolved_since(self.status_since)
                 .into_iter()
                 .find(|r| states.contains(&r.state) && id.as_ref().is_none_or(|id| *id == r.id))
         {
@@ -343,6 +397,14 @@ impl Waiter {
                 record: Some(record),
                 ..fired(WaitReason::Status, cursor_of(s))
             })));
+        }
+        // Output that came after the scan is scanned before anything
+        // later in the stream counts.
+        if self.facts.output.is_some()
+            && let Some(live) = live
+            && self.scanned < live.stream.offset()
+        {
+            return Ok(Check::Pending(Some(Instant::now())));
         }
         let ended = s.exited_at.is_some() || live.is_none();
         if self.facts.exited && ended {
@@ -396,9 +458,11 @@ pub async fn run(
         let notified = wake.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
+        let new = waiter.unscanned(&session.lock().unwrap());
+        let found = waiter.scan(new);
         let next = {
             let s = session.lock().unwrap();
-            match waiter.check(&s)? {
+            match waiter.check(&s, found)? {
                 Check::Fired(waited) => return Ok(*waited),
                 Check::Pending(_) if deadline.is_some_and(|d| Instant::now() >= d) => {
                     return Ok(Waited {
@@ -459,9 +523,9 @@ mod tests {
     fn a_text_needle_is_found_across_chunks_once() {
         let mut p = plain(&[b"xxpi"]);
         let needle = Needle::Text(b"ping".to_vec());
-        assert_eq!(p.find(&needle), None);
+        assert_eq!(p.find(&needle, 0), None);
         p.push(104, b"ng!");
-        assert_eq!(p.find(&needle), Some((2, 6)));
+        assert_eq!(p.find(&needle, 4), Some((2, 6)));
     }
 
     #[test]
@@ -469,6 +533,7 @@ mod tests {
         let mut p = Plain::new();
         p.push(0, &vec![b'a'; MAX_PLAIN]);
         p.push(MAX_PLAIN as u64, b"\x1b[mzz");
+        p.trim();
         assert!(p.bytes.len() <= MAX_PLAIN / 2 + 2);
         let z = p.bytes.len() - 2;
         assert_eq!(p.offset_of(z), MAX_PLAIN as u64 + 3);

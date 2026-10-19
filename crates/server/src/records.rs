@@ -131,12 +131,23 @@ impl Records {
         self.by_id.values().map(|(r, _)| r.clone()).collect()
     }
 
+    /// The tick of the latest report; records set later have a higher one.
+    pub fn tick(&self) -> u64 {
+        self.tick
+    }
+
     /// The records for `inspect`: `app` taken from the nearest ancestor
     /// that has one when a record lacks it.
     pub fn resolved(&self) -> Vec<StatusRecord> {
+        self.resolved_since(0)
+    }
+
+    /// `resolved`, of the records set after `tick`.
+    pub fn resolved_since(&self, tick: u64) -> Vec<StatusRecord> {
         let app_of = |id: &str| self.by_id.get(id).and_then(|(r, _)| r.app.clone());
         self.by_id
             .values()
+            .filter(|(_, set)| *set > tick)
             .map(|(record, _)| {
                 let mut out = record.clone();
                 if out.app.is_none() {

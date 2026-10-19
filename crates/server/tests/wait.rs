@@ -288,13 +288,45 @@ async fn send_with_a_wait_catches_what_the_program_prints_at_once() {
         let waited = sent.wait.clone().unwrap();
         assert_eq!(waited.reason, WaitReason::Matched);
         assert_eq!(waited.matched.unwrap().offset, 0);
-        assert!(sent.at.offset <= waited.at.offset + 2, "{sent:?}");
+        // The cursor when the text was queued, before the echo.
+        assert_eq!(sent.at.offset, 0, "{sent:?}");
     }
     // A plain send replies with its cursor.
     let s = c.create(json!({"argv": ["/bin/cat"]})).await;
     let sent: Sent =
         serde_json::from_value(c.ok("send", json!({"session": s.id, "text": "x"})).await).unwrap();
     assert!(sent.wait.is_none());
+}
+
+#[tokio::test]
+async fn a_send_waits_for_a_status_set_after_it() {
+    let server = start(fast_limits());
+    let mut c = client(&server).await;
+    // `done` from the turn before, then a new turn on each line read.
+    let s = c
+        .create(json!({"argv": ["/bin/sh", "-c",
+            "printf '\\033]7501;state=done:id=a\\033\\\\'; read x; \
+             printf '\\033]7501;state=working:id=b\\033\\\\'; sleep 0.3; \
+             printf '\\033]7501;state=done:id=b\\033\\\\'; exec cat"]}))
+        .await;
+    let w = wait(
+        &mut c,
+        json!({"session": s.id, "until": {"status": {"states": ["done"]}}}),
+    )
+    .await;
+    assert_eq!(w.record.unwrap().id, "a", "a wait takes the record there");
+    let sent: Sent = serde_json::from_value(
+        c.ok(
+            "send",
+            json!({"session": s.id, "text": "go\r",
+                   "wait": {"until": {"status": {"states": ["done"]}}, "timeout_ms": 5000}}),
+        )
+        .await,
+    )
+    .unwrap();
+    let waited = sent.wait.unwrap();
+    assert_eq!(waited.reason, WaitReason::Status);
+    assert_eq!(waited.record.unwrap().id, "b", "a send's, only a later one");
 }
 
 #[tokio::test]

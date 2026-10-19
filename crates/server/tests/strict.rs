@@ -73,6 +73,49 @@ async fn an_unknown_field_in_a_request_is_invalid() {
             "{method}"
         );
     }
+    // The objects inside them, and `wait` and `cancel`.
+    let until = json!({"output": {"text": "x"}, "status": {"states": ["done"]}});
+    let nested = [
+        ("wait", json!({"session": id, "until": until}), &[][..]),
+        (
+            "wait",
+            json!({"session": id, "until": until}),
+            &["until"][..],
+        ),
+        (
+            "wait",
+            json!({"session": id, "until": until}),
+            &["until", "output"][..],
+        ),
+        (
+            "wait",
+            json!({"session": id, "until": until}),
+            &["until", "status"][..],
+        ),
+        (
+            "wait",
+            json!({"session": id, "until": until, "after": {"offset": 0, "marker": 0}}),
+            &["after"][..],
+        ),
+        (
+            "send",
+            json!({"session": id, "text": "x", "wait": {"until": until}}),
+            &["wait"][..],
+        ),
+        (
+            "send",
+            json!({"session": id, "text": "x", "wait": {"until": until}}),
+            &["wait", "until"][..],
+        ),
+        ("cancel", json!({"id": 99}), &[][..]),
+    ];
+    for (method, params, path) in nested {
+        assert_eq!(
+            c.err(method, with_extra(params, path)).await,
+            ErrorCode::InvalidRequest,
+            "{method} {path:?}"
+        );
+    }
     assert_eq!(
         c.err("subscribe", json!({"after": id})).await,
         ErrorCode::InvalidRequest,

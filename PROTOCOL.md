@@ -13,7 +13,9 @@ terminal. The server is the only writer to a PTY.
   `VIEWPORT`, and the objects inside them) holds only the fields this
   document defines, and the server refuses any other with
   `invalid_request`. A payload the server sends may gain fields; a client
-  ignores the ones it does not know.
+  ignores the ones it does not know. That covers fields: a new value of
+  an enumerated field (an error code, a reason, a status) is a protocol
+  change.
 - `base64` fields are standard base64 with padding.
 - Byte sizes are in bytes. `MiB` is 1,048,576 bytes. Durations in JSON
   are integer milliseconds.
@@ -162,11 +164,15 @@ processed and answered.
   spaces, and the whole is bracketed (`ESC [200~` ... `ESC [201~`) when
   the session's terminal has mode 2004 set, else its newlines become
   carriage returns. The bytes are written to the PTY as one unit. The
-  reply, Sent, comes once they are written. With `wait`
-  (`{until, timeout_ms?}`), a wait as `wait` describes it is armed at the
-  session's cursor before the bytes are queued, so it sees everything the
-  program writes in answer, and the reply comes when it ends, carrying
-  its result. Fails with `not_running` unless `status` is `running`, and
+  reply, Sent, comes once they are written; its `at` is the session's
+  cursor when the bytes were queued, so a `wait` with `after: at` misses
+  nothing written in answer. With `wait` (`{until, timeout_ms?}`), a
+  wait as `wait` describes it is armed at that cursor before the bytes
+  are queued, so it sees everything the program writes in answer, and the
+  reply comes when it ends, carrying its result. Its `status` counts only
+  records set after it was armed, not one already in a state. The
+  terminal's echo of what was typed is output too: match on what only
+  the program prints. Fails with `not_running` unless `status` is `running`, and
   with `invalid_request`, writing nothing, for an unknown key (named in
   the message), `keys` with `paste`, or an invalid `wait`. Cancelling a
   `send` stops its wait, not its bytes.
@@ -180,8 +186,11 @@ processed and answered.
     bytes): the stream from `after` on, as plain text: printable
     characters, newlines and tabs, with escape sequences, carriage
     returns and other controls left out, searched from `after.offset` or
-    the oldest retained byte when that is gone. Text more than 512 KiB
-    behind the newest may be dropped from the search;
+    the oldest retained byte when that is gone. Text more than 256 KiB
+    behind the newest may be dropped from the search, and a `regex` match
+    is found when it starts at most 64 KiB before the output that
+    completes it. An `after` inside an escape sequence reads the rest of
+    it as text;
   - `status: {states, record?}`: a program status record, or the record
     with id `record`, is in one of `states` (`idle`, `working`, `done`,
     `blocked`, `error`);
@@ -213,7 +222,7 @@ Sent
 
 | Field  | Type    | Meaning                                                    |
 | ------ | ------- | ---------------------------------------------------------- |
-| `at`   | object  | `{offset, marker}`: the session's cursor once the PTY took the bytes |
+| `at`   | object  | `{offset, marker}`: the session's cursor when the bytes were queued |
 | `wait` | Waited? | With `send.wait`                                           |
 
 Waited
@@ -633,7 +642,8 @@ streams `snapshot.ghostsnp` as a bootstrap with no stream frames after
 
 ## Carriers
 
-Frames are carried on any ordered reliable byte stream.
+Frames are carried on any ordered reliable byte stream. The server always
+listens on its Unix socket; the other carriers are added to it.
 
 | Carrier     | Rule                                                                                                              |
 | ----------- | ----------------------------------------------------------------------------------------------------------------- |

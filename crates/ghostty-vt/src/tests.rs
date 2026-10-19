@@ -398,6 +398,11 @@ mod keys {
         term.vt_write(b"\x1b[>1u");
         assert_eq!(press(&term, "ctrl+c"), b"\x1b[99;5u");
         assert_eq!(press(&term, "esc"), b"\x1b[27u");
+        // Text that shift made goes as text.
+        assert_eq!(press(&term, "A"), b"A");
+        assert_eq!(press(&term, "?"), b"?");
+        assert_eq!(press(&term, "shift+1"), b"!");
+        assert_eq!(press(&term, "shift+tab"), b"\x1b[9;2u");
         term.vt_write(b"\x1b[<u");
         assert_eq!(press(&term, "esc"), b"\x1b");
     }
@@ -441,9 +446,12 @@ mod keys {
 
     #[test]
     fn a_paste_is_bracketed_only_in_mode_2004_and_never_escapes() {
-        assert_eq!(encode_paste(b"a\nb", false), b"a\rb");
-        assert_eq!(encode_paste(b"a\nb", true), b"\x1b[200~a\nb\x1b[201~");
-        let injected = encode_paste(b"x\x1b[201~y", true);
+        assert_eq!(encode_paste(b"a\nb", false).unwrap(), b"a\rb");
+        assert_eq!(
+            encode_paste(b"a\nb", true).unwrap(),
+            b"\x1b[200~a\nb\x1b[201~"
+        );
+        let injected = encode_paste(b"x\x1b[201~y", true).unwrap();
         assert_eq!(
             injected.iter().filter(|&&b| b == 0x1b).count(),
             2,

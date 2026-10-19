@@ -381,12 +381,26 @@ fn matching<'a>(sessions: &'a [Session], needle: &str) -> Vec<&'a Session> {
         .unwrap_or_default()
 }
 
-/// A session argument as an id; omitted, `$CLANKERMUX_SESSION`. None or
+/// The session a command runs inside, when it talks to that session's
+/// server.
+fn here_session(here: bool) -> Option<String> {
+    std::env::var(SESSION_ENV)
+        .ok()
+        .filter(|v| here && !v.is_empty())
+}
+
+/// A session argument as an id; omitted, `$CLANKERMUX_SESSION` when `here`
+/// (the command talks to the server in `$CLANKERMUX_SOCKET`). None or
 /// several matches fail, listing the candidates.
-async fn resolve(conn: &Connection, needle: Option<String>) -> Result<String, Fail> {
-    let needle = match needle.or_else(|| std::env::var(SESSION_ENV).ok().filter(|v| !v.is_empty()))
-    {
+async fn resolve(conn: &Connection, here: bool, needle: Option<String>) -> Result<String, Fail> {
+    let needle = match needle.or_else(|| here_session(here)) {
         Some(needle) => needle,
+        None if std::env::var_os(SESSION_ENV).is_some_and(|v| !v.is_empty()) => {
+            return Err(Fail::Client(Error::Usage(format!(
+                "a session is needed: ${SESSION_ENV} is a session of the server in \
+                 ${SOCKET_ENV}, not of this one"
+            ))));
+        }
         None => {
             return Err(Fail::Client(Error::Usage(format!(
                 "a session is needed: name one, or run inside a session (${SESSION_ENV})"
@@ -536,8 +550,8 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
         || matches!(ws_bind, Some(WsBind::Port(_)))
         || (ws_bind.is_some() && tls_files.is_none());
     let tailnet = if needs_tailnet {
-        let api =
-            server::tailscale::LocalApi::discover().map_err(|e| Error::Usage(e.to_string()))?;
+        let api = server::tailscale::LocalApi::discover()
+            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
         let status = api.status().await?;
         Some((api, status))
     } else {
@@ -551,7 +565,7 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
             .iter()
             .find(|ip| ip.is_ipv4())
             .or(status.this.tailscale_ips.first())
-            .ok_or_else(|| Error::Usage("this node has no tailnet address".into()))?;
+            .ok_or_else(|| Error::Io(std::io::Error::other("this node has no tailnet address")))?;
         Ok::<SocketAddr, Error>(SocketAddr::new(*ip, port))
     };
     let mut tcp_listener = None;
@@ -569,9 +583,9 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
             None => {
                 let (api, status) = tailnet.as_ref().expect("needed, so requested");
                 let domain = status.cert_domains.first().cloned().ok_or_else(|| {
-                    Error::Usage(
-                        "this node has no certificate domain; pass --tls-cert and --tls-key".into(),
-                    )
+                    Error::Io(std::io::Error::other(
+                        "this node has no certificate domain; pass --tls-cert and --tls-key",
+                    ))
                 })?;
                 server::tls::Source::Tailscale {
                     api: api.clone(),
@@ -741,9 +755,11 @@ async fn send_chunks(
     wait: Option<SendWait>,
 ) -> Result<Option<(i64, client::connection::Reply)>, Error> {
     let limits = &conn.welcome.limits;
+    // A paste's brackets add 12 bytes.
+    let bracket = if paste { 12 } else { 0 };
     let budget = (limits.control_body as usize)
         .saturating_sub(1024)
-        .min(limits.input_queue as usize)
+        .min((limits.input_queue as usize).saturating_sub(bracket))
         .max(1);
     let mut requests = Vec::new();
     for chunk in chunks {
@@ -801,9 +817,14 @@ async fn finish_wait(
         outcome = &mut finished => Ok(outcome?),
         _ = tokio::signal::ctrl_c() => {
             let _ = conn.request("cancel", CancelParams { id }).await;
-            // The cancelled request's error comes first.
-            let _ = finished.await;
-            Err(Fail::Interrupted)
+            // The cancelled request's error comes first; a wait that had
+            // already ended keeps its result.
+            match finished.await {
+                Err(Error::Server(e)) if e.code == proto::ErrorCode::Cancelled => {
+                    Err(Fail::Interrupted)
+                }
+                outcome => Ok(outcome?),
+            }
         }
     }
 }
@@ -852,13 +873,77 @@ fn report_wait(json: bool, reply: &serde_json::Value, waited: &Waited) -> i32 {
     wait_status(waited)
 }
 
-/// A `wait` request, Ctrl-C cancelling it.
-async fn wait_for(conn: &Connection, json: bool, params: WaitParams) -> Result<i32, Fail> {
+/// A `wait` request, Ctrl-C cancelling it: the reply and its result.
+async fn wait_request(
+    conn: &Connection,
+    params: WaitParams,
+) -> Result<(serde_json::Value, Waited), Fail> {
     let (id, reply) = conn.begin("wait", params)?;
     let reply = finish_wait(conn, id, reply).await?;
     let waited: Waited = serde_json::from_value(reply.clone())
         .map_err(|e| Error::Protocol(format!("wait reply: {e}")))?;
-    Ok(report_wait(json, &reply, &waited))
+    Ok((reply, waited))
+}
+
+/// Whether `text` names a session by its full id or its label, the forms
+/// a person would mean as a session.
+async fn names_session(conn: &Connection, text: &str) -> Result<bool, Error> {
+    let lower = text.to_lowercase();
+    Ok(all_sessions(conn)
+        .await?
+        .iter()
+        .any(|s| s.id == text || s.label.to_lowercase() == lower))
+}
+
+/// Checks a command's arguments before connecting, so a usage error is
+/// one whatever the server's state.
+fn check_args(command: &Command) -> Result<(), Error> {
+    match command {
+        Command::Create {
+            env, detach_key, ..
+        } => {
+            parse_detach_key(detach_key)?;
+            parse_env(env)?;
+        }
+        Command::Attach { detach_key, .. } => {
+            parse_detach_key(detach_key)?;
+        }
+        Command::Resize { args } => {
+            parse_size(args.last().expect("clap requires one"))?;
+        }
+        Command::Send {
+            args,
+            enter,
+            keys,
+            bytes,
+            wait,
+            ..
+        } => {
+            wait.until()?;
+            if let Some(key) = keys
+                .iter()
+                .find(|k| ghostty_vt::keys::KeyPress::parse(k).is_none())
+            {
+                return Err(Error::Usage(format!("unknown key {key:?}")));
+            }
+            let payload = !keys.is_empty() || *bytes;
+            if payload && args.len() > 1 {
+                return Err(Error::Usage("--keys and --bytes take no TEXT".into()));
+            }
+            if !payload && args.is_empty() && !enter {
+                return Err(Error::Usage(
+                    "send takes TEXT, --enter, --keys or --bytes".into(),
+                ));
+            }
+        }
+        Command::Wait { wait, .. } if wait.until()?.is_none() => {
+            return Err(Error::Usage(
+                "wait for something: --exit, --match, --status, --prompt or --quiet".into(),
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn run(cli: Cli) -> Result<i32, Fail> {
@@ -904,6 +989,12 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
     let Some(command) = command else {
         return relay(socket).await;
     };
+    check_args(&command)?;
+    // `$CLANKERMUX_SESSION` names a session of the server in
+    // `$CLANKERMUX_SOCKET`, and of no other.
+    let here = cli.connect.is_none()
+        && cli.ssh.is_none()
+        && std::env::var_os(SOCKET_ENV).is_some_and(|env| env == socket.as_os_str());
     let endpoint = match (cli.connect, cli.ssh) {
         (Some(addr), _) => Endpoint::Tcp(addr),
         (None, Some(destination)) => Endpoint::Ssh(destination),
@@ -957,11 +1048,10 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             if wait {
                 // From the first byte, so an exit before this request
                 // still counts.
-                return wait_for(
+                let (reply, waited) = wait_request(
                     &conn,
-                    json,
                     WaitParams {
-                        session: created.id,
+                        session: created.id.clone(),
                         until: Until {
                             exited: Some(true),
                             ..Default::default()
@@ -973,7 +1063,17 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                         timeout_ms: timeout.map(|t| t.as_millis() as u64),
                     },
                 )
-                .await;
+                .await?;
+                if json {
+                    let both = serde_json::json!({"session": created, "wait": reply});
+                    emit(&format!(
+                        "{}\n",
+                        serde_json::to_string_pretty(&both).unwrap()
+                    ));
+                } else {
+                    emit(&wait_line(&waited));
+                }
+                return Ok(wait_status(&waited));
             }
             print(json, &created, |s| emit(&format!("{}\n", s.id)));
         }
@@ -984,7 +1084,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             });
         }
         Command::Inspect { session } => {
-            let session = resolve(&conn, session).await?;
+            let session = resolve(&conn, here, session).await?;
             let value = conn.request("inspect", SessionParams { session }).await?;
             emit(&format!(
                 "{}\n",
@@ -997,7 +1097,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             detach_key,
         } => {
             let detach_key = parse_detach_key(&detach_key)?;
-            let session = resolve(&conn, session).await?;
+            let session = resolve(&conn, here, session).await?;
             let code = attach::run(
                 attach::Options {
                     endpoint,
@@ -1011,23 +1111,23 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             return Ok(status_of(code));
         }
         Command::End { session } => {
-            let session = resolve(&conn, session).await?;
+            let session = resolve(&conn, here, session).await?;
             conn.request("end", SessionParams { session }).await?;
         }
         Command::Signal { args } => {
             let (session, mut rest) = target_and(args, 1);
-            let session = resolve(&conn, session).await?;
+            let session = resolve(&conn, here, session).await?;
             let signal = rest.remove(0);
             conn.request("signal", SignalParams { session, signal })
                 .await?;
         }
         Command::Remove { session } => {
-            let session = resolve(&conn, session).await?;
+            let session = resolve(&conn, here, session).await?;
             conn.request("remove", SessionParams { session }).await?;
         }
         Command::Label { args } => {
             let (session, mut rest) = target_and(args, 1);
-            let session = resolve(&conn, session).await?;
+            let session = resolve(&conn, here, session).await?;
             let label = rest.remove(0);
             let updated: Session = conn.call("label", LabelParams { session, label }).await?;
             print(json, &updated, |_| {});
@@ -1035,7 +1135,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
         Command::Resize { args } => {
             let (session, rest) = target_and(args, 1);
             let (cols, rows) = parse_size(&rest[0])?;
-            let session = resolve(&conn, session).await?;
+            let session = resolve(&conn, here, session).await?;
             conn.request(
                 "resize",
                 ResizeParams {
@@ -1050,7 +1150,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             session,
             scrollback,
         } => {
-            let session = resolve(&conn, session).await?;
+            let session = resolve(&conn, here, session).await?;
             let read: Read = conn
                 .call(
                     "read",
@@ -1076,6 +1176,15 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             if payload && !rest.is_empty() {
                 return Err(Error::Usage("--keys and --bytes take no TEXT".into()).into());
             }
+            // `send build --enter` means the session `build`, not the text.
+            if let (None, [text]) = (&session, rest.as_slice())
+                && names_session(&conn, text).await?
+            {
+                return Err(Error::Usage(format!(
+                    "{text:?} names a session: give SESSION and TEXT, or --keys enter"
+                ))
+                .into());
+            }
             let mut chunks = match rest.into_iter().next() {
                 _ if bytes => {
                     let mut data = Vec::new();
@@ -1098,7 +1207,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                     _ => chunks.push(Chunk::Keys(vec!["enter".into()])),
                 }
             }
-            let session = resolve(&conn, session).await?;
+            let session = resolve(&conn, here, session).await?;
             let wait = until.map(|until| SendWait {
                 until,
                 timeout_ms: wait.timeout_ms(),
@@ -1120,10 +1229,9 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                 )
                 .into());
             };
-            let session = resolve(&conn, session).await?;
-            return wait_for(
+            let session = resolve(&conn, here, session).await?;
+            let (reply, waited) = wait_request(
                 &conn,
-                json,
                 WaitParams {
                     session,
                     until,
@@ -1131,7 +1239,8 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                     timeout_ms: wait.timeout_ms(),
                 },
             )
-            .await;
+            .await?;
+            return Ok(report_wait(json, &reply, &waited));
         }
         Command::Events => {
             let mut events = conn.events();

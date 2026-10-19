@@ -21,15 +21,41 @@ use crate::{pty, session};
 /// A connection's requests that answer later and can be cancelled (a
 /// `wait`, or a `send` carrying one), by id, with what stops each. The
 /// lock is held while the answer is queued, so a `cancel` and the answer
-/// cannot cross: whoever removes the id answers it.
-pub type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<()>>>>;
+/// cannot cross: whoever removes the entry answers it.
+pub type Pending = Arc<Mutex<PendingMap>>;
 
-/// Answers pending request `id` with `outcome`, unless a `cancel` (or the
-/// connection's end) took it first.
-fn finish(pending: &Pending, writer: &Writer, id: i64, outcome: Result<Value, Fail>) {
+#[derive(Default)]
+pub struct PendingMap {
+    /// Per id: the serial of the request that holds it, and its stop.
+    by_id: HashMap<i64, (u64, oneshot::Sender<()>)>,
+    serial: u64,
+}
+
+impl PendingMap {
+    /// Drops every entry, which stops their waits.
+    pub fn clear(&mut self) {
+        self.by_id.clear();
+    }
+}
+
+/// One pending request's claim on its id.
+struct Claim {
+    id: i64,
+    serial: u64,
+}
+
+/// Answers the pending request `claim` with `outcome`, unless a `cancel`
+/// (or the connection's end) took it first; a later request that reused
+/// the id after a cancel is not this one.
+fn finish(pending: &Pending, writer: &Writer, claim: Claim, outcome: Result<Value, Fail>) {
     let mut pending = pending.lock().unwrap();
-    if pending.remove(&id).is_some() {
-        reply(writer, id, outcome);
+    if pending
+        .by_id
+        .get(&claim.id)
+        .is_some_and(|(serial, _)| *serial == claim.serial)
+    {
+        pending.by_id.remove(&claim.id);
+        reply(writer, claim.id, outcome);
     }
 }
 
@@ -44,21 +70,25 @@ fn spawn_wait(
     timeout: Option<Duration>,
     answer: impl FnOnce(proto::Waited) -> Value + Send + 'static,
 ) {
-    let stop = register(pending, id);
+    let (claim, stop) = register(pending, id);
     let (pending, writer) = (pending.clone(), writer.clone());
     tokio::spawn(async move {
         let outcome = tokio::select! {
-            outcome = wait::run(&session, waiter, timeout) => outcome,
+            biased;
             _ = stop => return,
+            outcome = wait::run(&session, waiter, timeout) => outcome,
         };
-        finish(&pending, &writer, id, outcome.map(answer));
+        finish(&pending, &writer, claim, outcome.map(answer));
     });
 }
 
-fn register(pending: &Pending, id: i64) -> oneshot::Receiver<()> {
+fn register(pending: &Pending, id: i64) -> (Claim, oneshot::Receiver<()>) {
     let (stop_tx, stop) = oneshot::channel();
-    pending.lock().unwrap().insert(id, stop_tx);
-    stop
+    let mut pending = pending.lock().unwrap();
+    pending.serial += 1;
+    let serial = pending.serial;
+    pending.by_id.insert(id, (serial, stop_tx));
+    (Claim { id, serial }, stop)
 }
 
 /// JSON overhead allowed around `read`'s text within `max_frame`.
@@ -125,7 +155,7 @@ pub fn dispatch(
             Ok(p) => {
                 // The cancelled request's last frame comes first.
                 let mut pending = pending.lock().unwrap();
-                let stop = pending.remove(&p.id);
+                let stop = pending.by_id.remove(&p.id);
                 if let Some(stop) = &stop {
                     let _ = stop;
                     reply(
@@ -212,7 +242,7 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
         let live = s.running()?;
         let bytes = match payload {
             Payload::Bytes(bytes) if p.paste => {
-                encode_paste(&bytes, live.term.mode(2004).unwrap_or(false))
+                encode_paste(&bytes, live.term.mode(2004).unwrap_or(false)).map_err(internal)?
             }
             Payload::Bytes(bytes) => bytes,
             Payload::Keys(keys) => {
@@ -224,9 +254,12 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
                 bytes
             }
         };
+        // Where the bytes are accepted: the reply's `at`, and where a
+        // wait is armed.
+        let at = wait::cursor_of(&s);
         let armed = facts.map(|(facts, timeout)| {
             (
-                Waiter::new(facts, wait::cursor_of(&s)),
+                Waiter::for_send(facts, &s),
                 timeout.map(Duration::from_millis),
             )
         });
@@ -237,7 +270,7 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
             .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?;
         s.touch();
         // Pending from here, so a cancel that follows finds it.
-        let stop = armed.as_ref().map(|_| register(pending, id));
+        let claim = armed.as_ref().map(|_| register(pending, id));
         let previous = s.send_chain.take();
         let (registry, writer, pending) = (registry.clone(), writer.clone(), pending.clone());
         let shared = session.clone();
@@ -247,14 +280,13 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
             }
             if written.await.is_err() {
                 let fail = internal("the PTY refused the bytes");
-                match stop {
-                    Some(_) => finish(&pending, &writer, id, Err(fail)),
+                match claim {
+                    Some((claim, _)) => finish(&pending, &writer, claim, Err(fail)),
                     None => reply(&writer, id, Err(fail)),
                 }
                 return;
             }
-            let at = wait::cursor_of(&shared.lock().unwrap());
-            let (Some((waiter, timeout)), Some(stop)) = (armed, stop) else {
+            let (Some((waiter, timeout)), Some((claim, stop))) = (armed, claim) else {
                 reply(&writer, id, Ok(json!(Sent { at, wait: None })));
                 return;
             };
@@ -262,8 +294,9 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
             drop(registry);
             tokio::spawn(async move {
                 let outcome = tokio::select! {
-                    outcome = wait::run(&shared, waiter, timeout) => outcome,
+                    biased;
                     _ = stop => return,
+                    outcome = wait::run(&shared, waiter, timeout) => outcome,
                 };
                 let outcome = outcome.map(|waited| {
                     json!(Sent {
@@ -271,7 +304,7 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
                         wait: Some(waited)
                     })
                 });
-                finish(&pending, &writer, id, outcome);
+                finish(&pending, &writer, claim, outcome);
             });
         }));
         Ok(())
