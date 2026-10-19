@@ -908,7 +908,7 @@ impl Session {
 
     /// Takes attachment `id` off the list: under `latest` it no longer
     /// owns the size; under `smallest` the size follows those left.
-    pub fn detach(&mut self, id: u64) {
+    pub fn remove_attachment(&mut self, id: u64) {
         self.attached.retain(|a| a.id != id);
         if self.size_owner == Some(id) {
             self.size_owner = None;
@@ -1150,6 +1150,14 @@ pub fn truncate(mut text: String, max: usize) -> String {
         text.truncate(end);
     }
     text
+}
+
+/// `text` with control characters replaced by `?`: safe to print on a
+/// terminal, and at most two bytes a byte as JSON.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 pub fn now() -> String {

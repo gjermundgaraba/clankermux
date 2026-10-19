@@ -50,6 +50,14 @@ fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
+/// `session.json`, with `attachments` as the count, always 0, that
+/// servers before the list wrote: one rolled back to still loads it.
+fn session_json(file: &ParkFile) -> serde_json::Result<Vec<u8>> {
+    let mut value = serde_json::to_value(file)?;
+    value["session"]["attachments"] = 0.into();
+    serde_json::to_vec(&value)
+}
+
 /// Writes one generation for `file.session.id` under `sessions`: into a
 /// dot-directory first, each file and the directory synced, then renamed
 /// to `generation`; older generations are deleted after.
@@ -70,7 +78,7 @@ pub fn write(
     let _ = fs::remove_dir_all(&temp);
     fs::DirBuilder::new().mode(0o700).create(&temp)?;
     let result = (|| {
-        write_file(&temp.join(FILES[0]), &serde_json::to_vec(file)?)?;
+        write_file(&temp.join(FILES[0]), &session_json(file)?)?;
         write_file(&temp.join(FILES[1]), snapshot)?;
         write_file(&temp.join(FILES[2]), screen.as_bytes())?;
         sync_dir(&temp)?;
@@ -165,18 +173,21 @@ fn load_session(session_dir: &Path) -> io::Result<Option<Loaded>> {
     Ok(chosen)
 }
 
-fn read_generation(dir: &Path) -> io::Result<Loaded> {
+/// Reads a `session.json` as `session_json` wrote it.
+fn read_session_json(path: &Path) -> io::Result<ParkFile> {
     let invalid = |e| io::Error::new(io::ErrorKind::InvalidData, e);
-    let mut raw: serde_json::Value =
-        serde_json::from_slice(&fs::read(dir.join(FILES[0]))?).map_err(invalid)?;
-    // Parks from 0.3.0 and before count the attachments, always 0, where
-    // the list is now.
+    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(path)?).map_err(invalid)?;
+    // A park counts the attachments, always 0, where `inspect` lists them.
     if let Some(attachments) = raw.pointer_mut("/session/attachments")
         && attachments.is_number()
     {
         *attachments = serde_json::Value::Array(Vec::new());
     }
-    let file: ParkFile = serde_json::from_value(raw).map_err(invalid)?;
+    serde_json::from_value(raw).map_err(invalid)
+}
+
+fn read_generation(dir: &Path) -> io::Result<Loaded> {
+    let file = read_session_json(&dir.join(FILES[0]))?;
     if file.protocol != PROTOCOL {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -197,12 +208,11 @@ pub fn rewrite_records(snapshot: &Path, records: Vec<proto::StatusRecord>) -> io
         .parent()
         .ok_or_else(|| io::Error::other("no generation directory"))?;
     let path = dir.join(FILES[0]);
-    let mut file: ParkFile = serde_json::from_slice(&fs::read(&path)?)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut file = read_session_json(&path)?;
     file.session.program_status = Some(records);
     let temp = dir.join(format!(".{}", FILES[0]));
     let _ = fs::remove_file(&temp);
-    write_file(&temp, &serde_json::to_vec(&file)?)?;
+    write_file(&temp, &session_json(&file)?)?;
     fs::rename(&temp, &path)?;
     sync_dir(dir)
 }

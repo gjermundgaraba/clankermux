@@ -17,7 +17,7 @@ use crate::connection::{Writer, reply};
 use crate::pty;
 use crate::read;
 use crate::registry::{Fail, Registry, internal};
-use crate::session::{Shared, Source};
+use crate::session::{self, Shared, Source};
 use crate::wait::{self, Facts, Waiter};
 
 /// A connection's requests that answer later and can be cancelled (a
@@ -431,7 +431,7 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
             if let Some(close) = attachment.close.upgrade() {
                 let _ = close.send(Ending::Closed(Closed {
                     reason: ClosedReason::Detached,
-                    message: p.reason,
+                    message: p.reason.as_deref().map(session::printable),
                 }));
             }
             Ok(json!({}))

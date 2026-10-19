@@ -608,6 +608,9 @@ async fn seen_survives_park_and_restore() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    // Still readable by a server that counts attachments.
+    let json = std::fs::read_to_string(generation.join("session.json")).unwrap();
+    assert!(json.contains("\"attachments\":0"), "{json}");
     drop(c);
     b.registry.stop().await;
     drop(b);

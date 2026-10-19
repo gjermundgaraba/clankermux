@@ -710,11 +710,13 @@ undelivered frames for it.
 ### CLOSE and CLOSED
 
 `CLOSED` is `{reason, message?}`. `CLOSE` detaches. The server answers
-`CLOSED {reason: "closed"}`; the client may reuse the channel after that.
+`CLOSED {reason: "closed"}`, unless another ending reached the attachment
+first; the client may reuse the channel after that.
 The server sends `CLOSED {reason}` on its own when the session is removed
 (`removed`), the server stops (`stopping`), or a `detach` request, from
 any connection, ends the attachment (`detached`, with the request's
-`reason` as `message` when it gave one). A client does not attach again
+`reason` as `message` when it gave one, control characters replaced by
+`?`). A client does not attach again
 by itself after `detached`. An attachment is finished when it has received the final
 marker and, if bootstrapping, `SNAPSHOT_END`. An explicit `remove` sends
 `CLOSED removed` to finished attachments at once and to the rest after
@@ -755,7 +757,9 @@ with it; `owner` is not.
 The server coalesces `VIEWPORT` reports arriving within 25 ms, then
 applies the policy, resizes its terminal, sets the PTY size, emits a mode
 2048 report if enabled, and appends `RESIZED` to the stream when the size
-changed. A report applied at once discards pending coalesced reports.
+changed. A report applied at once discards pending coalesced reports. A
+coalesced report whose attachment closed meanwhile still sets the size
+under `latest`, with no `owner`.
 Resize requests from the program (CSI 8 t) are ignored. `session_changed`
 follows when the size, `owner` or a recorded viewport changed.
 
@@ -827,7 +831,7 @@ the park time as Unix epoch milliseconds, mode 0700, files 0600:
 
 | File                | Contents                                                     |
 | ------------------- | ------------------------------------------------------------ |
-| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines, commands}`: the `inspect` object (`attachments: 0`, no `pid`, `program_status` as reported with no inherited `app`, with `seen`, oldest report first; no `attention`), how many leading lines of `screen.txt` are history, and the commands kept (see Commands) |
+| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines, commands}`: the `inspect` object (`attachments: 0`, as servers before the list wrote it, `size` without `owner`, no `pid`, `program_status` as reported with no inherited `app`, with `seen`, oldest report first; no `attention`), how many leading lines of `screen.txt` are history, and the commands kept (see Commands) |
 | `snapshot.ghostsnp` | The snapshot bytes                                           |
 | `screen.txt`        | The `read` text with all retained history, at `parked_at`   |
 
@@ -870,9 +874,8 @@ directory's name is skipped with a warning.
 
 On start, each session directory becomes a session: `status` is `exited`
 if `session.json` says so, `restored` otherwise, with the size policy it
-recorded. A `session.json` whose `attachments` is a number, as servers
-before this list wrote it, loads as an empty list, and one without `size`
-as `latest`. `read` serves
+recorded. One without `size`, as servers before the policy wrote it,
+loads as `latest`. `read` serves
 `screen.txt` for `text` of `screen` and `history`, with `scrollback`
 taken from its history lines, and decodes `snapshot.ghostsnp` for the
 rest. Stream bytes are not parked: `tail` and `last_command` have none. `OPEN`
@@ -948,6 +951,7 @@ an attachment channel it ends the attachment, except `read_only`,
 | `invalid_request`  | Malformed payload, a field the protocol does not define, unknown method, a resume marker above the session's latest, a `subscribe` `after` above the latest event, `read` with `scrollback` and a scope other than `screen`, or `tail` from past the stream's end or with `max_bytes` 0 |
 | `limit_exceeded`   | `label`, `text` or `attachments` exceeded, or a snapshot failed |
 | `no_such_session`  |                                                           |
+| `no_such_attachment` | `detach` named no open attachment of the session        |
 | `not_running`      | `status` is not `running`, or the stream has ended; for a wait, nothing matched before the stream ended |
 | `running`          | `remove` on a running session                             |
 | `signal_failed`    | `end` or `signal` found no process to signal              |
@@ -959,7 +963,6 @@ an attachment channel it ends the attachment, except `read_only`,
 | `cancelled`        | A `cancel` ended the request                              |
 | `scope_unavailable`| `read` of `alternate` off the alternate screen, or of `last_command` with no command output marked |
 | `internal`         |                                                           |
-| `no_such_attachment` | `detach` named no open attachment of the session        |
 
 ## Not in version 1
 

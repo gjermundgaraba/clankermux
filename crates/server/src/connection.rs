@@ -499,18 +499,12 @@ impl Connection {
             );
             return;
         }
-        let client = match &self.hello {
-            Some(hello) => proto::Peer {
-                name: hello.client.name.clone(),
-                version: hello.client.version.clone(),
-            },
-            None => return,
-        };
+        let hello = self.hello.as_ref().expect("OPEN follows HELLO");
         match attach::open(
             &self.registry,
             &self.writer,
             channel,
-            &client,
+            &hello.client,
             open,
             session,
         ) {

@@ -129,15 +129,26 @@ async fn the_list_follows_open_input_viewport_and_close() {
         ("two", true, None)
     );
 
-    // Input sets `last_input` without an event.
+    // Input sets `last_input` without an event: the next one is the
+    // label's.
     one.send(FrameType::Input, 1, b"x").await;
     inspect_until(&mut ctl, &session.id, |s| {
         s.attachments[0].last_input.is_some()
     })
     .await;
+    ctl.ok("label", json!({"session": session.id, "label": "after"}))
+        .await;
+    loop {
+        match ctl.event().await {
+            Event::SessionChanged { session: s } if s.id == session.id => {
+                assert_eq!(s.label, "after", "input sent no session_changed");
+                break;
+            }
+            _ => {}
+        }
+    }
 
-    // A viewport report that changes nothing but the recorded viewport
-    // still changes the list.
+    // A viewport report changes the list and the size.
     one.send_json(FrameType::Viewport, 1, &json!({"cols": 40, "rows": 10}))
         .await;
     let reported = changed_until(&mut ctl, &session.id, |s| {
@@ -277,12 +288,14 @@ async fn each_policy_with_two_attachments() {
         .await;
     inspect_until(&mut ctl, id, |s| size_of(s) == (60, 20)).await;
 
-    // fixed: reports are recorded, not applied; `resize` applies.
+    // fixed: reports are recorded, not applied, and the list's change
+    // alone is announced; `resize` applies.
     ctl.ok("resize", json!({"session": id, "policy": "fixed"}))
         .await;
+    ctl.ok("subscribe", json!({})).await;
     a.send_json(FrameType::Viewport, 1, &json!({"cols": 70, "rows": 25}))
         .await;
-    let s = inspect_until(&mut ctl, id, |s| {
+    let s = changed_until(&mut ctl, id, |s| {
         s.attachments[0].viewport == viewport(70, 25)
     })
     .await;
@@ -328,18 +341,53 @@ async fn each_policy_with_two_attachments() {
 async fn the_policy_is_parked_and_restored() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let mut a = start_with(fast_limits(), state.clone());
+    // Parked soon after a change, so the policy reaches the disk without
+    // a stop.
+    let timing = server::ParkTiming {
+        interval: Duration::from_secs(300),
+        quiet: Duration::from_millis(50),
+        gap: Duration::from_millis(50),
+        busy: Duration::from_millis(200),
+    };
+    let mut a = Server::start_with_park(fast_limits(), state.clone(), timing);
     let mut c = client(&a).await;
     let session = c.create(json!({"argv": ["/bin/cat"]})).await;
-    c.open(
-        1,
-        json!({"session": session.id, "viewport": {"cols": 30, "rows": 6}}),
-    )
-    .await;
-    c.bootstrap(1).await;
+    let parked = |state: &std::path::Path| {
+        let dir = state.join("sessions").join(&session.id);
+        let newest = std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<u64>().ok())
+            .max()?;
+        let json = std::fs::read(
+            state
+                .join("sessions")
+                .join(&session.id)
+                .join(newest.to_string())
+                .join("session.json"),
+        )
+        .ok()?;
+        let file: Value = serde_json::from_slice(&json).ok()?;
+        Some(file["session"]["size"]["policy"].clone())
+    };
+    // The creation's park first, so that the policy's is its own.
+    for _ in 0..500 {
+        if parked(&state) == Some(json!("latest")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(parked(&state), Some(json!("latest")), "parked at creation");
     c.ok("resize", json!({"session": session.id, "policy": "fixed"}))
         .await;
-    a.registry.stop().await;
+    for _ in 0..500 {
+        if parked(&state) == Some(json!("fixed")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(parked(&state), Some(json!("fixed")), "parked by the change");
+    // Killed, not stopped: nothing parks on the way out.
     a.shutdown();
     drop(c);
     drop(a);

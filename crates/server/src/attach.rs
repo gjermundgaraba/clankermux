@@ -5,15 +5,17 @@ use std::sync::{Arc, Weak};
 
 use ghostty_vt::snapshot;
 use proto::{
-    AttachMode, Attached, Closed, ClosedReason, ErrorCode, Event, Exited, FrameType, Gap, Open,
-    Peer, Resized, Resume, Status, Viewport, encode_frame, encode_json_frame, encode_output,
+    AttachMode, Attached, ClientPeer, Closed, ClosedReason, ErrorCode, Event, Exited, FrameType,
+    Gap, Open, Peer, Resized, Resume, Status, Viewport, encode_frame, encode_json_frame,
+    encode_output,
 };
 use tokio::sync::mpsc;
 
 use crate::connection::{Writer, error_frame};
 use crate::registry::{Fail, Registry};
 use crate::session::{
-    Attachment, Body, SNAPSHOT_RETRY, Session, Shared, Source, now, snapshot_with_retry, truncate,
+    Attachment, Body, SNAPSHOT_RETRY, Session, Shared, Source, now, printable, snapshot_with_retry,
+    truncate,
 };
 use crate::stream::MarkerKind;
 
@@ -92,7 +94,7 @@ pub fn open(
     registry: &Arc<Registry>,
     writer: &Writer,
     channel: u32,
-    client: &Peer,
+    client: &ClientPeer,
     open: Open,
     session: Shared,
 ) -> Result<Handle, Fail> {
@@ -178,15 +180,10 @@ pub fn open(
     })
 }
 
-/// The first `CLIENT_TEXT` bytes of a client's `HELLO` text, control
-/// characters replaced by `?`, so that the attachments list stays small
-/// within `inspect`.
+/// The first `CLIENT_TEXT` bytes of a client's `HELLO` text, printable,
+/// so that the attachments list stays small within `inspect`.
 fn client_text(text: &str) -> String {
-    let text = text
-        .chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect();
-    truncate(text, CLIENT_TEXT)
+    truncate(printable(text), CLIENT_TEXT)
 }
 
 #[derive(Clone, Copy)]
@@ -237,7 +234,7 @@ impl Task {
         // it finds the channel free and the attachment gone.
         let (events, snapshot, last) = {
             let mut s = self.session.lock().unwrap();
-            s.detach(self.id);
+            s.remove_attachment(self.id);
             self.ended.store(true, Ordering::Release);
             let last = s.attached.is_empty() && s.status() == Status::Running;
             (s.take_events(), s.to_proto(false), last)
