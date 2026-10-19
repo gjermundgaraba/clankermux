@@ -35,6 +35,8 @@ A session argument is resolved in order: the full id; the label, ignoring case; 
 | 3 | The session argument named no session, or several |
 | 4 | The server cannot be reached |
 
+`clankermux skill show` (or `--skill`) prints a guide for agents: what a session is, the variables above, each command with an example, the exit codes, and the rules for sessions an agent did not create.
+
 ## Parks
 
 `serve` writes each running session's screen, scrollback and state under `$XDG_STATE_HOME/clankermux/sessions/` (PROTOCOL.md, "Persisted state"):

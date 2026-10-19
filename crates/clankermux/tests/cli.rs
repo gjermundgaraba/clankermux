@@ -686,3 +686,20 @@ async fn a_command_inside_a_session_reaches_its_server_and_session() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+#[tokio::test]
+async fn the_guide_is_printed_without_a_server() {
+    let dead = tempfile::tempdir().unwrap();
+    let socket = dead.path().join("sock");
+    let (code, shown, _) = run_status(
+        &["--socket", socket.to_str().unwrap(), "skill", "show"],
+        &[],
+    )
+    .await;
+    assert_eq!(code, 0);
+    let (code, flag, _) = run_status(&["--skill"], &[]).await;
+    assert_eq!((code, &flag), (0, &shown));
+    for needle in ["CLANKERMUX_SESSION", "CLANKERMUX_SOCKET", "--json", "| 3 |"] {
+        assert!(shown.contains(needle), "{needle}");
+    }
+}

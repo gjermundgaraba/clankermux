@@ -54,6 +54,9 @@ struct Cli {
     /// Relay between stdio and the Unix socket, for `ssh`.
     #[arg(long, conflicts_with_all = ["connect", "ssh", "json"])]
     stdio: bool,
+    /// Print the guide for agents, as `skill show` does.
+    #[arg(long, conflicts_with = "stdio")]
+    skill: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -160,7 +163,22 @@ enum Command {
     },
     /// Print session events as JSON lines until interrupted.
     Events,
+    /// The guide for agents.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
 }
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Print it: what a session is, the commands, the exit codes, the
+    /// rules.
+    Show,
+}
+
+/// The guide `skill show` prints, built into the binary so it matches it.
+const SKILL: &str = include_str!("skill.md");
 
 /// Why the CLI failed, by exit code: a client error (1, or 2 for a
 /// usage error), a session argument that names no session or several (3),
@@ -600,6 +618,17 @@ async fn send_bytes(conn: &Connection, session: &str, data: &[u8]) -> Result<(),
 
 async fn run(cli: Cli) -> Result<i32, Fail> {
     let json = cli.json;
+    if cli.skill
+        || matches!(
+            cli.command,
+            Some(Command::Skill {
+                command: SkillCommand::Show
+            })
+        )
+    {
+        emit(SKILL);
+        return Ok(0);
+    }
     let command = match (cli.stdio, cli.command) {
         (true, None) => None,
         (true, Some(_)) => return Err(Error::Usage("--stdio takes no command".into()).into()),
@@ -642,7 +671,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
         other => other.into(),
     })?;
     match command {
-        Command::Serve(_) => unreachable!(),
+        Command::Serve(_) | Command::Skill { .. } => unreachable!(),
         Command::Create {
             label,
             cwd,
