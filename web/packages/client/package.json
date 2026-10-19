@@ -24,7 +24,8 @@
   },
   "dependencies": {
     "@clankermux/engine": "workspace:*",
-    "@clankermux/proto": "workspace:*"
+    "@clankermux/proto": "workspace:*",
+    "@clankermux/renderer": "workspace:*"
   },
   "devDependencies": {
     "ws": "^8.18.0",

@@ -187,9 +187,6 @@ importers:
       '@clankermux/proto':
         specifier: workspace:*
         version: link:../../packages/proto
-      '@clankermux/renderer':
-        specifier: workspace:*
-        version: link:../../packages/renderer
     devDependencies:
       esbuild:
         specifier: ^0.28.0
@@ -203,6 +200,9 @@ importers:
       '@clankermux/proto':
         specifier: workspace:*
         version: link:../proto
+      '@clankermux/renderer':
+        specifier: workspace:*
+        version: link:../renderer
     devDependencies:
       '@types/ws':
         specifier: ^8.18.0
