@@ -577,9 +577,10 @@ async fn queries_are_answered_from_the_latest_profile_and_cell_size() {
         &json!({"cols": 81, "rows": 24, "cell_width": 9, "cell_height": 18}),
     )
     .await;
-    c.send_json(FrameType::Viewport, 1, &json!({"cols": 80, "rows": 24}))
+    c.send_json(FrameType::Viewport, 1, &json!({"cols": 82, "rows": 24}))
         .await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // Both reports have applied once the later size has.
+    while c.expect_resized(1).await.cols != 82 {}
     c.send(FrameType::Input, 1, b"\x1b[16t").await;
     c.output_until(1, b"\x1b[6;18;9t").await;
 
@@ -588,7 +589,7 @@ async fn queries_are_answered_from_the_latest_profile_and_cell_size() {
         .send_json(
             FrameType::Viewport,
             7,
-            &json!({"cols": 80, "rows": 24, "profile": {"bg": "#000000"}}),
+            &json!({"cols": 82, "rows": 24, "profile": {"bg": "#000000"}}),
         )
         .await;
     c.output_until(1, b"\x1b[?997;1n").await;
