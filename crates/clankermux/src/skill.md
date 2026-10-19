@@ -33,10 +33,19 @@ the human-readable listing.
     clankermux --json list                   # the same as JSON
     clankermux create --label build -- make  # start a session; prints its id
     clankermux create --keep -- ./test.sh    # keep it listed after it exits
+    clankermux create --wait -- make test    # run it, wait, exit with its status
     clankermux inspect build                 # one session as JSON, with program status
     clankermux read build --scrollback 200   # its screen, with 200 history lines before it
     clankermux send build 'make test' --enter   # type text, then Enter
+    clankermux send build --keys ctrl+c         # keys by name: enter, tab, esc, up, f5, shift+tab, alt+x
+    clankermux send build --paste "$(cat notes.txt)"  # a paste, as if pasted by a person
     clankermux send build --bytes < input.bin   # send stdin's bytes as they are
+    clankermux send build 'make' --enter --wait-match 'error|done' --timeout 5m
+                                             # send, then wait for what it prints
+    clankermux wait build --exit             # wait for it to exit
+    clankermux wait build --prompt           # wait for the shell's next prompt (OSC 133)
+    clankermux wait build --status done,error   # wait for a program status (OSC 7501)
+    clankermux wait build --quiet 2000       # wait until it prints nothing for 2 s
     clankermux label build release           # set the label
     clankermux resize build 120x40           # set the size (or 120x, x40)
     clankermux signal build INT              # send a signal by name
@@ -47,6 +56,10 @@ the human-readable listing.
 
 Inside a session, leave the session out: `clankermux label building`.
 
+A wait given with `send` starts before the text is written, so it cannot
+miss a quick answer. `--match` sees the output as plain text, without
+colours or other escape sequences. Ctrl-C cancels a wait.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -56,6 +69,12 @@ Inside a session, leave the session out: `clankermux label building`.
 | 2 | Usage: bad arguments, or no session named outside a session |
 | 3 | The session argument named no session, or several |
 | 4 | The server cannot be reached |
+| 124 | A wait timed out |
+| 130 | A wait was cancelled with Ctrl-C |
+
+A wait that ends because the session exited (`--exit`, `create --wait`)
+exits with the program's status instead: its exit code, or 128 plus the
+signal's number.
 
 ## Rules
 
