@@ -5,5 +5,6 @@ export type { ErrorKind, Transport } from "./connection.ts";
 export { Osc52Scanner } from "./osc52.ts";
 export type { ClipboardWrite } from "./osc52.ts";
 export { mountTerminal } from "./mount.ts";
-export type { Colors, MountOptions, MountedTerminal } from "./mount.ts";
-export type { Scheme, Session } from "../proto/index.ts";
+export type { Colors, CreateOptions, MountOptions, MountedTerminal } from "./mount.ts";
+export type { Link, LinkEnd } from "./worker.ts";
+export type { ErrorCode, Exit, OnExit, Scheme, Session } from "../proto/index.ts";

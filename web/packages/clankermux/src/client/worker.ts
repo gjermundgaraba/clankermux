@@ -6,10 +6,13 @@
  */
 import { ENGINE, Engine, type Frame, KeyEncoder, type KeyInput, RenderState, type Terminal } from "../engine/index.ts";
 import {
+  type CreateParams,
+  type ErrorCode,
   type ErrorMessage,
   type Event,
   type Exit,
   FrameType,
+  type OnExit,
   type Page,
   type Profile,
   type Session,
@@ -17,14 +20,63 @@ import {
 } from "../proto/index.ts";
 
 import { type Action, Attachment } from "./attachment.ts";
-import { ClientError, Connection, type Transport, hello } from "./connection.ts";
+import { ClientError, Connection, type ErrorKind, type Transport, hello } from "./connection.ts";
 import { Osc52Scanner } from "./osc52.ts";
+
+/** Why the link to the session ended. `closed`: the connection closed
+ * (not a `CLOSED` frame, which the worker does not wait for when it
+ * detaches); `removed` and `stopping`: the server's `CLOSED`; `exited`:
+ * the session's program exited; `no_such_session` and `engine_mismatch`:
+ * an `OPEN` refused; `error`: any other error, the server's or the
+ * client's own. */
+export type LinkEnd =
+  | "closed"
+  | "removed"
+  | "stopping"
+  | "exited"
+  | "no_such_session"
+  | "engine_mismatch"
+  | "error";
+
+/** The page's link to its session, through the connection and the
+ * attachment. */
+export type Link =
+  /** Opening a connection; `attempt` counts from 1 and starts again once
+   * a server answers. */
+  | { state: "connecting"; attempt: number }
+  /** Connected, and showing `session` as `ATTACHED` described it (its
+   * `status` may be `restored` or `exited`), or attached to none. */
+  | { state: "connected"; session: Session | undefined }
+  /** The link ended. `code` and `message` are the error's, when there is
+   * one; `exit` is the program's, for `exited`. `retry`: the worker
+   * reconnects or attaches again by itself, so `connecting` or
+   * `connected` follows; otherwise nothing does until the page attaches
+   * or creates. */
+  | {
+      state: "ended";
+      reason: LinkEnd;
+      code?: ErrorCode;
+      message?: string;
+      exit?: Exit;
+      retry: boolean;
+    };
+
+/** A failed request, as it crosses to the page. */
+export interface Failure {
+  /** Absent for a request that needs a session when none is attached. */
+  kind?: ErrorKind;
+  message: string;
+  server?: ErrorMessage;
+}
 
 /** Messages from the page to the worker. */
 export type ToWorker =
   | { type: "init"; wasm: string; url: string; viewport: Size; profile: Profile; session: string | undefined }
   | { type: "attach"; session: string }
-  | { type: "create" }
+  /** Each request is answered by a `done` with its `id`. */
+  | { type: "create"; id: number; onExit?: OnExit }
+  | { type: "end"; id: number }
+  | { type: "remove"; id: number }
   | { type: "key"; input: KeyInput }
   | { type: "paste"; text: string }
   | { type: "viewport"; size: Size; profile: Profile }
@@ -34,6 +86,8 @@ export type ToWorker =
 /** Messages from the worker to the page. */
 export type ToPage =
   | { type: "status"; text: string }
+  | { type: "link"; link: Link }
+  | { type: "done"; id: number; session?: Session; error?: Failure }
   | { type: "frame"; frame: Frame }
   | { type: "sessions"; sessions: Session[]; current: string | undefined }
   | { type: "clipboard"; text: string };
@@ -106,6 +160,22 @@ class Client {
   /** Shared by reconnects and re-attaches after a failure; reset by a screen. */
   private backoff = BACKOFF_MIN_MS;
   private reopenTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Connection attempts since a server last answered. */
+  private attempt = 0;
+
+  private link(link: Link): void {
+    this.post({ type: "link", link });
+  }
+
+  /** The link ended with `error`: the server's, else the client's own. */
+  private endedWith(err: unknown, retry: boolean): void {
+    const server = err instanceof ClientError ? err.server : undefined;
+    this.link(
+      server
+        ? { state: "ended", reason: linkEnd(server.code), code: server.code, message: server.message, retry }
+        : { state: "ended", reason: "error", message: err instanceof Error ? err.message : String(err), retry },
+    );
+  }
 
   private delay(): number {
     const delay = this.backoff;
@@ -119,8 +189,14 @@ class Client {
     this.profile = message.profile;
     this.session = message.session;
     this.post({ type: "status", text: "loading engine" });
-    const wasm = await (await fetch(message.wasm)).arrayBuffer();
-    this.engine = await Engine.load(wasm);
+    try {
+      const wasm = await (await fetch(message.wasm)).arrayBuffer();
+      this.engine = await Engine.load(wasm);
+    } catch (err) {
+      this.post({ type: "status", text: `cannot load the engine: ${err}` });
+      this.endedWith(err, false);
+      return;
+    }
     this.render = new RenderState(this.engine);
     this.keys = new KeyEncoder(this.engine);
     await this.connect();
@@ -128,6 +204,7 @@ class Client {
 
   private async connect(): Promise<void> {
     this.post({ type: "status", text: this.attachment ? "reconnecting" : "connecting" });
+    this.link({ state: "connecting", attempt: ++this.attempt });
     let conn: Connection;
     try {
       conn = await Connection.connect(await SocketTransport.connect(this.url), hello("clankermux-web", ENGINE));
@@ -135,18 +212,22 @@ class Client {
       // A server that answers and refuses is not retried; a lost one is.
       if (err instanceof ClientError && (err.kind === "server" || err.kind === "protocol")) {
         this.post({ type: "status", text: err.message });
+        this.endedWith(err, false);
         return;
       }
       setTimeout(() => void this.connect(), this.delay());
       return;
     }
+    this.attempt = 0;
     this.conn = conn;
     conn.onEnd = (err) => {
       if (this.conn !== conn) return;
       this.conn = undefined;
       if (err.kind === "server") {
         this.post({ type: "status", text: err.message });
+        this.endedWith(err, false);
       } else {
+        this.link({ state: "ended", reason: "closed", retry: true });
         setTimeout(() => void this.connect(), this.delay());
       }
     };
@@ -163,11 +244,17 @@ class Client {
       }
     } catch (err) {
       this.post({ type: "status", text: String(err) });
+      // A lost connection is reported through onEnd, which ran first.
+      if (this.conn === conn) this.endedWith(err, false);
       return;
     }
     this.postSessions();
-    if (this.session !== undefined) this.open();
-    else this.post({ type: "status", text: "no session" });
+    if (this.session !== undefined) {
+      this.open();
+    } else {
+      this.post({ type: "status", text: "no session" });
+      this.link({ state: "connected", session: undefined });
+    }
   }
 
   private event(event: Event): void {
@@ -212,17 +299,31 @@ class Client {
           // A lost place in the stream: CLOSE and OPEN again, afresh. Any
           // other fault would only repeat.
           this.post({ type: "status", text: String(err) });
-          if (err instanceof ClientError && err.kind === "desync") this.reopen();
+          const desync = err instanceof ClientError && err.kind === "desync";
+          this.endedWith(err, desync);
+          if (desync) this.reopen();
           else this.giveUp();
           return;
         }
         if (frame.header.type === FrameType.Attached && actions.length === 0) {
           this.post({ type: "status", text: "attached" });
+          // Resumed: the terminal shows the stream already. A snapshot's
+          // screen comes later, as an action.
+          if (attachment.resume()) this.attached(attachment.session);
         }
         for (const action of actions) this.apply(action);
       });
     } catch (err) {
       this.post({ type: "status", text: String(err) });
+    }
+  }
+
+  /** The screen of `session` is shown: `connected`, and at once `ended
+   * exited` when its program has exited already. */
+  private attached(session: Session | undefined): void {
+    this.link({ state: "connected", session });
+    if (session?.status === "exited") {
+      this.link({ state: "ended", reason: "exited", ...(session.exit && { exit: session.exit }), retry: false });
     }
   }
 
@@ -257,6 +358,7 @@ class Client {
               ? `exited: ${describe(session.exit)}`
               : "attached";
         this.post({ type: "status", text });
+        this.attached(session);
         break;
       }
       case "output":
@@ -273,6 +375,7 @@ class Client {
       case "exited":
         this.paint();
         this.post({ type: "status", text: `exited: ${describe(action.exit)}` });
+        this.link({ state: "ended", reason: "exited", exit: action.exit, retry: false });
         break;
       case "gap":
         this.clipboard.reset();
@@ -280,17 +383,24 @@ class Client {
         break;
       case "closed":
         this.post({ type: "status", text: `closed: ${action.reason}` });
+        // `stopping` is followed by the connection's close, and the
+        // reconnect attaches again; a removed session is gone for good.
+        this.link({ state: "ended", reason: action.reason, retry: action.reason === "stopping" });
+        if (action.reason === "removed") this.giveUp();
         break;
-      case "error":
+      case "error": {
         this.post({ type: "status", text: `${action.error.code}: ${action.error.message}` });
         // An error ended the attachment: attach again after a backoff
         // (`too_slow`, a snapshot that could not be taken), unless a new
         // OPEN would fail the same way.
-        if (this.attachment?.closed()) {
-          if (PERMANENT.has(action.error.code)) this.giveUp();
-          else this.reopen();
-        }
+        if (!this.attachment?.closed()) break;
+        const { code, message } = action.error;
+        const retry = !PERMANENT.has(code);
+        this.link({ state: "ended", reason: linkEnd(code), code, message, retry });
+        if (retry) this.reopen();
+        else this.giveUp();
         break;
+      }
     }
   }
 
@@ -356,15 +466,48 @@ class Client {
     this.open();
   }
 
-  async create(): Promise<void> {
+  /** Creates a session at the current size and attaches it; `on_exit`
+   * only when given, so the server's default holds otherwise. */
+  async create(id: number, onExit: OnExit | undefined): Promise<void> {
     const conn = this.conn;
-    if (!conn) return;
+    if (!conn) return this.fail(id, new ClientError("closed", "not connected"));
+    const params: CreateParams = { cols: this.viewport.cols, rows: this.viewport.rows };
+    if (onExit !== undefined) params.on_exit = onExit;
+    let session: Session;
     try {
-      const session = await conn.call<Session>("create", { cols: this.viewport.cols, rows: this.viewport.rows });
-      this.attach(session.id);
+      session = await conn.call<Session>("create", params);
     } catch (err) {
       this.post({ type: "status", text: String(err) });
+      return this.fail(id, err);
     }
+    this.attach(session.id);
+    this.post({ type: "done", id, session });
+  }
+
+  /** `end` (SIGHUP) or `remove` for the session attached or being
+   * attached. `not_running` from `end` is success: there is nothing left
+   * to end. */
+  async request(id: number, method: "end" | "remove"): Promise<void> {
+    const conn = this.conn;
+    const session = this.session;
+    if (!conn) return this.fail(id, new ClientError("closed", "not connected"));
+    if (session === undefined) return this.fail(id, new Error("no session is attached"));
+    try {
+      await conn.call(method, { session });
+    } catch (err) {
+      if (!(method === "end" && err instanceof ClientError && err.server?.code === "not_running")) {
+        return this.fail(id, err);
+      }
+    }
+    this.post({ type: "done", id });
+  }
+
+  private fail(id: number, err: unknown): void {
+    const error: Failure =
+      err instanceof ClientError
+        ? { kind: err.kind, message: err.message, ...(err.server && { server: err.server }) }
+        : { message: err instanceof Error ? err.message : String(err) };
+    this.post({ type: "done", id, error });
   }
 
   /** Input for the session, dropped unless attached on a live connection.
@@ -428,6 +571,11 @@ class Client {
   }
 }
 
+/** The reason an error code ends the link with. */
+function linkEnd(code: ErrorCode): LinkEnd {
+  return code === "no_such_session" || code === "engine_mismatch" ? code : "error";
+}
+
 function describe(exit: Exit): string {
   return "code" in exit ? `code ${exit.code}` : `signal ${exit.signal}`;
 }
@@ -446,7 +594,11 @@ export function runWorker(port: WorkerPort): void {
         client.attach(message.session);
         break;
       case "create":
-        void client.create();
+        void client.create(message.id, message.onExit);
+        break;
+      case "end":
+      case "remove":
+        void client.request(message.id, message.type);
         break;
       case "key":
         client.key(message.input);

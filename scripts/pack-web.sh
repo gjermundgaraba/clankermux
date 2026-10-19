@@ -28,7 +28,7 @@ files=$(tar tzf "$tarball")
 for want in package.json $(jq -r '.publishConfig.exports[] | if type == "string" then . else .[] end | ltrimstr("./")' "$dir/package.json"); do
     grep -qx "package/$want" <<< "$files" || { echo "$tarball lacks $want" >&2; exit 1; }
 done
-extra=$(grep -v -e '^package/package\.json$' -e '^package/dist/' -e '^package/ghostty-vt\.wasm$' <<< "$files" || true)
+extra=$(grep -v -e '^package/package\.json$' -e '^package/README\.md$' -e '^package/dist/' -e '^package/ghostty-vt\.wasm$' <<< "$files" || true)
 [ -z "$extra" ] || { echo "$tarball holds files outside dist: $extra" >&2; exit 1; }
 if tar xzOf "$tarball" package/package.json | grep -q 'workspace:\|src/'; then
     echo "$tarball's package.json still names the workspace" >&2

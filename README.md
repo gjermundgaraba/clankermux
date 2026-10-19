@@ -50,7 +50,7 @@ The last line, or the package's settings on npmjs.com, names this repository and
 
 ## The web package
 
-`@gjermundgaraba/clankermux` exports the page mount at `.` (`mountTerminal` and its types), the worker at `./worker` (`runWorker`, with no DOM types), the engine build at `./ghostty-vt.wasm`, and `./proto`, `./engine` and `./renderer` beneath them.
+`@gjermundgaraba/clankermux` exports the page mount at `.` (`mountTerminal` and its types), the worker at `./worker` (`runWorker`, with no DOM types), the engine build at `./ghostty-vt.wasm`, and `./proto`, `./engine` and `./renderer` beneath them. Its [README](web/packages/clankermux/README.md) describes the mounted terminal's methods (`create`, `end`, `remove`, ...) and the link changes `onLink` reports.
 
 ```ts
 // worker.ts, started as a module worker

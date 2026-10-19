@@ -1,11 +1,12 @@
 /** The page side of a terminal: canvas, keyboard, paste and resize, with
  * the engine in a worker running `runWorker`. */
-import type { Scheme, Session, Size } from "../proto/index.ts";
+import type { OnExit, Scheme, Session, Size } from "../proto/index.ts";
 import { CanvasRenderer, type Metrics } from "../renderer/index.ts";
 
+import { ClientError } from "./connection.ts";
 import { type Keyboard, browserKeeps, keyInput } from "./keyboard.ts";
 import { profileFrom } from "./profile.ts";
-import type { ToPage, ToWorker } from "./worker.ts";
+import type { Failure, Link, ToPage, ToWorker } from "./worker.ts";
 
 /** The terminal's default colours as CSS colours (hex or `rgb()`). */
 export interface Colors {
@@ -35,20 +36,38 @@ export interface MountOptions {
   /** The colour scheme reported to the session; the page's preferred
    * scheme by default. */
   scheme?: () => Scheme;
+  /** A line of text for each change, for display. */
   onStatus?: (text: string) => void;
+  /** Each change of the link to the session, to switch on. */
+  onLink?: (link: Link) => void;
   onSessions?: (sessions: Session[], current: string | undefined) => void;
+}
+
+export interface CreateOptions {
+  /** `keep`: the session stays listed as `exited` when its program
+   * exits; `remove`: it is removed `limits.remove_grace` after. The
+   * server's default (`remove`) when absent. */
+  onExit?: OnExit;
 }
 
 export interface MountedTerminal {
   /** Detaches the current session and attaches `session`. */
   attach(session: string): void;
-  /** Creates a session at the current size and attaches it. */
-  create(): void;
+  /** Creates a session at the current size and attaches it; resolves
+   * with it as created. */
+  create(options?: CreateOptions): Promise<Session>;
+  /** Hangs up the attached session's processes (SIGHUP); its exit
+   * follows as a link `ended` with reason `exited`. Resolves too when the
+   * session is not running (`exited` or `restored`). */
+  end(): Promise<void>;
+  /** Removes the attached session, which must be `exited` or `restored`
+   * (else `running`); the link ends with `removed`. */
+  remove(): Promise<void>;
   /** Reports the container's size, the colours and the scheme again. */
   report(): void;
   paste(text: string): void;
   /** Removes the listeners and terminates the worker, which ends its
-   * connection. */
+   * connection; requests in flight reject. */
   dispose(): void;
 }
 
@@ -118,12 +137,37 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
 
   const send = (message: ToWorker) => worker.postMessage(message);
 
+  /** Requests waiting for their `done`, by id. They reject with a
+   * `ClientError` for a server's refusal or a lost connection, or an
+   * `Error` when no session is attached. */
+  const pending = new Map<number, { resolve: (session: Session | undefined) => void; reject: (err: Error) => void }>();
+  let nextId = 1;
+  function request(message: (id: number) => ToWorker): Promise<Session | undefined> {
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      send(message(id));
+    });
+  }
+  const failure = (error: Failure): Error =>
+    error.kind ? new ClientError(error.kind, error.message, error.server) : new Error(error.message);
+
   worker.onmessage = (e: MessageEvent<ToPage>) => {
     const message = e.data;
     switch (message.type) {
       case "status":
         options.onStatus?.(message.text);
         break;
+      case "link":
+        options.onLink?.(message.link);
+        break;
+      case "done": {
+        const waiter = pending.get(message.id);
+        pending.delete(message.id);
+        if (message.error) waiter?.reject(failure(message.error));
+        else waiter?.resolve(message.session);
+        break;
+      }
       case "frame":
         fitCanvas(message.frame.cols, message.frame.rows);
         if (fullNext && !message.frame.full) {
@@ -195,7 +239,12 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
 
   return {
     attach: (session) => send({ type: "attach", session }),
-    create: () => send({ type: "create" }),
+    create: async (create) => {
+      const session = await request((id) => ({ type: "create", id, ...(create?.onExit && { onExit: create.onExit }) }));
+      return session!;
+    },
+    end: async () => void (await request((id) => ({ type: "end", id }))),
+    remove: async () => void (await request((id) => ({ type: "remove", id }))),
     report,
     paste: (text) => send({ type: "paste", text }),
     dispose: () => {
@@ -203,6 +252,8 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
       resizes.disconnect();
       worker.onmessage = null;
       worker.terminate();
+      for (const waiter of pending.values()) waiter.reject(new ClientError("closed", "disposed"));
+      pending.clear();
     },
   };
 }

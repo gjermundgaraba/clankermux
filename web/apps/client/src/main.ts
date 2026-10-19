@@ -1,11 +1,14 @@
 /** The page: the session bar around a mounted terminal. */
-import { type Session, mountTerminal } from "@gjermundgaraba/clankermux";
+import { type Link, type Session, mountTerminal } from "@gjermundgaraba/clankermux";
 
 const canvas = document.getElementById("screen") as HTMLCanvasElement;
 const container = document.getElementById("terminal") as HTMLElement;
 const sessionsSelect = document.getElementById("sessions") as HTMLSelectElement;
 const newButton = document.getElementById("new") as HTMLButtonElement;
+const endButton = document.getElementById("end") as HTMLButtonElement;
+const removeButton = document.getElementById("remove") as HTMLButtonElement;
 const status = document.getElementById("status") as HTMLElement;
+const linkText = document.getElementById("link") as HTMLElement;
 
 const params = new URLSearchParams(location.search);
 // The server's default WebSocket port on the host the page came from;
@@ -28,8 +31,24 @@ const terminal = mountTerminal({
     cursor: style.getPropertyValue("--cursor"),
   }),
   onStatus: (text) => (status.textContent = text),
+  onLink: (link) => (linkText.textContent = describeLink(link)),
   onSessions: showSessions,
 });
+
+/** The link in a few words, so the page shows what a consumer would
+ * switch on. */
+function describeLink(link: Link): string {
+  switch (link.state) {
+    case "connecting":
+      return `connecting (${link.attempt})`;
+    case "connected":
+      return link.session ? `connected, ${link.session.status}` : "connected, no session";
+    case "ended":
+      return `ended: ${link.reason}${link.code ? ` (${link.code})` : ""}${link.retry ? ", retrying" : ""}`;
+  }
+}
+
+const failed = (err: unknown) => (status.textContent = String(err));
 
 function showSessions(sessions: Session[], current: string | undefined): void {
   sessionsSelect.replaceChildren(
@@ -49,7 +68,9 @@ sessionsSelect.onchange = () => {
   }
 };
 newButton.onclick = () => {
-  terminal.create();
+  terminal.create().catch(failed);
   canvas.focus();
 };
+endButton.onclick = () => terminal.end().catch(failed);
+removeButton.onclick = () => terminal.remove().catch(failed);
 canvas.focus();

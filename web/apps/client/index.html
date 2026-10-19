@@ -49,6 +49,9 @@
         margin-left: auto;
         opacity: 0.8;
       }
+      #link {
+        opacity: 0.6;
+      }
       #terminal {
         flex: 1;
         min-height: 0;
@@ -66,7 +69,10 @@
     <div id="bar">
       <select id="sessions" aria-label="Session"></select>
       <button id="new">New session</button>
+      <button id="end" title="Hang up the session's processes">End</button>
+      <button id="remove" title="Remove an exited or restored session">Remove</button>
       <span id="status">loading</span>
+      <span id="link"></span>
     </div>
     <div id="terminal"><canvas id="screen" tabindex="0"></canvas></div>
     <script type="module" src="./main.js"></script>
