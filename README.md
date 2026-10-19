@@ -48,6 +48,11 @@ npm trust github @gjermundgaraba/clankermux --repo gjermundgaraba/clankermux --f
 
 The last line, or the package's settings on npmjs.com, names this repository and `npm.yml` as its trusted publisher.
 
+### Versions
+
+- **0.1.1**: a running session parks within seconds of a change and when its last attachment closes, so a server killed without a signal restores it as it was; `serve --park-timing` sets the park times for tests. The web package's `create({ onExit })`, `end()`, `remove()` and `onLink`.
+- **0.1.0**: the first release.
+
 ## The web package
 
 `@gjermundgaraba/clankermux` exports the page mount at `.` (`mountTerminal` and its types), the worker at `./worker` (`runWorker`, with no DOM types), the engine build at `./ghostty-vt.wasm`, and `./proto`, `./engine` and `./renderer` beneath them. Its [README](web/packages/clankermux/README.md) describes the mounted terminal's methods (`create`, `end`, `remove`, ...) and the link changes `onLink` reports.
