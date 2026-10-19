@@ -95,3 +95,14 @@ Nothing fires for:
 `reason: "closed"` is the connection's close. The worker detaches without waiting for the server's `CLOSED closed`, so that frame never shows up as a link change.
 
 "The server ended an answered connection with an error, and nothing will reconnect" is `ended` with `reason: "error"` and `retry: false` after a `connected`, with no `connecting` after it. An attached session is the latest `connected` with a `session`.
+
+## Colour scheme
+
+The terminal reports a colour scheme, `light` or `dark`, with its colours; programs read it through the colour scheme query (mode 2031). By default it is the canvas's own:
+
+- the scheme the canvas's computed `color-scheme` names, when it names one of `light` and `dark` (`color-scheme: dark`, `only light`);
+- otherwise (`normal`, `light dark`) the page's `prefers-color-scheme`.
+
+It is reported again when the preference changes, and when an attribute changes on the canvas or an ancestor (a `class`, `style` or `data-*` that pins the page's scheme) and the scheme or the colours differ from the last report. A stylesheet swapped without an attribute change is not noticed; call `report()` after it.
+
+To pin it, set `color-scheme` on the canvas (or an ancestor) in CSS, or pass `scheme: () => "dark"`, or a function of your own; it is read on every report.

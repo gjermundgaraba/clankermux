@@ -5,7 +5,7 @@ import { CanvasRenderer, type Metrics } from "../renderer/index.ts";
 
 import { ClientError } from "./connection.ts";
 import { type Keyboard, browserKeeps, keyInput } from "./keyboard.ts";
-import { profileFrom } from "./profile.ts";
+import { profileFrom, schemeOf } from "./profile.ts";
 import type { Failure, Link, ToPage, ToWorker } from "./worker.ts";
 
 /** The terminal's default colours as CSS colours (hex or `rgb()`). */
@@ -33,8 +33,10 @@ export interface MountOptions {
   font: string;
   /** Read again on every report. */
   colors: () => Colors;
-  /** The colour scheme reported to the session; the page's preferred
-   * scheme by default. */
+  /** The colour scheme reported to the session. By default the canvas's
+   * own: the scheme its computed `color-scheme` names, when it names one
+   * of `light` and `dark`, else the page's preferred scheme. Read again
+   * on every report. */
   scheme?: () => Scheme;
   /** A line of text for each change, for display. */
   onStatus?: (text: string) => void;
@@ -94,7 +96,7 @@ function measure(font: string): Metrics {
 export function mountTerminal(options: MountOptions): MountedTerminal {
   const { worker, canvas, container, colors } = options;
   const light = matchMedia("(prefers-color-scheme: light)");
-  const scheme = options.scheme ?? (() => (light.matches ? "light" : "dark"));
+  const scheme = options.scheme ?? (() => schemeOf(getComputedStyle(canvas).colorScheme, light.matches));
   const metrics = measure(options.font);
   const ctx = canvas.getContext("2d")!;
   const renderer = new CanvasRenderer(ctx, metrics, { cursor: colors().cursor });
@@ -212,10 +214,25 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
   );
   canvas.addEventListener("mousedown", () => canvas.focus(), { signal });
 
-  const report = () => send({ type: "viewport", size: viewport(), profile: profileFrom(colors(), scheme()) });
+  /** The profile last reported, to tell when it changed. */
+  let reported = "";
+  const profile = () => {
+    const current = profileFrom(colors(), scheme());
+    reported = JSON.stringify(current);
+    return current;
+  };
+  const report = () => send({ type: "viewport", size: viewport(), profile: profile() });
   const resizes = new ResizeObserver(report);
   resizes.observe(container);
   light.addEventListener("change", report, { signal });
+  // A page pins its scheme (and its colours with it) with an attribute or
+  // a class on the canvas or an ancestor, which no event announces.
+  const restyles = new MutationObserver(() => {
+    if (JSON.stringify(profileFrom(colors(), scheme())) !== reported) report();
+  });
+  for (let element: Element | null = canvas; element; element = element.parentElement) {
+    restyles.observe(element, { attributes: true });
+  }
   // Zoom or a move to another screen changes the pixel ratio: the canvas
   // is refitted on the next frame; the cell size in pixels is re-reported.
   const watchRatio = () => {
@@ -236,7 +253,7 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
     wasm: new URL(options.wasm, location.href).toString(),
     url: options.url,
     viewport: viewport(),
-    profile: profileFrom(colors(), scheme()),
+    profile: profile(),
     session: options.session,
   });
 
@@ -254,6 +271,7 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
       disposed = true;
       listening.abort();
       resizes.disconnect();
+      restyles.disconnect();
       worker.onmessage = null;
       worker.terminate();
       for (const waiter of pending.values()) waiter.reject(new ClientError("closed", "disposed"));

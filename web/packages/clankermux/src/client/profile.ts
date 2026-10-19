@@ -14,6 +14,17 @@ export function hexColor(value: string): string | undefined {
   return `#${channel(rgb[1]!)}${channel(rgb[2]!)}${channel(rgb[3]!)}`;
 }
 
+/** The scheme of an element whose computed `color-scheme` is
+ * `colorScheme`: the one it names when it names one of `light` and
+ * `dark`, else (`normal`, or both) the page's preference. */
+export function schemeOf(colorScheme: string, prefersLight: boolean): Scheme {
+  const names = colorScheme.split(/\s+/);
+  const light = names.includes("light");
+  const dark = names.includes("dark");
+  if (light !== dark) return light ? "light" : "dark";
+  return prefersLight ? "light" : "dark";
+}
+
 /** The profile a page with these colours and scheme reports. */
 export function profileFrom(colors: { fg: string; bg: string; cursor: string }, scheme: Scheme): Profile {
   const profile: Profile = { scheme };

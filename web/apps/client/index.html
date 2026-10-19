@@ -13,13 +13,25 @@
         --chrome: #1b1e24;
         --font: 14px Menlo, "DejaVu Sans Mono", monospace;
       }
+      /* The scheme menu pins the page with data-scheme; the terminal
+         reports the canvas's color-scheme. */
       @media (prefers-color-scheme: light) {
-        :root {
+        :root:not([data-scheme="dark"]) {
           --fg: #24292e;
           --bg: #ffffff;
           --cursor: #24292e;
           --chrome: #eaeef2;
         }
+      }
+      :root[data-scheme="light"] {
+        color-scheme: light;
+        --fg: #24292e;
+        --bg: #ffffff;
+        --cursor: #24292e;
+        --chrome: #eaeef2;
+      }
+      :root[data-scheme="dark"] {
+        color-scheme: dark;
       }
       html,
       body {
@@ -71,6 +83,11 @@
       <button id="new">New session</button>
       <button id="end" title="Hang up the session's processes">End</button>
       <button id="remove" title="Remove an exited or restored session">Remove</button>
+      <select id="scheme" aria-label="Colour scheme">
+        <option value="">auto</option>
+        <option value="light">light</option>
+        <option value="dark">dark</option>
+      </select>
       <span id="status">loading</span>
       <span id="link"></span>
     </div>

@@ -7,6 +7,7 @@ const sessionsSelect = document.getElementById("sessions") as HTMLSelectElement;
 const newButton = document.getElementById("new") as HTMLButtonElement;
 const endButton = document.getElementById("end") as HTMLButtonElement;
 const removeButton = document.getElementById("remove") as HTMLButtonElement;
+const schemeSelect = document.getElementById("scheme") as HTMLSelectElement;
 const status = document.getElementById("status") as HTMLElement;
 const linkText = document.getElementById("link") as HTMLElement;
 
@@ -73,4 +74,10 @@ newButton.onclick = () => {
 };
 endButton.onclick = () => terminal.end().catch(failed);
 removeButton.onclick = () => terminal.remove().catch(failed);
+// Pins the page's scheme; the terminal notices the attribute and reports
+// the canvas's scheme and colours again.
+schemeSelect.onchange = () => {
+  if (schemeSelect.value) document.documentElement.dataset["scheme"] = schemeSelect.value;
+  else delete document.documentElement.dataset["scheme"];
+};
 canvas.focus();
