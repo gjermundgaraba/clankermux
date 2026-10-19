@@ -54,10 +54,12 @@ the human-readable listing.
     clankermux remove build                  # delete an exited session
     clankermux ack build                     # mark its done and error reports seen
     clankermux events                        # session events as JSON lines, each with its seq
-    clankermux events --after 41             # the events after seq 41, then the live ones
+    clankermux events --after 41 --incarnation ID   # the events after seq 41, then the live ones
     clankermux attach build                  # attach this terminal (people, not agents)
 
 Inside a session, leave the session out: `clankermux label building`.
+`events` names the server's incarnation on stderr; `seq` counts from 1
+again when the server restarts, so keep both to resume.
 
 A wait given with `send` starts before the text is written, so it cannot
 miss a quick answer; its `--status` counts only a status set after the

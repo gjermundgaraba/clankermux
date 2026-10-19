@@ -232,8 +232,9 @@ processed and answered.
   event is replayed, later ones follow as usual, and the client pages
   `list` again for the current state. An `after` above
   `latest` with the server's `incarnation` is `invalid_request`. A
-  connection subscribes once: a later `subscribe` with `{}` returns a
-  page and changes nothing, one with `after` is `invalid_request`.
+  connection subscribes once: a later `subscribe` with `{}` returns
+  Subscribed with the first page and changes nothing, one with `after`
+  is `invalid_request`.
 - `ack` marks `done` and `error` records of the session seen: those
   named by `record_ids`, every one when it is absent. The reply lists the
   records it marked; ids that name no such record, or one already seen,
@@ -317,8 +318,8 @@ reported by the program.
 `EVENT` is `{seq, event, ...}`. `seq` numbers the events of a server
 incarnation from 1, across sessions, in the order every subscriber gets
 them. The server retains the latest `limits.events` events in memory for
-`subscribe {after}`, fewer when they would exceed `limits.max_frame`
-bytes as frames.
+`subscribe {after}`, fewer when they would exceed twice
+`limits.max_frame` bytes as frames.
 
 | Event                    | Fields                             | When                                            |
 | ------------------------ | ---------------------------------- | ----------------------------------------------- |
@@ -670,7 +671,7 @@ the park time as Unix epoch milliseconds, mode 0700, files 0600:
 
 | File                | Contents                                                     |
 | ------------------- | ------------------------------------------------------------ |
-| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines}`: the `inspect` object (`attachments: 0`, no `pid`, `program_status` as reported with no inherited `app`, with `seen`) and how many leading lines of `screen.txt` are history |
+| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines}`: the `inspect` object (`attachments: 0`, no `pid`, `program_status` as reported with no inherited `app`, with `seen`, oldest report first; no `attention`) and how many leading lines of `screen.txt` are history |
 | `snapshot.ghostsnp` | The snapshot bytes                                           |
 | `screen.txt`        | The `read` text with all retained history, at `parked_at`   |
 

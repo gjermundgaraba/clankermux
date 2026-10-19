@@ -31,6 +31,9 @@ use crate::stream::Stream;
 
 pub type Fail = (ErrorCode, String);
 
+/// The retained events' bytes, in `max_frame`s: with a first page, a
+/// replay stays under a connection's ceiling (`connection::Writer`).
+const RETAINED_FRAMES: u64 = 2;
 /// JSON overhead allowed around a page's sessions within `max_frame`.
 const PAGE_MARGIN: usize = 4096;
 /// How long a stop waits for the attachments to end, and then for the
@@ -114,7 +117,8 @@ impl State {
     }
 }
 
-/// `EVENT`: the event and its `seq`.
+/// `EVENT`: the event and its `seq`, as `proto::Numbered` but borrowing
+/// the event, which is encoded once for every subscriber.
 #[derive(serde::Serialize)]
 struct Numbered<'a> {
     seq: u64,
@@ -217,7 +221,7 @@ impl Registry {
         let info = file.session;
         let limits = &self.config.limits;
         let (records, dropped) = Records::load(info.program_status.unwrap_or_default());
-        let session = Session {
+        let mut session = Session {
             id: info.id.clone(),
             label: info.label,
             argv: info.argv,
@@ -254,6 +258,9 @@ impl Registry {
                 snapshot_path,
             }),
         };
+        // What the clients of this incarnation are shown first.
+        let shown = session.to_proto(false);
+        session.announced = (shown.title, shown.pwd, shown.attention);
         self.state
             .lock()
             .unwrap()
@@ -455,7 +462,9 @@ impl Registry {
         }
         if let Some(after) = replay {
             for (_, bytes) in state.retained.iter().filter(|(seq, _)| *seq > after) {
-                writer.send(bytes.clone());
+                if !writer.send(bytes.clone()) {
+                    return false;
+                }
             }
         }
         state.subscribers.push(writer.clone());
@@ -498,8 +507,8 @@ impl Registry {
     /// Numbers `event`, retains it, and queues it for every subscriber
     /// under the state lock, so it follows any page replied before it.
     /// The retained events are at most `limits.events`, and at most
-    /// `max_frame` bytes, so a replay stays well within what a connection
-    /// may queue.
+    /// `RETAINED_FRAMES` frames' worth of bytes, so a replay stays well
+    /// within what a connection may queue.
     pub fn emit(&self, event: &Event) {
         let mut state = self.state.lock().unwrap();
         state.seq += 1;
@@ -510,7 +519,7 @@ impl Registry {
         state.retained.push_back((seq, bytes));
         let limits = &self.config.limits;
         while state.retained.len() as u64 > limits.events
-            || state.retained_bytes as u64 > limits.max_frame
+            || state.retained_bytes as u64 > RETAINED_FRAMES * limits.max_frame
         {
             let Some((_, dropped)) = state.retained.pop_front() else {
                 break;
@@ -789,27 +798,49 @@ impl Registry {
 
     /// `ack` changed a session's records: they reach its files with its
     /// next park when it runs, with a park now when it ended and is
-    /// kept, and at once for a session loaded from a park file, whose
-    /// `session.json` alone changes.
+    /// kept, and with a rewrite of `session.json` alone for a session
+    /// loaded from a park file.
     pub fn records_changed(self: &Arc<Self>, session: &Shared) {
         let mut s = session.lock().unwrap();
         if s.gone() || self.is_stopping() {
             return;
         }
-        if let Some(parked) = s.parked() {
-            // Under the session lock, so a removal deletes the files after
-            // this.
-            let records = s.records.all();
-            if let Err(err) = blocking(|| park::rewrite_records(&parked.snapshot_path, records)) {
-                tracing::warn!(session = s.id, error = %err, "records not saved");
-            }
-        } else if s.status() == Status::Running {
+        if s.status() == Status::Running {
             s.touch();
-        } else {
-            drop(s);
-            let registry = self.clone();
-            let session = session.clone();
-            tokio::spawn(async move { registry.park(&session).await });
+            return;
+        }
+        let parked = s.parked().is_some();
+        drop(s);
+        let registry = self.clone();
+        let session = session.clone();
+        tokio::spawn(async move {
+            if parked {
+                registry.rewrite_records(&session).await;
+            } else {
+                registry.park(&session).await;
+            }
+        });
+    }
+
+    /// Writes a parked session's records into its `session.json` under
+    /// its park lock, outside the session lock: the fsyncs hold up no
+    /// one. A removal that overlaps the write takes the files with it.
+    async fn rewrite_records(self: &Arc<Self>, session: &Shared) {
+        let park_lock = session.lock().unwrap().park_lock.clone();
+        let _one_at_a_time = park_lock.lock().await;
+        let (id, path, records) = {
+            let s = session.lock().unwrap();
+            let Some(parked) = s.parked() else { return };
+            if s.gone() || self.is_stopping() {
+                return;
+            }
+            (s.id.clone(), parked.snapshot_path.clone(), s.records.all())
+        };
+        let result = blocking(|| park::rewrite_records(&path, records));
+        if session.lock().unwrap().gone() {
+            park::remove(&self.sessions_dir(), &id);
+        } else if let Err(err) = result {
+            tracing::warn!(session = id, error = %err, "records not saved");
         }
     }
 

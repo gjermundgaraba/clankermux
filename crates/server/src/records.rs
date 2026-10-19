@@ -50,22 +50,26 @@ fn text(value: String) -> Option<String> {
 }
 
 impl Records {
-    /// Records loaded from a park file, minus the transient ones, whose
-    /// ids are returned too; newest last, as the attention order needs.
+    /// Records loaded from a park file, oldest report first as [`all`]
+    /// writes them, minus the transient ones, whose ids are returned too.
     /// A file from before `seen` has the `done` and `error` records
     /// unseen.
+    ///
+    /// [`all`]: Records::all
     pub fn load(records: Vec<StatusRecord>) -> (Self, Vec<String>) {
-        let (kept, dropped): (Vec<_>, Vec<_>) = records.into_iter().partition(|r| !transient(r));
-        let mut kept: Vec<StatusRecord> = kept;
-        kept.sort_by_key(|r| r.updated_at.parse::<jiff::Timestamp>().ok());
         let mut out = Records::default();
-        for mut record in kept {
+        let mut dropped = Vec::new();
+        for mut record in records {
+            if transient(&record) {
+                dropped.push(record.id);
+                continue;
+            }
             if seeable(&record.state) && record.seen.is_none() {
                 record.seen = Some(false);
             }
             out.insert(record);
         }
-        (out, dropped.into_iter().map(|r| r.id).collect())
+        (out, dropped)
     }
 
     fn insert(&mut self, record: StatusRecord) {
@@ -166,9 +170,12 @@ impl Records {
         acked
     }
 
-    /// The records as reported: every key of their last report.
+    /// The records as reported, every key of their last report, oldest
+    /// report first: a park file keeps the order the attention reads.
     pub fn all(&self) -> Vec<StatusRecord> {
-        self.by_id.values().map(|(r, _)| r.clone()).collect()
+        let mut records: Vec<_> = self.by_id.values().collect();
+        records.sort_by_key(|(_, tick)| *tick);
+        records.into_iter().map(|(r, _)| r.clone()).collect()
     }
 
     /// The tick of the latest report; records set later have a higher one.
@@ -343,9 +350,21 @@ mod tests {
             record("a", "working", "t3"),
         ]);
         let ids: Vec<_> = loaded.all().into_iter().map(|x| x.id).collect();
-        assert_eq!(ids, vec!["b".to_string(), "c".to_string()]);
+        assert_eq!(ids, vec!["c".to_string(), "b".to_string()], "in file order");
         assert_eq!(dropped, vec!["a".to_string()]);
         assert!(loaded.all().iter().all(|r| r.seen == Some(false)));
+    }
+
+    #[test]
+    fn a_park_keeps_the_report_order_the_attention_reads() {
+        let mut r = Records::default();
+        r.apply(report(ProgramStatusState::Done, "b", ""), 10, "same");
+        r.apply(report(ProgramStatusState::Done, "a", ""), 10, "same");
+        let ids: Vec<_> = r.all().into_iter().map(|x| x.id).collect();
+        assert_eq!(ids, ["b", "a"]);
+        let (loaded, _) = Records::load(r.all());
+        assert_eq!(loaded.attention().unwrap().record, "a");
+        assert_eq!(r.attention().unwrap().record, "a");
     }
 
     #[test]

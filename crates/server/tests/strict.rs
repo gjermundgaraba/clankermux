@@ -65,6 +65,8 @@ async fn an_unknown_field_in_a_request_is_invalid() {
         ("resize", json!({"session": id, "cols": 81})),
         ("read", json!({"session": id})),
         ("send", json!({"session": id, "data": ""})),
+        ("ack", json!({"session": id})),
+        ("subscribe", json!({"after": 0, "incarnation": "x"})),
     ];
     for (method, params) in requests {
         assert_eq!(

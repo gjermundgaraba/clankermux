@@ -937,7 +937,11 @@ async fn events_after_a_cursor_replay_with_their_seq() {
     let conn = connect(&server).await;
     let socket = server.socket.to_str().unwrap();
     let session = create(&conn, json!({"argv": ["/bin/cat"], "label": "first"})).await;
-    let (line, _) = first_event_line(socket, &["--after", "0"]).await;
+    let (line, err) = first_event_line(socket, &["--after", "0"]).await;
+    assert!(
+        err.contains(&format!("incarnation {}", server.registry.incarnation)),
+        "{err}"
+    );
     let event: Numbered = serde_json::from_str(&line).unwrap();
     assert_eq!(event.seq, 1);
     assert!(matches!(event.event, Event::SessionCreated { session: s } if s.id == session.id));

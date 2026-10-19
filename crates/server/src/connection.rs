@@ -499,11 +499,11 @@ impl Connection {
             );
             return;
         }
-        let client = self.hello.as_ref().map(|h| proto::Peer {
-            name: h.client.name.clone(),
-            version: h.client.version.clone(),
-        });
-        let client = client.expect("OPEN follows HELLO");
+        let hello = self.hello.as_ref().expect("OPEN follows HELLO");
+        let client = proto::Peer {
+            name: hello.client.name.clone(),
+            version: hello.client.version.clone(),
+        };
         let handle = attach::open(&self.registry, &self.writer, channel, open, session, client);
         self.channels.insert(channel, handle);
     }

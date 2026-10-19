@@ -550,8 +550,27 @@ async fn seen_survives_park_and_restore() {
         }
     );
 
-    // An ack of the restored session reaches its files at once.
+    // An ack of the restored session is announced and reaches its files.
     c.ok("ack", json!({"session": id})).await;
+    let (record, reason) = status_event(&mut c).await;
+    assert_eq!(
+        (record.unwrap().id.as_str(), reason),
+        ("e", StatusReason::Ack)
+    );
+    assert_eq!(attention_changed(&mut c).await, None);
+    let generation = std::fs::read_dir(state.join("sessions").join(&id))
+        .unwrap()
+        .flatten()
+        .find(|g| g.path().join("session.json").is_file())
+        .unwrap()
+        .path();
+    for _ in 0..500 {
+        let json = std::fs::read_to_string(generation.join("session.json")).unwrap();
+        if !json.contains("\"seen\":false") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     drop(c);
     b.registry.stop().await;
     drop(b);
@@ -603,4 +622,106 @@ async fn an_ack_after_the_exit_of_a_kept_session_parks_it_again() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("the ack was not parked");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_events_are_bounded_in_bytes_too() {
+    let server = start(Limits {
+        max_frame: 4096,
+        ..fast_limits()
+    });
+    let incarnation = server.registry.incarnation.clone();
+    let mut c = client(&server).await;
+    let session = c.create(json!({"argv": ["/bin/cat"]})).await;
+    for n in 0..40 {
+        c.ok(
+            "label",
+            json!({"session": session.id, "label": format!("label {n}")}),
+        )
+        .await;
+    }
+    let mut b = client(&server).await;
+    let reply: Subscribed = from(
+        b.ok("subscribe", json!({"after": 1, "incarnation": incarnation}))
+            .await,
+    );
+    assert_eq!((reply.latest, reply.gap), (41, Some(true)));
+    let retained = reply.latest + 1 - reply.oldest;
+    assert!(retained > 0 && retained < 40, "{retained} retained");
+    let mut r = client(&server).await;
+    r.ok(
+        "subscribe",
+        json!({"after": reply.oldest - 1, "incarnation": incarnation}),
+    )
+    .await;
+    for seq in reply.oldest..=reply.latest {
+        assert_eq!(r.numbered().await.seq, seq);
+    }
+    c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ack_of_a_running_session_reaches_its_next_park() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let timing = server::ParkTiming {
+        interval: Duration::from_secs(300),
+        quiet: Duration::from_millis(50),
+        gap: Duration::from_millis(50),
+        busy: Duration::from_millis(500),
+    };
+    let a = Server::start_with_park(fast_limits(), state.clone(), timing);
+    let mut c = client(&a).await;
+    let session = c.create(json!({"argv": ["/bin/cat"]})).await;
+    c.ok("send", report(&session.id, "state=done:id=d")).await;
+    let parked = |seen: &str| {
+        let dir = state.join("sessions").join(&session.id);
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|g| {
+                std::fs::read_to_string(g.path().join("session.json"))
+                    .is_ok_and(|json| json.contains(seen))
+            })
+    };
+    let wait = |seen: &'static str| async move {
+        for _ in 0..500 {
+            if parked(seen) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    };
+    assert!(wait("\"seen\":false").await, "the report parked");
+    c.ok("ack", json!({"session": session.id})).await;
+    assert!(wait("\"seen\":true").await, "the ack parked");
+    c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removal_closes_its_attachments_as_removed() {
+    let server = start(fast_limits());
+    let mut c = client(&server).await;
+    c.ok("subscribe", json!({})).await;
+    let session = c
+        .create(json!({"on_exit": "keep", "argv": ["/bin/sh", "-c", "exit 0"]}))
+        .await;
+    c.wait_exit(&session.id).await;
+    let mut o = client(&server).await;
+    o.open(2, json!({"session": session.id, "read_only": true}))
+        .await;
+    o.bootstrap(2).await;
+    c.wait_attachments(&session.id, 1).await;
+    c.ok("remove", json!({"session": session.id})).await;
+    assert_eq!(o.expect_closed(2).await, ClosedReason::Removed);
+    let reason = event_where(&mut c, |e| match e {
+        Event::AttachmentClosed { reason, .. } => Some(reason.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(reason, "removed");
 }

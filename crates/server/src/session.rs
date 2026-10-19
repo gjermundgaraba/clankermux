@@ -806,6 +806,8 @@ impl Session {
                 attachments: 0,
                 pid: None,
                 program_status: Some(self.records.all()),
+                // Computed again from the records at load.
+                attention: None,
                 ..self.to_proto(false)
             },
             history_lines: history_lines as u64,

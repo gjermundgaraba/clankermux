@@ -209,8 +209,8 @@ enum Command {
         /// when it kept too few the sessions are printed first, as without.
         #[arg(long, value_name = "SEQ")]
         after: Option<u64>,
-        /// The server incarnation `--after` counts in; the connected
-        /// server's by default.
+        /// The server incarnation `--after` counts in, as `events` prints
+        /// it on stderr; the connected server's by default.
         #[arg(long, value_name = "ID", requires = "after")]
         incarnation: Option<String>,
     },
@@ -521,7 +521,7 @@ fn session_line(s: &Session) {
         None => String::new(),
     };
     emit(&format!(
-        "{:<6} {:<12} {:<8}{:<9} {:<16} {:>3}x{:<3} {} {}\n",
+        "{:<6} {:<12} {:<8}{:<9} {:<18} {:>3}x{:<3} {} {}\n",
         short_id(&s.id),
         s.label,
         s.status.to_string(),
@@ -1294,6 +1294,11 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                     .map(|_| incarnation.unwrap_or_else(|| conn.welcome.incarnation.clone())),
             };
             let subscribed: Subscribed = conn.call("subscribe", params).await?;
+            // What a later `--after` needs, off the event stream.
+            eprintln!(
+                "clankermux: incarnation {}, latest event {}",
+                conn.welcome.incarnation, subscribed.latest
+            );
             let sessions = match subscribed.sessions {
                 Some(sessions) => {
                     let page = Page {
