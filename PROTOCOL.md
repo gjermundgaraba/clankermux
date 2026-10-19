@@ -122,8 +122,12 @@ the order the server produced them.
 - `create`: `argv` defaults to the user's login shell, `cwd` to the server
   user's home directory, `cols` to 80, `rows` to 24, `on_exit` to `remove`.
   `env` is an object of additions and overrides; the server sets `TERM` to
-  `xterm-ghostty` unless overridden. The child runs in a new session with
-  the PTY as its controlling terminal.
+  `xterm-ghostty` unless overridden. It also sets `CLANKERMUX_SESSION` to
+  the new session's id and `CLANKERMUX_SOCKET` to the absolute path of its
+  Unix socket, which a server always has (see Carriers), whatever `env`
+  says: these two are managed and win over `env`. A client run inside the
+  session finds its server and its session from them. The child runs in a
+  new session with the PTY as its controlling terminal.
 - `end` sends SIGHUP to the session's processes. `signal` sends the named
   signal (`HUP`, `INT`, `TERM`, `KILL`, ...) to them. The targets are the
   child's process group while it exists, and otherwise every process that

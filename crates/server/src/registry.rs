@@ -46,6 +46,9 @@ pub struct Config {
     pub version: String,
     /// Holds `lock` and `sessions/`.
     pub state_dir: PathBuf,
+    /// The Unix socket, absolute: every child gets it as
+    /// `CLANKERMUX_SOCKET`.
+    pub socket: PathBuf,
     pub park: ParkTiming,
 }
 
@@ -464,8 +467,15 @@ impl Registry {
             cell_width: None,
             cell_height: None,
         })?;
+        // `TERM` is a default; the session's own id and socket are not.
+        let id = uuid::Uuid::new_v4().to_string();
         let mut env = BTreeMap::from([("TERM".to_string(), "xterm-ghostty".to_string())]);
         env.extend(params.env.unwrap_or_default());
+        env.insert("CLANKERMUX_SESSION".into(), id.clone());
+        env.insert(
+            "CLANKERMUX_SOCKET".into(),
+            self.config.socket.to_string_lossy().into_owned(),
+        );
 
         // Everything that can fail is tried before the child exists.
         let mut term =
@@ -507,7 +517,7 @@ impl Registry {
         let (input, input_rx) = InputQueue::new(limits.input_queue as usize);
         let created = Instant::now();
         let session = Session {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             label,
             argv,
             cwd,

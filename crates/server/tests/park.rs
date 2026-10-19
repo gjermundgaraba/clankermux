@@ -543,6 +543,7 @@ async fn the_lock_refuses_a_second_server() {
             home: dir.path().to_path_buf(),
             version: "test".into(),
             state_dir: state.clone(),
+            socket: dir.path().join("sock"),
             park: Default::default(),
         })
     };

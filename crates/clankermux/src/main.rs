@@ -394,6 +394,8 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
     if let Some(park) = park_timing {
         config.park = park;
     }
+    // Children run elsewhere: they get the socket as an absolute path.
+    config.socket = std::path::absolute(&socket)?;
     let registry = server::Registry::new(config)?;
     // One status request serves every carrier that needs the tailnet.
     let needs_tailnet = tcp.is_some()

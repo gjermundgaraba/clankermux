@@ -639,3 +639,50 @@ async fn exit_codes_tell_failure_usage_target_and_server_apart() {
         "{out}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_inside_a_session_reaches_its_server_and_session() {
+    // A relative socket: the child, elsewhere, still finds it.
+    let dir = tempfile::tempdir().unwrap();
+    let _server = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
+        .args(["--socket", "sock", "serve"])
+        .current_dir(dir.path())
+        .env("XDG_STATE_HOME", dir.path().join("state"))
+        .env_remove("CLANKERMUX_SOCKET")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let conn = connect_when_up(dir.path()).await;
+    let script = format!(
+        "{} label from-inside && printf '<%s>' \"$CLANKERMUX_SOCKET\"; exec cat",
+        env!("CARGO_BIN_EXE_clankermux")
+    );
+    let session = create(
+        &conn,
+        json!({"argv": ["/bin/sh", "-c", script], "cwd": "/"}),
+    )
+    .await;
+    let labelled = wait_session(&conn, &session.id, |s| s.label == "from-inside").await;
+    assert_eq!(labelled.id, session.id);
+    let socket = std::fs::canonicalize(dir.path().join("sock")).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let read: Read = conn
+            .call("read", json!({"session": session.id}))
+            .await
+            .unwrap();
+        let shown = read.text.replace('\n', "");
+        let canonical = shown
+            .split_once('<')
+            .and_then(|(_, rest)| rest.split_once('>'))
+            .map(|(path, _)| std::fs::canonicalize(path).unwrap());
+        if let Some(path) = canonical {
+            assert_eq!(path, socket, "{shown}");
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{shown}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

@@ -23,6 +23,8 @@ A terminal multiplexer server with CLI and browser clients; the wire protocol is
 
 ## The command line
 
+Every session's child gets `CLANKERMUX_SESSION` (its session's id) and `CLANKERMUX_SOCKET` (the server's socket, an absolute path), whatever `create`'s `env` says, so a command run inside a session needs no flags: `clankermux label building` labels the session it runs in.
+
 A session argument is resolved in order: the full id; the label, ignoring case; four or more characters from the start or the end of the id. Left out, it is `$CLANKERMUX_SESSION`. `list` shows the last six characters of each id. When the argument names no session or several, the candidates go to stderr (short id, label, status) and the exit code is 3. A command's socket is `--socket`, else `$CLANKERMUX_SOCKET`, else the default; `serve` ignores `$CLANKERMUX_SOCKET`.
 
 | Exit code | Meaning |

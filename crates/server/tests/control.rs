@@ -648,3 +648,19 @@ async fn a_connection_that_stops_reading_is_closed() {
     // The idle subscriber reads what the socket buffered, then end of file.
     while idle.recv().await.is_some() {}
 }
+
+#[tokio::test]
+async fn every_child_knows_its_session_and_socket_whatever_env_says() {
+    let server = start(fast_limits());
+    let mut c = client(&server).await;
+    let s = c
+        .create(json!({
+            "argv": ["/bin/sh", "-c",
+                     "printf '<%s|%s|%s>\\n' \"$CLANKERMUX_SESSION\" \"$CLANKERMUX_SOCKET\" \"$TERM\"; exec cat"],
+            "env": {"CLANKERMUX_SESSION": "forged", "CLANKERMUX_SOCKET": "/forged", "TERM": "dumb"},
+        }))
+        .await;
+    // TERM is a default a caller may change; the other two are managed.
+    let expected = format!("<{}|{}|dumb>", s.id, server.socket.display());
+    wait_text(&mut c, &s.id, &expected).await;
+}

@@ -176,6 +176,7 @@ pub fn default_config() -> Config {
         home,
         version: env!("CARGO_PKG_VERSION").into(),
         state_dir: state_dir(),
+        socket: socket_path(),
         park: ParkTiming::default(),
     }
 }

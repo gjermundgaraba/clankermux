@@ -62,6 +62,7 @@ impl Server {
             home: dir.path().to_path_buf(),
             version: "test".into(),
             state_dir,
+            socket: socket.clone(),
             park,
         };
         let (stop, stopped) = oneshot::channel();
