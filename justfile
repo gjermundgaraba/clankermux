@@ -32,3 +32,12 @@ pin sha:
 # Build and pack the npm packages into web/dist-packages.
 pack-web: wasm
     scripts/pack-web.sh
+
+# The release binary, as a tagged release builds it.
+release-build:
+    cargo build --release -p clankermux
+    @echo "{{justfile_directory()}}/target/release/clankermux"
+
+# The release binary as a server for local development, under target/dev.
+dev-serve: release-build
+    scripts/dev-serve.sh

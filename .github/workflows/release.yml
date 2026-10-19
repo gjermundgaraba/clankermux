@@ -1,0 +1,62 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+      - uses: jdx/mise-action@v2
+      # The tag names the version the binary reports.
+      - name: version
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          crate=$(cargo pkgid -p clankermux | sed 's/.*[#@]//')
+          if [ "$version" != "$crate" ]; then
+            echo "tag $GITHUB_REF_NAME does not match clankermux $crate" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - run: cargo build --release --locked -p clankermux --target ${{ matrix.target }}
+      - name: package
+        run: |
+          name=clankermux-$VERSION-${{ matrix.target }}
+          mkdir out
+          cp target/${{ matrix.target }}/release/clankermux "out/$name"
+          strip "out/$name"
+          (cd out && sha256sum "$name" > "$name.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: out/*
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out
+          cat ./*.sha256 > SHA256SUMS
+          rm ./*.sha256
+          sha256sum -c SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" ./*
