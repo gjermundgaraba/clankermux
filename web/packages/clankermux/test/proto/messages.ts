@@ -6,6 +6,8 @@
 import limits from "../../../../../crates/proto/vectors/limits.json";
 import type {
   Attached,
+  CancelParams,
+  Cancelled,
   Closed,
   CreateParams,
   ErrorMessage,
@@ -24,11 +26,14 @@ import type {
   ResizeParams,
   Resized,
   SendParams,
+  Sent,
   Session,
   SessionParams,
   SignalParams,
   StatusRecord,
   Viewport,
+  WaitParams,
+  Waited,
   Welcome,
 } from "../../src/proto/index.ts";
 
@@ -128,6 +133,30 @@ export const vectors = {
   "params/read": { session: SESSION, scrollback: 50 } satisfies ReadParams,
   "params/read-screen": { session: SESSION } satisfies ReadParams,
   "params/send": { session: SESSION, data: "bHMK" } satisfies SendParams,
+  "params/send-text": {
+    session: SESSION,
+    text: "make test\r",
+    wait: { until: { exited: true, output: { regex: "PASS|FAIL" } }, timeout_ms: 60000 },
+  } satisfies SendParams,
+  "params/send-keys": { session: SESSION, keys: ["ctrl+c", "up", "enter"] } satisfies SendParams,
+  "params/send-paste": { session: SESSION, text: "line one\nline two", paste: true } satisfies SendParams,
+  "params/wait": {
+    session: SESSION,
+    until: { status: { states: ["done", "error"], record: "build" }, prompt: true, quiet_ms: 500 },
+    after: { offset: 1024, marker: 2 },
+    timeout_ms: 10000,
+  } satisfies WaitParams,
+  "params/wait-output": { session: SESSION, until: { output: { text: "$ " } } } satisfies WaitParams,
+  "params/cancel": { id: 7 } satisfies CancelParams,
+  "sent/plain": { at: { offset: 2048, marker: 2 } } satisfies Sent,
+  "sent/wait": {
+    at: { offset: 2048, marker: 2 },
+    wait: { reason: "matched", at: { offset: 2100, marker: 2 }, match: { text: "PASS", offset: 2096 } },
+  } satisfies Sent,
+  "waited/exited": { reason: "exited", at: { offset: 4096, marker: 3 }, exit: { code: 0 } } satisfies Waited,
+  "waited/status": { reason: "status", at: { offset: 4096, marker: 3 }, record: blocked } satisfies Waited,
+  "waited/timeout": { reason: "timeout", at: { offset: 4096, marker: 3 } } satisfies Waited,
+  "cancelled/yes": { cancelled: true } satisfies Cancelled,
   "open/full": {
     session: SESSION,
     read_only: false,

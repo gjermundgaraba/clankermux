@@ -14,6 +14,7 @@ httparse = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
 proto = { workspace = true }
+regex = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

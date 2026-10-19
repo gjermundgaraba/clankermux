@@ -703,3 +703,123 @@ async fn the_guide_is_printed_without_a_server() {
         assert!(shown.contains(needle), "{needle}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn waits_exit_with_the_child_status_a_timeout_or_an_interrupt() {
+    let server = start();
+    let conn = connect(&server).await;
+    let socket = server.socket.to_str().unwrap();
+    // create --wait: the child's code, however fast it exits.
+    let (code, out, err) = run_status(
+        &[
+            "--socket", socket, "create", "--wait", "--", "/bin/sh", "-c", "exit 5",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(code, 5, "{err}");
+    assert_eq!(out, "exited 5\n");
+
+    // A signal: 128 + its number.
+    let session = create(&conn, json!({"argv": ["/bin/cat"], "on_exit": "keep"})).await;
+    let waiting = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
+        .args(["--socket", socket, "wait", &session.id, "--wait-exit"])
+        .output();
+    let killer = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        conn.request("signal", json!({"session": session.id, "signal": "KILL"}))
+            .await
+            .unwrap();
+    };
+    let (output, ()) = tokio::join!(waiting, killer);
+    let output = output.unwrap();
+    assert_eq!(output.status.code(), Some(128 + 9), "{output:?}");
+
+    // A timeout: 124. Text and keys with a match.
+    let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
+    let (code, out, _) = run_status(
+        &[
+            "--socket",
+            socket,
+            "wait",
+            &session.id,
+            "--match",
+            "never",
+            "--timeout",
+            "200ms",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!((code, out.as_str()), (124, "timeout at 0\n"));
+    let (code, out, err) = run_status(
+        &[
+            "--socket",
+            socket,
+            "send",
+            &session.id,
+            "polo",
+            "--enter",
+            "--wait-match",
+            "po+lo",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "matched \"polo\" at 0\n");
+    let (code, out, err) = run_status(
+        &[
+            "--socket",
+            socket,
+            "--json",
+            "send",
+            &session.id,
+            "--keys",
+            "x",
+            "enter",
+            "--wait-match",
+            "x",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    let sent: Sent = serde_json::from_str(&out).unwrap();
+    assert_eq!(sent.wait.unwrap().reason, WaitReason::Matched);
+    // Usage: nothing to wait for; a timeout alone.
+    let (code, _, _) = run_status(&["--socket", socket, "wait", &session.id], &[]).await;
+    assert_eq!(code, 2);
+    let (code, _, _) = run_status(
+        &[
+            "--socket",
+            socket,
+            "send",
+            &session.id,
+            "x",
+            "--timeout",
+            "1s",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(code, 2);
+
+    // Ctrl-C cancels the wait: 130.
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
+        .args(["--socket", socket, "wait", &session.id, "--exit"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Long enough for the binary to start and listen for Ctrl-C on a
+    // loaded machine; before that, SIGINT would kill it outright.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let pid = rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("the wait ends")
+        .unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cancelled"));
+}

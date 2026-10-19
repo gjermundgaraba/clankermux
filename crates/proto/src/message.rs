@@ -75,6 +75,7 @@ pub enum ErrorCode {
     ReadOnly,
     InputOverflow,
     TooSlow,
+    Cancelled,
     Internal,
 }
 
@@ -246,12 +247,153 @@ pub struct ReadParams {
     pub scrollback: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `send`: exactly one of `text`, `keys` and `data`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendParams {
     pub session: String,
-    /// Base64.
-    pub data: String,
+    /// UTF-8, written as typed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Key names, encoded by the session's terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<String>>,
+    /// Base64 bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// `text` or `data` as a paste, bracketed when mode 2004 is set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paste: bool,
+    /// A wait armed before the bytes are written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<SendWait>,
+}
+
+/// `send.wait`: a `wait` on the same session, from the cursor before the
+/// bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SendWait {
+    pub until: Until,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// What a wait waits for: one or more facts, the first to hold wins.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Until {
+    /// `true`: the stream ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exited: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<OutputMatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<StatusMatch>,
+    /// `true`: the next OSC 133 `A`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<bool>,
+    /// No output for this long.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_ms: Option<u64>,
+}
+
+/// `until.output`: exactly one of `text` and `regex`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputMatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
+}
+
+/// `until.status`: a record in one of `states`, or the record `record`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatusMatch {
+    pub states: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<String>,
+}
+
+/// A stream cursor as a request gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CursorParams {
+    pub offset: u64,
+    pub marker: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WaitParams {
+    pub session: String,
+    pub until: Until,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<CursorParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancelParams {
+    pub id: i64,
+}
+
+/// A stream cursor as the server reports it: the next byte's offset and
+/// the latest marker reflected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCursor {
+    pub offset: u64,
+    pub marker: u64,
+}
+
+/// The `send` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sent {
+    /// The cursor once the PTY took the bytes.
+    pub at: StreamCursor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<Waited>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitReason {
+    Exited,
+    Matched,
+    Status,
+    Prompt,
+    Quiet,
+    Timeout,
+}
+
+/// The `wait` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waited {
+    pub reason: WaitReason,
+    pub at: StreamCursor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<Exit>,
+    #[serde(rename = "match", default, skip_serializing_if = "Option::is_none")]
+    pub matched: Option<Match>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record: Option<StatusRecord>,
+}
+
+/// `wait.match`: the text that matched and the offset of its first byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Match {
+    pub text: String,
+    pub offset: u64,
+}
+
+/// The `cancel` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cancelled {
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,7 +562,7 @@ macro_rules! wire_display {
     )*};
 }
 
-wire_display!(ErrorCode, Status, ClosedReason);
+wire_display!(ErrorCode, Status, ClosedReason, WaitReason);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

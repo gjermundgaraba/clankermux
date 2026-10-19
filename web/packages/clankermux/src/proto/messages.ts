@@ -62,6 +62,7 @@ export type ErrorCode =
   | "read_only"
   | "input_overflow"
   | "too_slow"
+  | "cancelled"
   | "internal";
 
 export interface ErrorMessage {
@@ -151,10 +152,74 @@ export interface ReadParams {
   scrollback?: number;
 }
 
+/** `send`: exactly one of `text`, `keys` and `data`. */
 export interface SendParams {
   session: string;
-  /** Base64. */
-  data: string;
+  /** UTF-8, written as typed. */
+  text?: string;
+  /** Key names, encoded by the session's terminal. */
+  keys?: string[];
+  /** Base64 bytes. */
+  data?: string;
+  /** `text` or `data` as a paste, bracketed when mode 2004 is set. */
+  paste?: boolean;
+  /** A wait armed before the bytes are written. */
+  wait?: SendWait;
+}
+
+export interface SendWait {
+  until: Until;
+  timeout_ms?: number;
+}
+
+/** What a wait waits for: one or more facts, the first to hold wins. */
+export interface Until {
+  exited?: true;
+  /** Exactly one of `text` and `regex`. */
+  output?: { text?: string; regex?: string };
+  status?: { states: string[]; record?: string };
+  prompt?: true;
+  quiet_ms?: number;
+}
+
+/** A stream cursor: the next byte's offset and the latest marker reflected. */
+export interface StreamCursor {
+  offset: number;
+  marker: number;
+}
+
+export interface WaitParams {
+  session: string;
+  until: Until;
+  after?: StreamCursor;
+  timeout_ms?: number;
+}
+
+export interface CancelParams {
+  id: number;
+}
+
+export type WaitReason = "exited" | "matched" | "status" | "prompt" | "quiet" | "timeout";
+
+/** The `wait` result. */
+export interface Waited {
+  reason: WaitReason;
+  at: StreamCursor;
+  exit?: Exit;
+  match?: { text: string; offset: number };
+  record?: StatusRecord;
+}
+
+/** The `send` result. */
+export interface Sent {
+  /** The cursor once the PTY took the bytes. */
+  at: StreamCursor;
+  wait?: Waited;
+}
+
+/** The `cancel` result. */
+export interface Cancelled {
+  cancelled: boolean;
 }
 
 export interface CreateParams {

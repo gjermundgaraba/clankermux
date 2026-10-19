@@ -101,9 +101,12 @@ The engine id is compared at `OPEN`, not at `HELLO`.
 ## Control
 
 `REQUEST` is `{id, method, params}`. The server answers `REPLY {id, result}`
-or `ERROR {id, code, message}`. `id` is a client-chosen integer. Requests
-on a connection are processed in order, and replies and events are sent in
-the order the server produced them.
+or `ERROR {id, code, message}`. `id` is a client-chosen integer, not reused
+on the connection while its request is pending. Requests on a connection
+are processed in order, and replies and events are sent in the order the
+server produced them. The exception is a wait: a `wait`, or a `send` with
+`wait`, holds its id until the wait ends, while the requests after it are
+processed and answered.
 
 | Method      | Params                                              | Result                  |
 | ----------- | --------------------------------------------------- | ----------------------- |
@@ -116,7 +119,9 @@ the order the server produced them.
 | `label`     | `session, label`                                    | Session                 |
 | `resize`    | `session, cols?, rows?`                             | `{}`                    |
 | `read`      | `session, scrollback?`                              | Read                    |
-| `send`      | `session, data`                                     | `{}`                    |
+| `send`      | `session, text? \| keys? \| data?, paste?, wait?`    | Sent                    |
+| `wait`      | `session, until, after?, timeout_ms?`               | Waited                  |
+| `cancel`    | `id`                                                | `{cancelled}`           |
 | `subscribe` |                                                     | Page                    |
 
 - `create`: `argv` defaults to the user's login shell, `cwd` to the server
@@ -150,12 +155,87 @@ the order the server produced them.
   newline, with soft-wrapped rows joined and trailing blanks trimmed. The
   oldest lines are dropped to keep the reply under `limits.max_frame`.
   Works for every status.
-- `send`: `data` is base64. Replies after the bytes are written to the PTY
-  as one unit. Fails with `not_running` unless `status` is `running`.
+- `send` takes exactly one of `text` (UTF-8, written as typed), `keys`
+  (key names, see Keys) and `data` (base64 bytes). With `paste: true`,
+  `text` or `data` is encoded as the engine encodes a paste: control
+  bytes that could end it or run a command (ESC, NUL, DEL, ...) become
+  spaces, and the whole is bracketed (`ESC [200~` ... `ESC [201~`) when
+  the session's terminal has mode 2004 set, else its newlines become
+  carriage returns. The bytes are written to the PTY as one unit. The
+  reply, Sent, comes once they are written. With `wait`
+  (`{until, timeout_ms?}`), a wait as `wait` describes it is armed at the
+  session's cursor before the bytes are queued, so it sees everything the
+  program writes in answer, and the reply comes when it ends, carrying
+  its result. Fails with `not_running` unless `status` is `running`, and
+  with `invalid_request`, writing nothing, for an unknown key (named in
+  the message), `keys` with `paste`, or an invalid `wait`. Cancelling a
+  `send` stops its wait, not its bytes.
+- `wait` answers when one of the facts in `until` holds at or after the
+  cursor `after` (`{offset, marker}`, default the session's cursor when
+  the request is handled; not past it, else `invalid_request`). A fact
+  that already holds there answers at once. `until` names one or more:
+  - `exited: true`: the stream has ended (`restored`: at once, without
+    `exit`);
+  - `output: {text}` or `output: {regex}` (Rust `regex` syntax, on
+    bytes): the stream from `after` on, as plain text: printable
+    characters, newlines and tabs, with escape sequences, carriage
+    returns and other controls left out, searched from `after.offset` or
+    the oldest retained byte when that is gone. Text more than 512 KiB
+    behind the newest may be dropped from the search;
+  - `status: {states, record?}`: a program status record, or the record
+    with id `record`, is in one of `states` (`idle`, `working`, `done`,
+    `blocked`, `error`);
+  - `prompt: true`: an OSC 133 `A` in output that ends after
+    `after.offset`;
+  - `quiet_ms: n`: no output for `n` ms, counted from the later of the
+    request and the last output.
+
+  When several hold at once, the first of `output`, `prompt`, `status`,
+  `exited` and `quiet_ms` wins.
+  `timeout_ms` (none: no limit) ends the wait with reason `timeout`, a
+  result, not an error. Fails with `no_such_session`, also when the
+  session is removed while waiting, and with `not_running` when the
+  stream has ended (or the session is `restored`) and nothing matched for
+  a wait on `output`, `prompt` or `quiet_ms`.
+- `cancel` ends the pending `wait`, or `send` with `wait`, whose request
+  id is `id` on this connection: it gets `ERROR cancelled`, and then the
+  `cancel` replies `{cancelled: true}`. After that reply the cancelled
+  request sends nothing more. An `id` that is not pending replies
+  `{cancelled: false}`.
 - `subscribe` takes `{}` as `params`. It starts `EVENT` frames on this
   connection and returns the first page of current sessions. Events are
   sent only for changes after the moment of subscription; later pages
   come from `list`.
+
+Sent
+
+| Field  | Type    | Meaning                                                    |
+| ------ | ------- | ---------------------------------------------------------- |
+| `at`   | object  | `{offset, marker}`: the session's cursor once the PTY took the bytes |
+| `wait` | Waited? | With `send.wait`                                           |
+
+Waited
+
+| Field    | Type    | Meaning                                                      |
+| -------- | ------- | ------------------------------------------------------------ |
+| `reason` | string  | `exited`, `matched`, `status`, `prompt`, `quiet` or `timeout` |
+| `at`     | object  | `{offset, marker}`: just past the match; after the output holding the prompt; at the end of the stream; else the cursor when it ended |
+| `exit`   | object? | `exited`: the session's `exit`                               |
+| `match`  | object? | `matched`: `{text, offset}`, the plain text that matched and the stream offset of its first byte |
+| `record` | object? | `status`: the record, as `inspect` shows it                  |
+
+Keys
+
+A key is modifiers joined with `+` (`ctrl`, `shift`, `alt`, `super`, any
+order) and a key: `enter`, `tab`, `esc`, `backspace`, `space`, `up`,
+`down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`, `insert`,
+`delete`, `f1` to `f12`, or one character (`a`, `A` as `shift+a`, `?`,
+`é`). Names ignore case but a single character's. The session's terminal
+encodes each key with the engine's key encoder as a press on a US layout,
+by the program's current modes (cursor and keypad application modes,
+kitty keyboard flags, modifyOtherKeys), so `up` is `ESC [A` or `ESC O A`
+as the program asked; all of a request's keys are encoded against the
+modes when it is handled, and written as one unit.
 
 Read
 
@@ -612,7 +692,7 @@ an attachment channel it ends the attachment, except `read_only`,
 | `invalid_request`  | Malformed payload, a field the protocol does not define, unknown method, or a resume marker above the session's latest |
 | `limit_exceeded`   | `label` or `text` exceeded, or a snapshot failed          |
 | `no_such_session`  |                                                           |
-| `not_running`      | `status` is not `running`, or the stream has ended        |
+| `not_running`      | `status` is not `running`, or the stream has ended; for a wait, nothing matched before the stream ended |
 | `running`          | `remove` on a running session                             |
 | `signal_failed`    | `end` or `signal` found no process to signal              |
 | `engine_mismatch`  | Engine ids differ                                         |
@@ -620,6 +700,7 @@ an attachment channel it ends the attachment, except `read_only`,
 | `read_only`        | `INPUT` or `VIEWPORT` on a read-only attachment           |
 | `input_overflow`   | The frame would exceed `limits.input_queue`               |
 | `too_slow`         | Second gap during a bootstrap                             |
+| `cancelled`        | A `cancel` ended the request                              |
 | `internal`         |                                                           |
 
 ## Not in version 1

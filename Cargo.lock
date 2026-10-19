@@ -1194,6 +1194,7 @@ dependencies = [
  "libc",
  "proptest",
  "proto",
+ "regex",
  "rustix",
  "serde",
  "serde_json",

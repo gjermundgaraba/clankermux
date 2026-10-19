@@ -552,6 +552,8 @@ impl Registry {
                 pty_eof: false,
                 pending: None,
                 timer_running: false,
+                prompts: Default::default(),
+                last_output: created,
             })),
         };
         let id = session.id.clone();
@@ -726,6 +728,8 @@ impl Registry {
             let mut s = session.lock().unwrap();
             s.removed = true;
             s.close_attachments(ClosedReason::Removed, false);
+            // Its waits end.
+            s.wake.notify_waiters();
         }
         park::remove(&self.sessions_dir(), id);
         self.emit(&Event::SessionRemoved { id: id.to_string() });

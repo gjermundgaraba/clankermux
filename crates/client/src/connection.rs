@@ -107,6 +107,9 @@ impl From<&Ended> for Error {
     }
 }
 
+/// The reply to a request in flight.
+pub struct Reply(oneshot::Receiver<Result<Value, ErrorMessage>>);
+
 pub struct Connection {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     pub welcome: Welcome,
@@ -213,6 +216,13 @@ impl Connection {
 
     /// A request and its reply.
     pub async fn request<T: Serialize>(&self, method: &str, params: T) -> Result<Value, Error> {
+        let (_, reply) = self.begin(method, params)?;
+        self.finish(reply).await
+    }
+
+    /// Sends a request; its id, and the reply to pass to `finish`. The id
+    /// is what a `cancel` names.
+    pub fn begin<T: Serialize>(&self, method: &str, params: T) -> Result<(i64, Reply), Error> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         {
@@ -231,7 +241,12 @@ impl Connection {
                 params: serde_json::to_value(params).expect("serializable"),
             },
         )?;
-        match reply_rx.await {
+        Ok((id, Reply(reply_rx)))
+    }
+
+    /// The reply to a request `begin` sent.
+    pub async fn finish(&self, reply: Reply) -> Result<Value, Error> {
+        match reply.0.await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => Err(error.into()),
             // The connection ended, and says why (an id-less ERROR among

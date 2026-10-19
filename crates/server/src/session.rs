@@ -1,5 +1,6 @@
 //! One session: the child, its PTY, the engine and the stream.
 
+use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +25,9 @@ use crate::registry::{Fail, Registry};
 use crate::stream::{MarkerKind, Stream};
 
 pub type Shared = Arc<Mutex<Session>>;
+
+/// Prompt starts kept per session for `wait {prompt}`.
+const PROMPTS: usize = 1024;
 
 /// Coalescing window for `VIEWPORT` reports.
 pub const COALESCE: Duration = Duration::from_millis(25);
@@ -223,6 +227,11 @@ pub struct Live {
     /// The latest coalesced report, waiting for the timer.
     pub pending: Option<Viewport>,
     pub timer_running: bool,
+    /// The stream offsets after the outputs that held an OSC 133 `A`,
+    /// within the ring.
+    pub prompts: VecDeque<u64>,
+    /// When the program last wrote.
+    pub last_output: Instant,
 }
 
 impl Live {
@@ -430,8 +439,10 @@ impl Session {
         };
         live.term.vt_write(bytes);
         live.stream.append(bytes);
-        self.wake.notify_waiters();
+        live.last_output = Instant::now();
         self.flush_effects();
+        // After the effects, so a wait sees the records they set.
+        self.wake.notify_waiters();
         self.touch();
     }
 
@@ -454,6 +465,14 @@ impl Session {
             let change = match event {
                 StatusEvent::Report(report) => self.records.apply(report, self.records_limit, &now),
                 StatusEvent::PromptStart => {
+                    if let Body::Live(live) = &mut self.body {
+                        let start = live.stream.retained_start();
+                        live.prompts.retain(|&o| o >= start);
+                        if live.prompts.len() >= PROMPTS {
+                            live.prompts.pop_front();
+                        }
+                        live.prompts.push_back(live.stream.offset());
+                    }
                     self.drop_transient_records();
                     continue;
                 }

@@ -1,16 +1,65 @@
 //! Channel 0 requests.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::Engine as _;
-use proto::{ErrorCode, Event, Request, Size, Viewport};
+use ghostty_vt::keys::{KeyEncoder, KeyPress, encode_paste};
+use proto::{ErrorCode, Event, Request, Sent, Size, Viewport};
 use rustix::process::Signal;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 
 use crate::connection::{Writer, reply};
 use crate::registry::{Fail, Registry, internal};
+use crate::session::Shared;
+use crate::wait::{self, Facts, Waiter};
 use crate::{pty, session};
+
+/// A connection's requests that answer later and can be cancelled (a
+/// `wait`, or a `send` carrying one), by id, with what stops each. The
+/// lock is held while the answer is queued, so a `cancel` and the answer
+/// cannot cross: whoever removes the id answers it.
+pub type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<()>>>>;
+
+/// Answers pending request `id` with `outcome`, unless a `cancel` (or the
+/// connection's end) took it first.
+fn finish(pending: &Pending, writer: &Writer, id: i64, outcome: Result<Value, Fail>) {
+    let mut pending = pending.lock().unwrap();
+    if pending.remove(&id).is_some() {
+        reply(writer, id, outcome);
+    }
+}
+
+/// Registers `id` as pending and runs `waiter` on a task until it fires,
+/// fails, or the request is cancelled; `answer` makes the reply.
+fn spawn_wait(
+    pending: &Pending,
+    writer: &Writer,
+    id: i64,
+    session: Shared,
+    waiter: Waiter,
+    timeout: Option<Duration>,
+    answer: impl FnOnce(proto::Waited) -> Value + Send + 'static,
+) {
+    let stop = register(pending, id);
+    let (pending, writer) = (pending.clone(), writer.clone());
+    tokio::spawn(async move {
+        let outcome = tokio::select! {
+            outcome = wait::run(&session, waiter, timeout) => outcome,
+            _ = stop => return,
+        };
+        finish(&pending, &writer, id, outcome.map(answer));
+    });
+}
+
+fn register(pending: &Pending, id: i64) -> oneshot::Receiver<()> {
+    let (stop_tx, stop) = oneshot::channel();
+    pending.lock().unwrap().insert(id, stop_tx);
+    stop
+}
 
 /// JSON overhead allowed around `read`'s text within `max_frame`.
 const READ_REPLY_MARGIN: usize = 4096;
@@ -60,12 +109,41 @@ fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
 pub fn dispatch(
     registry: &Arc<Registry>,
     writer: &Writer,
+    pending: &Pending,
     subscribed: &mut bool,
     request: Request,
 ) {
     let id = request.id;
     match request.method.as_str() {
-        "send" => send(registry, writer, id, request.params),
+        "send" => send(registry, writer, pending, id, request.params),
+        "wait" => {
+            if let Err(fail) = wait(registry, writer, pending, id, request.params) {
+                reply(writer, id, Err(fail));
+            }
+        }
+        "cancel" => match params::<proto::CancelParams>(request.params) {
+            Ok(p) => {
+                // The cancelled request's last frame comes first.
+                let mut pending = pending.lock().unwrap();
+                let stop = pending.remove(&p.id);
+                if let Some(stop) = &stop {
+                    let _ = stop;
+                    reply(
+                        writer,
+                        p.id,
+                        Err((ErrorCode::Cancelled, format!("cancelled by request {id}"))),
+                    );
+                }
+                reply(
+                    writer,
+                    id,
+                    Ok(json!(proto::Cancelled {
+                        cancelled: stop.is_some()
+                    })),
+                );
+            }
+            Err(fail) => reply(writer, id, Err(fail)),
+        },
         "list" => match params::<proto::ListParams>(request.params) {
             Ok(p) => registry.reply_page(writer, id, p.after.as_deref(), false),
             Err(fail) => reply(writer, id, Err(fail)),
@@ -81,46 +159,146 @@ pub fn dispatch(
     }
 }
 
-/// `send`: answered once the PTY took the bytes, meanwhile the
-/// connection reads on. The reply task is chained on the session's
-/// previous one under the session lock, as the bytes are queued, so the
-/// replies come in queue order; a failure is answered at once.
-fn send(registry: &Arc<Registry>, writer: &Writer, id: i64, p: Value) {
+/// What a `send` writes, before the session's terminal encodes it.
+enum Payload {
+    Bytes(Vec<u8>),
+    Keys(Vec<KeyPress>),
+}
+
+/// The payload of a `send`: exactly one of text, keys and data, every key
+/// known.
+fn payload(p: &mut proto::SendParams) -> Result<Payload, Fail> {
+    let invalid = |m: String| (ErrorCode::InvalidRequest, m);
+    match (p.text.take(), p.keys.take(), p.data.take()) {
+        (Some(text), None, None) => Ok(Payload::Bytes(text.into_bytes())),
+        (None, Some(keys), None) => {
+            if p.paste {
+                return Err(invalid("paste takes text or data, not keys".into()));
+            }
+            keys.iter()
+                .map(|name| {
+                    KeyPress::parse(name).ok_or_else(|| invalid(format!("unknown key {name:?}")))
+                })
+                .collect::<Result<_, _>>()
+                .map(Payload::Keys)
+        }
+        (None, None, Some(data)) => base64::engine::general_purpose::STANDARD
+            .decode(&data)
+            .map(Payload::Bytes)
+            .map_err(|e| invalid(format!("data is not base64: {e}"))),
+        _ => Err(invalid(
+            "send takes exactly one of text, keys and data".into(),
+        )),
+    }
+}
+
+/// `send`: answered once the PTY took the bytes, or with a wait once that
+/// fires; meanwhile the connection reads on. The keys are encoded and a
+/// paste bracketed by the session's terminal as the bytes are queued, and
+/// the wait is armed at the cursor then. The write's task is chained on
+/// the session's previous one under the session lock, so the bytes and
+/// the replies without a wait come in queue order; a failure is answered
+/// at once.
+fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p: Value) {
     let started = (|| {
-        let p: proto::SendParams = params(p)?;
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(&p.data)
-            .map_err(|e| {
-                (
-                    ErrorCode::InvalidRequest,
-                    format!("data is not base64: {e}"),
-                )
-            })?;
+        let mut p: proto::SendParams = params(p)?;
+        let payload = payload(&mut p)?;
+        let facts = match p.wait {
+            Some(w) => Some((Facts::new(w.until)?, w.timeout_ms)),
+            None => None,
+        };
         let session = registry.get(&p.session)?;
         let mut s = session.lock().unwrap();
-        let wait = s
+        let live = s.running()?;
+        let bytes = match payload {
+            Payload::Bytes(bytes) if p.paste => {
+                encode_paste(&bytes, live.term.mode(2004).unwrap_or(false))
+            }
+            Payload::Bytes(bytes) => bytes,
+            Payload::Keys(keys) => {
+                let mut encoder = KeyEncoder::new().map_err(internal)?;
+                let mut bytes = Vec::new();
+                for key in &keys {
+                    bytes.extend(encoder.encode(&live.term, key).map_err(internal)?);
+                }
+                bytes
+            }
+        };
+        let armed = facts.map(|(facts, timeout)| {
+            (
+                Waiter::new(facts, wait::cursor_of(&s)),
+                timeout.map(Duration::from_millis),
+            )
+        });
+        let written = s
             .running()?
             .input
-            .push(data)
+            .push(bytes)
             .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?;
         s.touch();
+        // Pending from here, so a cancel that follows finds it.
+        let stop = armed.as_ref().map(|_| register(pending, id));
         let previous = s.send_chain.take();
-        let writer = writer.clone();
+        let (registry, writer, pending) = (registry.clone(), writer.clone(), pending.clone());
+        let shared = session.clone();
         s.send_chain = Some(tokio::spawn(async move {
             if let Some(previous) = previous {
                 let _ = previous.await;
             }
-            let outcome = wait
-                .await
-                .map(|()| json!({}))
-                .map_err(|_| internal("the PTY refused the bytes"));
-            reply(&writer, id, outcome);
+            if written.await.is_err() {
+                let fail = internal("the PTY refused the bytes");
+                match stop {
+                    Some(_) => finish(&pending, &writer, id, Err(fail)),
+                    None => reply(&writer, id, Err(fail)),
+                }
+                return;
+            }
+            let at = wait::cursor_of(&shared.lock().unwrap());
+            let (Some((waiter, timeout)), Some(stop)) = (armed, stop) else {
+                reply(&writer, id, Ok(json!(Sent { at, wait: None })));
+                return;
+            };
+            // The wait goes on off the chain, so later sends answer.
+            drop(registry);
+            tokio::spawn(async move {
+                let outcome = tokio::select! {
+                    outcome = wait::run(&shared, waiter, timeout) => outcome,
+                    _ = stop => return,
+                };
+                let outcome = outcome.map(|waited| {
+                    json!(Sent {
+                        at,
+                        wait: Some(waited)
+                    })
+                });
+                finish(&pending, &writer, id, outcome);
+            });
         }));
         Ok(())
     })();
     if let Err(fail) = started {
         reply(writer, id, Err(fail));
     }
+}
+
+/// `wait`: anchored at `after`, or the cursor now, and answered from a
+/// task once a fact holds.
+fn wait(
+    registry: &Arc<Registry>,
+    writer: &Writer,
+    pending: &Pending,
+    id: i64,
+    p: Value,
+) -> Result<(), Fail> {
+    let p: proto::WaitParams = params(p)?;
+    let facts = Facts::new(p.until)?;
+    let session = registry.get(&p.session)?;
+    let waiter = Waiter::new(facts, wait::anchor(&session.lock().unwrap(), p.after)?);
+    let timeout = p.timeout_ms.map(Duration::from_millis);
+    spawn_wait(pending, writer, id, session, waiter, timeout, |waited| {
+        json!(waited)
+    });
+    Ok(())
 }
 
 /// Handles one request but `send`, `list` and `subscribe`.

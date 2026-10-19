@@ -411,5 +411,121 @@
   "params/send": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001",
     "data": "bHMK"
+  },
+  "params/send-text": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "text": "make test\r",
+    "wait": {
+      "until": {
+        "exited": true,
+        "output": {
+          "regex": "PASS|FAIL"
+        }
+      },
+      "timeout_ms": 60000
+    }
+  },
+  "params/send-keys": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "keys": [
+      "ctrl+c",
+      "up",
+      "enter"
+    ]
+  },
+  "params/send-paste": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "text": "line one\nline two",
+    "paste": true
+  },
+  "params/wait": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "until": {
+      "status": {
+        "states": [
+          "done",
+          "error"
+        ],
+        "record": "build"
+      },
+      "prompt": true,
+      "quiet_ms": 500
+    },
+    "after": {
+      "offset": 1024,
+      "marker": 2
+    },
+    "timeout_ms": 10000
+  },
+  "params/wait-output": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "until": {
+      "output": {
+        "text": "$ "
+      }
+    }
+  },
+  "params/cancel": {
+    "id": 7
+  },
+  "sent/plain": {
+    "at": {
+      "offset": 2048,
+      "marker": 2
+    }
+  },
+  "sent/wait": {
+    "at": {
+      "offset": 2048,
+      "marker": 2
+    },
+    "wait": {
+      "reason": "matched",
+      "at": {
+        "offset": 2100,
+        "marker": 2
+      },
+      "match": {
+        "text": "PASS",
+        "offset": 2096
+      }
+    }
+  },
+  "waited/exited": {
+    "reason": "exited",
+    "at": {
+      "offset": 4096,
+      "marker": 3
+    },
+    "exit": {
+      "code": 0
+    }
+  },
+  "waited/status": {
+    "reason": "status",
+    "at": {
+      "offset": 4096,
+      "marker": 3
+    },
+    "record": {
+      "id": "",
+      "state": "blocked",
+      "kind": "permission",
+      "app": "terraform",
+      "title": "Plan",
+      "msg": "Apply?",
+      "progress": 42,
+      "updated_at": "2026-10-18T12:01:00Z"
+    }
+  },
+  "waited/timeout": {
+    "reason": "timeout",
+    "at": {
+      "offset": 4096,
+      "marker": 3
+    }
+  },
+  "cancelled/yes": {
+    "cancelled": true
   }
 }

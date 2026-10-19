@@ -11,6 +11,7 @@ pub mod session;
 mod stream;
 pub mod tailscale;
 pub mod tls;
+mod wait;
 pub mod ws;
 
 use std::io;

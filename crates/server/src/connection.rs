@@ -159,6 +159,7 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
         decoder: FrameDecoder::default(),
         hello: None,
         subscribed: false,
+        pending: Default::default(),
         channels: HashMap::new(),
     };
     let mut buf = vec![0u8; 64 * 1024];
@@ -203,7 +204,9 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
             break;
         }
     }
-    // Dropping the channel table ends every attachment silently.
+    // Dropping the channel table ends every attachment silently, and
+    // dropping what stops each pending wait ends it.
+    state.pending.lock().unwrap().clear();
     drop(state);
     if flush {
         let _ = close_tx.send(());
@@ -252,6 +255,7 @@ struct Connection {
     decoder: FrameDecoder,
     hello: Option<Hello>,
     subscribed: bool,
+    pending: control::Pending,
     channels: HashMap<u32, Handle>,
 }
 
@@ -401,7 +405,13 @@ impl Connection {
                 }
             }
         };
-        control::dispatch(&self.registry, &self.writer, &mut self.subscribed, request);
+        control::dispatch(
+            &self.registry,
+            &self.writer,
+            &self.pending,
+            &mut self.subscribed,
+            request,
+        );
         true
     }
 

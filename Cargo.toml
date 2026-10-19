@@ -17,6 +17,7 @@ proto = { path = "crates/proto" }
 server = { path = "crates/server" }
 testkit = { path = "crates/testkit" }
 proptest = "1"
+regex = "1"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tempfile = "3"
 base64 = "0.22"

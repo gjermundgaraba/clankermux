@@ -13,8 +13,9 @@ use clap::{Args, Parser, Subcommand};
 use client::connection::hello;
 use client::{Connection, Endpoint, Error};
 use proto::{
-    CreateParams, LabelParams, ListParams, OnExit, Page, Read, ReadParams, ResizeParams,
-    SendParams, Session, SessionParams, SignalParams,
+    CancelParams, CreateParams, CursorParams, LabelParams, ListParams, OnExit, OutputMatch, Page,
+    Read, ReadParams, ResizeParams, SendParams, SendWait, Sent, Session, SessionParams,
+    SignalParams, StatusMatch, Until, WaitParams, WaitReason, Waited,
 };
 use serde::Serialize;
 
@@ -29,6 +30,10 @@ const SOCKET_ENV: &str = "CLANKERMUX_SOCKET";
 const EXIT_USAGE: i32 = 2;
 const EXIT_TARGET: i32 = 3;
 const EXIT_UNREACHABLE: i32 = 4;
+/// A wait that timed out, as `timeout(1)` exits.
+const EXIT_TIMEOUT: i32 = 124;
+/// A wait interrupted with Ctrl-C and cancelled.
+const EXIT_INTERRUPTED: i32 = 130;
 
 #[derive(Parser)]
 #[command(version, about = "clankermux terminal multiplexer")]
@@ -82,8 +87,15 @@ enum Command {
         #[arg(short = 'e', long = "env")]
         env: Vec<String>,
         /// Attach once created.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "wait")]
         attach: bool,
+        /// Wait for it to exit, from its first byte, and exit with its
+        /// status.
+        #[arg(long)]
+        wait: bool,
+        /// With `--wait`: give up after DUR (`500ms`, `10s`, `2m`).
+        #[arg(long, value_name = "DUR", value_parser = parse_duration, requires = "wait")]
+        timeout: Option<std::time::Duration>,
         /// Prefix key for `--attach` (`C-x`); followed by `d` it detaches,
         /// twice it is sent.
         #[arg(long, default_value = DETACH_KEY)]
@@ -149,17 +161,37 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         scrollback: u32,
     },
-    /// Send text as typed, or stdin's bytes with `--bytes`.
+    /// Send text as typed, named keys, or stdin's bytes; optionally wait
+    /// for what follows.
     Send {
         /// The session, `$CLANKERMUX_SESSION` when left out, then the text.
         #[arg(value_name = "[SESSION] TEXT", num_args = 0..=2)]
         args: Vec<String>,
         /// Press Enter after the text.
-        #[arg(long, conflicts_with = "bytes")]
+        #[arg(long, conflicts_with_all = ["bytes", "keys"])]
         enter: bool,
+        /// Send the text (or stdin's bytes) as a paste: bracketed when the
+        /// program asked for it, control bytes made harmless.
+        #[arg(long, conflicts_with = "keys")]
+        paste: bool,
+        /// Keys by name, encoded as the program expects them: `enter`,
+        /// `tab`, `esc`, `up`, `f5`, `ctrl+c`, `shift+tab`, `alt+x`, `a`.
+        #[arg(long, value_name = "KEY", num_args = 1.., conflicts_with = "bytes")]
+        keys: Vec<String>,
         /// Send stdin's bytes as they are.
         #[arg(long)]
         bytes: bool,
+        #[command(flatten)]
+        wait: WaitArgs,
+    },
+    /// Wait for the session to exit, print a match, show a status or a
+    /// prompt, or fall quiet.
+    Wait {
+        /// Id, label, or four or more characters from either end of the
+        /// id; `$CLANKERMUX_SESSION` when left out.
+        session: Option<String>,
+        #[command(flatten)]
+        wait: WaitArgs,
     },
     /// Print session events as JSON lines until interrupted.
     Events,
@@ -168,6 +200,88 @@ enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+}
+
+/// What to wait for; the first to happen ends the wait.
+#[derive(Args)]
+struct WaitArgs {
+    /// Until the session exits; then exit with its status (128 + the
+    /// signal's number for a signal).
+    #[arg(long = "wait-exit", visible_alias = "exit")]
+    exit: bool,
+    /// Until its output, escape sequences aside, matches RE (Rust regex).
+    #[arg(long = "wait-match", visible_alias = "match", value_name = "RE")]
+    matching: Option<String>,
+    /// Until a program status record is in one of these states (`idle`,
+    /// `working`, `done`, `blocked`, `error`).
+    #[arg(
+        long = "wait-status",
+        visible_alias = "status",
+        value_name = "STATE,...",
+        value_delimiter = ','
+    )]
+    status: Vec<String>,
+    /// Until the next prompt (OSC 133 A).
+    #[arg(long = "wait-prompt", visible_alias = "prompt")]
+    prompt: bool,
+    /// Until no output for MS milliseconds.
+    #[arg(long = "wait-quiet", visible_alias = "quiet", value_name = "MS")]
+    quiet: Option<u64>,
+    /// Give up after DUR (`500ms`, `10s`, `2m`, or seconds) and exit 124.
+    #[arg(long, value_name = "DUR", value_parser = parse_duration)]
+    timeout: Option<std::time::Duration>,
+}
+
+impl WaitArgs {
+    /// The `until` these flags name, if any; a timeout alone is a usage
+    /// error.
+    fn until(&self) -> Result<Option<Until>, Error> {
+        let until = Until {
+            exited: self.exit.then_some(true),
+            output: self.matching.clone().map(|regex| OutputMatch {
+                text: None,
+                regex: Some(regex),
+            }),
+            status: (!self.status.is_empty()).then(|| StatusMatch {
+                states: self.status.clone(),
+                record: None,
+            }),
+            prompt: self.prompt.then_some(true),
+            quiet_ms: self.quiet,
+        };
+        if until == Until::default() {
+            return match self.timeout {
+                Some(_) => Err(Error::Usage("--timeout needs something to wait for".into())),
+                None => Ok(None),
+            };
+        }
+        Ok(Some(until))
+    }
+
+    fn timeout_ms(&self) -> Option<u64> {
+        self.timeout.map(|t| t.as_millis() as u64)
+    }
+}
+
+/// `500ms`, `10s`, `2m`, `1h`, or a number of seconds.
+fn parse_duration(spec: &str) -> Result<std::time::Duration, String> {
+    let (number, unit) = match spec.find(|c: char| !c.is_ascii_digit() && c != '.') {
+        Some(at) => spec.split_at(at),
+        None => (spec, "s"),
+    };
+    let scale = match unit {
+        "ms" => 0.001,
+        "s" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        _ => return Err(format!("{spec:?} is not a duration: 500ms, 10s, 2m, 1h")),
+    };
+    number
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map(|n| std::time::Duration::from_secs_f64(n * scale))
+        .ok_or_else(|| format!("{spec:?} is not a duration: 500ms, 10s, 2m, 1h"))
 }
 
 #[derive(Subcommand)]
@@ -187,6 +301,8 @@ enum Fail {
     Client(Error),
     Target(String),
     Unreachable(String),
+    /// Ctrl-C cancelled a wait.
+    Interrupted,
 }
 
 impl From<Error> for Fail {
@@ -589,31 +705,160 @@ fn status_of(code: ExitCode) -> i32 {
     if code == ExitCode::SUCCESS { 0 } else { 1 }
 }
 
-/// Text and stdin go as `send` requests whose base64 fits the server's
-/// control body with room for the rest of the JSON, and whose bytes fit
-/// the input queue (at least one byte, so an absurd limit still makes
-/// progress).
-async fn send_bytes(conn: &Connection, session: &str, data: &[u8]) -> Result<(), Error> {
+/// One `send` request's worth of input.
+enum Chunk {
+    Text(String),
+    Data(Vec<u8>),
+    Keys(Vec<String>),
+}
+
+/// `text` in pieces whose JSON fits `budget` bytes (at least one
+/// character each).
+fn text_chunks(text: &str, budget: usize) -> Vec<String> {
+    let mut chunks = vec![String::new()];
+    let mut size = 0;
+    for c in text.chars() {
+        let len = serde_json::to_string(&c).map_or(6, |s| s.len() - 2);
+        if size + len > budget && size > 0 {
+            chunks.push(String::new());
+            size = 0;
+        }
+        chunks.last_mut().unwrap().push(c);
+        size += len;
+    }
+    chunks
+}
+
+/// Input as `send` requests, each within the server's control body (with
+/// room for the rest of the JSON) and input queue: text in pieces, bytes
+/// as base64 pieces. The wait goes with the last, so it is armed before
+/// that one's bytes are written; its reply is returned.
+async fn send_chunks(
+    conn: &Connection,
+    session: &str,
+    chunks: Vec<Chunk>,
+    paste: bool,
+    wait: Option<SendWait>,
+) -> Result<Option<(i64, client::connection::Reply)>, Error> {
     let limits = &conn.welcome.limits;
-    let chunk = ((limits.control_body as usize).saturating_sub(1024) / 4 * 3)
+    let budget = (limits.control_body as usize)
+        .saturating_sub(1024)
         .min(limits.input_queue as usize)
         .max(1);
-    let chunks: Vec<&[u8]> = if data.is_empty() {
-        vec![&[]]
-    } else {
-        data.chunks(chunk).collect()
-    };
+    let mut requests = Vec::new();
     for chunk in chunks {
-        conn.request(
-            "send",
-            SendParams {
-                session: session.to_string(),
-                data: base64::engine::general_purpose::STANDARD.encode(chunk),
-            },
-        )
-        .await?;
+        match chunk {
+            Chunk::Text(text) => {
+                for text in text_chunks(&text, budget) {
+                    requests.push(SendParams {
+                        text: Some(text),
+                        paste,
+                        ..Default::default()
+                    });
+                }
+            }
+            Chunk::Data(data) => {
+                let pieces: Vec<&[u8]> = if data.is_empty() {
+                    vec![&[]]
+                } else {
+                    data.chunks((budget / 4 * 3).max(1)).collect()
+                };
+                for piece in pieces {
+                    requests.push(SendParams {
+                        data: Some(base64::engine::general_purpose::STANDARD.encode(piece)),
+                        paste,
+                        ..Default::default()
+                    });
+                }
+            }
+            Chunk::Keys(keys) => requests.push(SendParams {
+                keys: Some(keys),
+                ..Default::default()
+            }),
+        }
     }
-    Ok(())
+    let last = requests.len() - 1;
+    for (i, mut params) in requests.into_iter().enumerate() {
+        params.session = session.to_string();
+        if i == last && wait.is_some() {
+            params.wait = wait;
+            return conn.begin("send", params).map(Some);
+        }
+        conn.request("send", params).await?;
+    }
+    Ok(None)
+}
+
+/// Waits for `reply`; Ctrl-C cancels the request and exits 130.
+async fn finish_wait(
+    conn: &Connection,
+    id: i64,
+    reply: client::connection::Reply,
+) -> Result<serde_json::Value, Fail> {
+    let finished = conn.finish(reply);
+    tokio::pin!(finished);
+    tokio::select! {
+        outcome = &mut finished => Ok(outcome?),
+        _ = tokio::signal::ctrl_c() => {
+            let _ = conn.request("cancel", CancelParams { id }).await;
+            // The cancelled request's error comes first.
+            let _ = finished.await;
+            Err(Fail::Interrupted)
+        }
+    }
+}
+
+/// The exit status a finished wait means: the child's for `exited` (128
+/// plus the signal's number for a signal, 1 with no exit), 124 for a
+/// timeout, else 0.
+fn wait_status(waited: &Waited) -> i32 {
+    match (waited.reason, &waited.exit) {
+        (WaitReason::Exited, Some(proto::Exit::Code { code })) => *code,
+        (WaitReason::Exited, Some(proto::Exit::Signal { signal })) => {
+            128 + server::pty::signal_by_name(signal)
+                .map(|s| s.as_raw())
+                .or_else(|| signal.parse().ok())
+                .unwrap_or(0)
+        }
+        (WaitReason::Exited, None) => 1,
+        (WaitReason::Timeout, _) => EXIT_TIMEOUT,
+        _ => 0,
+    }
+}
+
+/// One line for a finished wait.
+fn wait_line(waited: &Waited) -> String {
+    let at = waited.at.offset;
+    match (&waited.matched, &waited.exit, &waited.record) {
+        (Some(m), _, _) => format!("matched {:?} at {}\n", m.text, m.offset),
+        (_, Some(proto::Exit::Code { code }), _) => format!("exited {code}\n"),
+        (_, Some(proto::Exit::Signal { signal }), _) => format!("exited SIG{signal}\n"),
+        (_, _, Some(r)) => format!("status {} {:?}\n", r.state, r.id),
+        _ => format!("{} at {at}\n", waited.reason),
+    }
+}
+
+/// Prints a finished wait (`--json`: the whole reply) and returns its
+/// exit status.
+fn report_wait(json: bool, reply: &serde_json::Value, waited: &Waited) -> i32 {
+    if json {
+        emit(&format!(
+            "{}\n",
+            serde_json::to_string_pretty(reply).unwrap()
+        ));
+    } else {
+        emit(&wait_line(waited));
+    }
+    wait_status(waited)
+}
+
+/// A `wait` request, Ctrl-C cancelling it.
+async fn wait_for(conn: &Connection, json: bool, params: WaitParams) -> Result<i32, Fail> {
+    let (id, reply) = conn.begin("wait", params)?;
+    let reply = finish_wait(conn, id, reply).await?;
+    let waited: Waited = serde_json::from_value(reply.clone())
+        .map_err(|e| Error::Protocol(format!("wait reply: {e}")))?;
+    Ok(report_wait(json, &reply, &waited))
 }
 
 async fn run(cli: Cli) -> Result<i32, Fail> {
@@ -680,6 +925,8 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             keep,
             env,
             attach,
+            wait,
+            timeout,
             detach_key,
             argv,
         } => {
@@ -706,6 +953,27 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                 )
                 .await?;
                 return Ok(status_of(code));
+            }
+            if wait {
+                // From the first byte, so an exit before this request
+                // still counts.
+                return wait_for(
+                    &conn,
+                    json,
+                    WaitParams {
+                        session: created.id,
+                        until: Until {
+                            exited: Some(true),
+                            ..Default::default()
+                        },
+                        after: Some(CursorParams {
+                            offset: 0,
+                            marker: 0,
+                        }),
+                        timeout_ms: timeout.map(|t| t.as_millis() as u64),
+                    },
+                )
+                .await;
             }
             print(json, &created, |s| emit(&format!("{}\n", s.id)));
         }
@@ -794,31 +1062,76 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                 .await?;
             print(json, &read, |read| emit(&read.text));
         }
-        Command::Send { args, enter, bytes } => {
-            let (session, rest) = target_and(args, if bytes { 0 } else { 1 });
-            if bytes && !rest.is_empty() {
-                return Err(Error::Usage("--bytes takes no TEXT".into()).into());
+        Command::Send {
+            args,
+            enter,
+            paste,
+            keys,
+            bytes,
+            wait,
+        } => {
+            let until = wait.until()?;
+            let payload = !keys.is_empty() || bytes;
+            let (session, rest) = target_and(args, if payload { 0 } else { 1 });
+            if payload && !rest.is_empty() {
+                return Err(Error::Usage("--keys and --bytes take no TEXT".into()).into());
             }
-            let data = match rest.into_iter().next() {
+            let mut chunks = match rest.into_iter().next() {
                 _ if bytes => {
                     let mut data = Vec::new();
                     std::io::stdin().read_to_end(&mut data)?;
-                    data
+                    vec![Chunk::Data(data)]
                 }
-                Some(text) => {
-                    let mut data = text.into_bytes();
-                    if enter {
-                        data.push(b'\r');
-                    }
-                    data
-                }
-                None if enter => b"\r".to_vec(),
+                _ if !keys.is_empty() => vec![Chunk::Keys(keys)],
+                Some(text) => vec![Chunk::Text(text)],
+                None if enter => Vec::new(),
                 None => {
-                    return Err(Error::Usage("send takes TEXT, --enter or --bytes".into()).into());
+                    return Err(
+                        Error::Usage("send takes TEXT, --enter, --keys or --bytes".into()).into(),
+                    );
                 }
             };
+            if enter {
+                // Enter after a paste, not inside it.
+                match chunks.last_mut() {
+                    Some(Chunk::Text(text)) if !paste => text.push('\r'),
+                    _ => chunks.push(Chunk::Keys(vec!["enter".into()])),
+                }
+            }
             let session = resolve(&conn, session).await?;
-            send_bytes(&conn, &session, &data).await?;
+            let wait = until.map(|until| SendWait {
+                until,
+                timeout_ms: wait.timeout_ms(),
+            });
+            if let Some((id, reply)) = send_chunks(&conn, &session, chunks, paste, wait).await? {
+                let reply = finish_wait(&conn, id, reply).await?;
+                let sent: Sent = serde_json::from_value(reply.clone())
+                    .map_err(|e| Error::Protocol(format!("send reply: {e}")))?;
+                let waited = sent
+                    .wait
+                    .ok_or_else(|| Error::Protocol("send reply without its wait".into()))?;
+                return Ok(report_wait(json, &reply, &waited));
+            }
+        }
+        Command::Wait { session, wait } => {
+            let Some(until) = wait.until()? else {
+                return Err(Error::Usage(
+                    "wait for something: --exit, --match, --status, --prompt or --quiet".into(),
+                )
+                .into());
+            };
+            let session = resolve(&conn, session).await?;
+            return wait_for(
+                &conn,
+                json,
+                WaitParams {
+                    session,
+                    until,
+                    after: None,
+                    timeout_ms: wait.timeout_ms(),
+                },
+            )
+            .await;
         }
         Command::Events => {
             let mut events = conn.events();
@@ -858,6 +1171,7 @@ async fn main() {
                 Fail::Client(err) => (err.to_string(), 1),
                 Fail::Target(message) => (message, EXIT_TARGET),
                 Fail::Unreachable(message) => (message, EXIT_UNREACHABLE),
+                Fail::Interrupted => ("cancelled".into(), EXIT_INTERRUPTED),
             };
             eprintln!("clankermux: {message}");
             code

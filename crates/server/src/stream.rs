@@ -90,6 +90,13 @@ impl Stream {
         Some(self.ring.range(skip..end).copied().collect())
     }
 
+    /// The latest marker `seq` at or before `offset`, as a cursor at
+    /// `offset` reflects it.
+    pub fn seq_at(&self, offset: u64) -> u64 {
+        let later = self.markers.iter().filter(|m| m.offset > offset).count();
+        self.latest_seq - later as u64
+    }
+
     /// Whether every marker with `seq` above `after` is still retained.
     pub fn markers_retained_after(&self, after: u64) -> bool {
         after >= self.latest_seq || self.markers.front().is_some_and(|m| m.seq <= after + 1)
