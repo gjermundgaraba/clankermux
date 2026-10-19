@@ -119,6 +119,18 @@ async fn an_unknown_field_in_open_or_viewport_is_invalid() {
     }
 }
 
+/// The payload of the next `frame_type` on `channel`; the login shell's
+/// output on any channel meanwhile is skipped.
+async fn until(c: &mut Client, channel: u32, frame_type: FrameType) -> Vec<u8> {
+    loop {
+        let (header, payload) = c.recv().await.expect("a frame");
+        if (header.channel, header.frame_type) == (channel, frame_type) {
+            return payload;
+        }
+        assert_eq!(header.frame_type, FrameType::Output, "{header:?}");
+    }
+}
+
 /// The payloads of `@gjermundgaraba/clankermux` 0.2.0, as its
 /// `connection.ts` and `worker.ts` build them, verbatim: a 0.2.0 page and
 /// this server work together, except for a paste (`write`).
@@ -171,7 +183,9 @@ async fn the_payloads_of_the_0_2_0_web_package_are_accepted() {
         &json!({"cols": 91, "rows": 21, "cell_width": 16, "cell_height": 34, "profile": profile}),
     )
     .await;
-    assert_eq!(c.expect_resized(1).await.cols, 91);
+    let resized: Resized =
+        serde_json::from_slice(&until(&mut c, 1, FrameType::Resized).await).unwrap();
+    assert_eq!(resized.cols, 91);
     // OPEN while hidden, resuming: no viewport or profile.
     c.open(
         2,
@@ -180,7 +194,9 @@ async fn the_payloads_of_the_0_2_0_web_package_are_accepted() {
                           "offset": attached.offset, "marker": attached.marker}}),
     )
     .await;
-    assert_eq!(c.attached(2).await.mode, AttachMode::Resume);
+    let resumed: Attached =
+        serde_json::from_slice(&until(&mut c, 2, FrameType::Attached).await).unwrap();
+    assert_eq!(resumed.mode, AttachMode::Resume);
 
     // `end`, then `remove` once exited.
     c.send(FrameType::Close, 1, b"").await;
