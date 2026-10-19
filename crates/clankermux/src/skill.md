@@ -34,6 +34,7 @@ the human-readable listing.
     clankermux create --label build -- make  # start a session; prints its id
     clankermux create --keep -- ./test.sh    # keep it listed after it exits
     clankermux create --wait -- make test    # run it, wait, exit with its status
+    clankermux --json create --wait -- make test   # the same; prints {session, wait}
     clankermux inspect build                 # one session as JSON, with program status
     clankermux read build --scrollback 200   # its screen, with 200 history lines before it
     clankermux send build 'make test' --enter   # type text, then Enter
