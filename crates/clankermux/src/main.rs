@@ -13,10 +13,10 @@ use clap::{Args, Parser, Subcommand};
 use client::connection::hello;
 use client::{Connection, Endpoint, Error};
 use proto::{
-    AckParams, Acked, CancelParams, CreateParams, CursorParams, LabelParams, ListParams, OnExit,
-    OutputMatch, Page, Read, ReadFormat, ReadParams, ReadScope, ResizeParams, SendParams, SendWait,
-    Sent, Session, SessionParams, SignalParams, StatusMatch, SubscribeParams, Subscribed, Tail,
-    TailParams, Until, WaitParams, WaitReason, Waited,
+    AckParams, Acked, CancelParams, CreateParams, CursorParams, DetachParams, LabelParams,
+    ListParams, OnExit, OutputMatch, Page, Read, ReadFormat, ReadParams, ReadScope, ResizeParams,
+    SendParams, SendWait, Sent, Session, SessionParams, SignalParams, SizePolicy, StatusMatch,
+    SubscribeParams, Subscribed, Tail, TailParams, Until, WaitParams, WaitReason, Waited,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -149,11 +149,29 @@ enum Command {
         #[arg(value_name = "[SESSION] LABEL", num_args = 1..=2, required = true)]
         args: Vec<String>,
     },
-    /// Set the size: `COLSxROWS`, or `COLSx` or `xROWS` to keep the other.
+    /// Set the size (`COLSxROWS`, or `COLSx` or `xROWS` to keep the
+    /// other), the size policy, or both.
     Resize {
-        /// The session, `$CLANKERMUX_SESSION` when left out, then the value.
-        #[arg(value_name = "[SESSION] SIZE", num_args = 1..=2, required = true)]
+        /// The session, `$CLANKERMUX_SESSION` when left out, then the
+        /// size. With `--policy` alone, one argument is the size when it
+        /// reads as one, else the session.
+        #[arg(value_name = "[SESSION] [SIZE]", num_args = 0..=2)]
         args: Vec<String>,
+        /// `latest`: the most recent viewport report wins; `smallest`: the
+        /// smallest viewport among the attachments; `fixed`: only resize
+        /// changes the size.
+        #[arg(long, value_parser = parse_policy)]
+        policy: Option<SizePolicy>,
+    },
+    /// Close another client's attachment; `inspect` lists them by channel.
+    Detach {
+        /// The session, `$CLANKERMUX_SESSION` when left out, then the
+        /// attachment's channel.
+        #[arg(value_name = "[SESSION] CHANNEL", num_args = 1..=2, required = true)]
+        args: Vec<String>,
+        /// Told to the detached client.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Print the screen, with history lines before it, or another scope.
     Read {
@@ -493,8 +511,11 @@ fn target_and(mut args: Vec<String>, rest: usize) -> (Option<String>, Vec<String
     }
 }
 
+/// Columns and rows, either left out.
+type Sides = (Option<u16>, Option<u16>);
+
 /// `COLSxROWS`, `COLSx` or `xROWS`.
-fn parse_size(spec: &str) -> Result<(Option<u16>, Option<u16>), Error> {
+fn parse_size(spec: &str) -> Result<Sides, Error> {
     let bad = || Error::Usage(format!("{spec:?} is not COLSxROWS, COLSx or xROWS"));
     let (cols, rows) = spec.split_once('x').ok_or_else(bad)?;
     let side = |s: &str| {
@@ -506,6 +527,11 @@ fn parse_size(spec: &str) -> Result<(Option<u16>, Option<u16>), Error> {
         (None, None) => Err(bad()),
         size => Ok(size),
     }
+}
+
+fn parse_policy(spec: &str) -> Result<SizePolicy, String> {
+    serde_json::from_value(serde_json::Value::String(spec.into()))
+        .map_err(|_| format!("{spec:?} is not latest, smallest or fixed"))
 }
 
 /// Writes to stdout; a closed pipe (`| head`) ends the program quietly.
@@ -951,6 +977,36 @@ async fn names_session(conn: &Connection, text: &str) -> Result<bool, Error> {
         .any(|s| s.id == text || s.label.to_lowercase() == lower))
 }
 
+/// `resize`'s session and size. Without a policy the last argument is the
+/// size; with one, a lone argument is the size only when it reads as one.
+fn resize_args(
+    mut args: Vec<String>,
+    policy: Option<SizePolicy>,
+) -> Result<(Option<String>, Option<Sides>), Error> {
+    let size = match (args.len(), policy) {
+        (0, None) => return Err(Error::Usage("resize takes SIZE, --policy or both".into())),
+        (0, Some(_)) => None,
+        (1, Some(_)) => match parse_size(&args[0]) {
+            Ok(size) => {
+                args.clear();
+                Some(size)
+            }
+            Err(_) => None,
+        },
+        _ => Some(parse_size(&args.pop().expect("an argument"))?),
+    };
+    Ok((args.pop(), size))
+}
+
+/// `detach`'s session and channel.
+fn detach_args(args: Vec<String>) -> Result<(Option<String>, u64), Error> {
+    let (session, rest) = target_and(args, 1);
+    let channel = rest[0]
+        .parse::<u64>()
+        .map_err(|_| Error::Usage(format!("{:?} is not a channel number", rest[0])))?;
+    Ok((session, channel))
+}
+
 /// Checks a command's arguments before connecting, so a usage error is
 /// one whatever the server's state.
 fn check_args(command: &Command) -> Result<(), Error> {
@@ -964,8 +1020,11 @@ fn check_args(command: &Command) -> Result<(), Error> {
         Command::Attach { detach_key, .. } => {
             parse_detach_key(detach_key)?;
         }
-        Command::Resize { args } => {
-            parse_size(args.last().expect("clap requires one"))?;
+        Command::Resize { args, policy } => {
+            resize_args(args.clone(), *policy)?;
+        }
+        Command::Detach { args, .. } => {
+            detach_args(args.clone())?;
         }
         Command::Send {
             args,
@@ -1285,16 +1344,30 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             let updated: Session = conn.call("label", LabelParams { session, label }).await?;
             print(json, &updated, |_| {});
         }
-        Command::Resize { args } => {
-            let (session, rest) = target_and(args, 1);
-            let (cols, rows) = parse_size(&rest[0])?;
+        Command::Resize { args, policy } => {
+            let (session, size) = resize_args(args, policy)?;
             let session = resolve(&conn, here, session).await?;
+            let (cols, rows) = size.unwrap_or_default();
             conn.request(
                 "resize",
                 ResizeParams {
                     session,
                     cols,
                     rows,
+                    policy,
+                },
+            )
+            .await?;
+        }
+        Command::Detach { args, reason } => {
+            let (session, channel) = detach_args(args)?;
+            let session = resolve(&conn, here, session).await?;
+            conn.request(
+                "detach",
+                DetachParams {
+                    session,
+                    channel,
+                    reason,
                 },
             )
             .await?;

@@ -35,7 +35,7 @@ the human-readable listing.
     clankermux create --keep -- ./test.sh    # keep it listed after it exits
     clankermux create --wait -- make test    # run it, wait, exit with its status
     clankermux --json create --wait -- make test   # the same; prints {session, wait}
-    clankermux inspect build                 # one session as JSON, with program status
+    clankermux inspect build                 # one session as JSON: program status, attachments
     clankermux read build --scrollback 200   # its screen, with 200 history lines before it
     clankermux read build --scope last_command   # the last command's output (needs shell integration)
     clankermux read build --format html      # the screen as styled HTML (or vt)
@@ -52,6 +52,8 @@ the human-readable listing.
     clankermux wait build --quiet 2000       # wait until it prints nothing for 2 s
     clankermux label build release           # set the label
     clankermux resize build 120x40           # set the size (or 120x, x40)
+    clankermux resize build --policy fixed   # only resize sets the size (or latest, smallest)
+    clankermux detach build 42 --reason why  # close attachment 42, by its channel in inspect
     clankermux signal build INT              # send a signal by name
     clankermux end build                     # hang up its processes
     clankermux remove build                  # delete an exited session
@@ -103,8 +105,9 @@ signal's number.
 
 ## Rules
 
-- Do not end, signal or remove a session you did not create, unless you
-  are asked to.
+- Do not end, signal or remove a session you did not create, and do not
+  detach anyone or change a session's size policy, unless you are asked
+  to.
 - Never send input to a session you did not create unless you are asked
   to: someone may be typing in it.
 - Keep the ids of the sessions you create, from `--json` output, and act

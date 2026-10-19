@@ -8,10 +8,11 @@
   "label": 256,
   "text": 2048,
   "markers": 1024,
-  "records": 200,
+  "records": 198,
   "commands": 64,
   "page": 32,
   "hello_timeout": 10000,
   "remove_grace": 10000,
-  "events": 4096
+  "events": 4096,
+  "attachments": 16
 }

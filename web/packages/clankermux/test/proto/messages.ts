@@ -12,6 +12,7 @@ import type {
   Cancelled,
   Closed,
   CreateParams,
+  DetachParams,
   ErrorMessage,
   Event,
   Exited,
@@ -62,14 +63,25 @@ const running = {
   created_at: "2026-10-18T12:00:00Z",
   offset: 1024,
   marker: 2,
-  attachments: 1,
+  attachments: [
+    {
+      channel: 7,
+      client: { name: "clankerspace", version: "0.3.0" },
+      read_only: false,
+      viewport: { cols: 120, rows: 40 },
+      since: "2026-10-18T12:00:01Z",
+      last_input: "2026-10-18T12:01:00Z",
+    },
+  ],
+  size: { policy: "latest", owner: 7 },
 } satisfies Session;
 
 const { pid: _pid, ...exitedBase } = running;
 const exited = {
   ...exitedBase,
   status: "exited",
-  attachments: 0,
+  attachments: [],
+  size: { policy: "latest" },
   exited_at: "2026-10-18T12:05:00Z",
   exit: { code: 0 },
 } satisfies Session;
@@ -179,11 +191,11 @@ export const vectors = {
     seq: 12,
     event: "attachment_opened",
     id: SESSION,
-    channel: 1,
+    channel: 7,
     client: { name: "clankermux", version: "0.3.0" },
     read_only: false,
   } satisfies Event,
-  "event/attachment_closed": { seq: 13, event: "attachment_closed", id: SESSION, channel: 1, reason: "disconnected" } satisfies Event,
+  "event/attachment_closed": { seq: 13, event: "attachment_closed", id: SESSION, channel: 7, reason: "disconnected" } satisfies Event,
   "params/create": createParams,
   "params/create-empty": {} satisfies CreateParams,
   "params/list": { after: SESSION } satisfies ListParams,
@@ -193,6 +205,8 @@ export const vectors = {
   "params/label": { session: SESSION, label: "deploy" } satisfies LabelParams,
   "params/resize": { session: SESSION, cols: 100, rows: 30 } satisfies ResizeParams,
   "params/resize-cols": { session: SESSION, cols: 100 } satisfies ResizeParams,
+  "params/resize-policy": { session: SESSION, policy: "smallest" } satisfies ResizeParams,
+  "params/detach": { session: SESSION, channel: 7, reason: "taken over" } satisfies DetachParams,
   "params/read": { session: SESSION, scrollback: 50 } satisfies ReadParams,
   "params/read-screen": { session: SESSION } satisfies ReadParams,
   "params/read-scoped": { session: SESSION, format: "html", scope: "last_command" } satisfies ReadParams,
@@ -242,4 +256,5 @@ export const vectors = {
   "gap/basic": { from: 100, to: 5000 } satisfies Gap,
   "closed/removed": { reason: "removed" } satisfies Closed,
   "acked/basic": { record_ids: ["sync/2"] } satisfies Acked,
+  "closed/detached": { reason: "detached", message: "taken over" } satisfies Closed,
 };

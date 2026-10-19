@@ -6,16 +6,21 @@ use std::sync::{Arc, Weak};
 use ghostty_vt::snapshot;
 use proto::{
     AttachMode, Attached, Closed, ClosedReason, ErrorCode, Event, Exited, FrameType, Gap, Open,
-    Resized, Resume, Status, Viewport, encode_frame, encode_json_frame, encode_output,
+    Peer, Resized, Resume, Status, Viewport, encode_frame, encode_json_frame, encode_output,
 };
 use tokio::sync::mpsc;
 
 use crate::connection::{Writer, error_frame};
-use crate::registry::Registry;
-use crate::session::{Attachment, Body, SNAPSHOT_RETRY, Session, Shared, snapshot_with_retry};
+use crate::registry::{Fail, Registry};
+use crate::session::{
+    Attachment, Body, SNAPSHOT_RETRY, Session, Shared, Source, now, snapshot_with_retry, truncate,
+};
 use crate::stream::MarkerKind;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Bytes kept of the client's name and of its version.
+const CLIENT_TEXT: usize = 32;
 
 /// Bytes pulled from the stream per lock hold.
 const PULL_BUDGET: usize = 64 * 1024;
@@ -23,13 +28,15 @@ const PULL_BUDGET: usize = 64 * 1024;
 /// How an attachment ends, as the session or the connection decides it.
 /// The task sends the frame after whatever it had queued.
 pub enum Ending {
-    Closed(ClosedReason),
+    Closed(Closed),
     Error(ErrorCode, String),
 }
 
 /// The connection's side of an attachment. The task holds the session;
 /// the handle only reaches it while the task runs.
 pub struct Handle {
+    /// Unique on the server: `AttachmentInfo.channel`.
+    pub id: u64,
     pub read_only: bool,
     session: Weak<std::sync::Mutex<Session>>,
     close: mpsc::UnboundedSender<Ending>,
@@ -57,7 +64,10 @@ impl Handle {
 
     /// `CLOSE`: the task sends `CLOSED closed` after its pending frames.
     pub fn close(&self) {
-        let _ = self.close.send(Ending::Closed(ClosedReason::Closed));
+        let _ = self.close.send(Ending::Closed(Closed {
+            reason: ClosedReason::Closed,
+            message: None,
+        }));
     }
 
     /// Asks the task to end with `ERROR code` after its pending frames.
@@ -74,42 +84,70 @@ impl Handle {
     }
 }
 
-/// Starts serving `open` on `channel`. The checks that precede this
-/// (channel, session, engine, size) are the connection's.
+/// Starts serving `open` on `channel` for a connection whose `HELLO`
+/// named `client`. The checks that precede this (channel, session,
+/// engine, size) are the connection's; a session at
+/// `limits.attachments` is `limit_exceeded`.
 pub fn open(
     registry: &Arc<Registry>,
     writer: &Writer,
     channel: u32,
+    client: &Peer,
     open: Open,
     session: Shared,
-    client: proto::Peer,
-) -> Handle {
+) -> Result<Handle, Fail> {
+    let limits = &registry.config.limits;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let (close_tx, close_rx) = mpsc::unbounded_channel();
     let finished = Arc::new(AtomicBool::new(false));
     let ended = Arc::new(AtomicBool::new(false));
     let (events, snapshot) = {
         let mut s = session.lock().unwrap();
-        // A writable OPEN's viewport and profile are one immediate report.
-        if !open.read_only && (open.viewport.is_some() || open.profile.is_some()) {
-            let size = open.viewport.unwrap_or_else(|| s.size());
-            s.apply_report(Viewport {
-                size,
-                profile: open.profile,
-            });
+        if s.attached.len() as u64 >= limits.attachments {
+            return Err((ErrorCode::LimitExceeded, "too many attachments".into()));
         }
         s.attached.push(Attachment {
             id,
+            client: Peer {
+                name: client_text(&client.name),
+                version: client_text(&client.version),
+            },
+            read_only: open.read_only,
+            viewport: None,
+            since: now(),
+            last_input: None,
             close: close_tx.downgrade(),
             finished: finished.clone(),
         });
+        // The same channel and client as the attachments list.
         let opened = Event::AttachmentOpened {
             id: s.id.clone(),
-            channel,
-            client,
+            channel: id,
+            client: s.attached.last().expect("just pushed").client.clone(),
             read_only: open.read_only,
         };
         s.events.push(opened);
+        // A writable OPEN's viewport is an immediate report; a profile
+        // alone is applied as it is.
+        if !open.read_only && s.running().is_ok() {
+            match open.viewport {
+                Some(size) => {
+                    s.record_viewport(id, &size);
+                    s.apply_report(
+                        Viewport {
+                            size,
+                            profile: open.profile,
+                        },
+                        Source::Attachment(id),
+                    );
+                }
+                None => {
+                    if let Some(profile) = open.profile {
+                        s.set_profile(profile);
+                    }
+                }
+            }
+        }
         (s.take_events(), s.to_proto(false))
     };
     registry.emit_session(events, Some(snapshot));
@@ -130,13 +168,25 @@ pub fn open(
         snapshot: None,
         done: false,
     };
-    Handle {
+    Ok(Handle {
+        id,
         read_only: open.read_only,
         session: Arc::downgrade(&session),
         close: close_tx,
         ended,
         task: registry.attachments.spawn(task.run(open.resume)),
-    }
+    })
+}
+
+/// The first `CLIENT_TEXT` bytes of a client's `HELLO` text, control
+/// characters replaced by `?`, so that the attachments list stays small
+/// within `inspect`.
+fn client_text(text: &str) -> String {
+    let text = text
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    truncate(text, CLIENT_TEXT)
 }
 
 #[derive(Clone, Copy)]
@@ -185,22 +235,29 @@ impl Task {
         let end = self.serve(resume).await;
         // Detach before the ending frame goes out, so a client that reads
         // it finds the channel free and the attachment gone.
-        let (snapshot, last) = {
+        let (events, snapshot, last) = {
             let mut s = self.session.lock().unwrap();
-            s.attached.retain(|a| a.id != self.id);
+            s.detach(self.id);
             self.ended.store(true, Ordering::Release);
             let last = s.attached.is_empty() && s.status() == Status::Running;
-            (s.to_proto(false), last)
+            (s.take_events(), s.to_proto(false), last)
         };
+        self.registry.emit_all(events);
         // The last detach parks: what the user left is on disk.
         if last {
             let registry = self.registry.clone();
             let session = self.session.clone();
             tokio::spawn(async move { registry.park(&session).await });
         }
-        let removed = matches!(end, Some(Ending::Closed(ClosedReason::Removed)));
+        let removed = matches!(
+            &end,
+            Some(Ending::Closed(Closed {
+                reason: ClosedReason::Removed,
+                ..
+            }))
+        );
         let reason = match &end {
-            Some(Ending::Closed(reason)) => reason.to_string(),
+            Some(Ending::Closed(closed)) => closed.reason.to_string(),
             Some(Ending::Error(code, _)) => code.to_string(),
             None => "disconnected".into(),
         };
@@ -219,7 +276,7 @@ impl Task {
         }
         self.registry.emit(&Event::AttachmentClosed {
             id: snapshot.id.clone(),
-            channel: self.channel,
+            channel: self.id,
             reason,
         });
         if !removed {
@@ -230,7 +287,7 @@ impl Task {
 
     fn send_ending(&self, ending: Ending) {
         match ending {
-            Ending::Closed(reason) => self.send_json(FrameType::Closed, &Closed { reason }),
+            Ending::Closed(closed) => self.send_json(FrameType::Closed, &closed),
             Ending::Error(code, message) => {
                 self.writer.send(error_frame(self.channel, code, message));
             }

@@ -291,11 +291,19 @@ async fn attachments_open_and_close_as_events() {
         _ => None,
     })
     .await;
+    // The event's channel is the one the attachments list shows and
+    // `detach` takes, not the frame channel.
+    let Event::SessionChanged { session } = c.event().await else {
+        panic!("session_changed after attachment_opened");
+    };
+    let listed = &session.attachments[..];
+    assert_eq!(listed.len(), 1);
+    let channel = listed[0].channel;
     assert_eq!(
         opened,
         Event::AttachmentOpened {
             id: id.clone(),
-            channel: 3,
+            channel,
             client: Peer {
                 name: "test".into(),
                 version: "0".into()
@@ -303,22 +311,44 @@ async fn attachments_open_and_close_as_events() {
             read_only: true,
         }
     );
-    assert!(
-        matches!(c.event().await, Event::SessionChanged { session } if session.attachments == 1)
-    );
+    assert_eq!(listed[0].client.name, "test");
     o.send(FrameType::Close, 3, b"").await;
     assert_eq!(o.expect_closed(3).await, ClosedReason::Closed);
     assert_eq!(
         c.event().await,
         Event::AttachmentClosed {
             id: id.clone(),
-            channel: 3,
+            channel,
             reason: "closed".into(),
         }
     );
     assert!(
-        matches!(c.event().await, Event::SessionChanged { session } if session.attachments == 0)
+        matches!(c.event().await, Event::SessionChanged { session } if session.attachments.is_empty())
     );
+
+    // A `detach` by the channel from the event.
+    o.open(3, json!({"session": id})).await;
+    o.bootstrap(3).await;
+    let detached = event_where(&mut c, |e| match e {
+        Event::AttachmentOpened { channel, .. } => Some(*channel),
+        _ => None,
+    })
+    .await;
+    assert_ne!(
+        detached, channel,
+        "never reused, though the frame channel is"
+    );
+    c.ok("detach", json!({"session": id, "channel": detached}))
+        .await;
+    let closed = event_where(&mut c, |e| match e {
+        Event::AttachmentClosed {
+            channel, reason, ..
+        } => Some((*channel, reason.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(closed, (detached, "detached".into()));
+    assert_eq!(o.expect_closed(3).await, ClosedReason::Detached);
 
     o.open(4, json!({"session": id})).await;
     o.bootstrap(4).await;
@@ -329,7 +359,7 @@ async fn attachments_open_and_close_as_events() {
         _ => None,
     })
     .await;
-    assert_eq!(opened, (4, false));
+    assert!(!opened.1);
     drop(o);
     let closed = event_where(&mut c, |e| match e {
         Event::AttachmentClosed {
@@ -338,7 +368,7 @@ async fn attachments_open_and_close_as_events() {
         _ => None,
     })
     .await;
-    assert_eq!(closed, (4, "disconnected".into()));
+    assert_eq!(closed, (opened.0, "disconnected".into()));
     c.ok("signal", json!({"session": id, "signal": "KILL"}))
         .await;
 }

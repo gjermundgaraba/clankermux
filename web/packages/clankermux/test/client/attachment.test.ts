@@ -64,7 +64,8 @@ function session(cols: number, rows: number): Session {
     created_at: "",
     offset: 0,
     marker: 0,
-    attachments: 1,
+    attachments: [],
+    size: { policy: "latest" },
   };
 }
 

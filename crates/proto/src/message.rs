@@ -78,6 +78,7 @@ pub enum ErrorCode {
     Cancelled,
     ScopeUnavailable,
     Internal,
+    NoSuchAttachment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,7 +181,8 @@ pub struct Session {
     pub exit: Option<Exit>,
     pub offset: u64,
     pub marker: u64,
-    pub attachments: u32,
+    /// Open attachments, in the order they opened.
+    pub attachments: Vec<AttachmentInfo>,
     /// The current or last command, from OSC 133 marks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Command>,
@@ -188,6 +190,55 @@ pub struct Session {
     pub program_status: Option<Vec<StatusRecord>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<Attention>,
+    #[serde(default)]
+    pub size: SizeInfo,
+}
+
+/// One open attachment of a session, as `list` and `inspect` show it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentInfo {
+    /// Unique on the server and never reused: `detach` takes it.
+    pub channel: u64,
+    /// The connection's `HELLO.client`.
+    pub client: Peer,
+    pub read_only: bool,
+    /// The size of its latest viewport report, if it made one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport: Option<Cells>,
+    /// When it opened, RFC 3339.
+    pub since: String,
+    /// When it last sent `INPUT`, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_input: Option<String>,
+}
+
+/// A size in cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cells {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// How a session's size follows its attachments' viewport reports.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizePolicy {
+    /// The most recent report wins.
+    #[default]
+    Latest,
+    /// The smallest columns and rows among the attachments' reports.
+    Smallest,
+    /// Only `resize` changes the size.
+    Fixed,
+}
+
+/// `Session.size`: the policy and, under `latest`, the attachment whose
+/// report is current.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizeInfo {
+    pub policy: SizePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,7 +353,8 @@ pub struct LabelParams {
     pub label: String,
 }
 
-/// `resize`: a side left out keeps the session's.
+/// `resize`: a side left out keeps the session's; `policy` left out
+/// keeps the session's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResizeParams {
@@ -311,6 +363,18 @@ pub struct ResizeParams {
     pub cols: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<SizePolicy>,
+}
+
+/// `detach`: `reason` goes to the attachment as `CLOSED.message`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetachParams {
+    pub session: String,
+    pub channel: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -585,13 +649,13 @@ pub enum Event {
     },
     AttachmentOpened {
         id: String,
-        channel: u32,
+        channel: u64,
         client: Peer,
         read_only: bool,
     },
     AttachmentClosed {
         id: String,
-        channel: u32,
+        channel: u64,
         reason: String,
     },
 }
@@ -775,7 +839,8 @@ wire_display!(
     ClosedReason,
     WaitReason,
     ReadFormat,
-    ReadScope
+    ReadScope,
+    SizePolicy
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -784,9 +849,13 @@ pub enum ClosedReason {
     Closed,
     Removed,
     Stopping,
+    Detached,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Closed {
     pub reason: ClosedReason,
+    /// The `reason` a `detach` gave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }

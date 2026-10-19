@@ -31,7 +31,7 @@ async fn snapshot_bootstrap_then_stream_then_close() {
     assert_eq!(boot.attached.offset, read.offset);
     assert_eq!(boot.attached.marker, 0);
     assert_eq!((boot.attached.cols, boot.attached.rows), (20, 5));
-    assert_eq!(boot.attached.session.attachments, 1);
+    assert_eq!(boot.attached.session.attachments.len(), 1);
     assert!(boot.stream.is_empty(), "no stream frames while idle");
     assert_eq!(boot.text(), "one\none");
     let mut decoder = snapshot::Decoder::new().unwrap();
@@ -48,7 +48,7 @@ async fn snapshot_bootstrap_then_stream_then_close() {
     assert_eq!(c.expect_closed(1).await, ClosedReason::Closed);
     // The attachment is gone and the channel free once CLOSED is read.
     let inspected = c.inspect(&session.id).await;
-    assert_eq!(inspected.attachments, 0);
+    assert!(inspected.attachments.is_empty());
     c.open(1, json!({"session": session.id})).await;
     let boot = c.bootstrap(1).await;
     assert_eq!(boot.attached.offset, offset + bytes.len() as u64);

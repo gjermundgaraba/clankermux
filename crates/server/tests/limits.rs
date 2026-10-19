@@ -240,6 +240,22 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
         msg: Some(worst(2048)),
         record: worst(128),
     };
+    // The server cuts the client's name and version to 32 bytes and
+    // replaces control characters, so `"` (escaped to two) is the worst.
+    let attachment = AttachmentInfo {
+        channel: u64::MAX,
+        client: Peer {
+            name: worst(32),
+            version: worst(32),
+        },
+        read_only: false,
+        viewport: Some(Cells {
+            cols: u16::MAX,
+            rows: u16::MAX,
+        }),
+        since: "2026-10-18T16:00:00.123456789Z".into(),
+        last_input: Some("2026-10-18T16:00:00.123456789Z".into()),
+    };
     let session = |records: bool| Session {
         id: "a8098c1a-f86e-11da-bd1a-00112444be1e".into(),
         label: worst_text(limits.label as usize),
@@ -259,7 +275,7 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
         }),
         offset: u64::MAX,
         marker: u64::MAX,
-        attachments: u32::MAX,
+        attachments: vec![attachment.clone(); limits.attachments as usize],
         command: Some(Command {
             start: u64::MAX,
             output: Some(u64::MAX),
@@ -268,6 +284,10 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
         }),
         program_status: records.then(|| vec![record.clone(); limits.records as usize]),
         attention: Some(attention.clone()),
+        size: SizeInfo {
+            policy: SizePolicy::Smallest,
+            owner: Some(u64::MAX),
+        },
     };
     let reply = |result: serde_json::Value| {
         serde_json::to_vec(&Reply {

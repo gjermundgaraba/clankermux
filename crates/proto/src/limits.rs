@@ -20,6 +20,7 @@ pub struct Limits {
     pub hello_timeout: u64,
     pub remove_grace: u64,
     pub events: u64,
+    pub attachments: u64,
 }
 
 impl Default for Limits {
@@ -34,12 +35,13 @@ impl Default for Limits {
             label: 256,
             text: 2048,
             markers: 1024,
-            records: 200,
+            records: 198,
             commands: 64,
             page: 32,
             hello_timeout: 10_000,
             remove_grace: 10_000,
             events: 4096,
+            attachments: 16,
         }
     }
 }

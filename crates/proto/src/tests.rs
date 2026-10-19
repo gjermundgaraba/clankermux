@@ -191,6 +191,7 @@ fn message_vectors() {
             ("cancelled", _) => round_trip::<Cancelled>(name, json),
             ("params", "subscribe") => round_trip::<SubscribeParams>(name, json),
             ("params", "ack") => round_trip::<AckParams>(name, json),
+            ("params", "detach") => round_trip::<DetachParams>(name, json),
             ("open", _) => round_trip::<Open>(name, json),
             ("viewport", _) => round_trip::<Viewport>(name, json),
             ("attached", _) => round_trip::<Attached>(name, json),

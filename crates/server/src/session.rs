@@ -12,8 +12,8 @@ use ghostty_vt::{
     SemanticPromptKind, SizeReport, Terminal, color_scheme_report, formatter, snapshot,
 };
 use proto::{
-    Attention, ClosedReason, ErrorCode, Event, Exit, OnExit, Profile, Scheme, Size, Status,
-    StatusReason, Viewport,
+    AttachmentInfo, Attention, Cells, Closed, ClosedReason, ErrorCode, Event, Exit, OnExit, Peer,
+    Profile, Scheme, Size, SizeInfo, SizePolicy, Status, StatusReason, Viewport,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -269,13 +269,52 @@ pub fn check_size(size: &Size) -> Result<(), Fail> {
 
 /// An open attachment as the session sees it.
 pub struct Attachment {
+    /// Unique on the server: `AttachmentInfo.channel`.
     pub id: u64,
+    pub client: Peer,
+    pub read_only: bool,
+    /// Its latest viewport report.
+    pub viewport: Option<Cells>,
+    pub since: String,
+    pub last_input: Option<String>,
     /// Tells the attachment to send `CLOSED` and end. Weak, so that the
     /// connection dropping its handle ends the attachment.
     pub close: mpsc::WeakUnboundedSender<Ending>,
     /// Set once it has sent the final marker and, if bootstrapping,
     /// `SNAPSHOT_END`.
     pub finished: Arc<AtomicBool>,
+}
+
+impl Attachment {
+    fn to_proto(&self) -> AttachmentInfo {
+        AttachmentInfo {
+            channel: self.id,
+            client: self.client.clone(),
+            read_only: self.read_only,
+            viewport: self.viewport,
+            since: self.since.clone(),
+            last_input: self.last_input.clone(),
+        }
+    }
+}
+
+/// Where a viewport report comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Attachment(u64),
+    /// `resize`, applied under every policy.
+    Resize,
+}
+
+/// A coalesced report waiting for the timer.
+pub struct Pending {
+    /// The latest dimensions, and the profile and cell size of the latest
+    /// report that carried them.
+    pub report: Viewport,
+    /// The attachment that sent the latest.
+    pub from: u64,
+    /// A report changed an attachment's recorded viewport.
+    pub recorded: bool,
 }
 
 /// What only a session with a process behind it has.
@@ -291,7 +330,7 @@ pub struct Live {
     pub input: InputQueue,
     pub pty_eof: bool,
     /// The latest coalesced report, waiting for the timer.
-    pub pending: Option<Viewport>,
+    pub pending: Option<Pending>,
     pub timer_running: bool,
     /// The stream offsets just after each OSC 133 `A`, within the ring.
     pub prompts: VecDeque<u64>,
@@ -364,7 +403,11 @@ pub struct Session {
     pub records_limit: usize,
     /// `limits.commands`.
     pub commands_limit: usize,
+    /// In the order they opened.
     pub attached: Vec<Attachment>,
+    pub size_policy: SizePolicy,
+    /// Under `latest`, the attachment whose report is current.
+    pub size_owner: Option<u64>,
     pub records: Records,
     pub commands: Commands,
     /// Events raised under the lock, emitted by whoever releases it.
@@ -480,10 +523,14 @@ impl Session {
             exit: self.exit.clone(),
             offset,
             marker,
-            attachments: self.attached.len() as u32,
+            attachments: self.attached.iter().map(Attachment::to_proto).collect(),
             command: self.commands.current(),
             program_status: with_records.then(|| self.records.resolved()),
             attention: self.records.attention(),
+            size: SizeInfo {
+                policy: self.size_policy,
+                owner: self.size_owner,
+            },
         }
     }
 
@@ -725,15 +772,44 @@ impl Session {
         }
     }
 
+    /// Records a writable attachment's viewport report; true when its
+    /// recorded viewport changed.
+    pub fn record_viewport(&mut self, id: u64, size: &Size) -> bool {
+        let cells = Some(Cells {
+            cols: size.cols,
+            rows: size.rows,
+        });
+        match self.attached.iter_mut().find(|a| a.id == id) {
+            Some(a) if a.viewport != cells => {
+                a.viewport = cells;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The smallest columns and rows among the recorded viewports.
+    fn smallest(&self) -> Option<(u16, u16)> {
+        let mut viewports = self.attached.iter().filter_map(|a| a.viewport);
+        let first = viewports.next()?;
+        Some(viewports.fold((first.cols, first.rows), |(cols, rows), v| {
+            (cols.min(v.cols), rows.min(v.rows))
+        }))
+    }
+
     /// Applies a viewport report at once, discarding any pending coalesced
-    /// report. Returns whether the size changed.
-    pub fn apply_report(&mut self, report: Viewport) -> bool {
+    /// report, with the size the policy gives: the report's under
+    /// `latest` and for `resize`, the smallest recorded under `smallest`,
+    /// the current one under `fixed`. Returns whether what `Session`
+    /// shows changed: the size, the owner, or a recorded viewport a
+    /// discarded report changed.
+    pub fn apply_report(&mut self, report: Viewport, from: Source) -> bool {
         let Body::Live(live) = &mut self.body else {
             return false;
         };
-        live.pending = None;
+        let recorded = live.pending.take().is_some_and(|p| p.recorded);
         if self.exited_at.is_some() {
-            return false;
+            return recorded;
         }
         let Viewport {
             size:
@@ -748,6 +824,38 @@ impl Session {
         if let Some(profile) = profile {
             self.set_profile(profile);
         }
+        let current = self.size();
+        let owner = self.size_owner;
+        let (cols, rows) = match (from, self.size_policy) {
+            (Source::Resize, _) => {
+                self.size_owner = None;
+                (cols, rows)
+            }
+            (Source::Attachment(id), SizePolicy::Latest) => {
+                // A coalesced report may outlive its attachment.
+                self.size_owner = self.attached.iter().any(|a| a.id == id).then_some(id);
+                (cols, rows)
+            }
+            (Source::Attachment(_), SizePolicy::Smallest) => {
+                self.smallest().unwrap_or((current.cols, current.rows))
+            }
+            (Source::Attachment(_), SizePolicy::Fixed) => (current.cols, current.rows),
+        };
+        let resized = self.resize_to(cols, rows, cell_width, cell_height);
+        recorded || resized || owner != self.size_owner
+    }
+
+    /// Sets the terminal and PTY size and the cell size the session
+    /// reports, a side of the cell size left out keeping the current
+    /// one, and appends `RESIZED` when the size changed. Returns whether
+    /// it did.
+    fn resize_to(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        cell_width: Option<u32>,
+        cell_height: Option<u32>,
+    ) -> bool {
         let Body::Live(live) = &mut self.body else {
             return false;
         };
@@ -778,6 +886,39 @@ impl Session {
         self.wake.notify_waiters();
         self.touch();
         true
+    }
+
+    /// Sets the size policy; `smallest` applies at once, the others wait
+    /// for the next report. No owner remains. Returns whether what
+    /// `Session` shows changed.
+    pub fn set_policy(&mut self, policy: SizePolicy) -> bool {
+        let before = (self.size_policy, self.size_owner);
+        self.size_policy = policy;
+        self.size_owner = None;
+        let resized = match (policy, self.smallest()) {
+            (SizePolicy::Smallest, Some((cols, rows))) => self.resize_to(cols, rows, None, None),
+            _ => false,
+        };
+        let changed = resized || before != (self.size_policy, self.size_owner);
+        if changed {
+            self.touch();
+        }
+        changed
+    }
+
+    /// Takes attachment `id` off the list: under `latest` it no longer
+    /// owns the size; under `smallest` the size follows those left.
+    pub fn detach(&mut self, id: u64) {
+        self.attached.retain(|a| a.id != id);
+        if self.size_owner == Some(id) {
+            self.size_owner = None;
+        }
+        if self.size_policy == SizePolicy::Smallest
+            && self.running().is_ok()
+            && let Some((cols, rows)) = self.smallest()
+        {
+            self.resize_to(cols, rows, None, None);
+        }
     }
 
     /// Makes `profile` the session's: default colours for OSC 10, 11 and
@@ -874,11 +1015,15 @@ impl Session {
             engine: ghostty_vt::ENGINE.into(),
             parked_at: at.to_string(),
             session: proto::Session {
-                attachments: 0,
+                attachments: Vec::new(),
                 pid: None,
                 program_status: Some(self.records.all()),
                 // Computed again from the records at load.
                 attention: None,
+                size: SizeInfo {
+                    policy: self.size_policy,
+                    owner: None,
+                },
                 ..self.to_proto(false)
             },
             history_lines: history_lines as u64,
@@ -901,42 +1046,43 @@ impl Session {
             if (!finished_only || a.finished.load(Ordering::Acquire))
                 && let Some(close) = a.close.upgrade()
             {
-                let _ = close.send(Ending::Closed(reason));
+                let _ = close.send(Ending::Closed(Closed {
+                    reason,
+                    message: None,
+                }));
             }
         }
     }
 }
 
-/// Applies a viewport report at once and emits `session_changed` when the
-/// size changed.
-pub fn report_now(registry: &Registry, session: &Shared, report: Viewport) {
+/// Records the viewport attachment `from` reported and applies the
+/// report after the coalescing window, merged with the reports that
+/// arrive within it; emits `session_changed` when what `Session` shows
+/// changed.
+pub fn report_coalesced(registry: &Arc<Registry>, session: &Shared, from: u64, report: Viewport) {
     let mut s = session.lock().unwrap();
-    let changed = s.apply_report(report).then(|| s.to_proto(false));
-    let events = s.take_events();
-    drop(s);
-    registry.emit_session(events, changed);
-}
-
-/// Applies a viewport report after the coalescing window, merged with the
-/// reports that arrive within it, and emits `session_changed` when the
-/// size changed.
-pub fn report_coalesced(registry: &Arc<Registry>, session: &Shared, report: Viewport) {
-    let mut s = session.lock().unwrap();
+    let recorded = s.record_viewport(from, &report.size);
     let Some(live) = s.live_mut() else {
         return;
     };
-    // The latest dimensions, and the profile and cell size of the latest
-    // report that carried them.
     live.pending = Some(match live.pending.take() {
-        Some(earlier) => Viewport {
-            size: Size {
-                cell_width: report.size.cell_width.or(earlier.size.cell_width),
-                cell_height: report.size.cell_height.or(earlier.size.cell_height),
-                ..report.size
+        Some(earlier) => Pending {
+            report: Viewport {
+                size: Size {
+                    cell_width: report.size.cell_width.or(earlier.report.size.cell_width),
+                    cell_height: report.size.cell_height.or(earlier.report.size.cell_height),
+                    ..report.size
+                },
+                profile: report.profile.or(earlier.report.profile),
             },
-            profile: report.profile.or(earlier.profile),
+            from,
+            recorded: recorded || earlier.recorded,
         },
-        None => report,
+        None => Pending {
+            report,
+            from,
+            recorded,
+        },
     });
     if live.timer_running {
         return;
@@ -954,7 +1100,7 @@ pub fn report_coalesced(registry: &Arc<Registry>, session: &Shared, report: View
                 live.pending.take()
             });
             let changed = pending
-                .is_some_and(|r| s.apply_report(r))
+                .is_some_and(|p| s.apply_report(p.report, Source::Attachment(p.from)) || p.recorded)
                 .then(|| s.to_proto(false));
             (changed, s.take_events())
         };

@@ -46,6 +46,8 @@ A program reports its status with OSC 7501 (PROTOCOL.md, "Program status"). `lis
 
 `read` takes `--format text|vt|html` and `--scope screen|history|alternate|last_command`; `last_command` needs a shell that marks its prompts and commands with OSC 133 (shell integration), and fails without one. `tail S [--after OFFSET] [--follow]` prints the session's output stream as plain text from a stream offset (by default the oldest byte kept) up to where the stream was when it began; `--follow` instead keeps going, with a `wait` for more output at the end of each page, until the stream ends.
 
+`inspect` shows a session's attachments: who is attached (each connection's `HELLO` client), read-only or not, the size each last reported, and when each last typed. `clankermux detach S CHANNEL [--reason TEXT]` closes one of them by its `channel`; a CLI attach so closed prints the reason and exits 0, and a web page shows it and does not attach that session again by itself. `clankermux resize S [COLSxROWS] [--policy latest|smallest|fixed]` sets the size, the size policy, or both: `latest` (the default) takes the most recent report, `smallest` the smallest columns and rows among the attachments' reports, `fixed` only what `resize` sets.
+
 `clankermux skill show` (or `--skill`) prints a guide for agents: what a session is, the variables above, each command with an example, the exit codes, and the rules for sessions an agent did not create.
 
 ## Parks

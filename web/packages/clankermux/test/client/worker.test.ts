@@ -115,7 +115,8 @@ function session(id: string, status: Session["status"] = "running"): Session {
     created_at: "",
     offset: 0,
     marker: 0,
-    attachments: 1,
+    attachments: [],
+    size: { policy: "latest" },
   };
 }
 
@@ -287,6 +288,25 @@ test("the link: connected to a session, its exit, then removed for good", async 
       { state: "ended", reason: "removed", retry: false },
     ]),
   );
+});
+
+test("the link: detached by another client, for good", async () => {
+  const worker = start("s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const channel = await server.opened("s");
+  bootstrap(server, channel, session("s"));
+  await vi.waitFor(() => expect(worker.links()).toContainEqual({ state: "connected", session: session("s") }));
+  server.push(FrameType.Closed, channel, { reason: "detached", message: "taken over" });
+  await vi.waitFor(() =>
+    expect(worker.links().at(-1)).toEqual({ state: "ended", reason: "detached", message: "taken over", retry: false }),
+  );
+  // A reconnect does not attach the session again.
+  server.close();
+  const next = await socket(1);
+  await next.serve([session("s")]);
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: undefined }));
+  expect(next.bodies(FrameType.Open)).toEqual([]);
 });
 
 test("only a page in use reports its size: OPEN and VIEWPORT carry none until it is active", async () => {

@@ -315,7 +315,7 @@ impl Client {
     /// Polls `inspect` until the session reports `count` attachments.
     pub async fn wait_attachments(&mut self, id: &str, count: u32) {
         for _ in 0..1000 {
-            if self.inspect(id).await.attachments == count {
+            if self.inspect(id).await.attachments.len() as u32 == count {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

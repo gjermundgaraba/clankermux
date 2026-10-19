@@ -27,7 +27,7 @@ export type Action =
   | { type: "exited"; exit: Exit }
   /** Bytes were lost; the terminal was discarded and a new bootstrap follows. */
   | { type: "gap"; gap: Gap }
-  | { type: "closed"; reason: Closed["reason"] }
+  | { type: "closed"; reason: Closed["reason"]; message?: string }
   /** `read_only`, `not_running` and `input_overflow` keep the attachment;
    * any other code ended it. */
   | { type: "error"; error: ErrorMessage };
@@ -193,7 +193,7 @@ export class Attachment {
       case FrameType.Closed: {
         const closed = this.json<Closed>(frame);
         this.end(true);
-        actions.push({ type: "closed", reason: closed.reason });
+        actions.push({ type: "closed", reason: closed.reason, ...(closed.message !== undefined && { message: closed.message }) });
         break;
       }
       case FrameType.Error: {

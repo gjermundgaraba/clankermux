@@ -62,7 +62,14 @@ async fn an_unknown_field_in_a_request_is_invalid() {
         ("signal", json!({"session": id, "signal": "CONT"})),
         ("remove", json!({"session": id})),
         ("label", json!({"session": id, "label": "x"})),
-        ("resize", json!({"session": id, "cols": 81})),
+        (
+            "resize",
+            json!({"session": id, "cols": 81, "policy": "fixed"}),
+        ),
+        (
+            "detach",
+            json!({"session": id, "channel": 1, "reason": "x"}),
+        ),
         ("read", json!({"session": id})),
         ("send", json!({"session": id, "data": ""})),
         ("ack", json!({"session": id})),
@@ -126,8 +133,13 @@ async fn an_unknown_field_in_a_request_is_invalid() {
     // Nothing above took effect: the session runs on unlabelled.
     let after = c.inspect(id).await;
     assert_eq!(
-        (after.status, after.label.as_str(), after.cols),
-        (Status::Running, "", 80)
+        (
+            after.status,
+            after.label.as_str(),
+            after.cols,
+            after.size.policy
+        ),
+        (Status::Running, "", 80, SizePolicy::Latest)
     );
 }
 

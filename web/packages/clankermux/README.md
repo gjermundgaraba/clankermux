@@ -60,7 +60,7 @@ Verified in headless Chrome on macOS through CDP (`Input.imeSetComposition`, `In
 
 ## `onSessions`
 
-`onSessions(sessions, current)` reports every session on the server, and which one the page shows, at each change: a session created, exited or removed, and a `session_changed`, which the server sends when a session's label, size, attachments, title, working directory or attention changes. The title is the program's (OSC 0 or 2), the working directory the one it reports (OSC 7, as a path), each empty until set, and both cleared by a full reset. A status line takes them from the session whose `id` is `current`; the `session` of a `connected` link is the one `ATTACHED` described, and does not follow these changes.
+`onSessions(sessions, current)` reports every session on the server, and which one the page shows, at each change: a session created, exited or removed, and a `session_changed`, which the server sends when a session's label, size, size policy, attachments, title, working directory or attention changes. `attachments` is the list of open attachments in the order they opened, each `{channel, client: {name, version}, read_only, viewport?: {cols, rows}, since, last_input?}`: `channel` is unique on the server, `client` the connecting page or program's own name, `viewport` its latest size report, `last_input` when it last typed (input alone sends no `session_changed`). `size` is `{policy, owner?}`, `owner` being the channel whose report sets the size under `latest`. The title is the program's (OSC 0 or 2), the working directory the one it reports (OSC 7, as a path), each empty until set, and both cleared by a full reset. A status line takes them from the session whose `id` is `current`; the `session` of a `connected` link is the one `ATTACHED` described, and does not follow these changes.
 
 A session's `attention`, when present, is the program status record that most wants the user (`{state, kind?, app?, msg?, record}`: `blocked`, then an unseen `error`, then an unseen `done`, then `working`), so a badge needs no request per session; a `session_changed` follows each change of it.
 
@@ -77,7 +77,7 @@ type Link =
   | { state: "connecting"; attempt: number }
   | { state: "connected"; session: Session | undefined }
   | { state: "ended"; reason: LinkEnd; code?: ErrorCode; message?: string; exit?: Exit; retry: boolean };
-type LinkEnd = "closed" | "removed" | "stopping" | "exited" | "no_such_session" | "engine_mismatch" | "error";
+type LinkEnd = "closed" | "removed" | "stopping" | "detached" | "exited" | "no_such_session" | "engine_mismatch" | "error";
 ```
 
 `retry` means the worker reconnects or attaches again by itself, so a `connecting` or `connected` follows. Otherwise nothing follows until the page calls `attach` or `create`. After a connection-level end (the last three rows of the first table) there is no connection: `create` rejects, and `attach` connects again (`connecting` from attempt 1), so "Retry" can be `attach`. An engine that failed to load needs a new mount.
@@ -102,6 +102,7 @@ Once connected:
 | The session's program exits (`EXITED`) | `ended exited` with `exit`, `retry: false` |
 | `CLOSED removed` | `ended removed`, `retry: false`; the worker forgets the session |
 | `CLOSED stopping` | `ended stopping`, `retry: true`; the connection's close follows, and the reconnect attaches the session again (as `restored`) |
+| `CLOSED detached` (another client's `detach`) | `ended detached`, `retry: false`, `message` the reason it gave, if any; the worker forgets the session, so a reconnect does not take it back |
 | `OPEN` refused, or the attachment ended, with `no_such_session` or `engine_mismatch` | `ended` with that reason and code, `retry: false` |
 | The attachment ended with `invalid_request` | `ended error`, `retry: false` |
 | The attachment ended with another error (`too_slow`, a snapshot that failed, `internal`) | `ended error` with the code, `retry: true`; the worker attaches again after a backoff |
@@ -153,7 +154,7 @@ While the view is scrolled back the canvas draws a mark at its right edge, the v
 
 ## Size between clients
 
-A session has one size, and the server applies the latest report (PROTOCOL.md, "Size"). The terminal reports its container's size, its colours and its scheme only while its page is visible and its window has the focus (`document.visibilityState === "visible"` and `document.hasFocus()`). It reports again when the page is shown or its window focused, even at an unchanged size, and when the session was resized to another client's size while the page kept its focus (the user went to another machine and came back), at the page's next input: a key or text that sends something, a paste, a click on the canvas, the wheel. So with the same session open in several tabs or on several machines, the session takes the size of the one you look at, and a hidden or unfocused one never resizes it: its `OPEN` carries no viewport, it sends no `VIEWPORT`, and its canvas shows the session's size, clipped or with a margin. `report()` follows the same rule. `create()` makes the session at the container's current size, focused or not. A headless browser counts only its newest page as visible and focused, and a terminal in an iframe has the focus only once the frame does; such a page does not size the session until then.
+A session has one size, and under the default size policy, `latest`, the server applies the latest report (PROTOCOL.md, "Size"); under `smallest` it takes the smallest columns and rows among the attachments' reports, and under `fixed` only a `resize` request changes it, the reports being recorded but not applied. The terminal reports its container's size, its colours and its scheme only while its page is visible and its window has the focus (`document.visibilityState === "visible"` and `document.hasFocus()`). It reports again when the page is shown or its window focused, even at an unchanged size, and when the session was resized to another client's size while the page kept its focus (the user went to another machine and came back), at the page's next input: a key or text that sends something, a paste, a click on the canvas, the wheel. So under `latest`, with the same session open in several tabs or on several machines, the session takes the size of the one you look at, and a hidden or unfocused one never resizes it: its `OPEN` carries no viewport, it sends no `VIEWPORT`, and its canvas shows the session's size, clipped or with a margin. `report()` follows the same rule. `create()` makes the session at the container's current size, focused or not. A headless browser counts only its newest page as visible and focused, and a terminal in an iframe has the focus only once the frame does; such a page does not size the session until then.
 
 ## Colour scheme
 

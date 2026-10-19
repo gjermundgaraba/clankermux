@@ -197,7 +197,7 @@ async fn attach_types_and_detaches() {
     let out = term.read_until(b"[clankermux: detached]").await;
     assert!(out.windows(RESET_TAIL.len()).any(|w| w == RESET_TAIL));
     assert_eq!(term.exit_code().await, 0);
-    let inspected = wait_session(&conn, &session.id, |s| s.attachments == 0).await;
+    let inspected = wait_session(&conn, &session.id, |s| s.attachments.is_empty()).await;
     assert_eq!((inspected.cols, inspected.rows), (80, 24));
 }
 
@@ -233,7 +233,7 @@ async fn repaint_clips_a_larger_session_to_the_bottom() {
 
     term.detach().await;
     assert_eq!(term.exit_code().await, 0);
-    let inspected = wait_session(&conn, &session.id, |s| s.attachments == 0).await;
+    let inspected = wait_session(&conn, &session.id, |s| s.attachments.is_empty()).await;
     assert_eq!((inspected.cols, inspected.rows), (100, 40), "read-only");
 }
 
@@ -1031,4 +1031,109 @@ async fn read_takes_a_format_and_a_scope_and_tail_follows() {
         .unwrap();
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "$ bold\nafter\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detach_and_resize_policy_from_the_command_line() {
+    let server = start();
+    let conn = connect(&server).await;
+    let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
+    let mut frames = conn
+        .open(
+            1,
+            &Open {
+                session: session.id.clone(),
+                read_only: false,
+                viewport: None,
+                profile: None,
+                resume: None,
+            },
+        )
+        .unwrap();
+    let attached = wait_session(&conn, &session.id, |s| s.attachments.len() == 1).await;
+    let channel = attached.attachments[0].channel.to_string();
+    let socket = server.socket.to_str().unwrap();
+
+    // Policy alone, then a lone argument that reads as a size.
+    let (code, _, err) = run_status(
+        &[
+            "--socket",
+            socket,
+            "resize",
+            &session.id,
+            "--policy",
+            "fixed",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        inspect(&conn, &session.id).await.size.policy,
+        SizePolicy::Fixed
+    );
+    let (code, _, err) = run_status(
+        &[
+            "--socket", socket, "resize", "90x20", "--policy", "smallest",
+        ],
+        &[
+            ("CLANKERMUX_SESSION", &session.id),
+            ("CLANKERMUX_SOCKET", socket),
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    let s = inspect(&conn, &session.id).await;
+    assert_eq!(
+        (s.size.policy, s.cols, s.rows),
+        (SizePolicy::Smallest, 90, 20)
+    );
+    let (code, _, _) = run_status(
+        &[
+            "--socket",
+            socket,
+            "resize",
+            &session.id,
+            "--policy",
+            "widest",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(code, 2);
+
+    let (code, _, err) =
+        run_status(&["--socket", socket, "detach", &session.id, "nine"], &[]).await;
+    assert_eq!(code, 2, "{err}");
+    let (code, _, err) = run_status(
+        &[
+            "--socket",
+            socket,
+            "detach",
+            &session.id,
+            &channel,
+            "--reason",
+            "mine now",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    let closed = loop {
+        let frame = frames.recv().await.expect("CLOSED");
+        if frame.header.frame_type == FrameType::Closed {
+            break frame.json::<Closed>().unwrap();
+        }
+    };
+    assert_eq!(
+        closed,
+        Closed {
+            reason: ClosedReason::Detached,
+            message: Some("mine now".into()),
+        }
+    );
+    let (code, _, err) =
+        run_status(&["--socket", socket, "detach", &session.id, &channel], &[]).await;
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("no_such_attachment"), "{err}");
 }

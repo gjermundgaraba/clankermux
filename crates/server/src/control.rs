@@ -6,17 +6,19 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use ghostty_vt::keys::{KeyEncoder, KeyPress, encode_paste};
-use proto::{ErrorCode, Event, Request, Sent, Size, Viewport};
+use proto::{Closed, ClosedReason, ErrorCode, Event, Request, Sent, Size, Viewport};
 use rustix::process::Signal;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
+use crate::attach::Ending;
 use crate::connection::{Writer, reply};
+use crate::pty;
+use crate::read;
 use crate::registry::{Fail, Registry, internal};
-use crate::session::Shared;
+use crate::session::{Shared, Source};
 use crate::wait::{self, Facts, Waiter};
-use crate::{pty, read, session};
 
 /// A connection's requests that answer later and can be cancelled (a
 /// `wait`, or a `send` carrying one), by id, with what stops each. The
@@ -368,8 +370,11 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
         }
         "resize" => {
             let p: proto::ResizeParams = params(p)?;
-            if p.cols.is_none() && p.rows.is_none() {
-                return Err((ErrorCode::InvalidRequest, "cols or rows is needed".into()));
+            if p.cols.is_none() && p.rows.is_none() && p.policy.is_none() {
+                return Err((
+                    ErrorCode::InvalidRequest,
+                    "cols, rows or policy is needed".into(),
+                ));
             }
             if p.cols == Some(0) || p.rows == Some(0) {
                 return Err((
@@ -378,22 +383,57 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
                 ));
             }
             let session = registry.get(&p.session)?;
-            let current = {
-                let s = session.lock().unwrap();
-                s.running()?;
-                s.size()
-            };
-            let size = Size {
-                cols: p.cols.unwrap_or(current.cols),
-                rows: p.rows.unwrap_or(current.rows),
-                cell_width: None,
-                cell_height: None,
-            };
-            let report = Viewport {
-                size,
-                profile: None,
-            };
-            session::report_now(registry, &session, report);
+            let mut s = session.lock().unwrap();
+            s.running()?;
+            // The policy first, so that a size given with `smallest`
+            // holds until the next report.
+            let mut changed = p.policy.is_some_and(|policy| s.set_policy(policy));
+            if p.cols.is_some() || p.rows.is_some() {
+                let current = s.size();
+                let report = Viewport {
+                    size: Size {
+                        cols: p.cols.unwrap_or(current.cols),
+                        rows: p.rows.unwrap_or(current.rows),
+                        cell_width: None,
+                        cell_height: None,
+                    },
+                    profile: None,
+                };
+                changed |= s.apply_report(report, Source::Resize);
+            }
+            let changed = changed.then(|| s.to_proto(false));
+            let events = s.take_events();
+            drop(s);
+            registry.emit_session(events, changed);
+            Ok(json!({}))
+        }
+        "detach" => {
+            let p: proto::DetachParams = params(p)?;
+            if p.reason
+                .as_ref()
+                .is_some_and(|r| r.len() > registry.config.limits.text as usize)
+            {
+                return Err((ErrorCode::LimitExceeded, "reason too long".into()));
+            }
+            let session = registry.get(&p.session)?;
+            let s = session.lock().unwrap();
+            let attachment = s
+                .attached
+                .iter()
+                .find(|a| a.id == p.channel)
+                .ok_or_else(|| {
+                    (
+                        ErrorCode::NoSuchAttachment,
+                        format!("no attachment {} on session {}", p.channel, p.session),
+                    )
+                })?;
+            // A connection that dropped the attachment is ending it already.
+            if let Some(close) = attachment.close.upgrade() {
+                let _ = close.send(Ending::Closed(Closed {
+                    reason: ClosedReason::Detached,
+                    message: p.reason,
+                }));
+            }
             Ok(json!({}))
         }
         "read" => Ok(json!(read::read(registry, params(p)?)?)),

@@ -35,7 +35,8 @@ import { Osc52Scanner } from "./osc52.ts";
 
 /** Why the link to the session ended. `closed`: the connection closed
  * (not a `CLOSED` frame, which the worker does not wait for when it
- * detaches); `removed` and `stopping`: the server's `CLOSED`; `exited`:
+ * detaches); `removed`, `stopping` and `detached` (another client's
+ * `detach`): the server's `CLOSED`; `exited`:
  * the session's program exited; `no_such_session` and `engine_mismatch`:
  * an `OPEN` refused; `error`: any other error, the server's or the
  * client's own. */
@@ -43,6 +44,7 @@ export type LinkEnd =
   | "closed"
   | "removed"
   | "stopping"
+  | "detached"
   | "exited"
   | "no_such_session"
   | "engine_mismatch"
@@ -58,7 +60,8 @@ export type Link =
    * `status` may be `restored` or `exited`), or attached to none. */
   | { state: "connected"; session: Session | undefined }
   /** The link ended. `code` and `message` are the error's, when there is
-   * one; `exit` is the program's, for `exited`. `retry`: the worker
+   * one, and `message` the reason a `detach` gave; `exit` is the
+   * program's, for `exited`. `retry`: the worker
    * reconnects or attaches again by itself, so `connecting` or
    * `connected` follows; otherwise nothing does until the page attaches
    * or creates. */
@@ -458,9 +461,15 @@ class Client {
       case "closed":
         this.post({ type: "status", text: `closed: ${action.reason}` });
         // `stopping` is followed by the connection's close, and the
-        // reconnect attaches again; a removed session is gone for good.
-        this.link({ state: "ended", reason: action.reason, retry: action.reason === "stopping" });
-        if (action.reason === "removed") this.giveUp();
+        // reconnect attaches again; a removed session is gone for good,
+        // and a detached page does not take its session back.
+        this.link({
+          state: "ended",
+          reason: action.reason,
+          ...(action.message !== undefined && { message: action.message }),
+          retry: action.reason === "stopping",
+        });
+        if (action.reason === "removed" || action.reason === "detached") this.giveUp();
         break;
       case "error": {
         this.post({ type: "status", text: `${action.error.code}: ${action.error.message}` });

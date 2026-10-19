@@ -11,7 +11,7 @@ use client::expect::Expect;
 use client::vt::{self, Scan};
 use client::{Action, Attachment, Connection, Endpoint, Error, Frame};
 use ghostty_vt::formatter::{self, Format, Region};
-use proto::{ClosedReason, Exit, FrameType, Open, Size, Viewport};
+use proto::{Closed, ClosedReason, Exit, FrameType, Open, Size, Viewport};
 use rustix::termios::{self, OptionalActions, Termios};
 use tokio::io::AsyncReadExt;
 use tokio::signal::unix::{SignalKind, signal};
@@ -144,7 +144,7 @@ enum Outcome {
     Exited(Exit),
     /// The session was restored from a previous server: a screen, no process.
     Restored,
-    Closed(ClosedReason),
+    Closed(Closed),
     Failed(String),
 }
 
@@ -269,7 +269,7 @@ impl Shell {
                 }
                 return Some(Outcome::Exited(exit));
             }
-            Action::Closed(reason) => return Some(Outcome::Closed(reason)),
+            Action::Closed(closed) => return Some(Outcome::Closed(closed)),
             Action::Error(error) => {
                 if self.attachment.ended() {
                     if error.code == proto::ErrorCode::TooSlow {
@@ -539,10 +539,21 @@ pub async fn run(opts: Options, conn: Connection) -> Result<ExitCode, Error> {
             "session restored from a previous server; no process".to_string(),
             ExitCode::SUCCESS,
         ),
-        Outcome::Closed(ClosedReason::Removed) => {
-            ("session removed".to_string(), ExitCode::SUCCESS)
-        }
-        Outcome::Closed(reason) => (format!("closed: {reason}"), ExitCode::SUCCESS),
+        Outcome::Closed(Closed {
+            reason: ClosedReason::Removed,
+            ..
+        }) => ("session removed".to_string(), ExitCode::SUCCESS),
+        Outcome::Closed(Closed {
+            reason: ClosedReason::Detached,
+            message,
+        }) => (
+            match message {
+                Some(message) => format!("detached by another client: {message}"),
+                None => "detached by another client".to_string(),
+            },
+            ExitCode::SUCCESS,
+        ),
+        Outcome::Closed(Closed { reason, .. }) => (format!("closed: {reason}"), ExitCode::SUCCESS),
         Outcome::Failed(message) => (message, ExitCode::FAILURE),
     };
     eprintln!("\r\n[clankermux: {message}]");

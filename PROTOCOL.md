@@ -119,12 +119,13 @@ processed and answered.
 | `signal`    | `session, signal`                                   | `{}`                    |
 | `remove`    | `session`                                           | `{}`                    |
 | `label`     | `session, label`                                    | Session                 |
-| `resize`    | `session, cols?, rows?`                             | `{}`                    |
+| `resize`    | `session, cols?, rows?, policy?`                    | `{}`                    |
 | `read`      | `session, scrollback?, format?, scope?`             | Read                    |
 | `tail`      | `session, after, max_bytes?`                        | Tail                    |
 | `send`      | `session, text? \| keys? \| data?, paste?, wait?`    | Sent                    |
 | `wait`      | `session, until, after?, timeout_ms?`               | Waited                  |
 | `cancel`    | `id`                                                | `{cancelled}`           |
+| `detach`    | `session, channel, reason?`                         | `{}`                    |
 | `subscribe` | `after?, incarnation?`                              | Subscribed              |
 | `ack`       | `session, record_ids?`                              | `{record_ids}`          |
 
@@ -146,10 +147,11 @@ processed and answered.
 - `remove` deletes a session whose `status` is `exited` or `restored`,
   including its files. Fails with `running` otherwise. It replies at once;
   open attachments get `CLOSED removed`.
-- `resize` counts as a viewport report applied at once, without
-  coalescing (see Size). A side left out keeps the session's; one of
-  `cols` and `rows` is required. Fails with `not_running` unless `status`
-  is `running`.
+- `resize` sets the size policy, `latest`, `smallest` or `fixed`, then
+  applies the size as a report at once, without coalescing, under every
+  policy (see Size). A side left out keeps the session's, and so does
+  `policy`; one of `cols`, `rows` and `policy` is required. Fails with
+  `not_running` unless `status` is `running`.
 - `list` returns a Page: `{sessions: Session[], next?}`. Sessions are
   ordered by `id`; at most `limits.page` per reply; `next` is the last id
   when more remain, to pass as `after`. Sessions carry no program status
@@ -280,6 +282,14 @@ processed and answered.
   `cancel` replies `{cancelled: true}`. After that reply the cancelled
   request sends nothing more. An `id` that is not pending replies
   `{cancelled: false}`.
+- `detach` ends the attachment whose `channel` (see Attachment) is
+  given, with `CLOSED {reason: "detached", message}`, `message` being
+  `reason` when given, at most `limits.text` bytes, else
+  `limit_exceeded`. Any connection may detach any attachment, of a
+  session of any status. Replies at once; the attachment's `CLOSED`
+  follows its pending frames on its own connection. Fails with
+  `no_such_attachment` when the session has no open attachment with
+  that `channel`.
 - `subscribe` starts `EVENT` frames on this connection. Its reply,
   Subscribed, has `oldest`, the `seq` of the oldest event the server
   retains (`latest + 1` when it retains none), and `latest`, the `seq`
@@ -378,10 +388,22 @@ Tail
 | `exit`           | object?  | `{code}` or `{signal}`, signal by name                  |
 | `offset`         | int      | Current stream offset                                   |
 | `marker`         | int      | Sequence number of the latest marker, 0 if none         |
-| `attachments`    | int      | Open attachments                                        |
+| `attachments`    | Attachment[] | Open attachments, in the order they opened          |
 | `command`        | object?  | The command running or the last that ran, `{start, output?, end?, exit?}`; see Commands |
 | `program_status` | Record[] | Only in `inspect`; see Program status                   |
 | `attention`      | object?  | The record that most wants the user; see Program status |
+| `size`           | object   | `{policy, owner?}`: the size policy, and under `latest` the `channel` of the attachment whose report is current; see Size |
+
+Attachment
+
+| Field        | Type    | Meaning                                                      |
+| ------------ | ------- | ------------------------------------------------------------ |
+| `channel`    | int     | Assigned by the server at `OPEN`, unique on it and never reused while it runs; not the frame channel, which only its connection knows |
+| `client`     | object  | `{name, version}` from the connection's `HELLO.client`, each cut to 32 bytes with control characters replaced by `?` |
+| `read_only`  | bool    |                                                              |
+| `viewport`   | object? | `{cols, rows}` of its latest viewport report, in `OPEN` or `VIEWPORT`; absent until it makes one |
+| `since`      | string  | When it opened, RFC 3339                                     |
+| `last_input` | string? | When it last sent `INPUT` the server accepted, RFC 3339      |
 
 `restored` means the session was running when a previous server
 incarnation stopped. It has a screen but no process and no exit.
@@ -401,7 +423,7 @@ them. The server retains the latest `limits.events` events in memory for
 | Event                    | Fields                             | When                                            |
 | ------------------------ | ---------------------------------- | ----------------------------------------------- |
 | `session_created`        | `session`                          |                                                 |
-| `session_changed`        | `session`                          | Label, size, title, pwd, `attachments`, `attention` or `command` changed |
+| `session_changed`        | `session`                          | Label, `cols`/`rows`, `size` (policy or owner), title, pwd, `attachments`, `attention` or `command` changed; not `last_input` alone |
 | `session_exited`         | `session`                          | The stream ended; `exit` is set                 |
 | `session_removed`        | `id`                               | Removed by request, or by `on_exit: remove`     |
 | `program_status_changed` | `id, record, reason`               | One record was set; see Program status          |
@@ -425,10 +447,11 @@ them. The server retains the latest `limits.events` events in memory for
 - `command_started` and `command_ended`: `offset` is the stream offset
   just after the sequence's terminator (BEL or ST, also when an ST is
   split across two reads of the PTY), the same as in `Session.command`.
-- `attachment_opened`: `channel` is the attachment's channel on its own
-  connection, `client` the connection's `HELLO.client`.
+- `attachment_opened`: `channel` and `client` are as in the session's
+  `attachments` (see Attachment): the server's own number for the
+  attachment, which `detach` takes, not the frame channel.
 - `attachment_closed`: `reason` is the `CLOSED` reason (`closed`,
-  `removed`, `stopping`) when the attachment got one, the error code when
+  `removed`, `stopping`, `detached`) when the attachment got one, the error code when
   an `ERROR` ended it, and `disconnected` when its connection closed.
   For a removed session it may follow `session_removed`.
 
@@ -554,12 +577,15 @@ Checks, in order, each failing with `ERROR` on the channel:
 2. the session exists, else `no_such_session`;
 3. the client sent an `engine` in `HELLO` equal to the server's, and, for
    a session loaded from a park file, the engine recorded there equals the
-   server's, else `engine_mismatch`.
+   server's, else `engine_mismatch`;
+4. the session has fewer than `limits.attachments` open attachments, else
+   `limit_exceeded`.
 
-A writable `OPEN` with `viewport` or `profile` on a running session is
-applied as a viewport report at once (at the session's size when
-`viewport` is absent), before the snapshot is taken, bypassing coalescing.
-On any other session it is ignored. A `cols` or `rows` of 0, in `OPEN` or
+The attachment then joins the session's `attachments`. A writable `OPEN`
+with `viewport` on a running session is a viewport report applied at once
+(see Size), before the snapshot is taken, bypassing coalescing; a
+`profile` without `viewport` sets the profile alone. On any other session
+both are ignored. A `cols` or `rows` of 0, in `OPEN` or
 `VIEWPORT`, is `invalid_request`, checked after the channel check and
 before the session check.
 
@@ -683,10 +709,13 @@ undelivered frames for it.
 
 ### CLOSE and CLOSED
 
-`CLOSE` detaches. The server answers `CLOSED {reason: "closed"}`; the client
-may reuse the channel after that. The server sends `CLOSED {reason}` on its
-own when the session is removed (`removed`) or the server stops
-(`stopping`). An attachment is finished when it has received the final
+`CLOSED` is `{reason, message?}`. `CLOSE` detaches. The server answers
+`CLOSED {reason: "closed"}`; the client may reuse the channel after that.
+The server sends `CLOSED {reason}` on its own when the session is removed
+(`removed`), the server stops (`stopping`), or a `detach` request, from
+any connection, ends the attachment (`detached`, with the request's
+`reason` as `message` when it gave one). A client does not attach again
+by itself after `detached`. An attachment is finished when it has received the final
 marker and, if bootstrapping, `SNAPSHOT_END`. An explicit `remove` sends
 `CLOSED removed` to finished attachments at once and to the rest after
 `limits.remove_grace`; the session stays listed as `exited` or `restored`
@@ -705,26 +734,47 @@ open attachment, finished or not, gets `CLOSED removed`.
 
 ## Size
 
-A session has one size. Writable attachments report their viewport in `OPEN`
-and `VIEWPORT`; `resize` is a report too. The most recent report wins. The
-server coalesces `VIEWPORT` reports arriving within 25 ms, then resizes its
-terminal, sets the PTY size, emits a mode 2048 report if enabled, and
-appends `RESIZED` to the stream. A report applied at once discards pending
-coalesced reports. Resize requests from the program (CSI 8 t) are ignored.
+A session has one size. Writable attachments report their viewport in
+`OPEN` and `VIEWPORT`; each attachment's latest report is recorded as its
+`viewport` (see Attachment), and a read-only one makes none. The session's
+size policy, `Session.size.policy`, decides what the reports do:
 
-Since the latest report wins, a client with a person in front of it
-reports only while it is in use, so the session takes the size of the
-client being looked at. The web client (`mountTerminal`) reports, in
-`OPEN` and `VIEWPORT`, only while its page is visible and its window has
-the focus (`document.visibilityState` and `document.hasFocus()`), and
-reports again as soon as it is shown or focused, whether or not its size
-changed, and at its next input when another client's report resized the
-session while it kept the focus. A hidden or unfocused web client sends `OPEN` without `viewport`
-or `profile` and no `VIEWPORT`; its terminal follows the session's size
-through `RESIZED` like any other.
+| Policy     | Size                                                                 |
+| ---------- | -------------------------------------------------------------------- |
+| `latest`   | The most recent report wins. `size.owner` is the `channel` of the attachment that made it, absent after a `resize` or once that attachment closes |
+| `smallest` | The smallest `cols` and, separately, the smallest `rows` among the attachments' recorded viewports, recomputed at each report and when an attachment closes; unchanged while none has reported |
+| `fixed`    | Reports are recorded and not applied                                 |
+
+A new session's policy is `latest`. `resize` applies its size under every
+policy; under `smallest` that size holds until the next report or close
+recomputes it. Setting `smallest` applies it at once; setting `latest` or
+`fixed` leaves the size until the next report or `resize`. Setting any
+policy clears `owner`. The policy is parked with the session and restored
+with it; `owner` is not.
+
+The server coalesces `VIEWPORT` reports arriving within 25 ms, then
+applies the policy, resizes its terminal, sets the PTY size, emits a mode
+2048 report if enabled, and appends `RESIZED` to the stream when the size
+changed. A report applied at once discards pending coalesced reports.
+Resize requests from the program (CSI 8 t) are ignored. `session_changed`
+follows when the size, `owner` or a recorded viewport changed.
+
+Under `latest`, a client with a person in front of it reports only while
+it is in use, so the session takes the size of the client being looked
+at. The web client (`mountTerminal`) reports, in `OPEN` and `VIEWPORT`,
+only while its page is visible and its window has the focus
+(`document.visibilityState` and `document.hasFocus()`), and reports again
+as soon as it is shown or focused, whether or not its size changed, and
+at its next input when another client's report resized the session while
+it kept the focus. A hidden or unfocused web client sends `OPEN` without
+`viewport` or `profile` and no `VIEWPORT`; its terminal follows the
+session's size through `RESIZED` like any other. Under `smallest`, a
+recorded viewport stays until its attachment closes, so a client that
+reported once keeps bounding the size while it is open.
 
 A report carries a size and may carry a `profile` and a cell size; what
-it omits is unchanged (`resize` carries neither). The session's profile
+it omits is unchanged (`resize` carries neither). The profile and the cell
+size apply under every policy. The session's profile
 and cell size are those of the latest reports that carried them. They
 answer the queries below and persist while no attachment is open; a
 parked session has no process to answer, so they are not parked. When
@@ -819,7 +869,10 @@ removed. On start, a `session.json` whose `session.id` is not its
 directory's name is skipped with a warning.
 
 On start, each session directory becomes a session: `status` is `exited`
-if `session.json` says so, `restored` otherwise. `read` serves
+if `session.json` says so, `restored` otherwise, with the size policy it
+recorded. A `session.json` whose `attachments` is a number, as servers
+before this list wrote it, loads as an empty list, and one without `size`
+as `latest`. `read` serves
 `screen.txt` for `text` of `screen` and `history`, with `scrollback`
 taken from its history lines, and decodes `snapshot.ghostsnp` for the
 rest. Stream bytes are not parked: `tail` and `last_command` have none. `OPEN`
@@ -858,8 +911,8 @@ deliberate trade-off for version 1.
 
 Announced in `WELCOME.limits`. `control_body` bounds client-sent JSON;
 server-sent JSON is bounded by `max_frame`: the defaults for `records`,
-`text`, and `label` keep the largest `inspect` reply under the default
-`max_frame`, and a `list` or `subscribe` page holds fewer than `page`
+`text`, `label` and `attachments` keep the largest `inspect` reply under
+the default `max_frame`, and a `list` or `subscribe` page holds fewer than `page`
 sessions when more would not fit (`next` still names the last one sent).
 
 | Field          | Default    | Meaning                                       |
@@ -873,12 +926,13 @@ sessions when more would not fit (`next` still names the last one sent).
 | `label`        | 256        | Label bytes                                   |
 | `text`         | 2048       | Bytes per `cwd`, `title`, `pwd`, and `argv`   |
 | `markers`      | 1024       | Retained markers per session                  |
-| `records`      | 200        | Program status records per session            |
+| `records`      | 198        | Program status records per session            |
 | `commands`     | 64         | Commands kept per session                     |
 | `page`         | 32         | Sessions per `list` or `subscribe` reply      |
 | `hello_timeout`| 10000      | Milliseconds allowed for `HELLO`              |
 | `remove_grace` | 10000      | Milliseconds before `on_exit: remove` removes |
 | `events`       | 4096       | Events retained for `subscribe {after}`       |
+| `attachments`  | 16         | Open attachments per session                  |
 
 ## Errors
 
@@ -892,7 +946,7 @@ an attachment channel it ends the attachment, except `read_only`,
 | `protocol_error`   | A connection error under Framing; the connection closes   |
 | `version_mismatch` | `HELLO.version` is not 1; the connection closes           |
 | `invalid_request`  | Malformed payload, a field the protocol does not define, unknown method, a resume marker above the session's latest, a `subscribe` `after` above the latest event, `read` with `scrollback` and a scope other than `screen`, or `tail` from past the stream's end or with `max_bytes` 0 |
-| `limit_exceeded`   | `label` or `text` exceeded, or a snapshot failed          |
+| `limit_exceeded`   | `label`, `text` or `attachments` exceeded, or a snapshot failed |
 | `no_such_session`  |                                                           |
 | `not_running`      | `status` is not `running`, or the stream has ended; for a wait, nothing matched before the stream ended |
 | `running`          | `remove` on a running session                             |
@@ -905,12 +959,12 @@ an attachment channel it ends the attachment, except `read_only`,
 | `cancelled`        | A `cancel` ended the request                              |
 | `scope_unavailable`| `read` of `alternate` off the alternate screen, or of `last_command` with no command output marked |
 | `internal`         |                                                           |
+| `no_such_attachment` | `detach` named no open attachment of the session        |
 
 ## Not in version 1
 
 Process survival across a server restart; encryption of parked state;
 authentication beyond socket ownership and tailnet policy; a WebTransport
 carrier; idle parking that frees a live terminal; a
-self-describing API; size policies other than latest-wins; images from
-before an attach; OSC 52 reads; input acknowledgements on attachment
+self-describing API; images from before an attach; OSC 52 reads; input acknowledgements on attachment
 channels.

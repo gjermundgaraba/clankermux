@@ -292,7 +292,7 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
     assert_eq!(restored.label, "work");
     assert_eq!(restored.title, "parked title");
     assert_eq!((restored.cols, restored.rows), (30, 6));
-    assert_eq!(restored.attachments, 0);
+    assert!(restored.attachments.is_empty());
     assert!(restored.exit.is_none());
 
     let read = c.read(&session.id, 100).await;
@@ -585,7 +585,7 @@ async fn loading_keeps_the_newest_complete_generation_only() {
             exit: None,
             offset: 7,
             marker: 2,
-            attachments: 3,
+            attachments: Vec::new(),
             command: None,
             program_status: Some(vec![
                 StatusRecord {
@@ -612,14 +612,19 @@ async fn loading_keeps_the_newest_complete_generation_only() {
                 },
             ]),
             attention: None,
+            size: Default::default(),
         },
     };
+    // As 0.3.0 wrote it: a count of attachments, no size.
+    let mut old = serde_json::to_value(&file).unwrap();
+    old["session"]["attachments"] = 3.into();
+    old["session"].as_object_mut().unwrap().remove("size");
     let write = |generation: &str, files: &[&str]| {
         let g = session_dir.join(generation);
         std::fs::create_dir_all(&g).unwrap();
         for name in files {
             let bytes = match *name {
-                "session.json" => serde_json::to_vec(&file).unwrap(),
+                "session.json" => serde_json::to_vec(&old).unwrap(),
                 "screen.txt" => format!("line one\nline two {generation}\n").into_bytes(),
                 _ => b"GHOSTSNP".to_vec(),
             };
@@ -653,7 +658,7 @@ async fn loading_keeps_the_newest_complete_generation_only() {
     assert_eq!(page.sessions.len(), 2);
     let s = page.sessions.iter().find(|s| s.id == id).unwrap();
     assert_eq!(
-        (s.status, s.pid, s.attachments, s.offset, s.marker),
+        (s.status, s.pid, s.attachments.len(), s.offset, s.marker),
         (Status::Restored, None, 0, 7, 2)
     );
     let names: Vec<String> = std::fs::read_dir(&session_dir)
@@ -739,10 +744,11 @@ async fn a_park_naming_another_session_is_skipped() {
             exit: None,
             offset: 0,
             marker: 0,
-            attachments: 0,
+            attachments: Vec::new(),
             command: None,
             program_status: None,
             attention: None,
+            size: Default::default(),
         },
         commands: Vec::new(),
     };

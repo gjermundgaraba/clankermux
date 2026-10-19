@@ -28,6 +28,7 @@ export interface Limits {
   hello_timeout: number;
   remove_grace: number;
   events: number;
+  attachments: number;
 }
 
 export interface Welcome {
@@ -66,7 +67,8 @@ export type ErrorCode =
   | "too_slow"
   | "cancelled"
   | "scope_unavailable"
-  | "internal";
+  | "internal"
+  | "no_such_attachment";
 
 export interface ErrorMessage {
   id?: number;
@@ -131,10 +133,36 @@ export interface Session {
   exit?: Exit;
   offset: number;
   marker: number;
-  attachments: number;
+  /** Open attachments, in the order they opened. */
+  attachments: AttachmentInfo[];
   command?: Command;
   program_status?: StatusRecord[];
   attention?: Attention;
+  size: SizeInfo;
+}
+
+/** One open attachment of a session. */
+export interface AttachmentInfo {
+  /** Unique on the server and never reused: `detach` takes it. */
+  channel: number;
+  /** The connection's `HELLO.client`. */
+  client: Peer;
+  read_only: boolean;
+  /** The size of its latest viewport report, if it made one. */
+  viewport?: { cols: number; rows: number };
+  since: string;
+  last_input?: string;
+}
+
+/** `latest`: the most recent report wins; `smallest`: the smallest
+ * columns and rows among the attachments' reports; `fixed`: only `resize`
+ * changes the size. */
+export type SizePolicy = "latest" | "smallest" | "fixed";
+
+export interface SizeInfo {
+  policy: SizePolicy;
+  /** Under `latest`, the attachment whose report is current. */
+  owner?: number;
 }
 
 export interface Page {
@@ -194,11 +222,19 @@ export interface LabelParams {
   label: string;
 }
 
-/** `resize`: a side left out keeps the session's. */
+/** `resize`: a side left out keeps the session's; so does a policy. */
 export interface ResizeParams {
   session: string;
   cols?: number;
   rows?: number;
+  policy?: SizePolicy;
+}
+
+/** `detach`: `reason` reaches the attachment as `CLOSED.message`. */
+export interface DetachParams {
+  session: string;
+  channel: number;
+  reason?: string;
 }
 
 export type ReadFormat = "text" | "vt" | "html";
@@ -393,5 +429,7 @@ export interface Gap {
 }
 
 export interface Closed {
-  reason: "closed" | "removed" | "stopping";
+  reason: "closed" | "removed" | "stopping" | "detached";
+  /** The reason a `detach` gave. */
+  message?: string;
 }

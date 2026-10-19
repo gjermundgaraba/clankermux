@@ -499,29 +499,42 @@ impl Connection {
             );
             return;
         }
-        let hello = self.hello.as_ref().expect("OPEN follows HELLO");
-        let client = proto::Peer {
-            name: hello.client.name.clone(),
-            version: hello.client.version.clone(),
+        let client = match &self.hello {
+            Some(hello) => proto::Peer {
+                name: hello.client.name.clone(),
+                version: hello.client.version.clone(),
+            },
+            None => return,
         };
-        let handle = attach::open(&self.registry, &self.writer, channel, open, session, client);
-        self.channels.insert(channel, handle);
+        match attach::open(
+            &self.registry,
+            &self.writer,
+            channel,
+            &client,
+            open,
+            session,
+        ) {
+            Ok(handle) => {
+                self.channels.insert(channel, handle);
+            }
+            Err((code, message)) => self.error(channel, code, message),
+        }
     }
 
-    /// The session of the writable attachment on `channel`; `read_only`
-    /// keeps the attachment and drops the frame. None when the channel is
-    /// not in use.
-    fn writable(&self, channel: u32) -> Option<Shared> {
+    /// The attachment id and session of the writable attachment on
+    /// `channel`; `read_only` keeps the attachment and drops the frame.
+    /// None when the channel is not in use.
+    fn writable(&self, channel: u32) -> Option<(u64, Shared)> {
         let handle = self.handle(channel)?;
         if handle.read_only {
             self.error(channel, ErrorCode::ReadOnly, "attachment is read-only");
             return None;
         }
-        handle.session()
+        Some((handle.id, handle.session()?))
     }
 
     fn input(&mut self, channel: u32, payload: &[u8]) {
-        let Some(session) = self.writable(channel) else {
+        let Some((id, session)) = self.writable(channel) else {
             return;
         };
         let pushed = {
@@ -529,6 +542,9 @@ impl Connection {
             let pushed = s.running().map(|live| live.input.push(payload.to_vec()));
             if let Ok(Some(_)) = pushed {
                 s.touch();
+                if let Some(a) = s.attached.iter_mut().find(|a| a.id == id) {
+                    a.last_input = Some(session::now());
+                }
             }
             pushed
         };
@@ -558,13 +574,13 @@ impl Connection {
             self.end(channel, code, message);
             return;
         }
-        let Some(session) = self.writable(channel) else {
+        let Some((id, session)) = self.writable(channel) else {
             return;
         };
         if let Err((code, message)) = session.lock().unwrap().running() {
             self.error(channel, code, message);
             return;
         }
-        session::report_coalesced(&self.registry, &session, viewport);
+        session::report_coalesced(&self.registry, &session, id, viewport);
     }
 }

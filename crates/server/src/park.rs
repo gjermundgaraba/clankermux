@@ -166,8 +166,17 @@ fn load_session(session_dir: &Path) -> io::Result<Option<Loaded>> {
 }
 
 fn read_generation(dir: &Path) -> io::Result<Loaded> {
-    let file: ParkFile = serde_json::from_slice(&fs::read(dir.join(FILES[0]))?)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let invalid = |e| io::Error::new(io::ErrorKind::InvalidData, e);
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join(FILES[0]))?).map_err(invalid)?;
+    // Parks from 0.3.0 and before count the attachments, always 0, where
+    // the list is now.
+    if let Some(attachments) = raw.pointer_mut("/session/attachments")
+        && attachments.is_number()
+    {
+        *attachments = serde_json::Value::Array(Vec::new());
+    }
+    let file: ParkFile = serde_json::from_value(raw).map_err(invalid)?;
     if file.protocol != PROTOCOL {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

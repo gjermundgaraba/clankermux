@@ -5,8 +5,8 @@
 use ghostty_vt::snapshot::Decoder;
 use ghostty_vt::{Handler, Terminal};
 use proto::{
-    AttachMode, Attached, Closed, ClosedReason, ErrorMessage, Exit, Exited, FrameType, Gap,
-    Resized, Resume, Session, Welcome, parse_output,
+    AttachMode, Attached, Closed, ErrorMessage, Exit, Exited, FrameType, Gap, Resized, Resume,
+    Session, Welcome, parse_output,
 };
 
 use crate::connection::{Error, Frame};
@@ -28,7 +28,8 @@ pub enum Action {
     /// Bytes were lost; the terminal was discarded and a new bootstrap
     /// follows.
     Gap(Gap),
-    Closed(ClosedReason),
+    /// `CLOSED`, with the message a `detach` gave.
+    Closed(Closed),
     /// `read_only`, `not_running` and `input_overflow` keep the
     /// attachment; any other code ended it.
     Error(ErrorMessage),
@@ -241,7 +242,7 @@ impl<H: Handler + Default> Attachment<H> {
             FrameType::Closed => {
                 let closed: Closed = frame.json()?;
                 self.end();
-                actions.push(Action::Closed(closed.reason));
+                actions.push(Action::Closed(closed));
             }
             FrameType::Error => {
                 let error: ErrorMessage = frame.json()?;
@@ -373,10 +374,11 @@ mod tests {
             exit: None,
             offset: 0,
             marker: 0,
-            attachments: 1,
+            attachments: Vec::new(),
             command: None,
             program_status: None,
             attention: None,
+            size: Default::default(),
         }
     }
 

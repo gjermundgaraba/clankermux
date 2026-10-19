@@ -35,12 +35,13 @@
       "label": 256,
       "text": 2048,
       "markers": 1024,
-      "records": 200,
+      "records": 198,
       "commands": 64,
       "page": 32,
       "hello_timeout": 10000,
       "remove_grace": 10000,
-      "events": 4096
+      "events": 4096,
+      "attachments": 16
     }
   },
   "request/create": {
@@ -112,7 +113,26 @@
     "created_at": "2026-10-18T12:00:00Z",
     "offset": 1024,
     "marker": 2,
-    "attachments": 1
+    "attachments": [
+      {
+        "channel": 7,
+        "client": {
+          "name": "clankerspace",
+          "version": "0.3.0"
+        },
+        "read_only": false,
+        "viewport": {
+          "cols": 120,
+          "rows": 40
+        },
+        "since": "2026-10-18T12:00:01Z",
+        "last_input": "2026-10-18T12:01:00Z"
+      }
+    ],
+    "size": {
+      "policy": "latest",
+      "owner": 7
+    }
   },
   "session/exited": {
     "id": "0f1e2d3c-0000-4000-8000-000000000001",
@@ -131,10 +151,13 @@
     "created_at": "2026-10-18T12:00:00Z",
     "offset": 1024,
     "marker": 2,
-    "attachments": 0,
+    "attachments": [],
     "exited_at": "2026-10-18T12:05:00Z",
     "exit": {
       "code": 0
+    },
+    "size": {
+      "policy": "latest"
     }
   },
   "session/inspect": {
@@ -155,7 +178,22 @@
     "created_at": "2026-10-18T12:00:00Z",
     "offset": 1024,
     "marker": 2,
-    "attachments": 1,
+    "attachments": [
+      {
+        "channel": 7,
+        "client": {
+          "name": "clankerspace",
+          "version": "0.3.0"
+        },
+        "read_only": false,
+        "viewport": {
+          "cols": 120,
+          "rows": 40
+        },
+        "since": "2026-10-18T12:00:01Z",
+        "last_input": "2026-10-18T12:01:00Z"
+      }
+    ],
     "program_status": [
       {
         "id": "",
@@ -185,6 +223,10 @@
       "app": "terraform",
       "msg": "Apply?",
       "record": ""
+    },
+    "size": {
+      "policy": "latest",
+      "owner": 7
     }
   },
   "session/signal-exit": {
@@ -204,10 +246,13 @@
     "created_at": "2026-10-18T12:00:00Z",
     "offset": 1024,
     "marker": 2,
-    "attachments": 0,
+    "attachments": [],
     "exited_at": "2026-10-18T12:05:00Z",
     "exit": {
       "signal": "KILL"
+    },
+    "size": {
+      "policy": "latest"
     }
   },
   "session/command": {
@@ -228,12 +273,31 @@
     "created_at": "2026-10-18T12:00:00Z",
     "offset": 1024,
     "marker": 2,
-    "attachments": 1,
+    "attachments": [
+      {
+        "channel": 7,
+        "client": {
+          "name": "clankerspace",
+          "version": "0.3.0"
+        },
+        "read_only": false,
+        "viewport": {
+          "cols": 120,
+          "rows": 40
+        },
+        "since": "2026-10-18T12:00:01Z",
+        "last_input": "2026-10-18T12:01:00Z"
+      }
+    ],
     "command": {
       "start": 900,
       "output": 960,
       "end": 1000,
       "exit": 2
+    },
+    "size": {
+      "policy": "latest",
+      "owner": 7
     }
   },
   "page/with-next": {
@@ -256,7 +320,26 @@
         "created_at": "2026-10-18T12:00:00Z",
         "offset": 1024,
         "marker": 2,
-        "attachments": 1
+        "attachments": [
+          {
+            "channel": 7,
+            "client": {
+              "name": "clankerspace",
+              "version": "0.3.0"
+            },
+            "read_only": false,
+            "viewport": {
+              "cols": 120,
+              "rows": 40
+            },
+            "since": "2026-10-18T12:00:01Z",
+            "last_input": "2026-10-18T12:01:00Z"
+          }
+        ],
+        "size": {
+          "policy": "latest",
+          "owner": 7
+        }
       }
     ],
     "next": "0f1e2d3c-0000-4000-8000-000000000001"
@@ -284,7 +367,26 @@
         "created_at": "2026-10-18T12:00:00Z",
         "offset": 1024,
         "marker": 2,
-        "attachments": 1
+        "attachments": [
+          {
+            "channel": 7,
+            "client": {
+              "name": "clankerspace",
+              "version": "0.3.0"
+            },
+            "read_only": false,
+            "viewport": {
+              "cols": 120,
+              "rows": 40
+            },
+            "since": "2026-10-18T12:00:01Z",
+            "last_input": "2026-10-18T12:01:00Z"
+          }
+        ],
+        "size": {
+          "policy": "latest",
+          "owner": 7
+        }
       }
     ],
     "next": "0f1e2d3c-0000-4000-8000-000000000001",
@@ -356,7 +458,26 @@
       "created_at": "2026-10-18T12:00:00Z",
       "offset": 1024,
       "marker": 2,
-      "attachments": 1
+      "attachments": [
+        {
+          "channel": 7,
+          "client": {
+            "name": "clankerspace",
+            "version": "0.3.0"
+          },
+          "read_only": false,
+          "viewport": {
+            "cols": 120,
+            "rows": 40
+          },
+          "since": "2026-10-18T12:00:01Z",
+          "last_input": "2026-10-18T12:01:00Z"
+        }
+      ],
+      "size": {
+        "policy": "latest",
+        "owner": 7
+      }
     }
   },
   "event/session_removed": {
@@ -444,7 +565,7 @@
     "seq": 12,
     "event": "attachment_opened",
     "id": "0f1e2d3c-0000-4000-8000-000000000001",
-    "channel": 1,
+    "channel": 7,
     "client": {
       "name": "clankermux",
       "version": "0.3.0"
@@ -455,7 +576,7 @@
     "seq": 13,
     "event": "attachment_closed",
     "id": "0f1e2d3c-0000-4000-8000-000000000001",
-    "channel": 1,
+    "channel": 7,
     "reason": "disconnected"
   },
   "open/full": {
@@ -515,7 +636,26 @@
       "created_at": "2026-10-18T12:00:00Z",
       "offset": 1024,
       "marker": 2,
-      "attachments": 1
+      "attachments": [
+        {
+          "channel": 7,
+          "client": {
+            "name": "clankerspace",
+            "version": "0.3.0"
+          },
+          "read_only": false,
+          "viewport": {
+            "cols": 120,
+            "rows": 40
+          },
+          "since": "2026-10-18T12:00:01Z",
+          "last_input": "2026-10-18T12:01:00Z"
+        }
+      ],
+      "size": {
+        "policy": "latest",
+        "owner": 7
+      }
     }
   },
   "resized/basic": {
@@ -537,6 +677,10 @@
   },
   "closed/removed": {
     "reason": "removed"
+  },
+  "closed/detached": {
+    "reason": "detached",
+    "message": "taken over"
   },
   "params/create": {
     "label": "build",
@@ -576,6 +720,15 @@
   "params/resize-cols": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001",
     "cols": 100
+  },
+  "params/resize-policy": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "policy": "smallest"
+  },
+  "params/detach": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001",
+    "channel": 7,
+    "reason": "taken over"
   },
   "params/read": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001",
