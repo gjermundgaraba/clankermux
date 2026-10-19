@@ -73,9 +73,10 @@ export class CanvasRenderer {
       this.drawRow(row);
       drawn.add(row.y);
     }
-    // A mark that moved or went away is erased with the rows under it.
+    // The last mark is erased with the rows under it, every frame: it is
+    // translucent, so one drawn over itself would darken.
     const mark = this.markOf(frame);
-    if (this.mark && (this.mark.top !== mark?.top || this.mark.height !== mark?.height)) {
+    if (this.mark) {
       const { cellHeight } = this.metrics;
       const last = Math.ceil((this.mark.top + this.mark.height) / cellHeight);
       for (let y = Math.floor(this.mark.top / cellHeight); y < last; y++) {
@@ -102,7 +103,7 @@ export class CanvasRenderer {
       this.drawCursor(cursor);
       this.cursorRow = cursor.y;
     }
-    // Over everything, on every frame: a row drawn under it erased it.
+    // Over everything, on rows just drawn.
     this.mark = mark;
     if (mark) {
       this.ctx.globalAlpha = 0.5;

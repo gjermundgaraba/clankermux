@@ -544,7 +544,9 @@ test("a drag selects and copies on release; a click, input or a new screen clear
   const channel = await server.opened("s");
   bootstrap(server, channel, session("s"), "one two\r\nthree four five");
   await vi.waitFor(() => expect(worker.scrollbar()).toBeDefined());
-  const selections = () => worker.posted.filter((m) => m.type === "selection");
+  // A release is always answered, with undefined when nothing is selected.
+  const selections = () => worker.posted.filter((m) => m.type === "selection" && (m.text !== undefined || !m.copy));
+  const answer = () => worker.posted.filter((m) => m.type === "selection").at(-1);
   const selectedRows = () =>
     worker.posted.flatMap((m) => (m.type === "frame" ? [m.frame.lines.map((l) => l.selection)] : [])).at(-1);
 
@@ -570,6 +572,7 @@ test("a drag selects and copies on release; a click, input or a new screen clear
   expect(selections().at(-1)).toEqual({ type: "selection", text: undefined, copy: false });
   worker.send({ type: "select", action: "release", at: { x: 1, y: 0.5 }, time: 9050 });
   expect(selections()).toHaveLength(4);
+  expect(answer()).toEqual({ type: "selection", text: undefined, copy: true });
 
   // Selected again, then a new screen: gone.
   worker.send({ type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 20000 });
@@ -578,4 +581,42 @@ test("a drag selects and copies on release; a click, input or a new screen clear
   expect(selections().at(-1)).toEqual({ type: "selection", text: "one t", copy: true });
   server.push(FrameType.Gap, channel, { from: 0, to: 10 });
   expect(selections().at(-1)).toEqual({ type: "selection", text: undefined, copy: false });
+
+  // A press, then a new screen: the drag that follows is not anchored in
+  // the freed terminal, and selects nothing until a new press.
+  worker.send({ type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 30000 });
+  bootstrap(server, channel, session("s"), "new screen");
+  await vi.waitFor(() => expect(worker.links().filter((l) => l.state === "connected")).toHaveLength(2));
+  worker.send({ type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
+  worker.send({ type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 30100 });
+  expect(answer()).toEqual({ type: "selection", text: undefined, copy: true });
+  worker.send({ type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 40000 });
+  worker.send({ type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
+  worker.send({ type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 40100 });
+  expect(answer()).toEqual({ type: "selection", text: "new s", copy: true });
+});
+
+test("a page still in use takes the size back at its next input after another client resized the session", async () => {
+  const worker = start("s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const channel = await server.opened("s");
+  bootstrap(server, channel, session("s"));
+  await vi.waitFor(() => expect(worker.scrollbar()).toBeDefined());
+  const size = { cols: 10, rows: 3 };
+  worker.send({ type: "viewport", size, profile: {}, active: true });
+  expect(server.bodies(FrameType.Viewport)).toHaveLength(1);
+  // Its own size coming back changes nothing.
+  server.push(FrameType.Resized, channel, { seq: 1, offset: 0, cols: 10, rows: 3 });
+  worker.send({ type: "key", input: key("KeyA", { key: "a" }) });
+  await vi.waitFor(() => expect(server.sent.filter((f) => f.header.type === FrameType.Input)).toHaveLength(1));
+  expect(server.bodies(FrameType.Viewport)).toHaveLength(1);
+  // Another client's: the next input reports this page's size first, once.
+  server.push(FrameType.Resized, channel, { seq: 2, offset: 0, cols: 20, rows: 5 });
+  worker.send({ type: "scroll", rows: -1 });
+  worker.send({ type: "key", input: key("KeyB", { key: "b" }) });
+  expect(server.bodies(FrameType.Viewport)).toEqual([
+    { channel, body: { ...size, profile: {} } },
+    { channel, body: { ...size, profile: {} } },
+  ]);
 });

@@ -433,7 +433,8 @@ client being looked at. The web client (`mountTerminal`) reports, in
 `OPEN` and `VIEWPORT`, only while its page is visible and its window has
 the focus (`document.visibilityState` and `document.hasFocus()`), and
 reports again as soon as it is shown or focused, whether or not its size
-changed. A hidden or unfocused web client sends `OPEN` without `viewport`
+changed, and at its next input when another client's report resized the
+session while it kept the focus. A hidden or unfocused web client sends `OPEN` without `viewport`
 or `profile` and no `VIEWPORT`; its terminal follows the session's size
 through `RESIZED` like any other.
 

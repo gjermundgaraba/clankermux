@@ -121,7 +121,7 @@ export type ToPage =
   | { type: "sessions"; sessions: Session[]; current: string | undefined }
   | { type: "clipboard"; text: string }
   /** The selection's text, or undefined once there is none; `copy`: the
-   * selection was just made, so it goes to the clipboard. */
+   * answer to a release, so the text (if any) goes to the clipboard. */
   | { type: "selection"; text: string | undefined; copy: boolean };
 
 /** The worker's end of the page's messages: `self` in a dedicated worker. */
@@ -189,6 +189,9 @@ class Client {
   private profile!: Profile;
   /** The page is in use; only then are its size and profile reported. */
   private active = false;
+  /** Another client resized the session while this page was in use: its
+   * next input reports its size again. */
+  private reclaim = false;
   private conn: Connection | undefined;
   private attachment: Attachment | undefined;
   private channel = 0;
@@ -431,6 +434,11 @@ class Client {
         this.paintTimer ??= setTimeout(() => this.paint(), PAINT_MS);
         break;
       case "resized":
+        // Another client's size, while this page kept its focus (the user
+        // went to another machine): taken back at this page's next input.
+        if (this.active && (action.cols !== this.viewport.cols || action.rows !== this.viewport.rows)) {
+          this.reclaim = true;
+        }
         this.paint();
         break;
       case "exited":
@@ -510,6 +518,7 @@ class Client {
     if (!term) return;
     switch (action) {
       case "press":
+        this.claim();
         if (this.selected) this.unselected();
         term.select(this.gesture.press(term, at, time));
         break;
@@ -520,9 +529,11 @@ class Client {
       }
       case "release": {
         this.gesture.release(term, at);
-        const text = term.selectionText();
+        // Answered either way: the page's copy waits for it. Blanks only
+        // (trimmed to nothing) are no text to copy.
+        const text = term.selectionText() || undefined;
         this.selected = text !== undefined;
-        if (text !== undefined) this.post({ type: "selection", text, copy: true });
+        this.post({ type: "selection", text, copy: true });
         break;
       }
     }
@@ -544,8 +555,8 @@ class Client {
   }
 
   /** The terminal goes, and its selection and the gesture's anchor with it. */
-  private forgetSelection(): void {
-    this.gesture.forget();
+  private forgetSelection(term?: Terminal): void {
+    this.gesture.forget(term);
     if (this.selected) this.unselected();
   }
 
@@ -554,7 +565,8 @@ class Client {
    * (EXITED) does. */
   private detach(): void {
     if (!this.attachment) return;
-    this.forgetSelection();
+    // Still alive: the gesture's anchor is released in it.
+    this.forgetSelection(this.attachment.term());
     if (this.conn) {
       this.conn.release(this.channel);
       if (!this.attachment.closed()) {
@@ -640,6 +652,7 @@ class Client {
     const session = this.session;
     const channel = this.channel;
     if (bytes.length === 0 || !conn || !attachment || attachment.ended() || session === undefined) return;
+    this.claim();
     this.live();
     this.unselect();
     // Each request's base64 fits the control body with room for the rest,
@@ -686,6 +699,7 @@ class Client {
   scroll(rows: number): void {
     const term = this.attachment?.term();
     if (!term || rows === 0) return;
+    this.claim();
     if (!term.alternate) {
       term.scroll(rows);
       this.paint();
@@ -733,12 +747,21 @@ class Client {
     if (!this.conn || !attachment || attachment.ended()) return;
     this.applyProfile(attachment.term());
     this.paint();
-    if (!active) return;
+    if (active) this.report();
+  }
+
+  private report(): void {
+    this.reclaim = false;
     try {
-      this.conn.sendJson(FrameType.Viewport, this.channel, { ...size, profile });
+      this.conn?.sendJson(FrameType.Viewport, this.channel, { ...this.viewport, profile: this.profile });
     } catch {
       // Reported through onEnd.
     }
+  }
+
+  /** Input from the page in use: its size again if another client took it. */
+  private claim(): void {
+    if (this.reclaim && this.active && this.attachment && !this.attachment.ended()) this.report();
   }
 }
 

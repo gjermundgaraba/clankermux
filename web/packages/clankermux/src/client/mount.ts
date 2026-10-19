@@ -172,6 +172,37 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
 
   /** The selection's text, for a copy. */
   let selected: string | undefined;
+  /** The clipboard write a release started, waiting for the worker to say
+   * what was selected. */
+  let copying: { resolve: (text: string) => void; reject: () => void } | undefined;
+  /** Starts the copy of what a release selected. Safari writes to the
+   * clipboard only within the user's gesture, which is over before the
+   * worker answers: the write starts here with the text to come, and
+   * fails, leaving the clipboard alone, when nothing was selected. */
+  function startCopy(): void {
+    copying?.reject();
+    copying = undefined;
+    if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) return;
+    let settle!: { resolve: (text: string) => void; reject: () => void };
+    const text = new Promise<Blob>((resolve, reject) => {
+      settle = {
+        resolve: (value) => resolve(new Blob([value], { type: "text/plain" })),
+        reject: () => reject(new Error("nothing selected")),
+      };
+    });
+    navigator.clipboard.write([new ClipboardItem({ "text/plain": text })]).catch(() => {});
+    const timer = setTimeout(() => settle.reject(), 2000);
+    copying = {
+      resolve: (value) => {
+        clearTimeout(timer);
+        settle.resolve(value);
+      },
+      reject: () => {
+        clearTimeout(timer);
+        settle.reject();
+      },
+    };
+  }
   /** Rows the view is scrolled back, as `onScroll` last reported. */
   let scrolled = 0;
   worker.onmessage = (e: MessageEvent<ToPage>) => {
@@ -213,10 +244,16 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
       case "clipboard":
         navigator.clipboard?.writeText(message.text).catch(() => {});
         break;
-      case "selection":
+      case "selection": {
         selected = message.text;
-        if (message.copy && message.text) navigator.clipboard?.writeText(message.text).catch(() => {});
+        if (!message.copy) break;
+        const copy = copying;
+        copying = undefined;
+        if (message.text === undefined) copy?.reject();
+        else if (copy) copy.resolve(message.text);
+        else navigator.clipboard?.writeText(message.text).catch(() => {});
         break;
+      }
     }
   };
 
@@ -253,8 +290,19 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
   canvas.after(input);
   /** Moves the input element to the cursor, and shows it while composing. */
   function placeInput(composing: boolean): void {
-    input.style.left = `${canvas.offsetLeft + cursorAt.x * metrics.cellWidth}px`;
-    input.style.top = `${canvas.offsetTop + cursorAt.y * metrics.cellHeight}px`;
+    // Its position is against its containing block: a positioned
+    // ancestor, or else the document.
+    const cell = canvas.getBoundingClientRect();
+    const parent = input.offsetParent;
+    let left = cell.left + window.scrollX;
+    let top = cell.top + window.scrollY;
+    if (parent && getComputedStyle(parent).position !== "static") {
+      const box = parent.getBoundingClientRect();
+      left = cell.left - box.left - parent.clientLeft + parent.scrollLeft;
+      top = cell.top - box.top - parent.clientTop + parent.scrollTop;
+    }
+    input.style.left = `${left + cursorAt.x * metrics.cellWidth}px`;
+    input.style.top = `${top + cursorAt.y * metrics.cellHeight}px`;
     if (!composing) {
       Object.assign(input.style, hidden);
       return;
@@ -287,7 +335,9 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
         send({ type: "key", input: key });
         e.preventDefault();
       } else if (e.isComposing || e.key === "Dead" || e.keyCode === 229) {
-        placeInput(true);
+        // At the cursor before the input method opens its window; shown
+        // once a composition starts.
+        placeInput(false);
       }
     },
     { signal },
@@ -313,6 +363,7 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
     { signal },
   );
   input.addEventListener("compositionstart", () => placeInput(true), { signal });
+  input.addEventListener("blur", () => placeInput(false), { signal });
   input.addEventListener(
     "compositionend",
     (e) => {
@@ -341,6 +392,15 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
     { signal },
   );
   // The browser's copy (Cmd+C, Ctrl+C in a menu) copies the selection.
+  // WebKit offers Copy on an empty textarea only when `beforecopy` is
+  // cancelled.
+  input.addEventListener(
+    "beforecopy",
+    (e) => {
+      if (selected !== undefined) e.preventDefault();
+    },
+    { signal },
+  );
   input.addEventListener(
     "copy",
     (e) => {
@@ -361,13 +421,17 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
     };
   }
   // Selection: press, drag (once a frame) and release, followed outside
-  // the canvas until the button is up.
+  // the canvas until the button is up. A release the page never saw (the
+  // button let go over another window) ends the drag at the next move or
+  // press.
+  let endDrag: ((at: CellPoint, time: number) => void) | undefined;
   canvas.addEventListener(
     "mousedown",
     (e) => {
       e.preventDefault();
       input.focus({ preventScroll: true });
       if (e.button !== 0) return;
+      endDrag?.(cellAt(e), e.timeStamp);
       send({ type: "select", action: "press", at: cellAt(e), time: e.timeStamp });
       let pending: CellPoint | undefined;
       let frame = 0;
@@ -377,17 +441,23 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
         if (pending) send({ type: "select", action: "drag", at: pending, time: 0 });
         pending = undefined;
       };
+      const end = (at: CellPoint, time: number) => {
+        flush();
+        window.removeEventListener("mousemove", move);
+        window.removeEventListener("mouseup", up);
+        endDrag = undefined;
+        startCopy();
+        send({ type: "select", action: "release", at, time });
+      };
       const move = (m: MouseEvent) => {
+        if ((m.buttons & 1) === 0) return end(cellAt(m), m.timeStamp);
         pending = cellAt(m);
         frame ||= requestAnimationFrame(flush);
       };
       const up = (u: MouseEvent) => {
-        if (u.button !== 0) return;
-        flush();
-        send({ type: "select", action: "release", at: cellAt(u), time: u.timeStamp });
-        window.removeEventListener("mousemove", move);
-        window.removeEventListener("mouseup", up);
+        if (u.button === 0) end(cellAt(u), u.timeStamp);
       };
+      endDrag = end;
       window.addEventListener("mousemove", move, { signal });
       window.addEventListener("mouseup", up, { signal });
     },

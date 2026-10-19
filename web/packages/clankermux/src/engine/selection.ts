@@ -70,12 +70,13 @@ export class SelectionGesture {
     this.apply(term, this.events.release);
   }
 
-  /** Starts afresh, for a terminal freed or about to be: its tracked
-   * anchor goes with it. The caller says so, since a new terminal may
-   * have the handle of a freed one. */
-  forget(): void {
+  /** Starts afresh, for a terminal freed or about to be: `term` when it
+   * is still alive, to release the tracked anchor in it, else none. The
+   * caller says so, since a new terminal may have the handle of a freed
+   * one. */
+  forget(term?: Terminal): void {
     if (this.term === undefined) return;
-    this.engine.call("ghostty_selection_gesture_free", this.gesture, 0);
+    this.engine.call("ghostty_selection_gesture_free", this.gesture, term?.handle ?? 0);
     this.gesture = this.engine.construct("ghostty_selection_gesture_new");
     this.term = undefined;
   }

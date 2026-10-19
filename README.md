@@ -50,7 +50,7 @@ The last line, or the package's settings on npmjs.com, names this repository and
 
 ### Versions
 
-- **0.2.0**: the web package for daily use. Mouse selection copied on release (word and line with double and triple click; Cmd+C and Ctrl+Shift+C copy again), scrollback with the wheel and Shift+PageUp/PageDown/Home/End (a mark while scrolled back, `onScroll`), input methods and dead keys through a textarea that takes the focus from the canvas (`focus()`), the session sized by the visible, focused client, and a reported scheme that follows the canvas's `color-scheme`. The server is unchanged; a test now covers its working-directory announcements.
+- **0.2.0**: the web package for daily use. Mouse selection copied on release (word and line with double and triple click; Cmd+C and Ctrl+Shift+C copy again), scrollback with the wheel and Shift+PageUp/PageDown/Home/End (a mark while scrolled back, `onScroll`), input methods and dead keys through a textarea that takes the focus from the canvas (`focus()`), the session sized by the visible, focused client, and a reported scheme that follows the canvas's `color-scheme`. For direct users of `./engine`, `./renderer` and the worker messages: `Frame.scrollbar`, `KeyEventLike.keyCode` and `active` in the `init` and `viewport` messages are new and required. The server is unchanged; a test now covers its working-directory announcements.
 - **0.1.1**: a running session parks within seconds of a change and when its last attachment closes, so a server killed without a signal restores it as it was; `serve --park-timing` sets the park times for tests. The web package's `create({ onExit })` (which now returns a promise), `end()`, `remove()` and `onLink`.
 - **0.1.0**: the first release.
 

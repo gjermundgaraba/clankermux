@@ -54,6 +54,8 @@ The terminal's input element is a textarea the mount places after the canvas: an
 - Text inserted with no key that sent it (a dead key's character, the emoji picker, dictation) is sent as it is inserted (`beforeinput` `insertText`); a line break or a backward delete from such a source is sent as Enter or Backspace.
 - Composed text goes to the program as UTF-8, as typed text does, not as a paste.
 
+A page that holds input back (a pause) holds these events, which the terminal acts on: on the input element `keydown`, `keyup`, `beforeinput`, `compositionstart`, `compositionend`, `paste`, `beforecopy` and `copy`; on the canvas `mousedown` (focus and selection; the drag continues on `window` `mousemove`/`mouseup`) and `wheel` (which sends arrow keys on the alternate screen). macOS press-and-hold accents send the base letter on its keydown and then the accented one, as in xterm.js.
+
 Verified in headless Chrome on macOS through CDP (`Input.imeSetComposition`, `Input.insertText`, `Input.dispatchKeyEvent`): a Japanese composition sent once at its end, nothing during it; a dead key (Option+E, then é) with no Alt+E sent; an emoji inserted with no key; plain keys sent once. Not verified by hand with a real input method, in Safari or in Firefox.
 
 ## `onSessions`
@@ -130,7 +132,7 @@ The selection is the engine's, drawn inverted, and the engine keeps it on its ce
 
 It is cleared by a click (a press that selects nothing), by input sent to the session (a key that sends something, a paste, composed text; not a modifier alone), by a switch to the alternate screen (it is not back when the program leaves it), by a full reset (RIS), and by a new screen (attaching, a gap).
 
-The copy on release goes through `navigator.clipboard.writeText` once the worker has the text, a few milliseconds after `mouseup`. Chrome allows that (the page is focused); a browser that asks for the user gesture to be still running may refuse it silently, and Cmd+C then copies. Programs that ask for mouse reports get none from this client, so the mouse always selects.
+The copy on release starts within `mouseup`, as Safari requires: `navigator.clipboard.write` with a `ClipboardItem` whose text arrives when the worker has it, a few milliseconds later; when nothing was selected it fails and the clipboard is left alone. Where `ClipboardItem` is missing it is `writeText` once the text arrives, which a browser that wants the gesture still running may refuse; Cmd+C then copies. Verified in headless Chrome only. A `beforecopy` listener lets WebKit offer Copy on the empty input element while there is a selection. Where the browser keeps Ctrl+Shift+C for itself (a developer tools shortcut), Cmd+C or the Copy menu copies. Programs that ask for mouse reports get none from this client, so the mouse always selects.
 
 ## Scrollback
 
@@ -145,7 +147,7 @@ While the view is scrolled back the canvas draws a mark at its right edge, the v
 
 ## Size between clients
 
-A session has one size, and the server applies the latest report (PROTOCOL.md, "Size"). The terminal reports its container's size, its colours and its scheme only while its page is visible and its window has the focus (`document.visibilityState === "visible"` and `document.hasFocus()`). It reports again when the page is shown or its window focused, even at an unchanged size. So with the same session open in several tabs or on several machines, the session takes the size of the one you look at, and a hidden or unfocused one never resizes it: its `OPEN` carries no viewport, it sends no `VIEWPORT`, and its canvas shows the session's size, clipped or with a margin. `report()` follows the same rule. `create()` makes the session at the container's current size, focused or not.
+A session has one size, and the server applies the latest report (PROTOCOL.md, "Size"). The terminal reports its container's size, its colours and its scheme only while its page is visible and its window has the focus (`document.visibilityState === "visible"` and `document.hasFocus()`). It reports again when the page is shown or its window focused, even at an unchanged size, and when the session was resized to another client's size while the page kept its focus (the user went to another machine and came back), at the page's next input: a key or text that sends something, a paste, a click on the canvas, the wheel. So with the same session open in several tabs or on several machines, the session takes the size of the one you look at, and a hidden or unfocused one never resizes it: its `OPEN` carries no viewport, it sends no `VIEWPORT`, and its canvas shows the session's size, clipped or with a margin. `report()` follows the same rule. `create()` makes the session at the container's current size, focused or not. A headless browser counts only its newest page as visible and focused, and a terminal in an iframe has the focus only once the frame does; such a page does not size the session until then.
 
 ## Colour scheme
 

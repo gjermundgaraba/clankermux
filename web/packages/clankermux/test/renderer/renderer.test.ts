@@ -119,6 +119,13 @@ test("a view scrolled back has a mark at the right edge, moved and erased with t
   expect(ctx.texts()).toEqual(["c"]);
   expect(ctx.ops.at(-1)).toEqual(["rect", "#ffffff", 27, 20, 3, 20]);
 
+  // Unchanged with no row under it changed: the row is redrawn first, so
+  // the translucent mark is never drawn over itself.
+  ctx.ops = [];
+  r.draw(frame([], undefined, false, { total: 16, offset: 8, len: 2 }));
+  expect(ctx.texts()).toEqual(["c"]);
+  expect(ctx.ops.at(-1)).toEqual(["rect", "#ffffff", 27, 20, 3, 20]);
+
   // Back at the live screen without a full frame: the rows under it are
   // redrawn and no mark is drawn.
   ctx.ops = [];
