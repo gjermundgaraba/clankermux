@@ -303,6 +303,8 @@ pub struct Session {
     /// The first and the latest change since the last park began, if
     /// any: output, input, a resize or a label.
     pub unparked: Option<(Instant, Instant)>,
+    /// When the last park began.
+    pub parked_at: Option<Instant>,
     /// Wakes the session's activity park at the first change after a
     /// park, and at the end of the stream.
     pub park_due: Arc<Notify>,
@@ -611,7 +613,8 @@ impl Session {
             .add_marker(MarkerKind::Exited { exit: exit.clone() });
         self.drop_transient_records();
         self.wake.notify_waiters();
-        // Ends the activity park; the stream's end has its own.
+        // Wakes the activity park to see the end and return; a kept
+        // session's last park is `Registry::ended`'s.
         self.park_due.notify_one();
         Some(exit)
     }

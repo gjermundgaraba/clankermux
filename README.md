@@ -25,12 +25,12 @@ A terminal multiplexer server with CLI and browser clients; the wire protocol is
 
 `serve` writes each running session's screen, scrollback and state under `$XDG_STATE_HOME/clankermux/sessions/` (PROTOCOL.md, "Persisted state"):
 
-- within 2 s of its output (or input, a resize, a label) stopping, and at least every 30 s while it continues;
+- within 5 s of its output (or input, a resize, a label) stopping (2 s when it has not parked in the last 5 s), and at least every 30 s while it continues, but no more than once every 5 s;
 - when its last attachment closes;
 - every 5 minutes;
 - on SIGTERM, SIGINT or SIGHUP, before it exits.
 
-A server that dies without a signal (SIGKILL, a machine powered off) starts again with each session `restored` as of its last park. `serve --park-timing INTERVAL,QUIET,BUSY` sets the three times in seconds, fractions allowed (default `300,2,30`), so that a test can kill a server soon after typing and find the line parked: `clankermux serve --park-timing 300,0.2,1`.
+A server that dies without a signal (SIGKILL, a machine powered off) starts again with each session `restored` as of its last park. `serve --park-timing INTERVAL,QUIET,GAP,BUSY` sets the times in seconds, fractions allowed (default `300,2,5,30`): every INTERVAL; QUIET after the last change, or BUSY after the first since the last park, whichever is sooner; never within GAP of the last park. A test can kill a server soon after typing and find the line parked: `clankermux serve --park-timing 300,0.2,0.2,1`.
 
 ## Release
 
@@ -50,7 +50,7 @@ The last line, or the package's settings on npmjs.com, names this repository and
 
 ### Versions
 
-- **0.1.1**: a running session parks within seconds of a change and when its last attachment closes, so a server killed without a signal restores it as it was; `serve --park-timing` sets the park times for tests. The web package's `create({ onExit })`, `end()`, `remove()` and `onLink`.
+- **0.1.1**: a running session parks within seconds of a change and when its last attachment closes, so a server killed without a signal restores it as it was; `serve --park-timing` sets the park times for tests. The web package's `create({ onExit })` (which now returns a promise), `end()`, `remove()` and `onLink`.
 - **0.1.0**: the first release.
 
 ## The web package

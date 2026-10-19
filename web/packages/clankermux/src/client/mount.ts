@@ -54,7 +54,8 @@ export interface MountedTerminal {
   /** Detaches the current session and attaches `session`. */
   attach(session: string): void;
   /** Creates a session at the current size and attaches it; resolves
-   * with it as created. */
+   * with it as created. Like `end` and `remove`, it needs a connection:
+   * call it after a `connected` link. */
   create(options?: CreateOptions): Promise<Session>;
   /** Hangs up the attached session's processes (SIGHUP); its exit
    * follows as a link `ended` with reason `exited`. Resolves too when the
@@ -138,11 +139,13 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
   const send = (message: ToWorker) => worker.postMessage(message);
 
   /** Requests waiting for their `done`, by id. They reject with a
-   * `ClientError` for a server's refusal or a lost connection, or an
-   * `Error` when no session is attached. */
+   * `ClientError` for a server's refusal, a lost connection or a
+   * disposed terminal, or an `Error` when no session is attached. */
   const pending = new Map<number, { resolve: (session: Session | undefined) => void; reject: (err: Error) => void }>();
   let nextId = 1;
+  let disposed = false;
   function request(message: (id: number) => ToWorker): Promise<Session | undefined> {
+    if (disposed) return Promise.reject(new ClientError("closed", "disposed"));
     const id = nextId++;
     return new Promise((resolve, reject) => {
       pending.set(id, { resolve, reject });
@@ -248,6 +251,7 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
     report,
     paste: (text) => send({ type: "paste", text }),
     dispose: () => {
+      disposed = true;
       listening.abort();
       resizes.disconnect();
       worker.onmessage = null;

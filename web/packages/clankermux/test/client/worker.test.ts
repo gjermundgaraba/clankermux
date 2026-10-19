@@ -170,8 +170,10 @@ function start(attach?: string) {
   };
 }
 
+/** The `index`th socket, once the worker opened it: the first waits for
+ * the engine's compile, so it gets a few seconds. */
 async function socket(index: number): Promise<FakeSocket> {
-  await vi.waitFor(() => expect(FakeSocket.all.length).toBeGreaterThan(index));
+  await vi.waitFor(() => expect(FakeSocket.all.length).toBeGreaterThan(index), { timeout: 5000 });
   return FakeSocket.all[index]!;
 }
 
@@ -335,6 +337,68 @@ test("the link: an answered connection's error ends it, and nothing reconnects",
   await new Promise((resolve) => setTimeout(resolve, 400));
   expect(FakeSocket.all).toHaveLength(1);
   expect(worker.links().at(-1)?.state).toBe("ended");
+  // Until the page attaches: that connects again.
+  worker.send({ type: "attach", session: "s" });
+  const next = await socket(1);
+  await next.serve([session("s")]);
+  bootstrap(next, await next.opened("s"), session("s"));
+  await vi.waitFor(() =>
+    expect(worker.links().slice(-2)).toEqual<Link[]>([
+      { state: "connecting", attempt: 1 },
+      { state: "connected", session: session("s") },
+    ]),
+  );
+});
+
+test("the link: a refused subscription closes the connection for good", async () => {
+  const worker = start();
+  const server = await socket(0);
+  await vi.waitFor(() => expect(server.bodies(FrameType.Hello)).toHaveLength(1));
+  server.push(FrameType.Welcome, 0, {
+    version: 1,
+    server: { name: "test", version: "0" },
+    engine: "x",
+    incarnation: "i",
+    capabilities: [],
+    limits,
+  });
+  const subscribe = await server.request("subscribe");
+  server.push(FrameType.Error, 0, { id: subscribe.id, code: "internal", message: "no" });
+  await vi.waitFor(() =>
+    expect(worker.links().at(-1)).toEqual({
+      state: "ended",
+      reason: "error",
+      code: "internal",
+      message: "no",
+      retry: false,
+    }),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  expect(FakeSocket.all).toHaveLength(1);
+  expect(worker.links().at(-1)?.state).toBe("ended");
+});
+
+test("the link: a resume onto a session that exited meanwhile ends once, at its EXITED", async () => {
+  const worker = start("s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  bootstrap(server, await server.opened("s"), session("s"));
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+  server.close();
+  const next = await socket(1);
+  const exited = { ...session("s", "exited"), exit: { code: 0 } };
+  await next.serve([exited]);
+  const channel = await next.opened("s");
+  expect(next.bodies(FrameType.Open).at(-1)?.body.resume).toEqual({ incarnation: "i", offset: 0, marker: 0 });
+  next.push(FrameType.Attached, channel, { mode: "resume", offset: 0, marker: 0, cols: 10, rows: 3, session: exited });
+  next.push(FrameType.Exited, channel, { seq: 1, offset: 0, exit: { code: 0 } });
+  await vi.waitFor(() =>
+    expect(worker.links().slice(-2)).toEqual<Link[]>([
+      { state: "connected", session: exited },
+      { state: "ended", reason: "exited", exit: { code: 0 }, retry: false },
+    ]),
+  );
+  expect(worker.links().filter((l) => l.state === "ended" && l.reason === "exited")).toHaveLength(1);
 });
 
 test("the link: a server refusing the handshake ends it; a lost one is tried again", async () => {

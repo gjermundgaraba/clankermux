@@ -71,19 +71,67 @@ async fn wait_parked_with(state: &Path, id: &str, needle: &str) -> PathBuf {
 }
 
 /// Parks soon after a change; the timer and the stop never in a test.
-fn prompt_parks(quiet_ms: u64, busy_ms: u64) -> server::ParkTiming {
+fn prompt_parks(quiet_ms: u64, gap_ms: u64, busy_ms: u64) -> server::ParkTiming {
     server::ParkTiming {
         interval: Duration::from_secs(3600),
         quiet: Duration::from_millis(quiet_ms),
+        gap: Duration::from_millis(gap_ms),
         busy: Duration::from_millis(busy_ms),
     }
+}
+
+/// The milliseconds between consecutive generations, by their names.
+fn spacing(parked: &[PathBuf]) -> Vec<u64> {
+    let ms: Vec<u64> = parked
+        .iter()
+        .map(|p| p.file_name().unwrap().to_str().unwrap().parse().unwrap())
+        .collect();
+    ms.windows(2).map(|w| w[1] - w[0]).collect()
+}
+
+/// Writes `tick-N` lines to `id` every `every` for at most `max`,
+/// collecting each new newest generation until there are `want`; also
+/// the longest time between two writes.
+async fn tick(
+    c: &mut Client,
+    state: &Path,
+    id: &str,
+    every: Duration,
+    max: Duration,
+    want: usize,
+) -> (Vec<PathBuf>, Duration) {
+    let mut parked = Vec::new();
+    let mut longest = Duration::ZERO;
+    let start = tokio::time::Instant::now();
+    let mut previous = start;
+    for tick in 0.. {
+        c.ok(
+            "write",
+            json!({"session": id, "data": b64(format!("tick-{tick}\n"))}),
+        )
+        .await;
+        let now = tokio::time::Instant::now();
+        longest = longest.max(now - previous);
+        previous = now;
+        if let Some(newest) = generations(state, id).pop()
+            && parked.last() != Some(&newest)
+        {
+            parked.push(newest);
+        }
+        if parked.len() == want || now - start > max {
+            break;
+        }
+        tokio::time::sleep(every).await;
+    }
+    (parked, longest)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_change_parks_once_quiet_and_while_busy() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let server = Server::start_with_park(fast_limits(), state.clone(), prompt_parks(200, 1000));
+    let server =
+        Server::start_with_park(fast_limits(), state.clone(), prompt_parks(400, 200, 1000));
     let mut c = client(&server).await;
 
     // Input echoed once, then quiet.
@@ -97,40 +145,73 @@ async fn a_change_parks_once_quiet_and_while_busy() {
     .await;
     wait_parked_with(&state, &quiet.id, "typed-line").await;
 
-    // A line every 50 ms is never quiet for 200 ms; it parks every
-    // second all the same. The test writes the lines itself: a loop of
-    // processes would load the machine the other tests share.
+    // A line every 50 ms is never quiet for 400 ms: it parks every
+    // second all the same, and no more often. The test writes the lines itself:
+    // a loop of processes would load the machine the other tests share.
     let busy = c
         .create(json!({"argv": ["/bin/sh", "-c", "exec cat"]}))
         .await;
-    let mut parked = Vec::new();
-    for tick in 0..200 {
-        c.ok(
-            "write",
-            json!({"session": busy.id, "data": b64(format!("tick-{tick}\n"))}),
-        )
-        .await;
-        if let Some(newest) = generations(&state, &busy.id).pop()
-            && parked.last() != Some(&newest)
-        {
-            parked.push(newest);
-        }
-        if parked.len() == 3 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let (parked, longest) = tick(
+        &mut c,
+        &state,
+        &busy.id,
+        Duration::from_millis(50),
+        Duration::from_secs(10),
+        3,
+    )
+    .await;
+    if longest >= Duration::from_millis(400) {
+        // The machine let the session go quiet: not this test's case.
+        eprintln!("skipped: {longest:?} between two writes");
+        return;
     }
-    // The first may be the park of its creation; two more came while busy.
     assert_eq!(parked.len(), 3, "{parked:?}");
+    assert!(
+        spacing(&parked).iter().all(|ms| *ms >= 900),
+        "{:?}",
+        spacing(&parked)
+    );
     assert_eq!(c.inspect(&busy.id).await.status, Status::Running);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bursts_park_no_more_often_than_the_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let server =
+        Server::start_with_park(fast_limits(), state.clone(), prompt_parks(100, 800, 5000));
+    let mut c = client(&server).await;
+    // A line every 250 ms is quiet for 100 ms each time; without the
+    // gap it would park four times a second.
+    let session = c
+        .create(json!({"argv": ["/bin/sh", "-c", "exec cat"]}))
+        .await;
+    let (parked, _) = tick(
+        &mut c,
+        &state,
+        &session.id,
+        Duration::from_millis(250),
+        Duration::from_millis(2500),
+        usize::MAX,
+    )
+    .await;
+    assert!(parked.len() >= 2, "{parked:?}");
+    assert!(
+        spacing(&parked).iter().all(|ms| *ms >= 750),
+        "{:?}",
+        spacing(&parked)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_last_detach_parks() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let server =
-        Server::start_with_park(fast_limits(), state.clone(), prompt_parks(60_000, 60_000));
+    let server = Server::start_with_park(
+        fast_limits(),
+        state.clone(),
+        prompt_parks(60_000, 60_000, 60_000),
+    );
     let mut c = client(&server).await;
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", "exec cat"]}))

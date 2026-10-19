@@ -162,6 +162,9 @@ class Client {
   private reopenTimer: ReturnType<typeof setTimeout> | undefined;
   /** Connection attempts since a server last answered. */
   private attempt = 0;
+  /** The connection ended for good with the server's refusal or error;
+   * `attach` connects again. */
+  private refused = false;
 
   private link(link: Link): void {
     this.post({ type: "link", link });
@@ -212,6 +215,7 @@ class Client {
       // A server that answers and refuses is not retried; a lost one is.
       if (err instanceof ClientError && (err.kind === "server" || err.kind === "protocol")) {
         this.post({ type: "status", text: err.message });
+        this.refused = true;
         this.endedWith(err, false);
         return;
       }
@@ -225,6 +229,7 @@ class Client {
       this.conn = undefined;
       if (err.kind === "server") {
         this.post({ type: "status", text: err.message });
+        this.refused = true;
         this.endedWith(err, false);
       } else {
         this.link({ state: "ended", reason: "closed", retry: true });
@@ -244,8 +249,14 @@ class Client {
       }
     } catch (err) {
       this.post({ type: "status", text: String(err) });
-      // A lost connection is reported through onEnd, which ran first.
-      if (this.conn === conn) this.endedWith(err, false);
+      // A lost connection is reported through onEnd, which ran first; a
+      // refused subscription ends this one for good.
+      if (this.conn === conn) {
+        this.conn = undefined;
+        conn.close();
+        this.refused = true;
+        this.endedWith(err, false);
+      }
       return;
     }
     this.postSessions();
@@ -307,9 +318,10 @@ class Client {
         }
         if (frame.header.type === FrameType.Attached && actions.length === 0) {
           this.post({ type: "status", text: "attached" });
-          // Resumed: the terminal shows the stream already. A snapshot's
-          // screen comes later, as an action.
-          if (attachment.resume()) this.attached(attachment.session);
+          // Resumed: the terminal shows the stream already, and an exit
+          // still to come arrives as EXITED. A snapshot's screen comes
+          // later, as an action.
+          if (attachment.resume()) this.link({ state: "connected", session: attachment.session });
         }
         for (const action of actions) this.apply(action);
       });
@@ -458,12 +470,20 @@ class Client {
     this.attachment = undefined;
   }
 
+  /** Attaches `session`; after the server refused or ended the
+   * connection, connects again first. */
   attach(session: string): void {
     this.detach();
     this.writes = Promise.resolve();
     this.session = session;
     this.postSessions();
-    this.open();
+    if (this.refused) {
+      this.refused = false;
+      this.attempt = 0;
+      void this.connect();
+    } else {
+      this.open();
+    }
   }
 
   /** Creates a session at the current size and attaches it; `on_exit`

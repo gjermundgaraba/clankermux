@@ -56,8 +56,10 @@ pub struct ParkTiming {
     pub interval: Duration,
     /// A session that changed, once it has been quiet this long...
     pub quiet: Duration,
-    /// ...or this long after its first change since its last park,
-    /// whichever comes first.
+    /// ...but no sooner than this long after its last park began...
+    pub gap: Duration,
+    /// ...and at the latest this long after its first change since its
+    /// last park, or `gap` after that park when later.
     pub busy: Duration,
 }
 
@@ -66,6 +68,7 @@ impl Default for ParkTiming {
         ParkTiming {
             interval: Duration::from_secs(300),
             quiet: Duration::from_secs(2),
+            gap: Duration::from_secs(5),
             busy: Duration::from_secs(30),
         }
     }
@@ -208,6 +211,7 @@ impl Registry {
             announced: Default::default(),
             park_lock: Default::default(),
             unparked: None,
+            parked_at: None,
             park_due: Arc::new(Notify::new()),
             write_chain: None,
             last_generation: 0,
@@ -235,9 +239,15 @@ impl Registry {
     /// the end of a kept session): nothing once the server is stopping,
     /// whose own parks come first.
     pub async fn park(self: &Arc<Self>, session: &Shared) {
+        self.park_if(session, false).await;
+    }
+
+    /// `park`, or with `changed` only when the session changed since
+    /// the last park began: a park it waited behind may have taken all.
+    async fn park_if(self: &Arc<Self>, session: &Shared, changed: bool) {
         let park_lock = session.lock().unwrap().park_lock.clone();
         let _one_at_a_time = park_lock.lock().await;
-        if !self.is_stopping() {
+        if !self.is_stopping() && (!changed || session.lock().unwrap().unparked.is_some()) {
             self.park_locked(session).await;
         }
     }
@@ -254,6 +264,7 @@ impl Registry {
         let id = {
             let mut s = session.lock().unwrap();
             s.unparked = None;
+            s.parked_at = Some(Instant::now());
             s.id.clone()
         };
         let at = jiff::Timestamp::now();
@@ -276,10 +287,11 @@ impl Registry {
             }
             Ok(Some(Err(err))) | Err(err) => Err(err.to_string()),
         };
+        // A removal deletes the files on purpose; a write it broke is no
+        // failure.
         if session.lock().unwrap().gone() {
             park::remove(&self.sessions_dir(), &id);
-        }
-        if let Err(error) = result {
+        } else if let Err(error) = result {
             tracing::warn!(session = id, error, "park failed; previous files kept");
         }
     }
@@ -515,6 +527,7 @@ impl Registry {
             // Created is changed: parked within `quiet` even if the
             // program never writes.
             unparked: Some((created, created)),
+            parked_at: None,
             park_due: Arc::new(Notify::new()),
             write_chain: None,
             last_generation: 0,
@@ -711,7 +724,8 @@ impl Registry {
 
 /// A running session's activity park: once its changes have been quiet
 /// for `park.quiet`, or `park.busy` after the first of them, whichever
-/// comes first. Woken by `due` at the first change after a park; ends
+/// comes first, and not within `park.gap` of the last park, so that
+/// output in bursts just over `quiet` apart parks once per `gap`. Woken by `due` at the first change after a park; ends
 /// with the session's stream, the session or the server.
 async fn park_when_due(
     registry: Weak<Registry>,
@@ -731,13 +745,16 @@ async fn park_when_due(
                 }
                 let timing = registry.config.park;
                 match s.unparked {
-                    Some((first, last)) => (last + timing.quiet).min(first + timing.busy),
+                    Some((first, last)) => {
+                        let due = (last + timing.quiet).min(first + timing.busy);
+                        s.parked_at.map_or(due, |at| due.max(at + timing.gap))
+                    }
                     // Parked meanwhile, by the timer or a detach.
                     None => break,
                 }
             };
             if Instant::now() >= deadline {
-                registry.park(&shared).await;
+                registry.park_if(&shared, true).await;
                 break;
             }
             drop((registry, shared));

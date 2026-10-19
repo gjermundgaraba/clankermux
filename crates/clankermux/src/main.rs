@@ -381,31 +381,34 @@ struct Carriers {
     /// When running sessions are parked, in seconds (fractions allowed),
     /// for tests: every session every INTERVAL, and a session that
     /// changed once it has been quiet for QUIET or BUSY after its first
-    /// change, whichever comes first. Also on the last detach and on
-    /// stop. [default: 300,2,30]
-    #[arg(long, value_name = "INTERVAL,QUIET,BUSY", value_parser = parse_park_timing)]
+    /// change, whichever comes first, but not within GAP of its last
+    /// park. Also on the last detach and on stop. [default: 300,2,5,30]
+    #[arg(long, value_name = "INTERVAL,QUIET,GAP,BUSY", value_parser = parse_park_timing)]
     park_timing: Option<server::ParkTiming>,
 }
 
 fn parse_park_timing(spec: &str) -> Result<server::ParkTiming, String> {
+    // Far beyond any use, and far from an `Instant` overflow.
+    const YEAR: f64 = 365.0 * 24.0 * 3600.0;
     let seconds: Vec<std::time::Duration> = spec
         .split(',')
         .map(|s| {
             s.trim()
                 .parse::<f64>()
                 .ok()
-                .and_then(|s| std::time::Duration::try_from_secs_f64(s).ok())
-                .filter(|d| !d.is_zero())
-                .ok_or_else(|| format!("{s:?} is not a positive number of seconds"))
+                .filter(|s| *s > 0.0 && *s <= YEAR)
+                .map(std::time::Duration::from_secs_f64)
+                .ok_or_else(|| format!("{s:?} is not a number of seconds above 0, up to a year"))
         })
         .collect::<Result<_, _>>()?;
     match seconds[..] {
-        [interval, quiet, busy] => Ok(server::ParkTiming {
+        [interval, quiet, gap, busy] => Ok(server::ParkTiming {
             interval,
             quiet,
+            gap,
             busy,
         }),
-        _ => Err("three durations are needed: INTERVAL,QUIET,BUSY".into()),
+        _ => Err("four durations are needed: INTERVAL,QUIET,GAP,BUSY".into()),
     }
 }
 

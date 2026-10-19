@@ -455,7 +455,7 @@ fn serve(dir: &std::path::Path) -> Child {
     tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
         .arg("--socket")
         .arg(dir.join("sock"))
-        .args(["serve", "--park-timing", "3600,0.2,1"])
+        .args(["serve", "--park-timing", "3600,0.2,0.2,1"])
         .env("XDG_STATE_HOME", dir.join("state"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

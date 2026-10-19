@@ -29,7 +29,7 @@ const terminal = mountTerminal({
 
 | Method | Does |
 | --- | --- |
-| `attach(session)` | Detaches the current session and attaches `session`. |
+| `attach(session)` | Detaches the current session and attaches `session`; after a connection-level end (below), connects again first. |
 | `create(options?)` | Creates a session at the current size, attaches it, and resolves with it. `options.onExit`: `"keep"` keeps it listed as `exited` when its program exits; `"remove"` removes it `limits.remove_grace` after. Without it the server's default (`remove`) applies. |
 | `end()` | Hangs up the attached session's processes (SIGHUP). Also resolves when the session is not running (`exited`, `restored`): there is nothing to end. |
 | `remove()` | Removes the attached session, which must be `exited` or `restored`; a running one rejects with `running`. |
@@ -37,12 +37,13 @@ const terminal = mountTerminal({
 | `paste(text)` | Pastes, bracketed when the program asked for it. |
 | `dispose()` | Removes the listeners and terminates the worker, which drops its connection; requests in flight reject. |
 
-`create`, `end` and `remove` reject with a `ClientError`:
+`create`, `end` and `remove` need a connection: call them after a `connected` link. They reject with a `ClientError`:
 
 - with `kind: "server"` and `server.code` when the server refuses;
-- with `kind: "closed"` when there is no connection.
+- with `kind: "closed"` when there is no connection, or after `dispose()`;
+- with `kind: "protocol"` when the server sent a malformed frame meanwhile (the connection then ends with `ended closed`, `retry: true`).
 
-`end` and `remove` reject with a plain `Error` when no session is attached. Closing a pane for good is `end()` for a running session and `remove()` for one that has exited, or that a previous server left `restored`. With `onExit: "remove"` an ended session also removes itself.
+`end` and `remove` reject with a plain `Error` when no session is attached. Since 0.1.1 `create` returns this promise, where it returned nothing and dropped a request it could not make; a caller that ignores it should `.catch` it. Closing a pane for good is `end()` for a running session and `remove()` for one that has exited, or that a previous server left `restored`. With `onExit: "remove"` an ended session also removes itself.
 
 ## `onLink`
 
@@ -56,7 +57,7 @@ type Link =
 type LinkEnd = "closed" | "removed" | "stopping" | "exited" | "no_such_session" | "engine_mismatch" | "error";
 ```
 
-`retry` means the worker reconnects or attaches again by itself, so a `connecting` or `connected` follows. Otherwise nothing follows until the page calls `attach` or `create`. After a connection-level end (the last four rows of the first table), those cannot work either, and only a new mount connects again.
+`retry` means the worker reconnects or attaches again by itself, so a `connecting` or `connected` follows. Otherwise nothing follows until the page calls `attach` or `create`. After a connection-level end (the last three rows of the first table) there is no connection: `create` rejects, and `attach` connects again (`connecting` from attempt 1), so "Retry" can be `attach`. An engine that failed to load needs a new mount.
 
 | When | Link |
 | --- | --- |
@@ -66,7 +67,7 @@ type LinkEnd = "closed" | "removed" | "stopping" | "exited" | "no_such_session" 
 | The engine cannot be loaded | `ended error`, `retry: false` |
 | The server refuses the handshake (`ERROR` before `WELCOME`, e.g. `version_mismatch`), or sends something else first | `ended error` with the code when there is one, `retry: false` |
 | The server ends the connection (`ERROR` without an id, e.g. `protocol_error`) | `ended error` with the code, `retry: false` |
-| `subscribe` fails on a live connection | `ended error`, `retry: false` |
+| `subscribe` fails on a live connection | `ended error`, `retry: false`; the worker closes the connection |
 
 Once connected:
 
@@ -74,7 +75,7 @@ Once connected:
 | --- | --- |
 | Connected with no session to attach | `connected`, `session: undefined` |
 | A session's screen is shown: a snapshot's first screen, a resume, again after a gap, a re-attach or a reconnect | `connected` with the session as `ATTACHED` described it; `status` tells `running`, `restored` or `exited` |
-| The session shown has exited already | `connected`, then at once `ended exited` with its `exit`, `retry: false` |
+| A snapshot shows a session that has exited already | `connected`, then at once `ended exited` with its `exit`, `retry: false` (a resume onto such a session gets its `EXITED`, the next row, instead) |
 | The session's program exits (`EXITED`) | `ended exited` with `exit`, `retry: false` |
 | `CLOSED removed` | `ended removed`, `retry: false`; the worker forgets the session |
 | `CLOSED stopping` | `ended stopping`, `retry: true`; the connection's close follows, and the reconnect attaches the session again (as `restored`) |

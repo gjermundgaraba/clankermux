@@ -495,9 +495,12 @@ A running session is parked:
 
 - after a change (output, input, a resize, a label, or its creation),
   once changes have been quiet for 2 s or 30 s after the first change
-  since its last park, whichever comes first. Its files are then at most
-  2 s behind once changes stop and 30 s behind while they continue, plus
-  the park's own time; a change during a park counts towards the next;
+  since its last park, whichever comes first, but not within 5 s of the
+  start of its last park. Its files are then at most 5 s behind once
+  changes stop (2 s when it has not parked in the 5 s before) and 30 s
+  behind while they continue, plus the park's own time, and these parks
+  of a session are at least 5 s apart; a change during a park counts
+  towards the next;
 - when its last attachment closes;
 - every 5 minutes.
 
