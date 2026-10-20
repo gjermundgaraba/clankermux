@@ -3,7 +3,6 @@ use serde_json::Value;
 use crate::*;
 
 const FRAMES: &str = include_str!("../vectors/frames.json");
-const MESSAGES: &str = include_str!("../vectors/messages.json");
 const LIMITS: &str = include_str!("../vectors/limits.json");
 
 fn hex(s: &str) -> Vec<u8> {
@@ -150,59 +149,63 @@ fn stream_decoder_handles_pieces_and_boundaries() {
     );
 }
 
-fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned>(name: &str, json: &Value) {
-    let typed: T = serde_json::from_value(json.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
-    assert_eq!(&serde_json::to_value(&typed).unwrap(), json, "{name}");
+/// Whether a value is a type, unchanged by a round trip through it.
+pub(crate) type Check = fn(&Value) -> Result<(), String>;
+
+pub(crate) fn same<T: serde::Serialize + serde::de::DeserializeOwned>(
+    value: &Value,
+) -> Result<(), String> {
+    let typed: T = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let back = serde_json::to_value(typed).map_err(|e| e.to_string())?;
+    (&back == value)
+        .then_some(())
+        .ok_or_else(|| format!("{value} came back as {back}"))
 }
 
 #[test]
 fn message_vectors() {
-    let vectors: serde_json::Map<String, Value> = serde_json::from_str(MESSAGES).unwrap();
+    let vectors: serde_json::Map<String, Value> = serde_json::from_str(catalog::VECTORS).unwrap();
+    // A method's params vectors are named after it, and checked as the
+    // catalog declares its params.
+    let typed = catalog::typed();
     for (name, json) in &vectors {
         let mut parts = name.split('/');
         let kind = parts.next().unwrap();
         let variant = parts.next().unwrap().split('-').next().unwrap();
         match (kind, variant) {
-            ("hello", _) => round_trip::<Hello>(name, json),
-            ("welcome", _) => round_trip::<Welcome>(name, json),
-            ("request", _) => round_trip::<Request>(name, json),
-            ("reply", _) => round_trip::<Reply>(name, json),
-            ("error", _) => round_trip::<ErrorMessage>(name, json),
-            ("session", _) => round_trip::<Session>(name, json),
-            ("page", _) => round_trip::<Page>(name, json),
-            ("read", _) => round_trip::<Read>(name, json),
-            ("tail", _) => round_trip::<Tail>(name, json),
-            ("subscribed", _) => round_trip::<Subscribed>(name, json),
-            ("event", _) => round_trip::<Numbered>(name, json),
-            ("acked", _) => round_trip::<Acked>(name, json),
-            ("params", "create") => round_trip::<CreateParams>(name, json),
-            ("params", "list") => round_trip::<ListParams>(name, json),
-            ("params", "inspect" | "end" | "remove") => round_trip::<SessionParams>(name, json),
-            ("params", "describe") => round_trip::<catalog::DescribeParams>(name, json),
-            ("empty", _) => round_trip::<Empty>(name, json),
-            ("params", "signal") => round_trip::<SignalParams>(name, json),
-            ("params", "label") => round_trip::<LabelParams>(name, json),
-            ("params", "resize") => round_trip::<ResizeParams>(name, json),
-            ("params", "read") => round_trip::<ReadParams>(name, json),
-            ("params", "tail") => round_trip::<TailParams>(name, json),
-            ("params", "send") => round_trip::<SendParams>(name, json),
-            ("params", "wait") => round_trip::<WaitParams>(name, json),
-            ("params", "cancel") => round_trip::<CancelParams>(name, json),
-            ("params", "detach") => round_trip::<DetachParams>(name, json),
-            ("sent", _) => round_trip::<Sent>(name, json),
-            ("waited", _) => round_trip::<Waited>(name, json),
-            ("cancelled", _) => round_trip::<Cancelled>(name, json),
-            ("params", "subscribe") => round_trip::<SubscribeParams>(name, json),
-            ("params", "ack") => round_trip::<AckParams>(name, json),
-            ("open", _) => round_trip::<Open>(name, json),
-            ("viewport", _) => round_trip::<Viewport>(name, json),
-            ("attached", _) => round_trip::<Attached>(name, json),
-            ("resized", _) => round_trip::<Resized>(name, json),
-            ("exited", _) => round_trip::<Exited>(name, json),
-            ("gap", _) => round_trip::<Gap>(name, json),
-            ("closed", _) => round_trip::<Closed>(name, json),
+            ("params", method) => {
+                let (_, params, _) = typed
+                    .iter()
+                    .find(|(name, ..)| *name == method)
+                    .unwrap_or_else(|| panic!("no method for vector {name}"));
+                params(json)
+            }
+            ("hello", _) => same::<Hello>(json),
+            ("welcome", _) => same::<Welcome>(json),
+            ("request", _) => same::<Request>(json),
+            ("reply", _) => same::<Reply>(json),
+            ("error", _) => same::<ErrorMessage>(json),
+            ("session", _) => same::<Session>(json),
+            ("page", _) => same::<Page>(json),
+            ("read", _) => same::<Read>(json),
+            ("tail", _) => same::<Tail>(json),
+            ("subscribed", _) => same::<Subscribed>(json),
+            ("event", _) => same::<Numbered>(json),
+            ("acked", _) => same::<Acked>(json),
+            ("empty", _) => same::<Empty>(json),
+            ("sent", _) => same::<Sent>(json),
+            ("waited", _) => same::<Waited>(json),
+            ("cancelled", _) => same::<Cancelled>(json),
+            ("open", _) => same::<Open>(json),
+            ("viewport", _) => same::<Viewport>(json),
+            ("attached", _) => same::<Attached>(json),
+            ("resized", _) => same::<Resized>(json),
+            ("exited", _) => same::<Exited>(json),
+            ("gap", _) => same::<Gap>(json),
+            ("closed", _) => same::<Closed>(json),
             _ => panic!("no type for vector {name}"),
         }
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
 }
 
@@ -307,11 +310,13 @@ fn params_schemas_are_closed_and_the_server_s_are_open() {
 #[test]
 fn every_method_s_examples_are_its_types() {
     let catalog = catalog::catalog("0");
-    for (name, check) in catalog::typed() {
+    for (name, params, result) in catalog::typed() {
         let method = catalog.method(name).unwrap();
         assert!(!method.examples.is_empty(), "{name}: no example");
         for example in &method.examples {
-            check(&example.params, &example.result).unwrap_or_else(|e| panic!("{name}: {e}"));
+            params(&example.params)
+                .and_then(|()| result(&example.result))
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
     }
 }
