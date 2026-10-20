@@ -204,7 +204,6 @@ impl Shell {
                 style: true,
                 hyperlink: true,
                 modes: true,
-                scrolling_region: false,
                 keyboard: true,
                 region: Region::Clip {
                     from_row,
