@@ -24,7 +24,7 @@ import type {
 
 import { ClientError } from "./connection.ts";
 import { type MountHost, type MountOptions, type Terminal, mountOn } from "./mount.ts";
-import type { Failure, ToPage, ToWorker } from "./worker.ts";
+import type { Failure, Link, ToPage, ToWorker } from "./worker.ts";
 
 export interface ConnectOptions {
   /** The server's WebSocket carrier, `wss://<node>:<port>/`. */
@@ -62,9 +62,9 @@ export interface WaitOptions {
 /**
  * Starts the worker and its connection to the server at `url`. Resolves
  * once the engine is loaded, before the connection is up: the worker
- * connects, and reconnects after a loss, by itself, and each mounted
- * terminal's `onLink` says how it goes. Rejects when the engine cannot be
- * loaded.
+ * connects, and reconnects after a loss, by itself, and the client's
+ * `onLink` (and each mounted terminal's) says how it goes. Rejects when
+ * the worker or the engine cannot be loaded.
  */
 export function connect(options: ConnectOptions): Promise<Client> {
   return new Promise((resolve, reject) => {
@@ -89,12 +89,18 @@ export function connect(options: ConnectOptions): Promise<Client> {
  */
 export class Client {
   private nextId = 1;
-  private readonly pending = new Map<number, { resolve: (result: unknown) => void; reject: (err: Error) => void }>();
+  private readonly pending = new Map<
+    number,
+    { resolve: (result: unknown) => void; reject: (err: Error) => void; done: () => void }
+  >();
   private readonly mounts = new Map<number, (message: ToPage) => void>();
   private readonly terminals = new Set<Terminal>();
   private readonly sessionListeners = new Set<(sessions: Session[]) => void>();
   private readonly eventListeners = new Set<(event: Event | EventGap) => void>();
+  private readonly linkListeners = new Set<(link: Link) => void>();
   private latest: Session[] | undefined;
+  private link: Link | undefined;
+  private started = false;
   private closed = false;
 
   /** @internal Use `connect`. */
@@ -102,10 +108,22 @@ export class Client {
     private readonly worker: Worker,
     started: (error?: Error) => void,
   ) {
+    // A worker script that does not load or run posts nothing: before
+    // `ready` that fails `connect`, after it every terminal's link.
+    worker.onerror = (e) => {
+      e.preventDefault?.();
+      const message = `the worker failed: ${e.message || "it did not load"}`;
+      if (!this.started) started(new Error(message));
+      const link: Link = { state: "ended", reason: "error", message, retry: false };
+      this.setLink(link);
+      for (const [mount, handler] of this.mounts) handler({ type: "link", mount, link });
+      this.close();
+    };
     worker.onmessage = (e: MessageEvent<ToPage>) => {
       const message = e.data;
       switch (message.type) {
         case "ready":
+          this.started = true;
           started();
           break;
         case "failed":
@@ -115,10 +133,14 @@ export class Client {
         case "reply": {
           const waiter = this.pending.get(message.id);
           this.pending.delete(message.id);
+          waiter?.done();
           if (message.error) waiter?.reject(errorOf(message.error));
           else waiter?.resolve(message.result);
           break;
         }
+        case "connection":
+          this.setLink(message.link);
+          break;
         case "sessions":
           this.latest = message.sessions;
           for (const listener of this.sessionListeners) listener(message.sessions);
@@ -135,6 +157,11 @@ export class Client {
     };
   }
 
+  private setLink(link: Link): void {
+    this.link = link;
+    for (const listener of this.linkListeners) listener(link);
+  }
+
   /** @internal */
   post(message: ToWorker): void {
     if (!this.closed) this.worker.postMessage(message);
@@ -148,14 +175,14 @@ export class Client {
     if (this.closed) return Promise.reject(new ClientError("closed", "closed"));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (result: unknown) => void, reject });
-      this.post({ type: "request", id, method, params });
-      if (!signal) return;
       // Cancelled by the server, so the rejection is its `cancelled`,
       // also when the signal was aborted already.
       const cancel = () => this.post({ type: "cancel", id });
-      if (signal.aborted) cancel();
-      else signal.addEventListener("abort", cancel, { once: true });
+      const done = () => signal?.removeEventListener("abort", cancel);
+      this.pending.set(id, { resolve: resolve as (result: unknown) => void, reject, done });
+      this.post({ type: "request", id, method, params });
+      if (signal?.aborted) cancel();
+      else signal?.addEventListener("abort", cancel, { once: true });
     });
   }
 
@@ -250,6 +277,16 @@ export class Client {
     await this.call("detach", { session, channel, ...(reason !== undefined && { reason }) });
   }
 
+  /** The connection's link, at each change: `connecting` with its
+   * attempt, `connected` (with no session), or `ended`, as a terminal's
+   * `onLink` reports the connection-level changes. Requests need
+   * `connected`. A listener added later gets the latest at once. */
+  onLink(listener: (link: Link) => void): () => void {
+    this.linkListeners.add(listener);
+    if (this.link) listener(this.link);
+    return () => void this.linkListeners.delete(listener);
+  }
+
   /** Every session on the server, at each change; a listener added once
    * the list is known gets it at once. */
   onSessions(listener: (sessions: Session[]) => void): () => void {
@@ -296,10 +333,14 @@ export class Client {
     this.closed = true;
     this.worker.onmessage = null;
     this.worker.terminate();
-    for (const waiter of this.pending.values()) waiter.reject(new ClientError("closed", "closed"));
+    for (const waiter of this.pending.values()) {
+      waiter.done();
+      waiter.reject(new ClientError("closed", "closed"));
+    }
     this.pending.clear();
     this.sessionListeners.clear();
     this.eventListeners.clear();
+    this.linkListeners.clear();
   }
 }
 

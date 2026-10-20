@@ -18,7 +18,7 @@ import { promisify } from "node:util";
 
 import * as esbuild from "esbuild";
 import { type Browser, type Page, chromium } from "playwright-core";
-import { afterAll, beforeAll, expect, test, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, expect, test, vi } from "vitest";
 
 import type { Session } from "@gjermundgaraba/clankermux";
 
@@ -159,6 +159,13 @@ beforeAll(async () => {
   });
 });
 
+// A failed test leaves neither its page reconnecting nor the proxy down.
+const contexts: { close(): Promise<void> }[] = [];
+afterEach(async () => {
+  for (const context of contexts.splice(0)) await context.close().catch(() => {});
+  proxy.down = false;
+});
+
 afterAll(async () => {
   await browser?.close();
   await stop();
@@ -170,6 +177,7 @@ afterAll(async () => {
 /** A fresh page, connected through the proxy. */
 async function opened(): Promise<Page> {
   const context = await browser.newContext({ ignoreHTTPSErrors: true });
+  contexts.push(context);
   const page = await context.newPage();
   page.on("pageerror", (err) => console.error(err));
   page.on("console", (message) => message.type() === "error" && console.error(message.text()));
@@ -316,4 +324,24 @@ test("a terminal that opted in marks its session's done record seen on focus; on
   expect(record.seen).toBe(true);
   expect((await listed(left))?.attention?.state).toBe("done");
   await page.context().close();
+});
+
+test("the client's link, the latest values a late listener gets, and close rejecting what is pending", async () => {
+  const session = await create("/bin/cat");
+  const page = await opened();
+  await eventually("the client connected", async () =>
+    (await page.evaluate(() => harness().clientLinks())).at(-1)?.state === "connected" ? true : undefined,
+  );
+  expect(await page.evaluate(() => harness().clientLinks())).toEqual([
+    { state: "connecting", attempt: 1 },
+    { state: "connected", session: undefined },
+  ]);
+  await page.evaluate((s) => harness().mount("only", s), session);
+  await connectedTo(page, "only");
+  const latest = await page.evaluate(() => harness().latest("only"));
+  expect(latest.link).toMatchObject({ state: "connected", session: { id: session } });
+  expect(latest.scroll).toBe(0);
+  expect(latest.status).toBe("attached");
+  expect(await page.evaluate((s) => harness().closedWhileWaiting(s), session)).toEqual({ kind: "closed" });
+  await eventually("the attachment closed", async () => ((await listed(session))?.attachments.length === 0 ? true : undefined));
 });

@@ -26,15 +26,21 @@ const terminal = client.mount({
   font: "14px monospace", colors: () => ({ fg: "#d8dee9", bg: "#282c34", cursor: "#ffffff" }),
 });
 terminal.onLink((link) => console.log(link));
-const { id } = await client.create({ ...terminal.size(), on_exit: "keep" });
-terminal.attach(id);
+// Requests need the connection: once the client's link is connected.
+let created = false;
+client.onLink(async (link) => {
+  if (link.state !== "connected" || created) return;
+  created = true;
+  const { id } = await client.create({ ...terminal.size(), on_exit: "keep" });
+  terminal.attach(id);
+});
 ```
 
 A page holds one client: one worker, one WebSocket, the session list and the event stream. Every terminal it mounts is one attachment on that connection, so a page with many panes holds one connection, and the client's methods serve them all.
 
 ## `connect`
 
-`connect({url, worker, wasm, client?})` starts the worker and resolves with the `Client` once the engine is loaded, before the connection is up: the worker connects, and after a loss reconnects, by itself, and each terminal's `onLink` says how that goes (below). It rejects when the engine cannot be loaded. `client` is the `{name, version}` the connection gives in `HELLO`, which the server lists in each session's `attachments`; `clankermux-web` and this package's version by default.
+`connect({url, worker, wasm, client?})` starts the worker and resolves with the `Client` once the engine is loaded, before the connection is up: the worker connects, and after a loss reconnects, by itself, and the client's `onLink`, and each terminal's, says how that goes (below). Requests need a `connected` link. It rejects when the worker script or the engine cannot be loaded; a worker that fails later ends every terminal's link with `ended error`, `retry: false`, and closes the client. `client` is the `{name, version}` the connection gives in `HELLO`, which the server lists in each session's `attachments`; `clankermux-web` and this package's version by default.
 
 ## `Client`
 
@@ -56,6 +62,7 @@ Each method is the protocol method of the same name (PROTOCOL.md has their param
 | `tail(id, after, {max_bytes?})` | `tail` |
 | `ack(id, recordIds?)` | `ack` |
 | `detach(id, channel, reason?)` | `detach`: another attachment, by its `channel` in `attachments` |
+| `onLink(listener)` | the connection's link: `connecting {attempt}`, `connected` (with no session) or `ended`, the connection-level rows of the tables below; the latest at once to a listener added later |
 | `onSessions(listener)` | every session at each change (below) |
 | `onEvent(listener)` | each event, without loss across reconnects (below) |
 | `mount(options)` | a `Terminal` on this connection |
@@ -69,7 +76,7 @@ A method rejects with a `ClientError`:
 
 A request is not retried across a reconnect. `end` rejects with `not_running` when the session is not running (`exited`, `restored`): there is nothing to end. Closing a pane for good is `end` for a running session, then `remove` once it has exited (`wait(id, {exited: true})` says when), and `remove` alone for one that has exited, or that a previous server left `restored`. With `on_exit: "remove"` an ended session removes itself.
 
-A cancelled wait is cancelled by the server, so it rejects with the server's `cancelled` also when its signal was aborted before the request was sent.
+While connected, a cancelled wait is cancelled by the server, so it rejects with the server's `cancelled` also when its signal was aborted before the request was sent; without a connection it rejects with `closed`, as any request does.
 
 ## `Terminal`
 
@@ -197,7 +204,7 @@ The terminal holds the session's history (the server sends what it keeps with th
 
 Output while the view is scrolled back leaves it where it is. Any input that sends something (a key, a paste, composed text) brings it back to the live screen first; a modifier alone does not. The alternate screen of full-screen programs (`vim`, `less`) has no history: there Shift+PageUp and the rest go to the program as keys, and the wheel sends the up and down arrow keys while the program leaves alternate scroll (mode 1007) on, as it is by default, or nothing.
 
-While the view is scrolled back the canvas draws a mark at its right edge, the view's share of the history and its place in it. `onScroll(rows)` reports, on the first frame and then at each change, the rows between the bottom of the view and the live screen's at each change: above 0 when scrolled back (it grows as output arrives meanwhile), 0 at the live screen.
+While the view is scrolled back the canvas draws a mark at its right edge, the view's share of the history and its place in it. `onScroll(rows)` reports, on the first frame and then at each change, the rows between the bottom of the view and the live screen's: above 0 when scrolled back (it grows as output arrives meanwhile), 0 at the live screen.
 
 ## Size between clients
 

@@ -139,6 +139,9 @@ export type ToPage =
   /** Events were lost: the server restarted, or more happened while the
    * connection was down than it retains. `sessions` was paged again. */
   | { type: "gap"; incarnation: string }
+  /** The connection's own link: `connecting`, `connected` with no
+   * session, or `ended`. */
+  | { type: "connection"; link: Link }
   | { type: "status"; mount: number; text: string }
   | { type: "link"; mount: number; link: Link }
   | { type: "frame"; mount: number; frame: Frame }
@@ -229,6 +232,8 @@ class Hub {
   /** The connection-level link, as a terminal mounted now first sees it:
    * `connecting`, `connected` (to no session), or `ended` for good. */
   private state: Link = { state: "connecting", attempt: 1 };
+  /** The latest connection-level status text, for a terminal mounted later. */
+  private statusText = "connecting";
   /** Connection attempts since a server last answered. */
   private attempt = 0;
   private backoff = BACKOFF_MIN_MS;
@@ -239,6 +244,8 @@ class Hub {
   private channel = 0;
   readonly mounts = new Map<number, Mount>();
   private readonly sessions = new Map<string, Session>();
+  /** The list is being paged: not shown to the page until it is whole. */
+  private paging = false;
   /** Where the event stream is, to replay from after a reconnect. */
   private events: { incarnation: string; seq: number } | undefined;
   /** The page's pending requests: their connection and its request id. */
@@ -265,14 +272,22 @@ class Hub {
     return delay;
   }
 
-  /** A connection-level change, to every terminal. */
+  /** A connection-level change, to the page and every terminal. A
+   * retrying end leaves the connection `connecting` meanwhile. */
   private linkAll(link: Link): void {
-    if (link.state !== "ended" || !link.retry) this.state = link;
+    this.state = link.state === "ended" && link.retry ? { state: "connecting", attempt: this.attempt + 1 } : link;
+    this.post({ type: "connection", link });
     for (const mount of this.mounts.values()) mount.link(link);
   }
 
   private statusAll(text: string): void {
+    this.statusText = text;
     for (const mount of this.mounts.values()) mount.status(text);
+  }
+
+  /** The connection is up and subscribed: terminals may open channels. */
+  live(): Connection | undefined {
+    return this.state.state === "connected" ? this.conn : undefined;
   }
 
   /** The connection ended for good with `err`. */
@@ -324,6 +339,8 @@ class Hub {
       return;
     }
     this.state = { state: "connected", session: undefined };
+    this.statusText = "connected";
+    this.post({ type: "connection", link: this.state });
     for (const mount of this.mounts.values()) mount.connected();
   }
 
@@ -341,6 +358,7 @@ class Hub {
       this.events = { incarnation, seq: replay.latest };
       await this.page(conn, await conn.call<Page>("list", {}));
       this.post({ type: "gap", incarnation });
+      for (const mount of this.mounts.values()) mount.recheck();
       return;
     }
     const first = await conn.call<Subscribed>("subscribe", {});
@@ -350,13 +368,18 @@ class Hub {
 
   /** The session list from `page` on. Events arriving between pages are
    * applied to the same map: a later page cannot hold a session removed
-   * before it was produced. */
+   * before it was produced. The page sees the list once it is whole. */
   private async page(conn: Connection, page: Page): Promise<void> {
     this.sessions.clear();
-    for (;;) {
-      for (const s of page.sessions) this.sessions.set(s.id, s);
-      if (page.next === undefined) break;
-      page = await conn.call<Page>("list", { after: page.next });
+    this.paging = true;
+    try {
+      for (;;) {
+        for (const s of page.sessions) this.sessions.set(s.id, s);
+        if (page.next === undefined) break;
+        page = await conn.call<Page>("list", { after: page.next });
+      }
+    } finally {
+      this.paging = false;
     }
     this.postSessions();
   }
@@ -384,7 +407,7 @@ class Hub {
   }
 
   private postSessions(): void {
-    this.post({ type: "sessions", sessions: [...this.sessions.values()] });
+    if (!this.paging) this.post({ type: "sessions", sessions: [...this.sessions.values()] });
   }
 
   nextChannel(): number {
@@ -423,8 +446,9 @@ class Hub {
   mount(id: number, init: MountInit): void {
     const mount = new Mount(this, id, init);
     this.mounts.set(id, mount);
+    mount.status(this.statusText);
     if (this.refused) this.reattach(mount);
-    else if (this.conn && this.state.state === "connected") mount.connected();
+    else if (this.live()) mount.connected();
     else mount.link(this.state);
   }
 
@@ -434,7 +458,8 @@ class Hub {
   }
 
   /** After the server refused or ended the connection, connects again;
-   * otherwise opens `mount`'s session. */
+   * otherwise opens `mount`'s session, or leaves it to the connection
+   * coming up. */
   reattach(mount: Mount): void {
     if (this.refused) {
       this.refused = false;
@@ -451,6 +476,10 @@ class Hub {
 class Mount {
   private attachment: Attachment | undefined;
   private channel = 0;
+  /** The connection the channel is open on. */
+  private openOn: Connection | undefined;
+  /** An `ack` is under way. */
+  private acking = false;
   /** The session attached or being attached. */
   private session: string | undefined;
   private viewport: Size;
@@ -526,13 +555,14 @@ class Mount {
 
   /** Opens a channel for `this.session`, resuming when the attachment can. */
   open(): void {
-    const conn = this.hub.conn;
-    if (!conn || this.session === undefined || this.disposed) return;
+    const conn = this.hub.live();
+    if (!conn || this.session === undefined || this.disposed || this.openOn === conn) return;
     if (!this.attachment) this.attachment = new Attachment(this.hub.engine);
     const attachment = this.attachment;
     attachment.openOn(conn.welcome);
     const channel = this.hub.nextChannel();
     this.channel = channel;
+    this.openOn = conn;
     const resume = attachment.resume();
     // An OPEN with a viewport or profile is a report applied at once.
     const open = {
@@ -780,6 +810,7 @@ class Mount {
     }
     this.attachment.free();
     this.attachment = undefined;
+    this.openOn = undefined;
   }
 
   /** Detaches the current session and attaches `session`; after the
@@ -951,17 +982,33 @@ class Mount {
 
   focus(focused: boolean): void {
     this.focused = focused;
+    this.recheck();
+  }
+
+  /** Looks at this terminal's session again, as `changed` does. */
+  recheck(): void {
     const session = this.session === undefined ? undefined : this.hub.session(this.session);
     if (session) this.changed(session);
   }
 
-  /** A session changed: when it is this terminal's, the page opted in and
-   * the terminal has the focus, the `done` and `error` records that want
-   * the user are marked seen. */
+  /** A session changed: when it is this terminal's, its screen is shown,
+   * the page opted in and the terminal has the focus, the `done` and
+   * `error` records that want the user are marked seen. */
   changed(session: Session): void {
-    if (!this.ackOnFocus || !this.focused || session.id !== this.session) return;
-    if (!this.attachment || !ACKED.has(session.attention?.state ?? "")) return;
-    this.hub.conn?.call("ack", { session: session.id }).catch(() => {});
+    if (!this.ackOnFocus || !this.focused || this.acking || session.id !== this.session) return;
+    if (!this.attachment?.term() || !ACKED.has(session.attention?.state ?? "")) return;
+    const conn = this.hub.live();
+    if (!conn) return;
+    // One at a time; a record that came meanwhile is looked at once the
+    // ack is answered (not after a refusal, which would only repeat).
+    this.acking = true;
+    conn.call("ack", { session: session.id }).then(
+      () => {
+        this.acking = false;
+        this.recheck();
+      },
+      () => (this.acking = false),
+    );
   }
 }
 

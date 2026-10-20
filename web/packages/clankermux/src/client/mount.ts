@@ -203,6 +203,9 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
         reject: () => reject(new Error("nothing selected")),
       };
     });
+    // A browser that refuses the write never reads `text`, whose
+    // rejection would then go unhandled.
+    text.catch(() => {});
     navigator.clipboard.write([new ClipboardItem({ "text/plain": text })]).catch(() => {});
     const timer = setTimeout(() => settle.reject(), 2000);
     copying = {

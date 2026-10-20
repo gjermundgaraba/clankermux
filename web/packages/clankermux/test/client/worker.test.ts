@@ -347,12 +347,21 @@ test("a terminal mounted later sees the connection as it is, up or retrying, and
 
   await (await socket(1)).serve([session("s")]);
   await vi.waitFor(() => expect(worker.links(1).at(-1)).toEqual({ state: "connected", session: undefined }));
+
+  // An established connection lost: a terminal mounted before the next
+  // attempt sees it connecting, not connected.
+  FakeSocket.all[1]!.close();
+  await vi.waitFor(() => expect(worker.links(1).at(-1)).toEqual({ state: "ended", reason: "closed", retry: true }));
+  worker.mount(5);
+  expect(worker.links(5)).toEqual([{ state: "connecting", attempt: 1 }]);
+  await (await socket(2)).serve([session("s")]);
+  await vi.waitFor(() => expect(worker.links(5).at(-1)).toEqual({ state: "connected", session: undefined }));
   worker.mount(3, "s");
-  const channel = await FakeSocket.all[1]!.opened("s");
-  bootstrap(FakeSocket.all[1]!, channel, session("s"));
+  const channel = await FakeSocket.all[2]!.opened("s");
+  bootstrap(FakeSocket.all[2]!, channel, session("s"));
   await vi.waitFor(() => expect(worker.links(3)).toEqual([{ state: "connected", session: session("s") }]));
 
-  FakeSocket.all[1]!.push(FrameType.Error, 0, { code: "protocol_error", message: "bad frame" });
+  FakeSocket.all[2]!.push(FrameType.Error, 0, { code: "protocol_error", message: "bad frame" });
   const refused = { state: "ended", reason: "error", code: "protocol_error", message: "bad frame", retry: false };
   await vi.waitFor(() => expect(worker.links(1).at(-1)).toEqual(refused));
   expect(worker.links(3).at(-1)).toEqual(refused);
@@ -360,8 +369,51 @@ test("a terminal mounted later sees the connection as it is, up or retrying, and
   worker.mount(4);
   expect(worker.links(4)).toEqual([{ state: "connecting", attempt: 1 }]);
   expect(worker.links(1).at(-1)).toEqual({ state: "connecting", attempt: 1 });
-  await (await socket(2)).serve();
+  await (await socket(3)).serve();
   await vi.waitFor(() => expect(worker.links(4).at(-1)).toEqual({ state: "connected", session: undefined }));
+});
+
+test("an attach while the connection is still subscribing opens the session once, when it is up", async () => {
+  const worker = await start();
+  worker.mount(1);
+  const server = await socket(0);
+  await vi.waitFor(() => expect(server.bodies(FrameType.Hello)).toHaveLength(1));
+  server.push(FrameType.Welcome, 0, {
+    version: 1,
+    server: { name: "test", version: "0" },
+    engine: "x",
+    incarnation: "i",
+    capabilities: [],
+    limits,
+  });
+  const subscribe = await server.request("subscribe");
+  worker.to(1, { type: "attach", session: "s" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(server.bodies(FrameType.Open)).toEqual([]);
+  server.push(FrameType.Reply, 0, { id: subscribe.id, result: { sessions: [session("s")], oldest: 1, latest: 0 } });
+  await server.opened("s");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(server.bodies(FrameType.Open)).toHaveLength(1);
+});
+
+test("the connection's own link reaches the page: connecting, connected, a loss, connecting again", async () => {
+  const worker = await start();
+  const server = await socket(0);
+  await server.serve();
+  const connection = () => worker.posted.flatMap((m) => (m.type === "connection" ? [m.link] : []));
+  await vi.waitFor(() =>
+    expect(connection()).toEqual<Link[]>([
+      { state: "connecting", attempt: 1 },
+      { state: "connected", session: undefined },
+    ]),
+  );
+  server.close();
+  await vi.waitFor(() =>
+    expect(connection().slice(2)).toEqual<Link[]>([
+      { state: "ended", reason: "closed", retry: true },
+      { state: "connecting", attempt: 1 },
+    ]),
+  );
 });
 
 test("after a reconnect each terminal resumes its stream and the events missed meanwhile are replayed", async () => {
@@ -413,7 +465,7 @@ test("after a restart the events cannot be replayed: the gap is posted and the s
   server.close();
   const next = await socket(1);
   await next.serve([session("t", "restored")], { incarnation: "j", latest: 2, gap: true });
-  await vi.waitFor(() => expect(worker.posted.at(-1)).toEqual({ type: "gap", incarnation: "j" }));
+  await vi.waitFor(() => expect(worker.posted).toContainEqual({ type: "gap", incarnation: "j" }));
   expect(worker.sessions()).toEqual([session("t", "restored")]);
   expect(next.bodies(FrameType.Request).at(0)?.body.params).toEqual({ after: 3, incarnation: "i" });
 
@@ -442,18 +494,27 @@ test("ack on focus: only when the page opted in, the terminal has the focus and 
   expect(acks()).toEqual([]);
   worker.to(1, { type: "focus", focused: true });
   await vi.waitFor(() => expect(acks()).toEqual([{ session: "s" }]));
+  // One at a time: a change while it is under way asks for no other.
+  server.push(FrameType.Event, 0, { seq: 2, event: "session_changed", session: done });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(acks()).toHaveLength(1);
+  const first = await server.request("ack");
+  server.push(FrameType.Reply, 0, { id: first.id, result: { record_ids: [""] } });
 
   // A record that wants the user while the terminal has the focus is
   // seen at once; a blocked one is not a record ack marks.
   const blocked = { ...session("s"), attention: { state: "blocked", record: "q" } };
-  server.push(FrameType.Event, 0, { seq: 2, event: "session_changed", session: blocked });
+  server.push(FrameType.Event, 0, { seq: 3, event: "session_changed", session: blocked });
   const error = { ...session("s"), attention: { state: "error", record: "e" } };
-  server.push(FrameType.Event, 0, { seq: 3, event: "session_changed", session: error });
+  server.push(FrameType.Event, 0, { seq: 4, event: "session_changed", session: error });
   await vi.waitFor(() => expect(acks()).toEqual([{ session: "s" }, { session: "s" }]));
 
   // Blurred: no more.
   worker.to(1, { type: "focus", focused: false });
-  server.push(FrameType.Event, 0, { seq: 4, event: "session_changed", session: done });
+  const second = await server.request("ack", first.id);
+  server.push(FrameType.Reply, 0, { id: second.id, result: { record_ids: ["e"] } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  server.push(FrameType.Event, 0, { seq: 5, event: "session_changed", session: done });
   await new Promise((resolve) => setTimeout(resolve, 20));
   expect(acks()).toHaveLength(2);
 });
