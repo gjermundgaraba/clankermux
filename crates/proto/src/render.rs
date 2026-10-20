@@ -91,11 +91,11 @@ pub fn render(what: &str, catalog: &Catalog) -> Result<String, String> {
                 catalog.frames.iter().map(|f| {
                     vec![
                         format!("`0x{:02X}`", f.frame_type),
-                        wire(&f.direction),
+                        f.direction.to_string(),
                         f.channel.clone(),
                         match f.payload {
                             Payload::Json => "JSON".into(),
-                            other => wire(&other),
+                            other => other.to_string(),
                         },
                         format!("`{}`", f.name),
                     ]
@@ -107,7 +107,7 @@ pub fn render(what: &str, catalog: &Catalog) -> Result<String, String> {
                     let params = field_names(resolve(&m.params, defs));
                     vec![
                         format!("`{}`", m.name),
-                        wire(&m.class),
+                        m.class.to_string(),
                         if params.is_empty() {
                             String::new()
                         } else {
@@ -137,7 +137,7 @@ pub fn render(what: &str, catalog: &Catalog) -> Result<String, String> {
                 catalog
                     .errors
                     .iter()
-                    .map(|e| vec![format!("`{}`", wire(&e.code)), one_line(&e.summary)]),
+                    .map(|e| vec![format!("`{}`", e.code), one_line(&e.summary)]),
             ),
             _ => return Err(format!("nothing renders {what:?}")),
         },
@@ -149,7 +149,7 @@ pub fn render(what: &str, catalog: &Catalog) -> Result<String, String> {
 pub fn method(description: &Description) -> String {
     let m = &description.method;
     let defs = &description.defs;
-    let mut out = format!("# {}\n\n{} ({})\n\n", m.name, m.summary, wire(&m.class));
+    let mut out = format!("# {}\n\n{} ({})\n\n", m.name, m.summary, m.class);
     out.push_str("## Params\n\n");
     let params = resolve(&m.params, defs);
     out.push_str(&about(params));
@@ -198,19 +198,11 @@ pub fn method(description: &Description) -> String {
     out
 }
 
-/// A wire enum's JSON name.
-fn wire<T: serde::Serialize>(value: &T) -> String {
-    match serde_json::to_value(value) {
-        Ok(Value::String(s)) => s,
-        other => panic!("not a wire name: {other:?}"),
-    }
-}
-
 /// Error codes in code style, comma-separated.
 fn codes(errors: &[ErrorCode]) -> String {
     errors
         .iter()
-        .map(|e| format!("`{}`", wire(e)))
+        .map(|e| format!("`{e}`"))
         .collect::<Vec<_>>()
         .join(", ")
 }

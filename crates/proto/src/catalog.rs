@@ -26,7 +26,7 @@ pub enum Class {
     Stream,
 }
 
-crate::message::wire_display!(Class);
+crate::message::wire_display!(Class, Direction, Payload);
 
 /// `describe`: one method, or the whole catalog.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
