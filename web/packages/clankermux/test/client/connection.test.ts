@@ -1,9 +1,9 @@
 import { expect, test } from "vitest";
 
-import limits from "../../../../../crates/proto/vectors/limits.json";
 import { type Frame, FrameType, encodeFrame, parseFrame } from "../../src/proto/index.ts";
 
 import { ClientError, Connection, type Transport, hello } from "../../src/client/connection.ts";
+import { limits } from "./bodies.ts";
 
 /** A transport whose peer is the test. */
 class Fake implements Transport {
