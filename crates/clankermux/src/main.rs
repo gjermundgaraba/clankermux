@@ -28,6 +28,10 @@ const SESSION_ENV: &str = "CLANKERMUX_SESSION";
 /// The socket of the server that holds it.
 const SOCKET_ENV: &str = "CLANKERMUX_SOCKET";
 
+/// The help of each command's session argument.
+const SESSION_HELP: &str = "Id, label, or four or more characters from either end of the id; \
+                            `$CLANKERMUX_SESSION` when left out";
+
 /// Exit codes besides 0, 1 and clap's 2.
 const EXIT_USAGE: i32 = 2;
 const EXIT_TARGET: i32 = 3;
@@ -109,14 +113,12 @@ enum Command {
     List,
     /// Show one session with its program status.
     Inspect {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
     },
     /// Attach the terminal to a session.
     Attach {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
         #[arg(long)]
         read_only: bool,
@@ -127,8 +129,7 @@ enum Command {
     },
     /// Hang up the session's process group.
     End {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
     },
     /// Send a signal by name (`TERM`, `INT`, `KILL`, ...).
@@ -139,8 +140,7 @@ enum Command {
     },
     /// Delete an exited session.
     Remove {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
     },
     /// Set the label.
@@ -175,8 +175,7 @@ enum Command {
     },
     /// Print the screen, with history lines before it, or another scope.
     Read {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
         /// History lines before the screen, for scope `screen`.
         #[arg(long)]
@@ -191,8 +190,7 @@ enum Command {
     },
     /// Print the output stream as plain text, from a stream offset.
     Tail {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
         /// The stream offset to start at; by default the oldest byte kept.
         #[arg(long)]
@@ -227,8 +225,7 @@ enum Command {
     /// Wait for the session to exit, print a match, show a status or a
     /// prompt, or fall quiet.
     Wait {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
         #[command(flatten)]
         wait: WaitArgs,
