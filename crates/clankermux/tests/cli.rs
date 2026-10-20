@@ -16,23 +16,6 @@ fn start() -> Server {
     Server::start(Limits::default())
 }
 
-/// Runs the binary with `args` and returns its stdout; the process must
-/// succeed.
-async fn run(args: &[&str], env: &[(&str, String)]) -> String {
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"));
-    command.args(args);
-    for (name, value) in env {
-        command.env(name, value);
-    }
-    let output = command.output().await.unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap()
-}
-
 /// Runs the binary with `args` outside any session (no inherited
 /// `CLANKERMUX_*`) plus `env`; its exit code, stdout and stderr.
 async fn run_status(args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
@@ -48,6 +31,14 @@ async fn run_status(args: &[&str], env: &[(&str, &str)]) -> (i32, String, String
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// Runs the binary as `run_status` does and returns its stdout; the
+/// process must succeed.
+async fn run(args: &[&str], env: &[(&str, &str)]) -> String {
+    let (code, stdout, stderr) = run_status(args, env).await;
+    assert_eq!(code, 0, "{stderr}");
+    stdout
 }
 
 async fn connect(server: &Server) -> Connection {
@@ -356,7 +347,7 @@ async fn ssh_relays_through_stdio() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let listed = run(&["--ssh", "remote-host", "list"], &[("PATH", path)]).await;
+    let listed = run(&["--ssh", "remote-host", "list"], &[("PATH", &path)]).await;
     assert!(listed.contains("over-ssh"), "{listed}");
 }
 
@@ -448,19 +439,19 @@ async fn send_sends_one_request_even_for_empty_text() {
     )
     .await;
     wait_session(&conn, &session.id, |s| s.status == Status::Exited).await;
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
-        .args([
+    let (code, _, stderr) = run_status(
+        &[
             "--socket",
             server.socket.to_str().unwrap(),
             "send",
             &session.id,
             "",
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert!(!output.status.success(), "an exited session refuses a send");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("not_running"));
+        ],
+        &[],
+    )
+    .await;
+    assert_ne!(code, 0, "an exited session refuses a send");
+    assert!(stderr.contains("not_running"));
 }
 
 /// `clankermux serve` as a process on `dir`'s socket and state, parking
