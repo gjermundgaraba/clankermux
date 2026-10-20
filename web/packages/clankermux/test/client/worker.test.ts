@@ -12,7 +12,8 @@ import { afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { Engine, type KeyInput } from "../../src/engine/index.ts";
 import { type Frame, FrameType, type Session, encodeFrame, parseFrame } from "../../src/proto/index.ts";
 
-import { type Link, type ToMount, type ToPage, type ToWorker, runWorker } from "../../src/client/worker.ts";
+import type { ToMount } from "../../src/client/mount.ts";
+import { type Link, type ToPage, type ToWorker, runWorker } from "../../src/client/worker.ts";
 import { output, session, welcome } from "./bodies.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));

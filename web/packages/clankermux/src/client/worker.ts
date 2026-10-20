@@ -128,10 +128,6 @@ export type ToWorker =
   /** The page lost its drawing: send the whole screen again. */
   | { type: "repaint"; mount: number };
 
-type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
-/** A message for one terminal, without its number. */
-export type ToMount = DistributiveOmit<Extract<ToWorker, { mount: number }>, "mount">;
-
 /** Messages from the worker to the page. */
 export type ToPage =
   /** The engine loaded: the client is usable. */

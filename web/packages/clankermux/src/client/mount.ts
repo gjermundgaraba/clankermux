@@ -8,7 +8,7 @@ import { type Copy, Copier } from "./copy.ts";
 import { type Keyboard, type Typed, Typing, composing } from "./keyboard.ts";
 import { Listeners } from "./listeners.ts";
 import { profileFrom, schemeOf } from "./profile.ts";
-import type { Link, ToMount, ToPage, ToWorker } from "./worker.ts";
+import type { Link, ToPage, ToWorker } from "./worker.ts";
 
 /** The terminal's default colours as CSS colours (hex or `rgb()`). */
 export interface Colors {
@@ -90,6 +90,10 @@ export interface MountHost {
   send(message: ToWorker): void;
   disposed(): void;
 }
+
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+/** A message for one terminal, without its number. */
+export type ToMount = DistributiveOmit<Extract<ToWorker, { mount: number }>, "mount">;
 
 /** Cell metrics from the font. */
 function measure(font: string): Metrics {
