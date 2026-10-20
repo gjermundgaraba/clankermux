@@ -33,7 +33,11 @@ pub struct Loaded {
     pub snapshot_path: PathBuf,
 }
 
-const FILES: [&str; 3] = ["session.json", "snapshot.ghostsnp", "screen.txt"];
+const SESSION_JSON: &str = "session.json";
+const SNAPSHOT: &str = "snapshot.ghostsnp";
+const SCREEN: &str = "screen.txt";
+/// A complete generation holds all three.
+const FILES: [&str; 3] = [SESSION_JSON, SNAPSHOT, SCREEN];
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
@@ -78,9 +82,9 @@ pub fn write(
     let _ = fs::remove_dir_all(&temp);
     fs::DirBuilder::new().mode(0o700).create(&temp)?;
     let result = (|| {
-        write_file(&temp.join(FILES[0]), &session_json(file)?)?;
-        write_file(&temp.join(FILES[1]), snapshot)?;
-        write_file(&temp.join(FILES[2]), screen.as_bytes())?;
+        write_file(&temp.join(SESSION_JSON), &session_json(file)?)?;
+        write_file(&temp.join(SNAPSHOT), snapshot)?;
+        write_file(&temp.join(SCREEN), screen.as_bytes())?;
         sync_dir(&temp)?;
         fs::rename(&temp, dir.join(generation.to_string()))?;
         sync_dir(&dir)?;
@@ -187,7 +191,7 @@ fn read_session_json(path: &Path) -> io::Result<ParkFile> {
 }
 
 fn read_generation(dir: &Path) -> io::Result<Loaded> {
-    let file = read_session_json(&dir.join(FILES[0]))?;
+    let file = read_session_json(&dir.join(SESSION_JSON))?;
     if file.protocol != PROTOCOL {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -196,8 +200,8 @@ fn read_generation(dir: &Path) -> io::Result<Loaded> {
     }
     Ok(Loaded {
         file,
-        screen: fs::read_to_string(dir.join(FILES[2]))?,
-        snapshot_path: dir.join(FILES[1]),
+        screen: fs::read_to_string(dir.join(SCREEN))?,
+        snapshot_path: dir.join(SNAPSHOT),
     })
 }
 
@@ -207,10 +211,10 @@ pub fn rewrite_records(snapshot: &Path, records: Vec<proto::StatusRecord>) -> io
     let dir = snapshot
         .parent()
         .ok_or_else(|| io::Error::other("no generation directory"))?;
-    let path = dir.join(FILES[0]);
+    let path = dir.join(SESSION_JSON);
     let mut file = read_session_json(&path)?;
     file.session.program_status = Some(records);
-    let temp = dir.join(format!(".{}", FILES[0]));
+    let temp = dir.join(format!(".{SESSION_JSON}"));
     let _ = fs::remove_file(&temp);
     write_file(&temp, &session_json(&file)?)?;
     fs::rename(&temp, &path)?;
