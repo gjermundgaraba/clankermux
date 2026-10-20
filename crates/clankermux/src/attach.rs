@@ -413,8 +413,8 @@ fn open(shell: &mut Shell, conn: &Connection) -> Result<mpsc::UnboundedReceiver<
     )
 }
 
-/// Attaches over `conn`, reconnecting to the endpoint when it is lost;
-/// the exit status.
+/// Attaches over `conn`, reconnecting to the endpoint when it is lost,
+/// and returns the exit status.
 pub async fn run(opts: Options, conn: Connection) -> Result<i32, Error> {
     let raw = Raw::enter()?;
     let mut shell = Shell::new(opts, outer_size());

@@ -1,7 +1,7 @@
-//! Limits conformance: checks for the rows of PROTOCOL.md's Limits table
-//! that the suites of what each limit bounds do not already make
-//! (`max_frame` both ways, `scrollback`, `continuation`, `label`, `text`,
-//! `markers`, and the default limits against the largest replies).
+//! Limits conformance: the rows of PROTOCOL.md's Limits table that no
+//! other suite checks (`max_frame` both ways, `scrollback`,
+//! `continuation`, `label`, `text`, `markers`, and the default limits
+//! against the largest replies).
 
 mod common;
 

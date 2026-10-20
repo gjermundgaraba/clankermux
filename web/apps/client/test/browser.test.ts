@@ -303,7 +303,7 @@ test("under the kitty keyboard protocol, shifted symbols reach the program as ty
   await page.context().close();
 });
 
-test("a key the input method processes puts the input element at the cursor, with key code 229 or without", async () => {
+test("a key the input method processes puts the input element at the cursor", async () => {
   const session = await create("/bin/sh", "-c", "printf abcdef; exec cat");
   const page = await opened();
   await page.evaluate((s) => harness().mount("only", s), session);
