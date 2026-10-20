@@ -108,15 +108,14 @@ export class Client {
     private readonly worker: Worker,
     started: (error?: Error) => void,
   ) {
-    // A worker script that does not load or run posts nothing: before
-    // `ready` that fails `connect`, after it every terminal's link.
+    // A worker script that does not load posts nothing, so `connect`
+    // would never settle. Once it runs, an error event is an exception in
+    // one of its handlers, which costs that message only: the browser
+    // reports it, and the client goes on.
     worker.onerror = (e) => {
+      if (this.started) return;
       e.preventDefault?.();
-      const message = `the worker failed: ${e.message || "it did not load"}`;
-      if (!this.started) started(new Error(message));
-      const link: Link = { state: "ended", reason: "error", message, retry: false };
-      this.setLink(link);
-      for (const [mount, handler] of this.mounts) handler({ type: "link", mount, link });
+      started(new Error(`the worker failed: ${e.message || "it did not load"}`));
       this.close();
     };
     worker.onmessage = (e: MessageEvent<ToPage>) => {

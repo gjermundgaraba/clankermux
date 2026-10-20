@@ -40,7 +40,7 @@ A page holds one client: one worker, one WebSocket, the session list and the eve
 
 ## `connect`
 
-`connect({url, worker, wasm, client?})` starts the worker and resolves with the `Client` once the engine is loaded, before the connection is up: the worker connects, and after a loss reconnects, by itself, and the client's `onLink`, and each terminal's, says how that goes (below). Requests need a `connected` link. It rejects when the worker script or the engine cannot be loaded; a worker that fails later ends every terminal's link with `ended error`, `retry: false`, and closes the client. `client` is the `{name, version}` the connection gives in `HELLO`, which the server lists in each session's `attachments`; `clankermux-web` and this package's version by default.
+`connect({url, worker, wasm, client?})` starts the worker and resolves with the `Client` once the engine is loaded, before the connection is up: the worker connects, and after a loss reconnects, by itself, and the client's `onLink`, and each terminal's, says how that goes (below). Requests need a `connected` link. It rejects when the worker script or the engine cannot be loaded. An exception in the worker after that is the browser's to report, as before: it costs the message being handled, and the client goes on. `client` is the `{name, version}` the connection gives in `HELLO`, which the server lists in each session's `attachments`; `clankermux-web` and this package's version by default.
 
 ## `Client`
 
