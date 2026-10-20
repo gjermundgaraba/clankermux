@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
 pub enum Error {
@@ -112,7 +112,6 @@ pub struct Connection {
     pub welcome: Welcome,
     next_id: AtomicI64,
     routes: Arc<Mutex<Routes>>,
-    ended: Arc<Notify>,
 }
 
 /// The `HELLO` a client of `name` sends; `engine` is set for attaching
@@ -174,21 +173,13 @@ impl Connection {
             }
         };
         let routes = Arc::new(Mutex::new(Routes::default()));
-        let ended = Arc::new(Notify::new());
         let max_frame = welcome.limits.max_frame;
-        tokio::spawn(read_loop(
-            reader,
-            decoder,
-            max_frame,
-            routes.clone(),
-            ended.clone(),
-        ));
+        tokio::spawn(read_loop(reader, decoder, max_frame, routes.clone()));
         Ok(Connection {
             tx,
             welcome,
             next_id: AtomicI64::new(1),
             routes,
-            ended,
         })
     }
 
@@ -288,22 +279,10 @@ impl Connection {
         rx
     }
 
-    /// Why the connection ended, once it has.
+    /// Why the connection ended, once it has: by the time `events()`,
+    /// a reply or a channel's frames end.
     pub fn ended(&self) -> Option<Error> {
         self.routes.lock().unwrap().closed.as_ref().map(Error::from)
-    }
-
-    /// Resolves once the connection has ended, with the reason.
-    pub async fn closed(&self) -> Error {
-        loop {
-            let notified = self.ended.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(error) = self.ended() {
-                return error;
-            }
-            notified.await;
-        }
     }
 }
 
@@ -312,7 +291,6 @@ async fn read_loop<R: AsyncRead + Unpin>(
     mut decoder: FrameDecoder,
     max_frame: u64,
     routes: Arc<Mutex<Routes>>,
-    ended: Arc<Notify>,
 ) {
     let mut buf = vec![0u8; 64 * 1024];
     let reason = loop {
@@ -337,7 +315,6 @@ async fn read_loop<R: AsyncRead + Unpin>(
     routes.pending.clear();
     routes.channels.clear();
     routes.events = None;
-    ended.notify_waiters();
 }
 
 /// Delivers one frame; an error ends the connection.

@@ -1591,7 +1591,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                 tokio::select! {
                     event = events.recv() => match event {
                         Some(event) => emit(&format!("{}\n", serde_json::to_string(&event).unwrap())),
-                        None => return Err(conn.closed().await.into()),
+                        None => return Err(conn.ended().unwrap_or(Error::Closed).into()),
                     },
                     _ = tokio::signal::ctrl_c() => break,
                 }
