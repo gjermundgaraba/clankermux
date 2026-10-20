@@ -104,7 +104,7 @@ impl std::fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
-pub fn encode_header(frame_type: FrameType, channel: u32, length: u32) -> [u8; HEADER_LEN] {
+pub(crate) fn encode_header(frame_type: FrameType, channel: u32, length: u32) -> [u8; HEADER_LEN] {
     let mut out = [0u8; HEADER_LEN];
     out[0] = frame_type as u8;
     out[2..6].copy_from_slice(&channel.to_le_bytes());

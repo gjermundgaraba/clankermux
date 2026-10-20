@@ -76,7 +76,7 @@ fn mark(text: &str, mark: &str) -> Option<usize> {
 
 /// One region: `frames`, `methods`, `events`, `errors`, or `type NAME`
 /// for the fields of a definition.
-pub fn render(what: &str, catalog: &Catalog) -> Result<String, String> {
+fn render(what: &str, catalog: &Catalog) -> Result<String, String> {
     let defs = &catalog.defs;
     Ok(match what.split_once(' ') {
         Some(("type", name)) => {
