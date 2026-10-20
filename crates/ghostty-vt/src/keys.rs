@@ -10,11 +10,11 @@ use crate::terminal::Term;
 
 /// Modifiers held with a key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Mods {
-    pub shift: bool,
-    pub ctrl: bool,
-    pub alt: bool,
-    pub super_: bool,
+struct Mods {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    super_: bool,
 }
 
 impl Mods {
@@ -39,7 +39,7 @@ impl Mods {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyPress {
     key: sys::GhosttyKey,
-    pub mods: Mods,
+    mods: Mods,
     text: String,
     unshifted: Option<char>,
     /// Shift made the text (`A`, `?`): consumed, as a keyboard reports
