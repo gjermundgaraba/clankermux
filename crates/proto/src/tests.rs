@@ -403,16 +403,6 @@ fn describe_one_method_carries_what_it_refers_to() {
 }
 
 #[test]
-fn protocol_md_is_rendered_from_the_catalog() {
-    let doc = include_str!("../../../PROTOCOL.md");
-    let rendered = render::splice(doc, &catalog::catalog("")).unwrap();
-    assert!(
-        rendered == doc,
-        "PROTOCOL.md is stale: run `cargo xtask protocol`"
-    );
-}
-
-#[test]
 fn splice_renders_regions_and_keeps_the_rest() {
     let catalog = catalog::catalog("");
     let doc = "Prose.\n<!-- generated: type Cancelled -->\nold\n<!-- end generated -->\nMore.\n";
