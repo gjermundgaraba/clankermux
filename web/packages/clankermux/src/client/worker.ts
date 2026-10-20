@@ -856,7 +856,7 @@ class Mount {
       return;
     }
     this.claim();
-    this.live();
+    this.backToLive();
     this.unselect();
     // Each request's base64 fits the control body with room for the rest,
     // and its bytes fit the input queue (at least one byte, so the loop
@@ -921,7 +921,7 @@ class Mount {
   view(rows: number | "live"): void {
     const term = this.attachment?.term();
     if (!term || term.alternate) return;
-    if (rows === "live") this.live();
+    if (rows === "live") this.backToLive();
     else if (rows !== 0) {
       term.scroll(rows);
       this.paint();
@@ -929,7 +929,7 @@ class Mount {
   }
 
   /** Back to the live screen before input, as any terminal does. */
-  private live(): void {
+  private backToLive(): void {
     const term = this.attachment?.term();
     if (!term) return;
     const { total, offset, len } = term.scrollbar;
