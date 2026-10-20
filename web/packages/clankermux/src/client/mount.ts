@@ -6,6 +6,7 @@ import { CanvasRenderer, type Metrics } from "../renderer/index.ts";
 
 import { type Copy, Copier } from "./copy.ts";
 import { type Keyboard, type Typed, Typing } from "./keyboard.ts";
+import { Listeners } from "./listeners.ts";
 import { profileFrom, schemeOf } from "./profile.ts";
 import type { Link, ToPage, ToWorker } from "./worker.ts";
 
@@ -88,27 +89,6 @@ export interface Terminal {
 export interface MountHost {
   send(message: ToWorker): void;
   receive(handler: ((message: ToPage) => void) | undefined): void;
-}
-
-/** Listeners of one kind, and the latest value they were told. */
-class Listeners<T> {
-  private readonly all = new Set<(value: T) => void>();
-  private latest: { value: T } | undefined;
-
-  add(listener: (value: T) => void): () => void {
-    this.all.add(listener);
-    if (this.latest) listener(this.latest.value);
-    return () => void this.all.delete(listener);
-  }
-
-  emit(value: T): void {
-    this.latest = { value };
-    for (const listener of this.all) listener(value);
-  }
-
-  clear(): void {
-    this.all.clear();
-  }
 }
 
 /** Cell metrics from the font. */
@@ -410,7 +390,7 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
       if (selected === undefined || !e.clipboardData) return;
       e.clipboardData.setData("text/plain", selected);
       e.preventDefault();
-      copier.copied(selected, "browser");
+      copier.copied(selected);
     },
     { signal },
   );

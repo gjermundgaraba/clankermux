@@ -108,6 +108,22 @@ test("a release while an earlier one waits drops the earlier, and the answers go
   expect(copies).toEqual([{ ok: true, source: "release", chars: 7 }]);
 });
 
+test("an answered release that times out leaves a later one waiting for its answer", async () => {
+  const board = clipboard("hang");
+  const { copier: c, copies } = copier(board, false);
+  c.answer(c.start(), "first");
+  await vi.advanceTimersByTimeAsync(1000);
+  const second = c.start();
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(copies).toEqual([{ ok: false, source: "release", reason: "timeout", chars: 5 }]);
+  c.answer(second, "second");
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(copies).toEqual([
+    { ok: false, source: "release", reason: "timeout", chars: 5 },
+    { ok: false, source: "release", reason: "timeout", chars: 6 },
+  ]);
+});
+
 test("without ClipboardItem the text is written once it arrives; without a clipboard the copy is unavailable", async () => {
   const board = clipboard();
   const plain = copier(board, false);
@@ -147,7 +163,7 @@ test("copies of text known at once: the keys, the program's, and the browser's o
   const { copier: c, copies } = copier(board);
   c.write("ab", "keys");
   c.write("osc", "program");
-  c.copied("menu", "browser");
+  c.copied("menu");
   await settled();
   expect(board.written).toEqual(["ab", "osc"]);
   expect(copies).toEqual([

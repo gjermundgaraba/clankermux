@@ -102,6 +102,8 @@ class Attempt {
 
 /** A release's copy, waiting for the worker to say what was selected. */
 interface Pending {
+  /** The release's number, for the worker's answer. */
+  id: number;
   attempt: Attempt;
   /** The text for the write under way; none where it waits to start. */
   text?: { resolve: (text: string) => void; reject: () => void };
@@ -109,8 +111,8 @@ interface Pending {
 
 /** A mounted terminal's copies. */
 export class Copier {
-  /** The releases' copies waiting for the worker's answer, by number. */
-  private readonly pending = new Map<number, Pending>();
+  /** The latest release's copy, while it waits for the worker's answer. */
+  private pending: Pending | undefined;
   private next = 1;
   /** Every copy not yet reported or dropped, for `dispose`. */
   private readonly live = new Set<Attempt>();
@@ -126,17 +128,17 @@ export class Copier {
    * release's copy still waiting is dropped, so the clipboard gets the
    * latest. */
   start(): number {
-    for (const earlier of this.pending.values()) this.dropOne(earlier);
-    this.pending.clear();
+    if (this.pending) this.dropOne(this.pending);
     const id = this.next++;
     const pending: Pending = {
+      id,
       // At the timeout the write is left without its text.
       attempt: this.attempt("release", () => {
-        this.pending.delete(id);
+        if (this.pending === pending) this.pending = undefined;
         pending.text?.reject();
       }),
     };
-    this.pending.set(id, pending);
+    this.pending = pending;
     const clipboard = this.host.clipboard();
     if (!this.host.item || !clipboard?.write) return id;
     const text = new Promise<Blob>((resolve, reject) => {
@@ -165,9 +167,9 @@ export class Copier {
    * when nothing was selected, which is no copy. An answer to a copy that
    * was dropped or timed out is ignored. */
   answer(id: number, text: string | undefined): void {
-    const pending = this.pending.get(id);
-    if (!pending) return;
-    this.pending.delete(id);
+    const pending = this.pending;
+    if (pending?.id !== id) return;
+    this.pending = undefined;
     if (text === undefined) return this.dropOne(pending);
     pending.attempt.text(text);
     if (pending.text) pending.text.resolve(text);
@@ -182,14 +184,14 @@ export class Copier {
   }
 
   /** A copy the browser made itself (the `copy` event's data). */
-  copied(text: string, source: CopySource): void {
-    this.host.report({ ok: true, source, chars: length(text) });
+  copied(text: string): void {
+    this.host.report({ ok: true, source: "browser", chars: length(text) });
   }
 
   /** Drops every copy under way, unreported. */
   dispose(): void {
-    for (const pending of this.pending.values()) this.dropOne(pending);
-    this.pending.clear();
+    if (this.pending) this.dropOne(this.pending);
+    this.pending = undefined;
     for (const attempt of this.live) attempt.drop();
   }
 
