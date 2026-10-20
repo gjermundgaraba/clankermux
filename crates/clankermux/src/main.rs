@@ -160,7 +160,7 @@ enum Command {
         /// `latest`: the most recent viewport report wins; `smallest`: the
         /// smallest viewport among the attachments; `fixed`: only resize
         /// changes the size.
-        #[arg(long, value_parser = parse_policy)]
+        #[arg(long, value_parser = wire::<SizePolicy>)]
         policy: Option<SizePolicy>,
     },
     /// Close another client's attachment; `inspect` lists them by channel.
@@ -435,10 +435,10 @@ fn parse_env(entries: &[String]) -> Result<BTreeMap<String, String>, Fail> {
         .collect()
 }
 
-/// A wire name (`last_command`) as its protocol value.
+/// A wire name (`last_command`) as its protocol value; serde's error
+/// lists the names there are.
 fn wire<T: DeserializeOwned>(name: &str) -> Result<T, String> {
-    serde_json::from_value(serde_json::Value::String(name.into()))
-        .map_err(|_| format!("unknown value {name:?}"))
+    serde_json::from_value(serde_json::Value::String(name.into())).map_err(|e| e.to_string())
 }
 
 /// The CLI's connections all name the engine, so any of them can attach.
@@ -564,11 +564,6 @@ fn parse_size(spec: &str) -> Result<Sides, Fail> {
         (None, None) => Err(bad()),
         size => Ok(size),
     }
-}
-
-fn parse_policy(spec: &str) -> Result<SizePolicy, String> {
-    serde_json::from_value(serde_json::Value::String(spec.into()))
-        .map_err(|_| format!("{spec:?} is not latest, smallest or fixed"))
 }
 
 /// Writes to stdout; a closed pipe (`| head`) ends the program quietly.
