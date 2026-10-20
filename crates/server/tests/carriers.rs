@@ -215,10 +215,9 @@ async fn each_message_is_exactly_one_frame() {
         br#"{"id":3,"method":"list","params":{}}"#,
     ));
     raw.send(Message::Binary(two.into())).await.unwrap();
-    assert!(
-        ends_with_protocol_error(&mut raw)
-            .await
-            .contains("exactly one frame")
+    assert_eq!(
+        ends_with_protocol_error(&mut raw).await,
+        "frame length 36 with 82 payload bytes"
     );
 
     // A text message, too.
@@ -237,10 +236,9 @@ async fn each_message_is_exactly_one_frame() {
         raw.send(Message::Binary(short.to_vec().into()))
             .await
             .unwrap();
-        assert!(
-            ends_with_protocol_error(&mut raw)
-                .await
-                .contains("exactly one frame"),
+        assert_eq!(
+            ends_with_protocol_error(&mut raw).await,
+            "message shorter than a frame header",
             "{short:?}"
         );
     }
