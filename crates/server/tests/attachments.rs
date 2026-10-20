@@ -11,45 +11,19 @@ use serde_json::{Value, json};
 /// A client whose `HELLO` names it `name` at `version`, with the engine.
 async fn client_named(server: &Server, name: &str, version: &str) -> Client {
     let mut c = Client::connect(server).await;
-    c.send_json(
-        FrameType::Hello,
-        0,
-        &json!({"version": 1, "client": {"name": name, "version": version},
-                "engine": ghostty_vt::ENGINE, "capabilities": []}),
-    )
-    .await;
-    let (header, body) = c.recv_json().await;
-    assert_eq!(header.frame_type, FrameType::Welcome);
-    c.max_frame = serde_json::from_value::<Welcome>(body)
-        .unwrap()
-        .limits
-        .max_frame;
+    c.hello_as(name, version, Some(ghostty_vt::ENGINE)).await;
     c
 }
 
 /// The next `session_changed` for `id` whose session `pick` accepts.
 async fn changed_until(c: &mut Client, id: &str, pick: impl Fn(&Session) -> bool) -> Session {
-    for _ in 0..50 {
-        if let Event::SessionChanged { session } = c.event().await
-            && session.id == id
-            && pick(&session)
-        {
-            return session;
+    event_where(c, |event| match event {
+        Event::SessionChanged { session } if session.id == id && pick(session) => {
+            Some(session.clone())
         }
-    }
-    panic!("no matching session_changed within 50 events");
-}
-
-/// Polls `inspect` until `pick` accepts the session.
-async fn inspect_until(c: &mut Client, id: &str, pick: impl Fn(&Session) -> bool) -> Session {
-    for _ in 0..500 {
-        let session = c.inspect(id).await;
-        if pick(&session) {
-            return session;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("inspect never matched: {:?}", c.inspect(id).await);
+        _ => None,
+    })
+    .await
 }
 
 /// `CLOSED` on `channel`, after any stream frames before it.
@@ -343,50 +317,20 @@ async fn the_policy_is_parked_and_restored() {
     let state = dir.path().join("state");
     // Parked soon after a change, so the policy reaches the disk without
     // a stop.
-    let timing = server::ParkTiming {
-        interval: Duration::from_secs(300),
-        quiet: Duration::from_millis(50),
-        gap: Duration::from_millis(50),
-        busy: Duration::from_millis(200),
-    };
-    let mut a = Server::start_with_park(fast_limits(), state.clone(), timing);
+    let mut a = Server::start_with_park(fast_limits(), state.clone(), prompt_parks(50, 50, 200));
     let mut c = client(&a).await;
     let session = c.create(json!({"argv": ["/bin/cat"]})).await;
-    let parked = |state: &std::path::Path| {
-        let dir = state.join("sessions").join(&session.id);
-        let newest = std::fs::read_dir(dir)
-            .ok()?
-            .flatten()
-            .filter_map(|e| e.file_name().to_str()?.parse::<u64>().ok())
-            .max()?;
-        let json = std::fs::read(
-            state
-                .join("sessions")
-                .join(&session.id)
-                .join(newest.to_string())
-                .join("session.json"),
-        )
-        .ok()?;
-        let file: Value = serde_json::from_slice(&json).ok()?;
-        Some(file["session"]["size"]["policy"].clone())
+    let parked = |policy: &'static str| {
+        move |json: &str| {
+            serde_json::from_str::<Value>(json)
+                .is_ok_and(|file| file["session"]["size"]["policy"] == policy)
+        }
     };
     // The creation's park first, so that the policy's is its own.
-    for _ in 0..500 {
-        if parked(&state) == Some(json!("latest")) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(parked(&state), Some(json!("latest")), "parked at creation");
+    wait_parked(&state, &session.id, "session.json", parked("latest")).await;
     c.ok("resize", json!({"session": session.id, "policy": "fixed"}))
         .await;
-    for _ in 0..500 {
-        if parked(&state) == Some(json!("fixed")) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(parked(&state), Some(json!("fixed")), "parked by the change");
+    wait_parked(&state, &session.id, "session.json", parked("fixed")).await;
     // Killed, not stopped: nothing parks on the way out.
     a.shutdown();
     drop(c);

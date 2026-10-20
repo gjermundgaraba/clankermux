@@ -406,16 +406,7 @@ async fn continuation_bounds_a_snapshot() {
         .create(json!({"argv": ["/bin/sh", "-c",
             "printf 'up\\033]2;'; head -c 6000 /dev/zero | tr '\\0' a; exec cat"]}))
         .await;
-    let mut filled = false;
-    for _ in 0..1000 {
-        let inspected = c.inspect(&session.id).await;
-        if inspected.offset >= 6000 {
-            filled = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(filled, "the title never reached 6000 bytes");
+    inspect_until(&mut c, &session.id, |s| s.offset >= 6000).await;
     // No snapshot can be taken for the whole 5 s retry window, so the
     // bootstrap fails and the attachment ends.
     c.open(1, json!({"session": session.id})).await;

@@ -9,77 +9,6 @@ use common::*;
 use proto::*;
 use serde_json::json;
 
-/// The next event of the kind `pick` accepts.
-async fn event_where<T>(c: &mut Client, mut pick: impl FnMut(&Event) -> Option<T>) -> T {
-    for _ in 0..50 {
-        let event = c.event().await;
-        if let Some(out) = pick(&event) {
-            return out;
-        }
-    }
-    panic!("no matching event within 50 events");
-}
-
-fn sessions_dir(state: &Path) -> PathBuf {
-    state.join("sessions")
-}
-
-/// The complete generation directories of `id`, oldest first.
-fn generations(state: &Path, id: &str) -> Vec<PathBuf> {
-    let mut found: Vec<(u64, PathBuf)> = std::fs::read_dir(sessions_dir(state).join(id))
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter_map(|entry| {
-                    let generation = entry.file_name().to_string_lossy().parse().ok()?;
-                    entry
-                        .path()
-                        .join("screen.txt")
-                        .is_file()
-                        .then(|| (generation, entry.path()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    found.sort();
-    found.into_iter().map(|(_, path)| path).collect()
-}
-
-/// Waits until a complete generation exists for `id`.
-async fn wait_parked(state: &Path, id: &str) -> PathBuf {
-    for _ in 0..500 {
-        if let Some(path) = generations(state, id).pop() {
-            return path;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("session {id} was not parked");
-}
-
-/// Waits until the newest complete generation of `id` holds `needle` on
-/// its screen.
-async fn wait_parked_with(state: &Path, id: &str, needle: &str) -> PathBuf {
-    for _ in 0..1000 {
-        if let Some(path) = generations(state, id).pop()
-            && std::fs::read_to_string(path.join("screen.txt")).is_ok_and(|t| t.contains(needle))
-        {
-            return path;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("session {id} was not parked with {needle:?}");
-}
-
-/// Parks soon after a change; the timer and the stop never in a test.
-fn prompt_parks(quiet_ms: u64, gap_ms: u64, busy_ms: u64) -> server::ParkTiming {
-    server::ParkTiming {
-        interval: Duration::from_secs(3600),
-        quiet: Duration::from_millis(quiet_ms),
-        gap: Duration::from_millis(gap_ms),
-        busy: Duration::from_millis(busy_ms),
-    }
-}
-
 /// The milliseconds between consecutive generations, by their names.
 fn spacing(parked: &[PathBuf]) -> Vec<u64> {
     let ms: Vec<u64> = parked
@@ -143,7 +72,10 @@ async fn a_change_parks_once_quiet_and_while_busy() {
         json!({"session": quiet.id, "data": b64("typed-line\n")}),
     )
     .await;
-    wait_parked_with(&state, &quiet.id, "typed-line").await;
+    wait_parked(&state, &quiet.id, "screen.txt", |t| {
+        t.contains("typed-line")
+    })
+    .await;
 
     // A line every 50 ms is never quiet for 400 ms: it parks every
     // second all the same, and no more often. The test writes the lines itself:
@@ -236,7 +168,10 @@ async fn the_last_detach_parks() {
         }
         assert_eq!(header.frame_type, FrameType::Output);
     }
-    wait_parked_with(&state, &session.id, "detached-line").await;
+    wait_parked(&state, &session.id, "screen.txt", |t| {
+        t.contains("detached-line")
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -369,7 +304,7 @@ async fn keep_parks_at_exit_and_restores_as_exited() {
         .await;
     let exited = c.wait_exit(&session.id).await;
     assert_eq!(exited.exit, Some(Exit::Code { code: 3 }));
-    wait_parked(&state, &session.id).await;
+    wait_parked(&state, &session.id, "screen.txt", |_| true).await;
     drop(c);
     a.registry.stop().await;
     drop(a);

@@ -13,17 +13,6 @@ fn from<T: serde::de::DeserializeOwned>(value: Value) -> T {
     serde_json::from_value(value).unwrap()
 }
 
-/// The next event that `pick` takes, skipping the others.
-async fn event_where<T>(c: &mut Client, mut pick: impl FnMut(&Event) -> Option<T>) -> T {
-    for _ in 0..50 {
-        let event = c.event().await;
-        if let Some(out) = pick(&event) {
-            return out;
-        }
-    }
-    panic!("no matching event within 50 events");
-}
-
 /// `send` of `text` to a session running `cat`, which writes it back.
 fn typed(id: &str, text: &str) -> Value {
     json!({"session": id, "data": b64(format!("{text}\n"))})
@@ -525,12 +514,10 @@ async fn seen_survives_park_and_restore() {
     for body in ["state=done:id=d", "state=error:id=e", "state=working:id=w"] {
         c.ok("send", report(&id, body)).await;
     }
-    for _ in 0..1000 {
-        if c.inspect(&id).await.program_status.unwrap().len() == 3 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    inspect_until(&mut c, &id, |s| {
+        s.program_status.as_ref().is_some_and(|r| r.len() == 3)
+    })
+    .await;
     let acked: Acked = from(
         c.ok("ack", json!({"session": id, "record_ids": ["d"]}))
             .await,
@@ -636,32 +623,16 @@ async fn an_ack_after_the_exit_of_a_kept_session_parks_it_again() {
             "printf '\\033]7501;state=done:id=d\\033\\\\'; exit 0"]}))
         .await;
     c.wait_exit(&session.id).await;
-    let parked = |seen: &str| {
-        let dir = state.join("sessions").join(&session.id);
-        std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|g| {
-                std::fs::read_to_string(g.path().join("session.json"))
-                    .is_ok_and(|json| json.contains(seen))
-            })
-    };
-    for _ in 0..500 {
-        if parked("\"seen\":false") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(parked("\"seen\":false"), "the park at the exit");
+    // The park at the exit, then the ack's.
+    wait_parked(&state, &session.id, "session.json", |json| {
+        json.contains("\"seen\":false")
+    })
+    .await;
     c.ok("ack", json!({"session": session.id})).await;
-    for _ in 0..500 {
-        if parked("\"seen\":true") {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the ack was not parked");
+    wait_parked(&state, &session.id, "session.json", |json| {
+        json.contains("\"seen\":true")
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -705,39 +676,20 @@ async fn retained_events_are_bounded_in_bytes_too() {
 async fn an_ack_of_a_running_session_reaches_its_next_park() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let timing = server::ParkTiming {
-        interval: Duration::from_secs(300),
-        quiet: Duration::from_millis(50),
-        gap: Duration::from_millis(50),
-        busy: Duration::from_millis(500),
-    };
-    let a = Server::start_with_park(fast_limits(), state.clone(), timing);
+    let a = Server::start_with_park(fast_limits(), state.clone(), prompt_parks(50, 50, 500));
     let mut c = client(&a).await;
     let session = c.create(json!({"argv": ["/bin/cat"]})).await;
+    // The report's park, then the ack's.
     c.ok("send", report(&session.id, "state=done:id=d")).await;
-    let parked = |seen: &str| {
-        let dir = state.join("sessions").join(&session.id);
-        std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|g| {
-                std::fs::read_to_string(g.path().join("session.json"))
-                    .is_ok_and(|json| json.contains(seen))
-            })
-    };
-    let wait = |seen: &'static str| async move {
-        for _ in 0..500 {
-            if parked(seen) {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        false
-    };
-    assert!(wait("\"seen\":false").await, "the report parked");
+    wait_parked(&state, &session.id, "session.json", |json| {
+        json.contains("\"seen\":false")
+    })
+    .await;
     c.ok("ack", json!({"session": session.id})).await;
-    assert!(wait("\"seen\":true").await, "the ack parked");
+    wait_parked(&state, &session.id, "session.json", |json| {
+        json.contains("\"seen\":true")
+    })
+    .await;
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
 }

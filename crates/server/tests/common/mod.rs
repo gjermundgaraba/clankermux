@@ -1,7 +1,7 @@
 //! Shared test harness: the test kit's server and a framed client.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ghostty_vt::{formatter, snapshot};
@@ -107,8 +107,13 @@ impl Client {
     }
 
     pub async fn hello_with(&mut self, engine: Option<&str>) -> Welcome {
-        let mut hello =
-            json!({"version": 1, "client": {"name": "test", "version": "0"}, "capabilities": []});
+        self.hello_as("test", "0", engine).await
+    }
+
+    /// HELLO from the client `name` at `version`.
+    pub async fn hello_as(&mut self, name: &str, version: &str, engine: Option<&str>) -> Welcome {
+        let mut hello = json!({"version": 1, "client": {"name": name, "version": version},
+                               "capabilities": []});
         if let Some(engine) = engine {
             hello["engine"] = json!(engine);
         }
@@ -314,13 +319,7 @@ impl Client {
 
     /// Polls `inspect` until the session reports `count` attachments.
     pub async fn wait_attachments(&mut self, id: &str, count: u32) {
-        for _ in 0..1000 {
-            if self.inspect(id).await.attachments.len() as u32 == count {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("attachments never reached {count}");
+        inspect_until(self, id, |s| s.attachments.len() as u32 == count).await;
     }
 }
 
@@ -374,4 +373,81 @@ pub async fn wait_text(c: &mut Client, id: &str, needle: &str) -> Read {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("{needle:?} never appeared");
+}
+
+/// Polls `inspect` until `pick` accepts the session.
+pub async fn inspect_until(c: &mut Client, id: &str, pick: impl Fn(&Session) -> bool) -> Session {
+    for _ in 0..1000 {
+        let session = c.inspect(id).await;
+        if pick(&session) {
+            return session;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("inspect never matched: {:?}", c.inspect(id).await);
+}
+
+/// The next event that `pick` takes, skipping the others.
+pub async fn event_where<T>(c: &mut Client, mut pick: impl FnMut(&Event) -> Option<T>) -> T {
+    for _ in 0..50 {
+        let event = c.event().await;
+        if let Some(out) = pick(&event) {
+            return out;
+        }
+    }
+    panic!("no matching event within 50 events");
+}
+
+/// Parks soon after a change; the timer and the stop never in a test.
+pub fn prompt_parks(quiet_ms: u64, gap_ms: u64, busy_ms: u64) -> server::ParkTiming {
+    server::ParkTiming {
+        interval: Duration::from_secs(3600),
+        quiet: Duration::from_millis(quiet_ms),
+        gap: Duration::from_millis(gap_ms),
+        busy: Duration::from_millis(busy_ms),
+    }
+}
+
+pub fn sessions_dir(state: &Path) -> PathBuf {
+    state.join("sessions")
+}
+
+/// The complete generation directories of `id`, oldest first.
+pub fn generations(state: &Path, id: &str) -> Vec<PathBuf> {
+    let mut found: Vec<(u64, PathBuf)> = std::fs::read_dir(sessions_dir(state).join(id))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let generation = entry.file_name().to_string_lossy().parse().ok()?;
+                    entry
+                        .path()
+                        .join("screen.txt")
+                        .is_file()
+                        .then(|| (generation, entry.path()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Waits until the newest complete generation of `id` has a `file`
+/// whose text `pick` accepts, and returns the generation.
+pub async fn wait_parked(
+    state: &Path,
+    id: &str,
+    file: &str,
+    pick: impl Fn(&str) -> bool,
+) -> PathBuf {
+    for _ in 0..1000 {
+        if let Some(path) = generations(state, id).pop()
+            && std::fs::read_to_string(path.join(file)).is_ok_and(|text| pick(&text))
+        {
+            return path;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("session {id} was not parked with that {file}");
 }

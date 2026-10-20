@@ -329,14 +329,7 @@ async fn create_defaults_and_limits() {
     }
 
     let env = c.create(json!({"argv": ["/bin/sh", "-c", "printf '%s|%s' \"$TERM\" \"$FOO\"; sleep 10"], "env": {"FOO": "bar"}})).await;
-    let mut text = String::new();
-    for _ in 0..500 {
-        text = c.read(&env.id, 0).await.text;
-        if text.contains('|') {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let text = wait_text(&mut c, &env.id, "|").await.text;
     assert_eq!(text.trim_end(), "xterm-ghostty|bar");
     c.ok("signal", json!({"session": env.id, "signal": "KILL"}))
         .await;

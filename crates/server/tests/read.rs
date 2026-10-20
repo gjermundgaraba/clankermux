@@ -2,8 +2,6 @@
 
 mod common;
 
-use std::time::Duration;
-
 use common::*;
 use proto::*;
 use serde_json::{Value, json};
@@ -14,18 +12,6 @@ async fn read_with(c: &mut Client, params: Value) -> Read {
 
 async fn tail(c: &mut Client, params: Value) -> Tail {
     serde_json::from_value(c.ok("tail", params).await).unwrap()
-}
-
-/// Polls `inspect` until `done` holds.
-async fn inspect_until(c: &mut Client, id: &str, done: impl Fn(&Session) -> bool) -> Session {
-    for _ in 0..1000 {
-        let session = c.inspect(id).await;
-        if done(&session) {
-            return session;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the session never got there");
 }
 
 /// The `command` of each `session_changed` for `id` received so far.
