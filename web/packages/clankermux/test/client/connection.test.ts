@@ -2,7 +2,7 @@ import { expect, test } from "vitest";
 
 import { type Frame, FrameType, encodeFrame, parseFrame } from "../../src/proto/index.ts";
 
-import { ClientError, Connection, type Transport, hello } from "../../src/client/index.ts";
+import { ClientError, Connection, type Transport, hello } from "../../src/client/connection.ts";
 
 /** A transport whose peer is the test. */
 class Fake implements Transport {

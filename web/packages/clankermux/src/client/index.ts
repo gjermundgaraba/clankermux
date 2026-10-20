@@ -1,12 +1,7 @@
-export { Attachment } from "./attachment.ts";
-export type { Action } from "./attachment.ts";
 export { Client, connect } from "./client.ts";
 export type { ConnectOptions, EventGap, SendInput, WaitOptions } from "./client.ts";
-export { ClientError, Connection, hello } from "./connection.ts";
-export type { ErrorKind, Transport } from "./connection.ts";
+export { ClientError } from "./connection.ts";
 export type { Copy, CopyFailure, CopySource } from "./copy.ts";
-export { Osc52Scanner } from "./osc52.ts";
-export type { ClipboardWrite } from "./osc52.ts";
 export type { Colors, MountOptions, Terminal } from "./mount.ts";
 export type { Link, LinkEnd } from "./worker.ts";
 export type {

@@ -15,7 +15,8 @@ import WebSocket from "ws";
 import { ENGINE, Engine } from "../../src/engine/index.ts";
 import { type Event, type Frame, FrameType, type Read, type Session, StreamFramer } from "../../src/proto/index.ts";
 
-import { type Action, Attachment, Connection, type Transport, hello } from "../../src/client/index.ts";
+import { type Action, Attachment } from "../../src/client/attachment.ts";
+import { Connection, type Transport, hello } from "../../src/client/connection.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const root = `${here}../../../../../`;

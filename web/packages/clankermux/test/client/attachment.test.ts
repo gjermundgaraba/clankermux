@@ -13,7 +13,7 @@ import {
   type Welcome,
 } from "../../src/proto/index.ts";
 
-import { Attachment } from "../../src/client/index.ts";
+import { Attachment } from "../../src/client/attachment.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const limits: Limits = JSON.parse(readFileSync(`${here}../../../../../crates/proto/vectors/limits.json`, "utf8"));

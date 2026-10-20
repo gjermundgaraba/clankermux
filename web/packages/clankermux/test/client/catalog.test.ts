@@ -15,7 +15,7 @@ import { afterAll, beforeAll, expect, test } from "vitest";
 
 import pkg from "../../package.json" with { type: "json" };
 import { type Catalog, StreamFramer, VERSION } from "../../src/proto/index.ts";
-import { Connection, type Transport, hello } from "../../src/client/index.ts";
+import { Connection, type Transport, hello } from "../../src/client/connection.ts";
 import { vectors } from "../proto/messages.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));

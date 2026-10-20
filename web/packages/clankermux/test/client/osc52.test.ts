@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 
-import { Osc52Scanner } from "../../src/client/index.ts";
+import { Osc52Scanner } from "../../src/client/osc52.ts";
 
 const bytes = (s: string) => new TextEncoder().encode(s);
 
