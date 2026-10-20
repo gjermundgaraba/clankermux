@@ -281,6 +281,26 @@ test("a server restart: the terminals come back to their restored sessions, and 
   await page.context().close();
 });
 
+test("under the kitty keyboard protocol, shifted symbols reach the program as typed", async () => {
+  // Disambiguation, as neovim asks for it; the program prints the bytes
+  // of four keys in hex.
+  const session = await create("/bin/sh", "-c", "printf '\\033[>1u'; stty raw -echo; dd bs=1 count=4 2>/dev/null | od -An -tx1; exec cat");
+  const page = await opened();
+  await page.evaluate((s) => harness().mount("only", s), session);
+  await connectedTo(page, "only");
+  await page.click("#only");
+  // Shift held, as a keyboard sends it: whatever the machine's layout has
+  // on these keys unshifted, the text is what Shift made.
+  await page.keyboard.down("Shift");
+  for (const key of ["Semicolon", "Quote", "Digit1"]) await page.keyboard.press(key);
+  await page.keyboard.up("Shift");
+  await page.keyboard.press("Enter");
+  await eventually("the bytes printed", async () =>
+    (await screenOf(session)).replace(/\s+/g, " ").includes("3a 22 21 0d") ? true : undefined,
+  );
+  await page.context().close();
+});
+
 test("wait through the client: a match resolves it, an abort cancels it on the server", async () => {
   const session = await create("/bin/cat");
   const page = await opened();

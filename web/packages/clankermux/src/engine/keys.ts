@@ -72,9 +72,15 @@ export class KeyEncoder {
     e.call("ghostty_key_event_set_action", this.event, e.enumValue("GhosttyKeyAction", input.action.toUpperCase()));
     e.call("ghostty_key_event_set_key", this.event, key);
     e.call("ghostty_key_event_set_mods", this.event, mods);
-    e.call("ghostty_key_event_set_consumed_mods", this.event, 0);
-    e.call("ghostty_key_event_set_composing", this.event, input.composing ? 1 : 0);
     const text = isText(input.key) ? input.key : "";
+    // Shift that made the text is consumed, as a keyboard reports it, so
+    // the kitty protocol's disambiguation sends the text (`:`, `A`) rather
+    // than shift and the key. It made it when the text is not the key's
+    // own character; with no layout to say, when it is any text but a
+    // space.
+    const shiftMade = input.shift && text !== "" && (input.unshifted !== undefined ? text !== input.unshifted : text !== " ");
+    e.call("ghostty_key_event_set_consumed_mods", this.event, shiftMade ? MODS.SHIFT : 0);
+    e.call("ghostty_key_event_set_composing", this.event, input.composing ? 1 : 0);
     const utf8 = new TextEncoder().encode(text);
     return e.withBytes(utf8, (textPtr) => {
       e.call("ghostty_key_event_set_utf8", this.event, textPtr, utf8.length);

@@ -124,6 +124,51 @@ test("keys encode with the terminal's modes", () => {
   term.free();
 });
 
+test("under the kitty protocol's disambiguation, text that shift made goes as text", () => {
+  const term = engine.terminalNew(10, 2);
+  const keys = new KeyEncoder(engine);
+  const press = (code: string, key: string, mods: Partial<KeyInput> = {}): string =>
+    text(keys.encode(term, { code, key, action: "press", shift: false, ctrl: false, alt: false, meta: false, ...mods }));
+  // Neovim's flags: disambiguate, and report event types.
+  for (const flags of ["1", "3"]) {
+    term.write(utf8(`\x1b[>${flags}u`));
+    expect(press("Escape", "Escape")).toBe("\x1b[27u");
+    expect(press("KeyC", "c", { ctrl: true, unshifted: "c" })).toBe("\x1b[99;5u");
+    expect(press("KeyA", "A", { shift: true, unshifted: "a" })).toBe("A");
+    expect(press("Semicolon", ":", { shift: true, unshifted: ";" })).toBe(":");
+    // A Norwegian layout: Shift+. is `:`, and Shift on the key whose own
+    // character is æ is `"`; neither goes as the key's own character.
+    expect(press("Period", ":", { shift: true, unshifted: "." })).toBe(":");
+    expect(press("Quote", '"', { shift: true, unshifted: "\u00e6" })).toBe('"');
+    expect(press("Backslash", "|", { shift: true, unshifted: "@" })).toBe("|");
+    expect(press("Equal", "`", { shift: true, unshifted: "\\" })).toBe("`");
+    expect(press("Digit8", "{", { alt: true, shift: true, altComposed: true, unshifted: "8" })).toBe("{");
+    // Without a layout (Safari, Firefox): a letter's own is its lower case,
+    // and other text is taken as shift's.
+    expect(press("KeyA", "A", { shift: true })).toBe("A");
+    expect(press("Digit1", "!", { shift: true })).toBe("!");
+    // Shift that made no text stays a modifier.
+    expect(press("Tab", "Tab", { shift: true })).toBe("\x1b[9;2u");
+    expect(press("Space", " ", { shift: true })).toBe("\x1b[32;2u");
+    expect(press("KeyA", "A", { shift: true, ctrl: true, unshifted: "a" })).toBe("\x1b[97;6u");
+    term.write(utf8("\x1b[<u"));
+  }
+  expect(press("Escape", "Escape")).toBe("\x1b");
+  // Reporting all keys, the key is the layout's own character with shift,
+  // the shifted one among the alternates when asked for, and the text when
+  // asked for.
+  term.write(utf8("\x1b[>11u"));
+  expect(press("Quote", '"', { shift: true, unshifted: "\u00e6" })).toBe("\x1b[230;2u");
+  term.write(utf8("\x1b[=15u"));
+  expect(press("Quote", '"', { shift: true, unshifted: "\u00e6" })).toBe("\x1b[230:34:39;2u");
+  term.write(utf8("\x1b[=31u"));
+  expect(press("Quote", '"', { shift: true, unshifted: "\u00e6" })).toBe("\x1b[230:34:39;2;34u");
+  expect(press("Digit8", "[", { alt: true, altComposed: true, unshifted: "8" })).toBe("\x1b[56;;91u");
+  term.write(utf8("\x1b[<u"));
+  keys.free();
+  term.free();
+});
+
 test("paste is encoded for the PTY and modes are queried", () => {
   expect(text(engine.encodePaste("a\nb", false))).toBe("a\rb");
   expect(text(engine.encodePaste("a\nb", true))).toBe("\x1b[200~a\nb\x1b[201~");
