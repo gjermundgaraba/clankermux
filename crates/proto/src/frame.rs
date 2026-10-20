@@ -201,15 +201,18 @@ impl FrameDecoder {
     }
 }
 
+/// The bytes of the stream offset that starts an `OUTPUT` payload.
+pub const OUTPUT_OFFSET_LEN: usize = 8;
+
 /// `OUTPUT` payload: the stream offset of the first byte, then the bytes.
 pub fn encode_output(offset: u64, bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + bytes.len());
+    let mut out = Vec::with_capacity(OUTPUT_OFFSET_LEN + bytes.len());
     out.extend_from_slice(&offset.to_le_bytes());
     out.extend_from_slice(bytes);
     out
 }
 
 pub fn parse_output(payload: &[u8]) -> Option<(u64, &[u8])> {
-    let (head, bytes) = payload.split_at_checked(8)?;
+    let (head, bytes) = payload.split_at_checked(OUTPUT_OFFSET_LEN)?;
     Some((u64::from_le_bytes(head.try_into().unwrap()), bytes))
 }
