@@ -48,26 +48,31 @@ fn bindings(check: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Renders PROTOCOL.md's generated regions from the catalog.
+/// Renders PROTOCOL.md's generated regions and the web package's protocol
+/// types from the catalog.
 fn protocol(check: bool) -> ExitCode {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../PROTOCOL.md");
-    let doc = std::fs::read_to_string(&path).expect("read PROTOCOL.md");
-    // The tables do not show the release.
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    // Neither shows the release.
     let catalog = proto::catalog::catalog("");
-    let rendered = match proto::render::splice(&doc, &catalog) {
+    let doc_path = root.join("PROTOCOL.md");
+    let doc = std::fs::read_to_string(&doc_path).expect("read PROTOCOL.md");
+    let doc = match proto::render::splice(&doc, &catalog) {
         Ok(rendered) => rendered,
         Err(err) => {
-            eprintln!("{}: {err}", path.display());
+            eprintln!("{}: {err}", doc_path.display());
             return ExitCode::FAILURE;
         }
     };
-    if check {
-        if rendered == doc {
-            return ExitCode::SUCCESS;
+    let types = proto::typescript::module(&catalog);
+    let types_path = root.join("web/packages/clankermux/src/proto/messages.ts");
+    let mut code = ExitCode::SUCCESS;
+    for (path, rendered) in [(doc_path, doc), (types_path, types)] {
+        if !check {
+            std::fs::write(&path, rendered).expect("write a rendered file");
+        } else if std::fs::read_to_string(&path).ok() != Some(rendered) {
+            eprintln!("{} is stale; run `cargo xtask protocol`", path.display());
+            code = ExitCode::FAILURE;
         }
-        eprintln!("{} is stale; run `cargo xtask protocol`", path.display());
-        return ExitCode::FAILURE;
     }
-    std::fs::write(&path, rendered).expect("write PROTOCOL.md");
-    ExitCode::SUCCESS
+    code
 }

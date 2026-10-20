@@ -217,7 +217,7 @@ fn code(shape: &str) -> String {
     }
 }
 
-fn ref_name(schema: &Value) -> Option<&str> {
+pub(crate) fn ref_name(schema: &Value) -> Option<&str> {
     schema.get("$ref")?.as_str()?.strip_prefix("#/$defs/")
 }
 
@@ -241,7 +241,7 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn required(schema: &Value) -> BTreeSet<&str> {
+pub(crate) fn required(schema: &Value) -> BTreeSet<&str> {
     schema
         .get("required")
         .and_then(Value::as_array)
