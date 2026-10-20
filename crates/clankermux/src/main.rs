@@ -1632,55 +1632,34 @@ async fn main() {
 mod tests {
     use super::*;
 
-    /// README.md and the guide list the same exit codes, and the codes
-    /// are the ones the CLI exits with.
+    /// README.md and the guide carry the same exit-code table, and its
+    /// codes are the ones the CLI exits with.
     #[test]
     fn the_exit_code_tables_are_the_cli_s() {
-        let rows = [
-            ("0", "Done"),
-            (
-                "1",
-                "Failed: the server refused the request, or the connection broke",
-            ),
-            (
-                &EXIT_USAGE.to_string(),
-                "Usage: arguments clap or the command cannot use, or no session given outside a \
-                 session",
-            ),
-            (
-                &EXIT_TARGET.to_string(),
-                "The session argument named no session, or several",
-            ),
-            (
-                &EXIT_UNREACHABLE.to_string(),
-                "The server cannot be reached",
-            ),
-            (&EXIT_TIMEOUT.to_string(), "A wait timed out"),
-            (
-                &EXIT_INTERRUPTED.to_string(),
-                "A wait was cancelled with Ctrl-C",
-            ),
-            (
-                "child's",
-                "A wait that ended with the session's exit (`--exit`, `create --wait`): its \
-                 code, or 128 plus the signal's number; 1 for a `restored` session, which has none",
-            ),
-        ];
-        let expected: Vec<String> = rows
-            .iter()
-            .map(|(code, meaning)| format!("| {code} | {meaning} |"))
-            .collect();
-        for (name, doc) in [
-            ("README.md", include_str!("../../../README.md")),
-            ("skill.md", SKILL),
-        ] {
-            let table: Vec<&str> = doc
-                .lines()
+        let table = |doc: &'static str| -> Vec<&'static str> {
+            doc.lines()
                 .skip_while(|line| !line.ends_with("| Meaning |"))
                 .skip(2)
                 .take_while(|line| line.starts_with('|'))
-                .collect();
-            assert_eq!(table, expected, "{name}");
-        }
+                .collect()
+        };
+        let readme = table(include_str!("../../../README.md"));
+        assert_eq!(readme, table(SKILL), "skill.md's table is README.md's");
+        let codes: Vec<&str> = readme
+            .iter()
+            .map(|row| row.split('|').nth(1).unwrap().trim())
+            .collect();
+        let expected = [
+            0,
+            1,
+            EXIT_USAGE,
+            EXIT_TARGET,
+            EXIT_UNREACHABLE,
+            EXIT_TIMEOUT,
+            EXIT_INTERRUPTED,
+        ]
+        .map(|code| code.to_string());
+        assert_eq!(codes[..expected.len()], expected);
+        assert_eq!(codes[expected.len()..], ["child's"]);
     }
 }
