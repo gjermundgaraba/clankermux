@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import * as esbuild from "esbuild";
-import { type Browser, type Page, chromium } from "playwright-core";
+import { type Browser, type BrowserContext, type Page, chromium } from "playwright-core";
 import { afterAll, afterEach, beforeAll, expect, test, vi } from "vitest";
 
 import type { Session } from "@gjermundgaraba/clankermux";
@@ -174,9 +174,10 @@ afterAll(async () => {
   if (dir) rmSync(dir, { recursive: true, force: true });
 });
 
-/** A fresh page, connected through the proxy. */
-async function opened(): Promise<Page> {
-  const context = await browser.newContext({ ignoreHTTPSErrors: true });
+/** A fresh page, connected through the proxy; in a fresh context unless
+ * given one. */
+async function opened(given?: BrowserContext): Promise<Page> {
+  const context = given ?? (await browser.newContext({ ignoreHTTPSErrors: true }));
   contexts.push(context);
   const page = await context.newPage();
   page.on("pageerror", (err) => console.error(err));
@@ -299,6 +300,51 @@ test("under the kitty keyboard protocol, shifted symbols reach the program as ty
     (await screenOf(session)).replace(/\s+/g, " ").includes("3a 22 21 0d") ? true : undefined,
   );
   await page.context().close();
+});
+
+test("a selection's copy is told to the page once the clipboard has it", async () => {
+  const session = await create("/bin/sh", "-c", "printf 'copyme\\n'; exec cat");
+  const context = await browser.newContext({ ignoreHTTPSErrors: true });
+  await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin });
+  const page = await opened(context);
+  await page.evaluate((s) => harness().mount("only", s), session);
+  await connectedTo(page, "only");
+  await eventually("the word drawn", async () => ((await screenOf(session)).includes("copyme") ? true : undefined));
+  // A double click selects the word; the first click selected nothing,
+  // which is no copy.
+  const box = (await page.locator("#only").boundingBox())!;
+  await page.mouse.dblclick(box.x + 10, box.y + 8);
+  const copies = await eventually("the copy told", async () => {
+    const told = await page.evaluate(() => harness().copies("only"));
+    return told.length > 0 ? told : undefined;
+  });
+  expect(copies).toEqual([{ ok: true, source: "release", chars: 6 }]);
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("copyme");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  expect(await page.evaluate(() => harness().copies("only"))).toHaveLength(1);
+  await context.close();
+
+  // With the permission denied Chrome refuses the write, and the page is
+  // told.
+  const denied = await browser.newContext({ ignoreHTTPSErrors: true });
+  const target = await (await denied.newCDPSession(await denied.newPage())).send("Target.getTargetInfo");
+  await (await browser.newBrowserCDPSession()).send("Browser.setPermission", {
+    permission: { name: "clipboard-write" },
+    setting: "denied",
+    origin,
+    browserContextId: target.targetInfo.browserContextId!,
+  });
+  const refused = await opened(denied);
+  await refused.evaluate((s) => harness().mount("only", s), session);
+  await connectedTo(refused, "only");
+  const at = (await refused.locator("#only").boundingBox())!;
+  await refused.mouse.dblclick(at.x + 10, at.y + 8);
+  const failed = await eventually("the refusal told", async () => {
+    const told = await refused.evaluate(() => harness().copies("only"));
+    return told.length > 0 ? told : undefined;
+  });
+  expect(failed).toEqual([{ ok: false, source: "release", reason: "refused", chars: 6, message: expect.stringMatching(/^NotAllowedError/) }]);
+  await refused.context().close();
 });
 
 test("wait through the client: a match resolves it, an abort cancels it on the server", async () => {

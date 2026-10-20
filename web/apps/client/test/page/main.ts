@@ -3,6 +3,7 @@
 import {
   type Client,
   ClientError,
+  type Copy,
   type Event,
   type EventGap,
   type Link,
@@ -17,6 +18,7 @@ interface Mounted {
   canvas: HTMLCanvasElement;
   links: Link[];
   statuses: string[];
+  copies: Copy[];
 }
 
 let client: Client | undefined;
@@ -47,8 +49,9 @@ const harness = {
       colors: () => ({ fg: "#24292e", bg: "#ffffff", cursor: "#24292e" }),
       ...options,
     });
-    const entry: Mounted = { terminal, canvas, links: [], statuses: [] };
+    const entry: Mounted = { terminal, canvas, links: [], statuses: [], copies: [] };
     terminal.onLink((link) => entry.links.push(link));
+    terminal.onCopy((copy) => entry.copies.push(copy));
     terminal.onStatus((text) => entry.statuses.push(text));
     mounted.set(name, entry);
   },
@@ -77,6 +80,7 @@ const harness = {
     }
   },
   statuses: (name: string): string[] => mounted.get(name)?.statuses ?? [],
+  copies: (name: string): Copy[] => mounted.get(name)?.copies ?? [],
   events: (): (Event | EventGap)[] => events,
 
   /** A wait through the client; aborted after `abortMs` when given, and

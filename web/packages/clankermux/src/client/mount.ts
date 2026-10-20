@@ -4,6 +4,7 @@ import type { CellPoint } from "../engine/index.ts";
 import type { Scheme, Size } from "../proto/index.ts";
 import { CanvasRenderer, type Metrics } from "../renderer/index.ts";
 
+import { type Copy, Copier } from "./copy.ts";
 import { type Keyboard, type Typed, Typing } from "./keyboard.ts";
 import { profileFrom, schemeOf } from "./profile.ts";
 import type { Link, ToPage, ToWorker } from "./worker.ts";
@@ -76,6 +77,10 @@ export interface Terminal {
   onScroll(listener: (rows: number) => void): () => void;
   /** A line of text for each change, for display; the latest at once. */
   onStatus(listener: (text: string) => void): () => void;
+  /** Each copy to the clipboard as it ends: copied, with the text's
+   * length, or failed and why. A release that selected nothing is no
+   * copy. A listener added later is not told of earlier copies. */
+  onCopy(listener: (copy: Copy) => void): () => void;
 }
 
 /** The client's side of a terminal: its messages to the worker, and the
@@ -183,42 +188,17 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
   const scrolls = new Listeners<number>();
   const statuses = new Listeners<string>();
 
+  const copies = new Set<(copy: Copy) => void>();
+
   /** The selection's text, for a copy. */
   let selected: string | undefined;
-  /** The clipboard write a release started, waiting for the worker to say
-   * what was selected. */
-  let copying: { resolve: (text: string) => void; reject: () => void } | undefined;
-  /** Starts the copy of what a release selected. Safari writes to the
-   * clipboard only within the user's gesture, which is over before the
-   * worker answers: the write starts here with the text to come, and
-   * fails, leaving the clipboard alone, when nothing was selected. */
-  function startCopy(): void {
-    copying?.reject();
-    copying = undefined;
-    if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) return;
-    let settle!: { resolve: (text: string) => void; reject: () => void };
-    const text = new Promise<Blob>((resolve, reject) => {
-      settle = {
-        resolve: (value) => resolve(new Blob([value], { type: "text/plain" })),
-        reject: () => reject(new Error("nothing selected")),
-      };
-    });
-    // A browser that refuses the write never reads `text`, whose
-    // rejection would then go unhandled.
-    text.catch(() => {});
-    navigator.clipboard.write([new ClipboardItem({ "text/plain": text })]).catch(() => {});
-    const timer = setTimeout(() => settle.reject(), 2000);
-    copying = {
-      resolve: (value) => {
-        clearTimeout(timer);
-        settle.resolve(value);
-      },
-      reject: () => {
-        clearTimeout(timer);
-        settle.reject();
-      },
-    };
-  }
+  const copier = new Copier({
+    clipboard: () => navigator.clipboard,
+    item: typeof ClipboardItem === "undefined" ? undefined : (text) => new ClipboardItem({ "text/plain": text }),
+    report: (copy) => {
+      for (const listener of copies) listener(copy);
+    },
+  });
   /** Rows the view is scrolled back, as `onScroll` last reported;
    * undefined before the first frame. */
   let scrolled: number | undefined;
@@ -248,18 +228,12 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
         break;
       }
       case "clipboard":
-        navigator.clipboard?.writeText(message.text).catch(() => {});
+        copier.write(message.text, "program");
         break;
-      case "selection": {
+      case "selection":
         selected = message.text;
-        if (!message.copy) break;
-        const copy = copying;
-        copying = undefined;
-        if (message.text === undefined) copy?.reject();
-        else if (copy) copy.resolve(message.text);
-        else navigator.clipboard?.writeText(message.text).catch(() => {});
+        if (message.copy) copier.answer(message.text);
         break;
-      }
     }
   });
 
@@ -345,7 +319,7 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
       // Ctrl+Shift+C copies a selection, where Ctrl+C is the terminal's;
       // without one it is a key.
       if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === "KeyC" && selected) {
-        navigator.clipboard?.writeText(selected).catch(() => {});
+        copier.write(selected, "keys");
         e.preventDefault();
         return;
       }
@@ -426,6 +400,7 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
       if (selected === undefined || !e.clipboardData) return;
       e.clipboardData.setData("text/plain", selected);
       e.preventDefault();
+      copier.copied(selected, "browser");
     },
     { signal },
   );
@@ -465,7 +440,7 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
         window.removeEventListener("mousemove", move);
         window.removeEventListener("mouseup", up);
         endDrag = undefined;
-        startCopy();
+        copier.start();
         send({ type: "select", action: "release", at, time });
       };
       const move = (m: MouseEvent) => {
@@ -583,9 +558,15 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
       links.clear();
       scrolls.clear();
       statuses.clear();
+      copier.dispose();
+      copies.clear();
     },
     onLink: (listener) => links.add(listener),
     onScroll: (listener) => scrolls.add(listener),
     onStatus: (listener) => statuses.add(listener),
+    onCopy: (listener) => {
+      copies.add(listener);
+      return () => void copies.delete(listener);
+    },
   };
 }
