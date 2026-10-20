@@ -356,7 +356,7 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
                 s.touch();
                 s.to_proto(false)
             };
-            registry.emit(&Event::SessionChanged {
+            registry.emit(Event::SessionChanged {
                 session: out.clone(),
             });
             Ok(json!(out))

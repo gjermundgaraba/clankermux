@@ -271,14 +271,14 @@ impl Task {
                 self.send_ending(ending);
             }
         }
-        self.registry.emit(&Event::AttachmentClosed {
+        self.registry.emit(Event::AttachmentClosed {
             id: snapshot.id.clone(),
             channel: self.id,
             reason,
         });
         if !removed {
             self.registry
-                .emit(&Event::SessionChanged { session: snapshot });
+                .emit(Event::SessionChanged { session: snapshot });
         }
     }
 

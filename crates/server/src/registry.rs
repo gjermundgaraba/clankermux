@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use proto::{
-    ClosedReason, ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status, StatusReason,
-    SubscribeParams, Subscribed, encode_json_frame,
+    ClosedReason, ErrorCode, Event, Exit, FrameType, Limits, Numbered, OnExit, Page, Status,
+    StatusReason, SubscribeParams, Subscribed, encode_json_frame,
 };
 use rustix::process::Signal;
 use tokio::io::unix::AsyncFd;
@@ -118,15 +118,6 @@ impl State {
         let oldest = self.retained.front().map_or(self.seq + 1, |(seq, _)| *seq);
         (oldest, self.seq)
     }
-}
-
-/// `EVENT`: the event and its `seq`, as `proto::Numbered` but borrowing
-/// the event, which is encoded once for every subscriber.
-#[derive(serde::Serialize)]
-struct Numbered<'a> {
-    seq: u64,
-    #[serde(flatten)]
-    event: &'a Event,
 }
 
 impl Registry {
@@ -258,7 +249,7 @@ impl Registry {
             .sessions
             .insert(info.id.clone(), Arc::new(Mutex::new(session)));
         if !dropped.is_empty() {
-            self.emit(&Event::ProgramStatusRemoved {
+            self.emit(Event::ProgramStatusRemoved {
                 id: info.id,
                 record_ids: dropped,
                 reason: StatusReason::Restore,
@@ -506,7 +497,7 @@ impl Registry {
     /// The retained events are at most `limits.events`, and at most
     /// `RETAINED_FRAMES` frames' worth of bytes, so a replay stays well
     /// within what a connection may queue.
-    pub fn emit(&self, event: &Event) {
+    pub fn emit(&self, event: Event) {
         let mut state = self.state.lock().unwrap();
         state.seq += 1;
         let seq = state.seq;
@@ -526,7 +517,7 @@ impl Registry {
     }
 
     pub fn emit_all(&self, events: Vec<Event>) {
-        for event in &events {
+        for event in events {
             self.emit(event);
         }
     }
@@ -536,7 +527,7 @@ impl Registry {
     pub fn emit_session(&self, events: Vec<Event>, changed: Option<proto::Session>) {
         self.emit_all(events);
         if let Some(session) = changed {
-            self.emit(&Event::SessionChanged { session });
+            self.emit(Event::SessionChanged { session });
         }
     }
 
@@ -663,7 +654,7 @@ impl Registry {
             .unwrap()
             .sessions
             .insert(id.clone(), shared.clone());
-        self.emit(&Event::SessionCreated {
+        self.emit(Event::SessionCreated {
             session: snapshot.clone(),
         });
         tokio::spawn(park_when_due(
@@ -762,7 +753,7 @@ impl Registry {
         self.emit_all(events);
         let remove = snapshot.on_exit == OnExit::Remove;
         let id = snapshot.id.clone();
-        self.emit(&Event::SessionExited { session: snapshot });
+        self.emit(Event::SessionExited { session: snapshot });
         if self.is_stopping() {
             return;
         }
@@ -878,7 +869,7 @@ impl Registry {
             s.wake.notify_waiters();
         }
         park::remove(&self.sessions_dir(), id);
-        self.emit(&Event::SessionRemoved { id: id.to_string() });
+        self.emit(Event::SessionRemoved { id: id.to_string() });
     }
 }
 
