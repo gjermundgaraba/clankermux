@@ -242,7 +242,9 @@ fn client_payloads_refuse_unknown_fields_and_server_payloads_ignore_them() {
     assert_eq!(gap.to, 2);
 }
 
-fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
+/// Whether each object `schema` reaches, through its references,
+/// refuses undefined fields.
+fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &mut Vec<bool>) {
     let mut names = Vec::new();
     catalog::refs(schema, &mut names);
     let mut seen = std::collections::BTreeSet::new();
@@ -254,14 +256,11 @@ fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &m
             stack.push(def);
         }
     }
-    fn walk(schema: &Value, out: &mut Vec<String>) {
+    fn walk(schema: &Value, out: &mut Vec<bool>) {
         match schema {
             Value::Object(map) => {
                 if map.contains_key("properties") {
-                    out.push(format!(
-                        "{}",
-                        map.get("additionalProperties") == Some(&Value::Bool(false))
-                    ));
+                    out.push(map.get("additionalProperties") == Some(&Value::Bool(false)));
                 }
                 map.values().for_each(|v| walk(v, out));
             }
@@ -279,23 +278,15 @@ fn params_schemas_are_closed_and_the_server_s_are_open() {
         let mut params = Vec::new();
         closed_objects(&method.params, &catalog.defs, &mut params);
         assert!(!params.is_empty(), "{}: no object", method.name);
-        assert!(
-            params.iter().all(|c| c == "true"),
-            "{}: params open",
-            method.name
-        );
+        assert!(params.iter().all(|&c| c), "{}: params open", method.name);
         let mut result = Vec::new();
         closed_objects(&method.result, &catalog.defs, &mut result);
-        assert!(
-            result.iter().all(|c| c == "false"),
-            "{}: result closed",
-            method.name
-        );
+        assert!(result.iter().all(|&c| !c), "{}: result closed", method.name);
     }
     for event in &catalog.events {
         let mut fields = Vec::new();
         closed_objects(&event.schema, &catalog.defs, &mut fields);
-        assert!(fields.iter().all(|c| c == "false"), "{}", event.name);
+        assert!(fields.iter().all(|&c| !c), "{}", event.name);
     }
     for frame in &catalog.frames {
         let Some(schema) = &frame.schema else {
@@ -306,7 +297,7 @@ fn params_schemas_are_closed_and_the_server_s_are_open() {
         // `HELLO.client` and `REQUEST.params` are objects of their own.
         let closed = frame.direction == catalog::Direction::Client;
         assert!(
-            fields.iter().all(|c| *c == closed.to_string()),
+            fields.iter().all(|&c| c == closed),
             "{}: {fields:?}",
             frame.name
         );
