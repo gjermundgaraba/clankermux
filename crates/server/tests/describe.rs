@@ -34,11 +34,11 @@ async fn describe_with_a_method_answers_that_entry_alone() {
     );
 
     let err = c
-        .request("describe", json!({"method": "write"}))
+        .request("describe", json!({"method": "no_such_method"}))
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidRequest);
-    assert!(err.message.contains("write"), "{}", err.message);
+    assert!(err.message.contains("no_such_method"), "{}", err.message);
     assert_eq!(
         c.err("describe", json!({"method": 1})).await,
         ErrorCode::InvalidRequest
@@ -63,7 +63,7 @@ async fn the_catalog_lists_exactly_the_methods_the_server_dispatches() {
             err.message
         );
     }
-    for name in ["write", "set_label", "set_size", "api", ""] {
+    for name in ["no_such_method", "List", "api", ""] {
         let err = c.request(name, json!({})).await.unwrap_err();
         assert_eq!(err.message, format!("unknown method {name}"));
     }

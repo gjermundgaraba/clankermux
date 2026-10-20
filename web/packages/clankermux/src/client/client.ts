@@ -94,8 +94,7 @@ export class Client {
     number,
     { resolve: (result: unknown) => void; reject: (err: Error) => void; done: () => void }
   >();
-  private readonly mounts = new Map<number, (message: ToPage) => void>();
-  private readonly terminals = new Set<Terminal>();
+  private readonly mounts = new Map<number, { terminal: Terminal; receive: (message: ToPage) => void }>();
   private readonly sessionListeners = new Listeners<Session[]>();
   private readonly linkListeners = new Listeners<Link>();
   private readonly eventListeners = new Set<(event: Event | EventGap) => void>();
@@ -149,7 +148,7 @@ export class Client {
           for (const listener of this.eventListeners) listener({ event: "gap", incarnation: message.incarnation });
           break;
         default:
-          this.mounts.get(message.mount)?.(message);
+          this.mounts.get(message.mount)?.receive(message);
       }
     };
   }
@@ -298,26 +297,18 @@ export class Client {
     const id = this.nextId++;
     const host: MountHost = {
       send: (message) => this.post(message),
-      receive: (handler) => {
-        if (handler) this.mounts.set(id, handler);
-        else this.mounts.delete(id);
-      },
+      disposed: () => void this.mounts.delete(id),
     };
-    const terminal = mountOn(host, id, options);
-    const dispose = terminal.dispose;
-    terminal.dispose = () => {
-      this.terminals.delete(terminal);
-      dispose();
-    };
-    this.terminals.add(terminal);
-    return terminal;
+    const mounted = mountOn(host, id, options);
+    this.mounts.set(id, mounted);
+    return mounted.terminal;
   }
 
   /** Disposes the terminals and terminates the worker, which ends the
    * connection; requests in flight reject with `closed`. */
   close(): void {
     if (this.closed) return;
-    for (const terminal of [...this.terminals]) terminal.dispose();
+    for (const { terminal } of [...this.mounts.values()]) terminal.dispose();
     this.closed = true;
     this.worker.onmessage = null;
     this.worker.terminate();

@@ -107,15 +107,12 @@ Ack what you have dealt with; leave others' reports alone unless asked.
 | --- | --- |
 | 0 | Done |
 | 1 | Failed: the server refused the request, or the connection broke |
-| 2 | Usage: bad arguments, or no session named outside a session |
+| 2 | Usage: arguments clap or the command cannot use, or no session given outside a session |
 | 3 | The session argument named no session, or several |
 | 4 | The server cannot be reached |
 | 124 | A wait timed out |
 | 130 | A wait was cancelled with Ctrl-C |
-
-A wait that ends because the session exited (`--exit`, `create --wait`)
-exits with the program's status instead: its exit code, or 128 plus the
-signal's number.
+| child's | A wait that ended with the session's exit (`--exit`, `create --wait`): its code, or 128 plus the signal's number; 1 for a `restored` session, which has none |
 
 ## Rules
 

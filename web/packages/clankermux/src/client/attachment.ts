@@ -26,7 +26,7 @@ export type Action =
   | { type: "resized"; cols: number; rows: number }
   | { type: "exited"; exit: Exit }
   /** Bytes were lost; the terminal was discarded and a new bootstrap follows. */
-  | { type: "gap"; gap: Gap }
+  | { type: "gap" }
   | { type: "closed"; reason: Closed["reason"]; message?: string }
   /** `read_only`, `not_running` and `input_overflow` keep the attachment;
    * any other code ended it. */
@@ -184,12 +184,12 @@ export class Attachment {
         }
         this.stream(frame, actions);
         break;
-      case FrameType.Gap: {
-        const gap = this.json<Gap>(frame);
+      case FrameType.Gap:
+        // Nothing in it is read, but a malformed one is still refused.
+        this.json<Gap>(frame);
         this.discard();
-        actions.push({ type: "gap", gap });
+        actions.push({ type: "gap" });
         break;
-      }
       case FrameType.Closed: {
         const closed = this.json<Closed>(frame);
         this.end(true);

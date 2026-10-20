@@ -104,7 +104,7 @@ impl std::fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
-pub fn encode_header(frame_type: FrameType, channel: u32, length: u32) -> [u8; HEADER_LEN] {
+pub(crate) fn encode_header(frame_type: FrameType, channel: u32, length: u32) -> [u8; HEADER_LEN] {
     let mut out = [0u8; HEADER_LEN];
     out[0] = frame_type as u8;
     out[2..6].copy_from_slice(&channel.to_le_bytes());
@@ -201,15 +201,18 @@ impl FrameDecoder {
     }
 }
 
+/// The bytes of the stream offset that starts an `OUTPUT` payload.
+pub const OUTPUT_OFFSET_LEN: usize = 8;
+
 /// `OUTPUT` payload: the stream offset of the first byte, then the bytes.
 pub fn encode_output(offset: u64, bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + bytes.len());
+    let mut out = Vec::with_capacity(OUTPUT_OFFSET_LEN + bytes.len());
     out.extend_from_slice(&offset.to_le_bytes());
     out.extend_from_slice(bytes);
     out
 }
 
 pub fn parse_output(payload: &[u8]) -> Option<(u64, &[u8])> {
-    let (head, bytes) = payload.split_at_checked(8)?;
+    let (head, bytes) = payload.split_at_checked(OUTPUT_OFFSET_LEN)?;
     Some((u64::from_le_bytes(head.try_into().unwrap()), bytes))
 }

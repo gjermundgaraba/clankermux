@@ -8,7 +8,7 @@ use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
 use futures_util::{Sink, Stream};
-use proto::{HEADER_LEN, parse_header};
+use proto::{HEADER_LEN, parse_frame, parse_header};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio_tungstenite::WebSocketStream;
@@ -167,8 +167,8 @@ fn other(error: tokio_tungstenite::tungstenite::Error) -> io::Error {
 
 /// A carrier-level protocol error: the connection reports it before
 /// closing.
-fn invalid(what: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, what)
+fn invalid(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
@@ -187,12 +187,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
             }
             match ready!(Pin::new(&mut this.ws).poll_next(cx)) {
                 Some(Ok(Message::Binary(bytes))) => {
-                    // A bad header passes through: the frame decoder
-                    // reports it like on any other carrier.
-                    if bytes.len() < HEADER_LEN
-                        || frame_len(&bytes, this.max_frame).is_some_and(|len| len != bytes.len())
-                    {
-                        return Poll::Ready(Err(invalid("a message must hold exactly one frame")));
+                    if let Err(error) = parse_frame(&bytes, this.max_frame) {
+                        return Poll::Ready(Err(invalid(error)));
                     }
                     this.incoming = bytes;
                     this.pos = 0;

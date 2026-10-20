@@ -303,6 +303,27 @@ test("under the kitty keyboard protocol, shifted symbols reach the program as ty
   await page.context().close();
 });
 
+test("a key the input method processes puts the input element at the cursor", async () => {
+  const session = await create("/bin/sh", "-c", "printf abcdef; exec cat");
+  const page = await opened();
+  await page.evaluate((s) => harness().mount("only", s), session);
+  await connectedTo(page, "only");
+  // `Process` as a browser may report it: key code 0, not composing. The
+  // input method's window opens at the input element, which follows the
+  // cursor after `abcdef` on the first row.
+  await eventually("the input element at the cursor", () =>
+    page.evaluate(() => {
+      const canvas = document.querySelector<HTMLCanvasElement>("#only")!;
+      const input = canvas.nextElementSibling as HTMLTextAreaElement;
+      input.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyA", key: "Process" }));
+      const cell = canvas.getBoundingClientRect();
+      const at = input.getBoundingClientRect();
+      return input.style.left !== "" && at.top === cell.top && at.left > cell.left && at.left < cell.right ? true : undefined;
+    }),
+  );
+  await page.context().close();
+});
+
 test("a selection's copy is told to the page once the clipboard has it", async () => {
   const session = await create("/bin/sh", "-c", "printf 'copyme\\n'; exec cat");
   const context = await browser.newContext({ ignoreHTTPSErrors: true });

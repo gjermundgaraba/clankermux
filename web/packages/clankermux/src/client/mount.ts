@@ -5,7 +5,7 @@ import type { Scheme, Size } from "../proto/index.ts";
 import { CanvasRenderer, type Metrics } from "../renderer/index.ts";
 
 import { type Copy, Copier } from "./copy.ts";
-import { type Keyboard, type Typed, Typing } from "./keyboard.ts";
+import { type Keyboard, type Typed, Typing, composing } from "./keyboard.ts";
 import { Listeners } from "./listeners.ts";
 import { profileFrom, schemeOf } from "./profile.ts";
 import type { Link, ToPage, ToWorker } from "./worker.ts";
@@ -84,12 +84,16 @@ export interface Terminal {
   onCopy(listener: (copy: Copy) => void): () => void;
 }
 
-/** The client's side of a terminal: its messages to the worker, and the
- * worker's for it. */
+/** The client's side of a terminal: its messages to the worker, and
+ * word that it is disposed. */
 export interface MountHost {
   send(message: ToWorker): void;
-  receive(handler: ((message: ToPage) => void) | undefined): void;
+  disposed(): void;
 }
+
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+/** A message for one terminal, without its number. */
+export type ToMount = DistributiveOmit<Extract<ToWorker, { mount: number }>, "mount">;
 
 /** Cell metrics from the font. */
 function measure(font: string): Metrics {
@@ -110,12 +114,13 @@ function measure(font: string): Metrics {
   };
 }
 
-type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
-/** A message for this terminal's part of the worker. */
-type ToMount = DistributiveOmit<Extract<ToWorker, { mount: number }>, "mount">;
-
-/** Mounts a terminal as `id` of the client `host` serves. */
-export function mountOn(host: MountHost, id: number, options: MountOptions): Terminal {
+/** Mounts a terminal as `id` of the client `host` serves, and the
+ * handler of the worker's messages for it. */
+export function mountOn(
+  host: MountHost,
+  id: number,
+  options: MountOptions,
+): { terminal: Terminal; receive: (message: ToPage) => void } {
   const { canvas, container, colors } = options;
   const light = matchMedia("(prefers-color-scheme: light)");
   const scheme = options.scheme ?? (() => schemeOf(getComputedStyle(canvas).colorScheme, light.matches));
@@ -192,7 +197,7 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
   /** Rows the view is scrolled back, as `onScroll` last reported;
    * undefined before the first frame. */
   let scrolled: number | undefined;
-  host.receive((message: ToPage) => {
+  const receive = (message: ToPage) => {
     switch (message.type) {
       case "status":
         statuses.emit(message.text);
@@ -225,7 +230,7 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
         if (message.copy !== undefined) copier.answer(message.copy, message.text);
         break;
     }
-  });
+  };
 
   /** Where the input element goes for a composition: the cursor's cell,
    * as the latest frame that had the cursor in view placed it. */
@@ -317,7 +322,7 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
       if (key) {
         send({ type: "key", input: key });
         e.preventDefault();
-      } else if (e.isComposing || e.key === "Dead" || e.keyCode === 229) {
+      } else if (composing(e)) {
         // At the cursor before the input method opens its window; shown
         // once a composition starts.
         placeInput(false);
@@ -522,7 +527,7 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
     ackOnFocus: options.ackOnFocus ?? false,
   });
 
-  return {
+  const terminal: Terminal = {
     attach: (session) => send({ type: "attach", session }),
     detach: () => send({ type: "detach" }),
     focus: () => input.focus({ preventScroll: true }),
@@ -539,7 +544,7 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
       if (disposed) return;
       host.send({ type: "unmount", mount: id });
       disposed = true;
-      host.receive(undefined);
+      host.disposed();
       listening.abort();
       resizes.disconnect();
       restyles.disconnect();
@@ -558,4 +563,5 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
       return () => void copies.delete(listener);
     },
   };
+  return { terminal, receive };
 }

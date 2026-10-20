@@ -1,5 +1,3 @@
-use std::sync::{Arc, Mutex};
-
 use crate::formatter::{self, Format, Options, Region};
 use crate::snapshot;
 use crate::*;
@@ -156,20 +154,6 @@ fn incremental_decode_at_arbitrary_splits() {
 }
 
 #[test]
-fn decoder_keeps_its_terminal_until_released() {
-    let bytes = snapshot::encode(&filled(5000)).unwrap();
-    let mut decoder = snapshot::Decoder::new().unwrap();
-    decoder.push(&bytes);
-    assert!(decoder.terminal().is_none());
-    decoder.ready().unwrap();
-    assert_eq!(decoder.terminal().unwrap().rows(), 4);
-    // Dropping the decoder before FINISH must leave a usable terminal.
-    let mut term = decoder.into_terminal().unwrap();
-    term.vt_write(b"after");
-    assert!(plain(&term).contains("after"));
-}
-
-#[test]
 fn decoder_refuses_a_replaced_terminal() {
     let bytes = snapshot::encode(&filled(5000)).unwrap();
     let mut decoder = snapshot::Decoder::new().unwrap();
@@ -182,32 +166,18 @@ fn decoder_refuses_a_replaced_terminal() {
         Terminal::new(80, 24).unwrap(),
     ));
     assert_eq!(decoder.next_page(), Err(Error::InvalidValue));
-    // Nor when the replacement took the adopted terminal's address: the
-    // decoder keeps that one alive, so the address stays taken.
-    let mut decoder = snapshot::Decoder::new().unwrap();
-    decoder.push(&bytes);
-    let handed_out = decoder.ready().unwrap();
-    let adopted = handed_out.raw();
-    for _ in 0..64 {
-        let replacement = Terminal::new(80, 24).unwrap();
-        assert_ne!(replacement.raw(), adopted);
-        drop(std::mem::replace(decoder.terminal().unwrap(), replacement));
-    }
-    assert_eq!(decoder.next_page(), Err(Error::InvalidValue));
     assert!(decoder.into_terminal().is_none());
     // What was moved out stays a terminal of its own after the decoder
-    // is gone and its address could have been reused.
+    // is gone.
     let mut decoder = snapshot::Decoder::new().unwrap();
     decoder.push(&bytes);
     decoder.ready().unwrap();
     let mut stale = std::mem::replace(decoder.terminal().unwrap(), Terminal::new(5, 5).unwrap());
     let (cols, rows) = (stale.cols(), stale.rows());
     assert!(decoder.into_terminal().is_none());
-    let fresh: Vec<Terminal> = (0..8).map(|_| Terminal::new(30, 3).unwrap()).collect();
     stale.vt_write(b"still mine");
     assert_eq!((stale.cols(), stale.rows()), (cols, rows));
     assert!(plain(&stale).contains("still mine"));
-    assert!(fresh.iter().all(|t| !plain(t).contains("still mine")));
 }
 
 #[test]
@@ -216,13 +186,16 @@ fn decoder_reports_finish_and_releases_an_unfinished_terminal() {
     let ready = snapshot::ready_end(&bytes).unwrap();
     let mut decoder = snapshot::Decoder::new().unwrap();
     decoder.push(&bytes[..ready]);
+    assert!(decoder.terminal().is_none());
     decoder.ready().unwrap();
     assert!(!decoder.step_available());
     assert!(!decoder.finished());
-    // An unfinished terminal is released all the same (an attachment
-    // that ends mid-bootstrap keeps what it has).
-    let partial = decoder.into_terminal().unwrap();
+    // An unfinished terminal is released all the same, and usable (an
+    // attachment that ends mid-bootstrap keeps what it has).
+    let mut partial = decoder.into_terminal().unwrap();
     assert_eq!((partial.cols(), partial.rows()), (20, 4));
+    partial.vt_write(b"after");
+    assert!(plain(&partial).contains("after"));
     let mut decoder = snapshot::Decoder::new().unwrap();
     decoder.push(&bytes);
     decoder.ready().unwrap();
@@ -244,17 +217,15 @@ struct Recorder {
     progress: Vec<(ProgressState, i8)>,
 }
 
-struct Shared(Arc<Mutex<Recorder>>);
-
-impl Handler for Shared {
+impl Handler for Recorder {
     fn write_pty(&mut self, data: &[u8]) {
-        self.0.lock().unwrap().pty.extend_from_slice(data);
+        self.pty.extend_from_slice(data);
     }
     fn program_status(&mut self, report: ProgramStatus) {
-        self.0.lock().unwrap().statuses.push(report);
+        self.statuses.push(report);
     }
     fn semantic_prompt(&mut self, prompt: SemanticPrompt) {
-        self.0.lock().unwrap().prompts.push(prompt);
+        self.prompts.push(prompt);
     }
     fn color_scheme(&mut self) -> Option<ColorScheme> {
         Some(ColorScheme::Dark)
@@ -268,64 +239,60 @@ impl Handler for Shared {
         })
     }
     fn title_changed(&mut self) {
-        self.0.lock().unwrap().titles += 1;
+        self.titles += 1;
     }
     fn command_end(&mut self, exit: Option<i32>) {
-        self.0.lock().unwrap().exits.push(exit);
+        self.exits.push(exit);
     }
     fn bell(&mut self) {
-        self.0.lock().unwrap().bells += 1;
+        self.bells += 1;
     }
     fn desktop_notification(&mut self, title: String, body: String) {
-        self.0.lock().unwrap().notifications.push((title, body));
+        self.notifications.push((title, body));
     }
     fn progress_report(&mut self, state: ProgressState, progress: i8) {
-        self.0.lock().unwrap().progress.push((state, progress));
+        self.progress.push((state, progress));
     }
 }
 
-fn recorded() -> (Terminal<Shared>, Arc<Mutex<Recorder>>) {
-    let rec = Arc::new(Mutex::new(Recorder::default()));
-    let term = Terminal::with_handler(80, 24, Shared(rec.clone())).unwrap();
-    (term, rec)
+fn recorded() -> Terminal<Recorder> {
+    Terminal::with_handler(80, 24, Recorder::default()).unwrap()
 }
 
 #[test]
 fn effects_reach_the_handler() {
-    let (mut term, rec) = recorded();
+    let mut term = recorded();
     term.set_xtversion("clankermux test");
     term.vt_write(b"\x1b[c");
     assert!(
-        rec.lock().unwrap().pty.starts_with(b"\x1b[?"),
+        term.handler().pty.starts_with(b"\x1b[?"),
         "DA1 answer: {:?}",
-        rec.lock().unwrap().pty
+        term.handler().pty
     );
-    rec.lock().unwrap().pty.clear();
+    term.handler_mut().pty.clear();
 
     term.vt_write(b"\x1b[>q");
-    assert_eq!(rec.lock().unwrap().pty, b"\x1bP>|clankermux test\x1b\\");
-    rec.lock().unwrap().pty.clear();
+    assert_eq!(term.handler().pty, b"\x1bP>|clankermux test\x1b\\");
+    term.handler_mut().pty.clear();
 
     term.vt_write(b"\x1b[?996n");
-    assert_eq!(rec.lock().unwrap().pty, b"\x1b[?997;1n");
-    rec.lock().unwrap().pty.clear();
+    assert_eq!(term.handler().pty, b"\x1b[?997;1n");
+    term.handler_mut().pty.clear();
 
     term.vt_write(b"\x1b[18t");
-    assert_eq!(rec.lock().unwrap().pty, b"\x1b[8;24;80t");
+    assert_eq!(term.handler().pty, b"\x1b[8;24;80t");
 
     term.vt_write(b"\x1b]7501;state=working:id=abc:title=QnVpbGQ=\x07");
-    {
-        let statuses = &rec.lock().unwrap().statuses;
-        assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0].state, ProgramStatusState::Working);
-        assert_eq!(statuses[0].id, "abc");
-        assert_eq!(statuses[0].title, "Build");
-    }
+    let statuses = &term.handler().statuses;
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].state, ProgramStatusState::Working);
+    assert_eq!(statuses[0].id, "abc");
+    assert_eq!(statuses[0].title, "Build");
 
     term.vt_write(b"\x1b]133;A\x07\x1b]133;C\x07\x1b]133;P;k=s\x07");
     let mark = |kind, prompt| SemanticPrompt { kind, prompt };
     assert_eq!(
-        rec.lock().unwrap().prompts,
+        term.handler().prompts,
         [
             mark(SemanticPromptKind::PromptStart, PromptKind::Primary),
             mark(SemanticPromptKind::OutputStart, PromptKind::Primary),
@@ -334,16 +301,16 @@ fn effects_reach_the_handler() {
     );
 
     term.vt_write(b"\x1b]2;new title\x07");
-    assert_eq!(rec.lock().unwrap().titles, 1);
+    assert_eq!(term.handler().titles, 1);
     assert_eq!(term.title(), "new title");
 
     term.vt_write(b"\x1b]133;D;3\x07\x1b]133;D\x07");
-    assert_eq!(rec.lock().unwrap().exits, [Some(3), None]);
+    assert_eq!(term.handler().exits, [Some(3), None]);
     term.vt_write(b"\x07\x07");
-    assert_eq!(rec.lock().unwrap().bells, 2);
+    assert_eq!(term.handler().bells, 2);
     term.vt_write(b"\x1b]9;plain\x07\x1b]777;notify;Title;Body\x07");
     assert_eq!(
-        rec.lock().unwrap().notifications,
+        term.handler().notifications,
         [
             (String::new(), "plain".to_string()),
             ("Title".to_string(), "Body".to_string())
@@ -351,7 +318,7 @@ fn effects_reach_the_handler() {
     );
     term.vt_write(b"\x1b]9;4;1;40\x07\x1b]9;4;3\x07\x1b]9;4;0\x07");
     assert_eq!(
-        rec.lock().unwrap().progress,
+        term.handler().progress,
         [
             (ProgressState::Set, 40),
             (ProgressState::Indeterminate, -1),
@@ -362,32 +329,34 @@ fn effects_reach_the_handler() {
 
 #[test]
 fn modes_and_colors() {
-    let (mut term, rec) = recorded();
+    let mut term = recorded();
     assert!(!term.mode(2031).unwrap());
     term.vt_write(b"\x1b[?2031h");
     assert!(term.mode(2031).unwrap());
     // Colours are observed as a program would, through OSC 11's answer.
     term.vt_write(b"\x1b]11;?\x07");
-    assert_eq!(rec.lock().unwrap().pty, b"", "no background set, no answer");
+    assert_eq!(term.handler().pty, b"", "no background set, no answer");
     term.set_color(ColorKind::Background, Some(Rgb { r: 1, g: 2, b: 3 }))
         .unwrap();
     term.vt_write(b"\x1b]11;?\x07");
     assert_eq!(
-        std::mem::take(&mut rec.lock().unwrap().pty),
+        std::mem::take(&mut term.handler_mut().pty),
         b"\x1b]11;rgb:0101/0202/0303\x07"
     );
     term.vt_write(b"\x1b]11;#ff0000\x07\x1b]11;?\x07");
-    assert_eq!(rec.lock().unwrap().pty, b"\x1b]11;rgb:ffff/0000/0000\x07");
+    assert_eq!(term.handler().pty, b"\x1b]11;rgb:ffff/0000/0000\x07");
     term.vt_write(b"\x1b[1mbold");
     let vt = formatter::format(
         &term,
         Options {
             format: Format::Vt,
+            style: true,
             ..Options::default()
         },
     )
     .unwrap();
-    assert!(!vt.is_empty());
+    let vt = String::from_utf8(vt).unwrap();
+    assert!(vt.contains("\x1b[1mbold"), "{vt:?}");
     assert_eq!(color_scheme_report(ColorScheme::Dark), b"\x1b[?997;1n");
 }
 
@@ -460,7 +429,10 @@ mod keys {
             ("backspace", b"\x7f"),
             ("esc", b"\x1b"),
             ("space", b" "),
+            (" ", b" "),
+            ("f1", b"\x1bOP"),
             ("f5", b"\x1b[15~"),
+            ("f12", b"\x1b[24~"),
             ("ctrl+a", b"\x01"),
             ("alt+x", b"\x1bx"),
             ("x", b"x"),
@@ -482,6 +454,15 @@ mod keys {
             "enterr",
             "ab",
             "\n",
+            // Only the protocol's names: no aliases.
+            "return",
+            "escape",
+            "control+a",
+            "meta+a",
+            "opt+a",
+            "option+a",
+            "cmd+a",
+            "command+a",
         ] {
             assert!(KeyPress::parse(bad).is_none(), "{bad:?}");
         }

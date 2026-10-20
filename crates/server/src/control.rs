@@ -61,18 +61,17 @@ fn finish(pending: &Pending, writer: &Writer, claim: Claim, outcome: Result<Valu
     }
 }
 
-/// Registers `id` as pending and runs `waiter` on a task until it fires,
-/// fails, or the request is cancelled; `answer` makes the reply.
+/// Runs `waiter` on a task until it fires, fails, or the request
+/// `register` claimed is cancelled; `answer` makes the reply.
 fn spawn_wait(
     pending: &Pending,
     writer: &Writer,
-    id: i64,
+    (claim, stop): (Claim, oneshot::Receiver<()>),
     session: Shared,
     waiter: Waiter,
     timeout: Option<Duration>,
     answer: impl FnOnce(proto::Waited) -> Value + Send + 'static,
 ) {
-    let (claim, stop) = register(pending, id);
     let (pending, writer) = (pending.clone(), writer.clone());
     tokio::spawn(async move {
         let outcome = tokio::select! {
@@ -128,22 +127,15 @@ pub fn dispatch(
             Ok(p) => {
                 // The cancelled request's last frame comes first.
                 let mut pending = pending.lock().unwrap();
-                let stop = pending.by_id.remove(&p.id);
-                if let Some(stop) = &stop {
-                    let _ = stop;
+                let cancelled = pending.by_id.remove(&p.id).is_some();
+                if cancelled {
                     reply(
                         writer,
                         p.id,
                         Err((ErrorCode::Cancelled, format!("cancelled by request {id}"))),
                     );
                 }
-                reply(
-                    writer,
-                    id,
-                    Ok(json!(proto::Cancelled {
-                        cancelled: stop.is_some()
-                    })),
-                );
+                reply(writer, id, Ok(json!(proto::Cancelled { cancelled })));
             }
             Err(fail) => reply(writer, id, Err(fail)),
         },
@@ -228,7 +220,7 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
         };
         // Where the bytes are accepted: the reply's `at`, and where a
         // wait is armed.
-        let at = wait::cursor_of(&s);
+        let at = s.cursor();
         let armed = facts.map(|(facts, timeout)| {
             (
                 Waiter::for_send(facts, &s),
@@ -244,7 +236,7 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
         // Pending from here, so a cancel that follows finds it.
         let claim = armed.as_ref().map(|_| register(pending, id));
         let previous = s.send_chain.take();
-        let (registry, writer, pending) = (registry.clone(), writer.clone(), pending.clone());
+        let (writer, pending) = (writer.clone(), pending.clone());
         let shared = session.clone();
         s.send_chain = Some(tokio::spawn(async move {
             if let Some(previous) = previous {
@@ -258,26 +250,18 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
                 }
                 return;
             }
-            let (Some((waiter, timeout)), Some((claim, stop))) = (armed, claim) else {
+            let (Some((waiter, timeout)), Some(claim)) = (armed, claim) else {
                 reply(&writer, id, Ok(json!(Sent { at, wait: None })));
                 return;
             };
             // The wait goes on off the chain, so later sends answer.
-            drop(registry);
-            tokio::spawn(async move {
-                let outcome = tokio::select! {
-                    biased;
-                    _ = stop => return,
-                    outcome = wait::run(&shared, waiter, timeout) => outcome,
-                };
-                let outcome = outcome.map(|waited| {
-                    json!(Sent {
-                        at,
-                        wait: Some(waited)
-                    })
-                });
-                finish(&pending, &writer, claim, outcome);
-            });
+            let answer = move |waited| {
+                json!(Sent {
+                    at,
+                    wait: Some(waited)
+                })
+            };
+            spawn_wait(&pending, &writer, claim, shared, waiter, timeout, answer);
         }));
         Ok(())
     })();
@@ -300,7 +284,8 @@ fn wait(
     let session = registry.get(&p.session)?;
     let waiter = Waiter::new(facts, wait::anchor(&session.lock().unwrap(), p.after)?);
     let timeout = p.timeout_ms.map(Duration::from_millis);
-    spawn_wait(pending, writer, id, session, waiter, timeout, |waited| {
+    let claim = register(pending, id);
+    spawn_wait(pending, writer, claim, session, waiter, timeout, |waited| {
         json!(waited)
     });
     Ok(())
@@ -371,7 +356,7 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
                 s.touch();
                 s.to_proto(false)
             };
-            registry.emit(&Event::SessionChanged {
+            registry.emit(Event::SessionChanged {
                 session: out.clone(),
             });
             Ok(json!(out))

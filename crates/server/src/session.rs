@@ -13,7 +13,7 @@ use ghostty_vt::{
 };
 use proto::{
     AttachmentInfo, Attention, Cells, Closed, ClosedReason, ErrorCode, Event, Exit, OnExit, Peer,
-    Profile, Scheme, Size, SizeInfo, SizePolicy, Status, StatusReason, Viewport,
+    Profile, Scheme, Size, SizeInfo, SizePolicy, Status, StatusReason, StreamCursor, Viewport,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -440,6 +440,42 @@ pub struct Session {
 }
 
 impl Session {
+    /// A session around `body` with nothing yet: no attachments, records,
+    /// commands or events, policy `latest`, nothing since a park. The
+    /// identity is left empty for the caller to set.
+    pub fn blank(limits: &proto::Limits, body: Body) -> Session {
+        Session {
+            id: String::new(),
+            label: String::new(),
+            argv: Vec::new(),
+            cwd: String::new(),
+            on_exit: OnExit::Remove,
+            created_at: String::new(),
+            exited_at: None,
+            exit: None,
+            wake: Arc::new(Notify::new()),
+            text_limit: limits.text as usize,
+            records_limit: limits.records as usize,
+            commands_limit: limits.commands as usize,
+            attached: Vec::new(),
+            size_policy: SizePolicy::Latest,
+            size_owner: None,
+            records: Records::default(),
+            commands: Commands::default(),
+            events: Vec::new(),
+            removed: false,
+            announced: Default::default(),
+            last_bell: None,
+            park_lock: Default::default(),
+            unparked: None,
+            parked_at: None,
+            park_due: Arc::new(Notify::new()),
+            send_chain: None,
+            last_generation: 0,
+            body,
+        }
+    }
+
     /// `running` while live and not ended, `exited` once ended, `restored`
     /// for a parked session that had not.
     pub fn status(&self) -> Status {
@@ -485,16 +521,28 @@ impl Session {
         }
     }
 
+    /// The cursor now: the end of the stream, or where the park left it.
+    pub fn cursor(&self) -> StreamCursor {
+        match &self.body {
+            Body::Live(live) => StreamCursor {
+                offset: live.stream.offset(),
+                marker: live.stream.latest_seq(),
+            },
+            Body::Parked(parked) => StreamCursor {
+                offset: parked.offset,
+                marker: parked.marker,
+            },
+        }
+    }
+
     pub fn to_proto(&self, with_records: bool) -> proto::Session {
-        let (pid, cols, rows, title, pwd, offset, marker) = match &self.body {
+        let (pid, cols, rows, title, pwd) = match &self.body {
             Body::Live(live) => (
                 live.pid,
                 live.term.cols(),
                 live.term.rows(),
                 live.term.title(),
                 pwd_path(&live.term.pwd()),
-                live.stream.offset(),
-                live.stream.latest_seq(),
             ),
             Body::Parked(parked) => (
                 None,
@@ -502,10 +550,9 @@ impl Session {
                 parked.rows,
                 parked.title.clone(),
                 parked.pwd.clone(),
-                parked.offset,
-                parked.marker,
             ),
         };
+        let StreamCursor { offset, marker } = self.cursor();
         proto::Session {
             id: self.id.clone(),
             label: self.label.clone(),
@@ -1142,13 +1189,7 @@ pub fn pwd_path(value: &str) -> String {
 
 /// The first at most `max` bytes of `text`, on a character boundary.
 pub fn truncate(mut text: String, max: usize) -> String {
-    if text.len() > max {
-        let mut end = max;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-    }
+    text.truncate(text.floor_char_boundary(max));
     text
 }
 
@@ -1221,13 +1262,6 @@ mod tests {
             "/Users/me/a b"
         );
         assert_eq!(pwd_path("file:///x%2"), "/x%2");
-    }
-
-    #[test]
-    fn truncates_on_character_boundaries() {
-        assert_eq!(truncate("héllo".into(), 2), "h");
-        assert_eq!(truncate("héllo".into(), 3), "hé");
-        assert_eq!(truncate("hi".into(), 10), "hi");
     }
 
     #[test]

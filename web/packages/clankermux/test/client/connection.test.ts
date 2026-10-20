@@ -2,7 +2,8 @@ import { expect, test } from "vitest";
 
 import { type Frame, FrameType, encodeFrame, parseFrame } from "../../src/proto/index.ts";
 
-import { ClientError, Connection, type Transport, hello } from "../../src/client/index.ts";
+import { ClientError, Connection, type Transport, hello } from "../../src/client/connection.ts";
+import { limits } from "./bodies.ts";
 
 /** A transport whose peer is the test. */
 class Fake implements Transport {
@@ -112,4 +113,19 @@ test("a rejected or closed handshake rejects", async () => {
   const second = Connection.connect(closing, hello("test"));
   closing.close();
   await expect(second).rejects.toMatchObject({ kind: "closed" });
+});
+
+test("before WELCOME a frame may be as long as the protocol's default max_frame", async () => {
+  const body = new TextEncoder().encode(JSON.stringify(welcome));
+  const handshake = (length: number) => {
+    const fake = new Fake();
+    const connecting = Connection.connect(fake, hello("test"));
+    // Trailing spaces, which JSON allows, make up the length.
+    const padded = new Uint8Array(length).fill(0x20);
+    padded.set(body);
+    fake.onMessage?.(encodeFrame(FrameType.Welcome, 0, padded));
+    return connecting;
+  };
+  await expect(handshake(limits.max_frame)).resolves.toBeInstanceOf(Connection);
+  await expect(handshake(limits.max_frame + 1)).rejects.toMatchObject({ kind: "protocol", message: /exceeds max_frame/ });
 });

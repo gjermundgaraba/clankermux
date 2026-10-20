@@ -10,11 +10,11 @@ use crate::terminal::Term;
 
 /// Modifiers held with a key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Mods {
-    pub shift: bool,
-    pub ctrl: bool,
-    pub alt: bool,
-    pub super_: bool,
+struct Mods {
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    super_: bool,
 }
 
 impl Mods {
@@ -39,7 +39,7 @@ impl Mods {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyPress {
     key: sys::GhosttyKey,
-    pub mods: Mods,
+    mods: Mods,
     text: String,
     unshifted: Option<char>,
     /// Shift made the text (`A`, `?`): consumed, as a keyboard reports
@@ -48,13 +48,11 @@ pub struct KeyPress {
     shift_consumed: bool,
 }
 
-/// Named keys that produce no text, and their aliases.
+/// Named keys that produce no text.
 const NAMED: &[(&str, sys::GhosttyKey)] = &[
     ("enter", sys::GHOSTTY_KEY_ENTER),
-    ("return", sys::GHOSTTY_KEY_ENTER),
     ("tab", sys::GHOSTTY_KEY_TAB),
     ("esc", sys::GHOSTTY_KEY_ESCAPE),
-    ("escape", sys::GHOSTTY_KEY_ESCAPE),
     ("backspace", sys::GHOSTTY_KEY_BACKSPACE),
     ("up", sys::GHOSTTY_KEY_ARROW_UP),
     ("down", sys::GHOSTTY_KEY_ARROW_DOWN),
@@ -66,21 +64,6 @@ const NAMED: &[(&str, sys::GhosttyKey)] = &[
     ("pagedown", sys::GHOSTTY_KEY_PAGE_DOWN),
     ("insert", sys::GHOSTTY_KEY_INSERT),
     ("delete", sys::GHOSTTY_KEY_DELETE),
-];
-
-const FUNCTION: [sys::GhosttyKey; 12] = [
-    sys::GHOSTTY_KEY_F1,
-    sys::GHOSTTY_KEY_F2,
-    sys::GHOSTTY_KEY_F3,
-    sys::GHOSTTY_KEY_F4,
-    sys::GHOSTTY_KEY_F5,
-    sys::GHOSTTY_KEY_F6,
-    sys::GHOSTTY_KEY_F7,
-    sys::GHOSTTY_KEY_F8,
-    sys::GHOSTTY_KEY_F9,
-    sys::GHOSTTY_KEY_F10,
-    sys::GHOSTTY_KEY_F11,
-    sys::GHOSTTY_KEY_F12,
 ];
 
 /// The US layout's punctuation keys: the character unshifted, shifted,
@@ -129,10 +112,10 @@ impl KeyPress {
         let mut mods = Mods::default();
         for part in parts {
             let held = match part.to_ascii_lowercase().as_str() {
-                "ctrl" | "control" => &mut mods.ctrl,
+                "ctrl" => &mut mods.ctrl,
                 "shift" => &mut mods.shift,
-                "alt" | "meta" | "opt" | "option" => &mut mods.alt,
-                "super" | "cmd" | "command" => &mut mods.super_,
+                "alt" => &mut mods.alt,
+                "super" => &mut mods.super_,
                 _ => return None,
             };
             if std::mem::replace(held, true) {
@@ -141,29 +124,18 @@ impl KeyPress {
         }
         let lower = key.to_ascii_lowercase();
         if let Some((_, code)) = NAMED.iter().find(|(n, _)| *n == lower) {
-            return Some(KeyPress {
-                key: *code,
-                mods,
-                text: String::new(),
-                unshifted: None,
-                shift_consumed: false,
-            });
+            return Some(Self::textless(*code, mods));
         }
-        if lower == "space" {
+        if lower == "space" || key == " " {
             return Some(Self::character(sys::GHOSTTY_KEY_SPACE, mods, ' ', ' '));
         }
         if let Some(n) = lower
             .strip_prefix('f')
-            .and_then(|n| n.parse::<usize>().ok())
-            && (1..=FUNCTION.len()).contains(&n)
+            .and_then(|n| n.parse::<sys::GhosttyKey>().ok())
+            && (1..=12).contains(&n)
         {
-            return Some(KeyPress {
-                key: FUNCTION[n - 1],
-                mods,
-                text: String::new(),
-                unshifted: None,
-                shift_consumed: false,
-            });
+            // The engine numbers F1 to F12 in order.
+            return Some(Self::textless(sys::GHOSTTY_KEY_F1 + n - 1, mods));
         }
         let mut chars = key.chars();
         let (Some(c), None) = (chars.next(), chars.next()) else {
@@ -191,9 +163,6 @@ impl KeyPress {
             let text = if mods.shift { shifted } else { plain };
             return Some(Self::character(code, mods, text, plain));
         }
-        if c == ' ' {
-            return Some(Self::character(sys::GHOSTTY_KEY_SPACE, mods, ' ', ' '));
-        }
         // Any other character is text with no key of its own.
         Some(KeyPress {
             key: sys::GHOSTTY_KEY_UNIDENTIFIED,
@@ -202,6 +171,16 @@ impl KeyPress {
             unshifted: Some(c),
             shift_consumed: false,
         })
+    }
+
+    fn textless(key: sys::GhosttyKey, mods: Mods) -> KeyPress {
+        KeyPress {
+            key,
+            mods,
+            text: String::new(),
+            unshifted: None,
+            shift_consumed: false,
+        }
     }
 
     fn character(key: sys::GhosttyKey, mods: Mods, text: char, unshifted: char) -> KeyPress {
@@ -220,10 +199,6 @@ pub struct KeyEncoder {
     encoder: sys::GhosttyKeyEncoder,
     event: sys::GhosttyKeyEvent,
 }
-
-// SAFETY: the encoder and event are plain heap objects with no thread
-// affinity; `&mut self` serializes their use.
-unsafe impl Send for KeyEncoder {}
 
 impl KeyEncoder {
     pub fn new() -> Result<Self> {

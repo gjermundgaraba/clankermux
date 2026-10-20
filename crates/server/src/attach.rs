@@ -6,8 +6,8 @@ use std::sync::{Arc, Weak};
 use ghostty_vt::snapshot;
 use proto::{
     AttachMode, Attached, ClientPeer, Closed, ClosedReason, ErrorCode, Event, Exited, FrameType,
-    Gap, Open, Peer, Resized, Resume, Status, Viewport, encode_frame, encode_json_frame,
-    encode_output,
+    Gap, OUTPUT_OFFSET_LEN, Open, Peer, Resized, Resume, Status, Viewport, encode_frame,
+    encode_json_frame, encode_output,
 };
 use tokio::sync::mpsc;
 
@@ -271,14 +271,14 @@ impl Task {
                 self.send_ending(ending);
             }
         }
-        self.registry.emit(&Event::AttachmentClosed {
+        self.registry.emit(Event::AttachmentClosed {
             id: snapshot.id.clone(),
             channel: self.id,
             reason,
         });
         if !removed {
             self.registry
-                .emit(&Event::SessionChanged { session: snapshot });
+                .emit(Event::SessionChanged { session: snapshot });
         }
     }
 
@@ -559,7 +559,7 @@ impl Task {
                 return Pull::Gap;
             }
             let end = stream.offset();
-            let chunk = self.max_frame - 8;
+            let chunk = self.max_frame - OUTPUT_OFFSET_LEN;
             let mut markers = stream.markers_after(self.cursor.marker).peekable();
             let mut budget = PULL_BUDGET;
             loop {

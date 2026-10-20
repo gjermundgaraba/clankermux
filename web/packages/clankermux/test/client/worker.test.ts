@@ -10,13 +10,14 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 
 import { Engine, type KeyInput } from "../../src/engine/index.ts";
-import { type Frame, FrameType, type Limits, type Session, encodeFrame, parseFrame } from "../../src/proto/index.ts";
+import { type Frame, FrameType, type Session, encodeFrame, parseFrame } from "../../src/proto/index.ts";
 
+import type { ToMount } from "../../src/client/mount.ts";
 import { type Link, type ToPage, type ToWorker, runWorker } from "../../src/client/worker.ts";
+import { output, session, welcome } from "./bodies.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const wasm = readFileSync(`${here}../../ghostty-vt.wasm`);
-const limits: Limits = JSON.parse(readFileSync(`${here}../../../../../crates/proto/vectors/limits.json`, "utf8"));
 let engine: Engine;
 beforeAll(async () => {
   engine = await Engine.load(wasm);
@@ -73,18 +74,16 @@ class FakeSocket {
     return found!;
   }
 
+  /** Answers `HELLO`. */
+  async welcome(incarnation = "i"): Promise<void> {
+    await vi.waitFor(() => expect(this.bodies(FrameType.Hello)).toHaveLength(1));
+    this.push(FrameType.Welcome, 0, welcome(incarnation));
+  }
+
   /** Answers `HELLO` and the `subscribe`: with `sessions` as its first
    * page, or, for a `subscribe` after a reconnect, with `gap`. */
   async serve(sessions: Session[] = [], { incarnation = "i", latest = 0, gap = false } = {}): Promise<void> {
-    await vi.waitFor(() => expect(this.bodies(FrameType.Hello)).toHaveLength(1));
-    this.push(FrameType.Welcome, 0, {
-      version: 1,
-      server: { name: "test", version: "0" },
-      engine: "x",
-      incarnation,
-      capabilities: [],
-      limits,
-    });
+    await this.welcome(incarnation);
     const subscribe = await this.request("subscribe");
     const result =
       subscribe.params.after === undefined ? { sessions, oldest: 1, latest } : { oldest: 1, latest, gap };
@@ -109,26 +108,6 @@ class FakeSocket {
   }
 }
 
-function session(id: string, status: Session["status"] = "running"): Session {
-  return {
-    id,
-    label: "",
-    status,
-    argv: [],
-    cwd: "",
-    cols: 10,
-    rows: 3,
-    title: "",
-    pwd: "",
-    on_exit: "remove",
-    created_at: "",
-    offset: 0,
-    marker: 0,
-    attachments: [],
-    size: { policy: "latest" },
-  };
-}
-
 /** A whole snapshot bootstrap of `s` on `channel`, its terminal showing `text`. */
 function bootstrap(socket: FakeSocket, channel: number, s: Session, text = "hello"): void {
   const source = engine.terminalNew(10, 3);
@@ -150,16 +129,9 @@ function bootstrap(socket: FakeSocket, channel: number, s: Session, text = "hell
 }
 
 type Message<T extends ToPage["type"]> = Extract<ToPage, { type: T }>;
-/** A message for one terminal, without its number. */
-type ToMount = Extract<ToWorker, { mount: number }> extends infer M
-  ? M extends unknown
-    ? Omit<M, "mount">
-    : never
-  : never;
 
-/** A worker started as `connect` starts it, once its engine is loaded,
- * and what it posted. */
-async function start() {
+/** A worker on a port as the page's: what it posted, and a send to it. */
+function run() {
   const posted: ToPage[] = [];
   const port = {
     postMessage: (message: ToPage) => posted.push(message),
@@ -167,6 +139,13 @@ async function start() {
   };
   runWorker(port);
   const send = (message: ToWorker) => port.onmessage!({ data: message } as MessageEvent<ToWorker>);
+  return { posted, send };
+}
+
+/** A worker started as `connect` starts it, once its engine is loaded,
+ * and what it posted. */
+async function start() {
+  const { posted, send } = run();
   send({ type: "init", wasm: "ghostty-vt.wasm", url: "wss://127.0.0.1:7438/", client: undefined });
   await vi.waitFor(() => expect(posted).toContainEqual({ type: "ready" }), { timeout: 5000 });
   let nextId = 100;
@@ -215,15 +194,6 @@ async function start() {
     events: () => of("event").map((m) => m.event),
     sessions: () => of("sessions").at(-1)?.sessions,
   };
-}
-
-/** `OUTPUT` of `text` at stream `offset`. */
-function output(offset: number, text: string): Uint8Array {
-  const bytes = new TextEncoder().encode(text);
-  const payload = new Uint8Array(8 + bytes.length);
-  new DataView(payload.buffer).setBigUint64(0, BigInt(offset), true);
-  payload.set(bytes, 8);
-  return payload;
 }
 
 /** A key press, or its release. */
@@ -377,15 +347,7 @@ test("an attach while the connection is still subscribing opens the session once
   const worker = await start();
   worker.mount(1);
   const server = await socket(0);
-  await vi.waitFor(() => expect(server.bodies(FrameType.Hello)).toHaveLength(1));
-  server.push(FrameType.Welcome, 0, {
-    version: 1,
-    server: { name: "test", version: "0" },
-    engine: "x",
-    incarnation: "i",
-    capabilities: [],
-    limits,
-  });
+  await server.welcome();
   const subscribe = await server.request("subscribe");
   worker.to(1, { type: "attach", session: "s" });
   await new Promise((resolve) => setTimeout(resolve, 20));
@@ -464,9 +426,9 @@ test("after a restart the events cannot be replayed: the gap is posted and the s
   await vi.waitFor(() => expect(worker.sessions()).toEqual([session("s"), session("t")]));
   server.close();
   const next = await socket(1);
-  await next.serve([session("t", "restored")], { incarnation: "j", latest: 2, gap: true });
+  await next.serve([session("t", { status: "restored" })], { incarnation: "j", latest: 2, gap: true });
   await vi.waitFor(() => expect(worker.posted).toContainEqual({ type: "gap", incarnation: "j" }));
-  expect(worker.sessions()).toEqual([session("t", "restored")]);
+  expect(worker.sessions()).toEqual([session("t", { status: "restored" })]);
   expect(next.bodies(FrameType.Request).at(0)?.body.params).toEqual({ after: 3, incarnation: "i" });
 
   // The next reconnect replays from the new incarnation.
@@ -635,8 +597,8 @@ test("the link: an exited or refused session ends it, a server stopping is retri
   const worker = await start();
   worker.mount(1, "old");
   const server = await socket(0);
-  await server.serve([session("old", "exited")]);
-  const exited = { ...session("old", "exited"), exit: { signal: "HUP" } };
+  await server.serve([session("old", { status: "exited" })]);
+  const exited = { ...session("old", { status: "exited" }), exit: { signal: "HUP" } };
   bootstrap(server, await server.opened("old"), exited);
   await vi.waitFor(() =>
     expect(worker.links().slice(1)).toEqual<Link[]>([
@@ -671,10 +633,10 @@ test("the link: an exited or refused session ends it, a server stopping is retri
   );
   // The reconnect attaches the same session again.
   const next = await socket(1);
-  await next.serve([session("s", "restored")], { incarnation: "j", gap: true });
-  bootstrap(next, await next.opened("s"), session("s", "restored"));
+  await next.serve([session("s", { status: "restored" })], { incarnation: "j", gap: true });
+  bootstrap(next, await next.opened("s"), session("s", { status: "restored" }));
   await vi.waitFor(() =>
-    expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s", "restored") }),
+    expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s", { status: "restored" }) }),
   );
 });
 
@@ -716,15 +678,7 @@ test("the link: a refused subscription closes the connection for good", async ()
   const worker = await start();
   worker.mount(1);
   const server = await socket(0);
-  await vi.waitFor(() => expect(server.bodies(FrameType.Hello)).toHaveLength(1));
-  server.push(FrameType.Welcome, 0, {
-    version: 1,
-    server: { name: "test", version: "0" },
-    engine: "x",
-    incarnation: "i",
-    capabilities: [],
-    limits,
-  });
+  await server.welcome();
   const subscribe = await server.request("subscribe");
   server.push(FrameType.Error, 0, { id: subscribe.id, code: "internal", message: "no" });
   await vi.waitFor(() =>
@@ -750,7 +704,7 @@ test("the link: a resume onto a session that exited meanwhile ends once, at its 
   await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
   server.close();
   const next = await socket(1);
-  const exited = { ...session("s", "exited"), exit: { code: 0 } };
+  const exited = { ...session("s", { status: "exited" }), exit: { code: 0 } };
   await next.serve([exited]);
   const channel = await next.opened("s");
   expect(next.bodies(FrameType.Open).at(-1)?.body.resume).toEqual({ incarnation: "i", offset: 0, marker: 0 });
@@ -794,22 +748,15 @@ test("the link: a server refusing the handshake ends it; a lost one is tried aga
 });
 
 test("the HELLO names the client the page gave", async () => {
-  const posted: ToPage[] = [];
-  const port = { postMessage: (m: ToPage) => posted.push(m), onmessage: null as ((e: MessageEvent<ToWorker>) => void) | null };
-  runWorker(port);
-  port.onmessage!({
-    data: { type: "init", wasm: "w", url: "wss://127.0.0.1:7438/", client: { name: "clankerspace", version: "9" } },
-  } as MessageEvent<ToWorker>);
+  run().send({ type: "init", wasm: "w", url: "wss://127.0.0.1:7438/", client: { name: "clankerspace", version: "9" } });
   const server = await socket(0);
   await vi.waitFor(() => expect(server.bodies(FrameType.Hello).at(0)?.body.client).toEqual({ name: "clankerspace", version: "9" }));
 });
 
 test("an engine that does not load fails the client", async () => {
   vi.stubGlobal("fetch", async () => ({ arrayBuffer: async () => new ArrayBuffer(8) }));
-  const posted: ToPage[] = [];
-  const port = { postMessage: (m: ToPage) => posted.push(m), onmessage: null as ((e: MessageEvent<ToWorker>) => void) | null };
-  runWorker(port);
-  port.onmessage!({ data: { type: "init", wasm: "w", url: "wss://127.0.0.1:7438/", client: undefined } } as MessageEvent<ToWorker>);
+  const { posted, send } = run();
+  send({ type: "init", wasm: "w", url: "wss://127.0.0.1:7438/", client: undefined });
   await vi.waitFor(() => expect(posted.at(0)?.type).toBe("failed"));
   expect(FakeSocket.all).toEqual([]);
 });

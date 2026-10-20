@@ -21,6 +21,27 @@ pub struct Change {
     pub removed: Vec<String>,
 }
 
+/// A record's state as the protocol names it; `clear` sets no record.
+const fn state_name(state: ProgramStatusState) -> &'static str {
+    match state {
+        ProgramStatusState::Idle => "idle",
+        ProgramStatusState::Working => "working",
+        ProgramStatusState::Done => "done",
+        ProgramStatusState::Blocked => "blocked",
+        ProgramStatusState::Error => "error",
+        ProgramStatusState::Clear => panic!("clear sets no record"),
+    }
+}
+
+/// Every state a record can be in, which a status wait may name.
+pub const STATES: [&str; 5] = [
+    state_name(ProgramStatusState::Idle),
+    state_name(ProgramStatusState::Working),
+    state_name(ProgramStatusState::Done),
+    state_name(ProgramStatusState::Blocked),
+    state_name(ProgramStatusState::Error),
+];
+
 /// Whether a record's state is one the program is still in the middle
 /// of: dropped at a prompt start, at the end of the stream, and on load.
 fn transient(record: &StatusRecord) -> bool {
@@ -100,14 +121,7 @@ impl Records {
             }
             return change;
         }
-        let state = match report.state {
-            ProgramStatusState::Idle => "idle",
-            ProgramStatusState::Working => "working",
-            ProgramStatusState::Done => "done",
-            ProgramStatusState::Blocked => "blocked",
-            ProgramStatusState::Error => "error",
-            ProgramStatusState::Clear => unreachable!(),
-        };
+        let state = state_name(report.state);
         // The engine clears `kind` outside `blocked` and `progress` outside
         // `working` and `blocked` or 0..=100 (terminal.h).
         let kind = match report.kind {

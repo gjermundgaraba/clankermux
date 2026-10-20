@@ -476,7 +476,8 @@ impl Connection {
                 return;
             }
         };
-        let engine = self.hello.as_ref().and_then(|h| h.engine.as_deref());
+        let hello = self.hello.as_ref().expect("OPEN follows HELLO");
+        let engine = hello.engine.as_deref();
         if engine != Some(ghostty_vt::ENGINE) {
             self.error(
                 channel,
@@ -499,7 +500,6 @@ impl Connection {
             );
             return;
         }
-        let hello = self.hello.as_ref().expect("OPEN follows HELLO");
         match attach::open(
             &self.registry,
             &self.writer,

@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand};
@@ -29,7 +28,12 @@ const SESSION_ENV: &str = "CLANKERMUX_SESSION";
 /// The socket of the server that holds it.
 const SOCKET_ENV: &str = "CLANKERMUX_SOCKET";
 
-/// Exit codes besides 0, 1 and clap's 2.
+/// The help of each command's session argument.
+const SESSION_HELP: &str = "Id, label, or four or more characters from either end of the id; \
+                            `$CLANKERMUX_SESSION` when left out";
+
+/// Exit codes besides 0 and 1, as README.md and skill.md tabulate them
+/// (a test holds both tables to these).
 const EXIT_USAGE: i32 = 2;
 const EXIT_TARGET: i32 = 3;
 const EXIT_UNREACHABLE: i32 = 4;
@@ -110,14 +114,12 @@ enum Command {
     List,
     /// Show one session with its program status.
     Inspect {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
     },
     /// Attach the terminal to a session.
     Attach {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
         #[arg(long)]
         read_only: bool,
@@ -128,8 +130,7 @@ enum Command {
     },
     /// Hang up the session's process group.
     End {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
     },
     /// Send a signal by name (`TERM`, `INT`, `KILL`, ...).
@@ -140,8 +141,7 @@ enum Command {
     },
     /// Delete an exited session.
     Remove {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
     },
     /// Set the label.
@@ -161,7 +161,7 @@ enum Command {
         /// `latest`: the most recent viewport report wins; `smallest`: the
         /// smallest viewport among the attachments; `fixed`: only resize
         /// changes the size.
-        #[arg(long, value_parser = parse_policy)]
+        #[arg(long, value_parser = wire::<SizePolicy>)]
         policy: Option<SizePolicy>,
     },
     /// Close another client's attachment; `inspect` lists them by channel.
@@ -176,8 +176,7 @@ enum Command {
     },
     /// Print the screen, with history lines before it, or another scope.
     Read {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
         /// History lines before the screen, for scope `screen`.
         #[arg(long)]
@@ -192,8 +191,7 @@ enum Command {
     },
     /// Print the output stream as plain text, from a stream offset.
     Tail {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
         /// The stream offset to start at; by default the oldest byte kept.
         #[arg(long)]
@@ -228,8 +226,7 @@ enum Command {
     /// Wait for the session to exit, print a match, show a status or a
     /// prompt, or fall quiet.
     Wait {
-        /// Id, label, or four or more characters from either end of the
-        /// id; `$CLANKERMUX_SESSION` when left out.
+        #[arg(help = SESSION_HELP)]
         session: Option<String>,
         #[command(flatten)]
         wait: WaitArgs,
@@ -315,7 +312,7 @@ struct WaitArgs {
 impl WaitArgs {
     /// The `until` these flags name, if any; a timeout alone is a usage
     /// error.
-    fn until(&self) -> Result<Option<Until>, Error> {
+    fn until(&self) -> Result<Option<Until>, Fail> {
         let until = Until {
             exited: self.exit.then_some(true),
             output: self.matching.clone().map(|regex| OutputMatch {
@@ -331,7 +328,7 @@ impl WaitArgs {
         };
         if until == Until::default() {
             return match self.timeout {
-                Some(_) => Err(Error::Usage("--timeout needs something to wait for".into())),
+                Some(_) => Err(Fail::Usage("--timeout needs something to wait for".into())),
                 None => Ok(None),
             };
         }
@@ -375,7 +372,7 @@ enum SkillCommand {
 const SKILL: &str = include_str!("skill.md");
 
 /// `api call`'s params: JSON as given, or read from stdin for `-`.
-fn api_params(params: Option<&str>) -> Result<serde_json::Value, Error> {
+fn api_params(params: Option<&str>) -> Result<serde_json::Value, Fail> {
     let text = match params {
         None => return Ok(serde_json::json!({})),
         Some("-") => {
@@ -385,14 +382,16 @@ fn api_params(params: Option<&str>) -> Result<serde_json::Value, Error> {
         }
         Some(text) => text.to_string(),
     };
-    serde_json::from_str(&text).map_err(|e| Error::Usage(format!("params are not JSON: {e}")))
+    serde_json::from_str(&text).map_err(|e| Fail::Usage(format!("params are not JSON: {e}")))
 }
 
-/// Why the CLI failed, by exit code: a client error (1, or 2 for a
-/// usage error), a session argument that names no session or several (3),
-/// or a server that cannot be reached (4).
+/// Why the CLI failed, by exit code: a client error (1), a usage error
+/// (2), a session argument that names no session or several (3), or a
+/// server that cannot be reached (4).
 enum Fail {
     Client(Error),
+    /// Arguments the command cannot use, reported as given.
+    Usage(String),
     Target(String),
     Unreachable(String),
     /// Ctrl-C cancelled a wait.
@@ -411,15 +410,15 @@ impl From<std::io::Error> for Fail {
     }
 }
 
-fn parse_detach_key(spec: &str) -> Result<u8, Error> {
+fn parse_detach_key(spec: &str) -> Result<u8, Fail> {
     attach::parse_key(spec).ok_or_else(|| {
-        Error::Usage(format!(
+        Fail::Usage(format!(
             "unusable detach key {spec:?}: use C-<letter> or C-<@ [ \\ ] ^ _ ?>"
         ))
     })
 }
 
-fn parse_env(entries: &[String]) -> Result<BTreeMap<String, String>, Error> {
+fn parse_env(entries: &[String]) -> Result<BTreeMap<String, String>, Fail> {
     entries
         .iter()
         .map(|entry| {
@@ -428,16 +427,16 @@ fn parse_env(entries: &[String]) -> Result<BTreeMap<String, String>, Error> {
                 .filter(|(name, _)| !name.is_empty())
                 .map(|(name, value)| (name.to_string(), value.to_string()))
                 .ok_or_else(|| {
-                    Error::Usage(format!("environment entry {entry:?} is not NAME=value"))
+                    Fail::Usage(format!("environment entry {entry:?} is not NAME=value"))
                 })
         })
         .collect()
 }
 
-/// A wire name (`last_command`) as its protocol value.
+/// A wire name (`last_command`) as its protocol value; serde's error
+/// lists the names there are.
 fn wire<T: DeserializeOwned>(name: &str) -> Result<T, String> {
-    serde_json::from_value(serde_json::Value::String(name.into()))
-        .map_err(|_| format!("unknown value {name:?}"))
+    serde_json::from_value(serde_json::Value::String(name.into())).map_err(|e| e.to_string())
 }
 
 /// The CLI's connections all name the engine, so any of them can attach.
@@ -496,15 +495,15 @@ async fn resolve(conn: &Connection, here: bool, needle: Option<String>) -> Resul
     let needle = match needle.or_else(|| here_session(here)) {
         Some(needle) => needle,
         None if std::env::var_os(SESSION_ENV).is_some_and(|v| !v.is_empty()) => {
-            return Err(Fail::Client(Error::Usage(format!(
+            return Err(Fail::Usage(format!(
                 "a session is needed: ${SESSION_ENV} is a session of the server in \
                  ${SOCKET_ENV}, not of this one"
-            ))));
+            )));
         }
         None => {
-            return Err(Fail::Client(Error::Usage(format!(
+            return Err(Fail::Usage(format!(
                 "a session is needed: name one, or run inside a session (${SESSION_ENV})"
-            ))));
+            )));
         }
     };
     let exact = SessionParams {
@@ -551,8 +550,8 @@ fn target_and(mut args: Vec<String>, rest: usize) -> (Option<String>, Vec<String
 type Sides = (Option<u16>, Option<u16>);
 
 /// `COLSxROWS`, `COLSx` or `xROWS`.
-fn parse_size(spec: &str) -> Result<Sides, Error> {
-    let bad = || Error::Usage(format!("{spec:?} is not COLSxROWS, COLSx or xROWS"));
+fn parse_size(spec: &str) -> Result<Sides, Fail> {
+    let bad = || Fail::Usage(format!("{spec:?} is not COLSxROWS, COLSx or xROWS"));
     let (cols, rows) = spec.split_once('x').ok_or_else(bad)?;
     let side = |s: &str| {
         (!s.is_empty())
@@ -563,11 +562,6 @@ fn parse_size(spec: &str) -> Result<Sides, Error> {
         (None, None) => Err(bad()),
         size => Ok(size),
     }
-}
-
-fn parse_policy(spec: &str) -> Result<SizePolicy, String> {
-    serde_json::from_value(serde_json::Value::String(spec.into()))
-        .map_err(|_| format!("{spec:?} is not latest, smallest or fixed"))
 }
 
 /// Writes to stdout; a closed pipe (`| head`) ends the program quietly.
@@ -583,12 +577,16 @@ fn emit(text: &str) {
     }
 }
 
+fn emit_json<T: Serialize>(value: &T) {
+    emit(&format!(
+        "{}\n",
+        serde_json::to_string_pretty(value).unwrap()
+    ));
+}
+
 fn print<T: Serialize>(json: bool, value: &T, human: impl FnOnce(&T)) {
     if json {
-        emit(&format!(
-            "{}\n",
-            serde_json::to_string_pretty(value).unwrap()
-        ));
+        emit_json(value);
     } else {
         human(value);
     }
@@ -625,7 +623,7 @@ fn session_line(s: &Session) {
 
 /// Binds the carriers `serve` was asked for and runs them with the Unix
 /// socket until a signal; then parks every running session.
-async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
+async fn serve(socket: PathBuf, carriers: Carriers) -> Result<(), Fail> {
     let Carriers {
         tcp,
         ws,
@@ -636,7 +634,7 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
     } = carriers;
     let origins = origin
         .iter()
-        .map(|o| server::ws::origin(o).map_err(Error::Usage))
+        .map(|o| server::ws::origin(o).map_err(Fail::Usage))
         .collect::<Result<Vec<_>, _>>()?;
     let ws_bind = ws
         .as_deref()
@@ -644,7 +642,7 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
             Ok(port) => Ok(WsBind::Port(port)),
             Err(_) => match bind.parse::<SocketAddr>() {
                 Ok(addr) if addr.ip().is_loopback() => Ok(WsBind::Loopback(addr)),
-                _ => Err(Error::Usage(format!(
+                _ => Err(Fail::Usage(format!(
                     "--ws takes a port on the tailnet address or a loopback address, not {bind:?}"
                 ))),
             },
@@ -748,8 +746,7 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
     // A graceful stop parks every running session and delivers `CLOSED
     // stopping` before the process ends.
     registry.stop().await;
-    result?;
-    Ok(ExitCode::SUCCESS)
+    Ok(result?)
 }
 
 #[derive(Args)]
@@ -832,11 +829,6 @@ async fn relay(socket: PathBuf) -> Result<i32, Fail> {
     tokio::io::copy(&mut from_server, &mut stdout).await?;
     stdout.flush().await?;
     Ok(0)
-}
-
-/// An attach's outcome as an exit status.
-fn status_of(code: ExitCode) -> i32 {
-    if code == ExitCode::SUCCESS { 0 } else { 1 }
 }
 
 /// One `send` request's worth of input.
@@ -982,14 +974,7 @@ fn wait_line(waited: &Waited) -> String {
 /// Prints a finished wait (`--json`: the whole reply) and returns its
 /// exit status.
 fn report_wait(json: bool, reply: &serde_json::Value, waited: &Waited) -> i32 {
-    if json {
-        emit(&format!(
-            "{}\n",
-            serde_json::to_string_pretty(reply).unwrap()
-        ));
-    } else {
-        emit(&wait_line(waited));
-    }
+    print(json, reply, |_| emit(&wait_line(waited)));
     wait_status(waited)
 }
 
@@ -1020,9 +1005,9 @@ async fn names_session(conn: &Connection, text: &str) -> Result<bool, Error> {
 fn resize_args(
     mut args: Vec<String>,
     policy: Option<SizePolicy>,
-) -> Result<(Option<String>, Option<Sides>), Error> {
+) -> Result<(Option<String>, Option<Sides>), Fail> {
     let size = match (args.len(), policy) {
-        (0, None) => return Err(Error::Usage("resize takes SIZE, --policy or both".into())),
+        (0, None) => return Err(Fail::Usage("resize takes SIZE, --policy or both".into())),
         (0, Some(_)) => None,
         (1, Some(_)) => match parse_size(&args[0]) {
             Ok(size) => {
@@ -1037,17 +1022,17 @@ fn resize_args(
 }
 
 /// `detach`'s session and channel.
-fn detach_args(args: Vec<String>) -> Result<(Option<String>, u64), Error> {
+fn detach_args(args: Vec<String>) -> Result<(Option<String>, u64), Fail> {
     let (session, rest) = target_and(args, 1);
     let channel = rest[0]
         .parse::<u64>()
-        .map_err(|_| Error::Usage(format!("{:?} is not a channel number", rest[0])))?;
+        .map_err(|_| Fail::Usage(format!("{:?} is not a channel number", rest[0])))?;
     Ok((session, channel))
 }
 
 /// Checks a command's arguments before connecting, so a usage error is
 /// one whatever the server's state.
-fn check_args(command: &Command) -> Result<(), Error> {
+fn check_args(command: &Command) -> Result<(), Fail> {
     match command {
         Command::Create {
             env, detach_key, ..
@@ -1077,14 +1062,14 @@ fn check_args(command: &Command) -> Result<(), Error> {
                 .iter()
                 .find(|k| ghostty_vt::keys::KeyPress::parse(k).is_none())
             {
-                return Err(Error::Usage(format!("unknown key {key:?}")));
+                return Err(Fail::Usage(format!("unknown key {key:?}")));
             }
             let payload = !keys.is_empty() || *bytes;
             if payload && args.len() > 1 {
-                return Err(Error::Usage("--keys and --bytes take no TEXT".into()));
+                return Err(Fail::Usage("--keys and --bytes take no TEXT".into()));
             }
             if !payload && args.is_empty() && !enter {
-                return Err(Error::Usage(
+                return Err(Fail::Usage(
                     "send takes TEXT, --enter, --keys or --bytes".into(),
                 ));
             }
@@ -1095,7 +1080,7 @@ fn check_args(command: &Command) -> Result<(), Error> {
             api_params(params.as_deref())?;
         }
         Command::Wait { wait, .. } if wait.until()?.is_none() => {
-            return Err(Error::Usage(
+            return Err(Fail::Usage(
                 "wait for something: --exit, --match, --status, --prompt or --quiet".into(),
             ));
         }
@@ -1245,10 +1230,7 @@ async fn api(conn: &Connection, command: ApiCommand, json: bool) -> Result<i32, 
                     }
                     other => other,
                 })?;
-            emit(&format!(
-                "{}\n",
-                serde_json::to_string_pretty(&result).unwrap()
-            ));
+            emit_json(&result);
         }
     }
     Ok(0)
@@ -1269,21 +1251,21 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
     }
     let command = match (cli.stdio, cli.command) {
         (true, None) => None,
-        (true, Some(_)) => return Err(Error::Usage("--stdio takes no command".into()).into()),
+        (true, Some(_)) => return Err(Fail::Usage("--stdio takes no command".into())),
         (false, None) => {
-            return Err(Error::Usage("a command is required; see --help".into()).into());
+            return Err(Fail::Usage("a command is required; see --help".into()));
         }
         (false, Some(command)) => Some(command),
     };
     if let Some(Command::Serve(carriers)) = command {
         if cli.connect.is_some() || cli.ssh.is_some() {
-            return Err(Error::Usage(
+            return Err(Fail::Usage(
                 "serve runs locally; --connect and --ssh do not apply".into(),
-            )
-            .into());
+            ));
         }
         let socket = cli.socket.unwrap_or_else(server::socket_path);
-        return Ok(status_of(serve(socket, carriers).await?));
+        serve(socket, carriers).await?;
+        return Ok(0);
     }
     // Inside a session, the server that holds it.
     let socket = cli
@@ -1352,7 +1334,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                     conn,
                 )
                 .await?;
-                return Ok(status_of(code));
+                return Ok(code);
             }
             if wait {
                 // From the first byte, so an exit before this request
@@ -1373,16 +1355,8 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                     },
                 )
                 .await?;
-                if json {
-                    let both = serde_json::json!({"session": created, "wait": reply});
-                    emit(&format!(
-                        "{}\n",
-                        serde_json::to_string_pretty(&both).unwrap()
-                    ));
-                } else {
-                    emit(&wait_line(&waited));
-                }
-                return Ok(wait_status(&waited));
+                let both = serde_json::json!({"session": created, "wait": reply});
+                return Ok(report_wait(json, &both, &waited));
             }
             print(json, &created, |s| emit(&format!("{}\n", s.id)));
         }
@@ -1395,10 +1369,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
         Command::Inspect { session } => {
             let session = resolve(&conn, here, session).await?;
             let value = conn.request("inspect", SessionParams { session }).await?;
-            emit(&format!(
-                "{}\n",
-                serde_json::to_string_pretty(&value).unwrap()
-            ));
+            emit_json(&value);
         }
         Command::Attach {
             session,
@@ -1417,7 +1388,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                 conn,
             )
             .await?;
-            return Ok(status_of(code));
+            return Ok(code);
         }
         Command::End { session } => {
             let session = resolve(&conn, here, session).await?;
@@ -1508,17 +1479,13 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             let until = wait.until()?;
             let payload = !keys.is_empty() || bytes;
             let (session, rest) = target_and(args, if payload { 0 } else { 1 });
-            if payload && !rest.is_empty() {
-                return Err(Error::Usage("--keys and --bytes take no TEXT".into()).into());
-            }
             // `send build --enter` means the session `build`, not the text.
             if let (None, [text]) = (&session, rest.as_slice())
                 && names_session(&conn, text).await?
             {
-                return Err(Error::Usage(format!(
+                return Err(Fail::Usage(format!(
                     "{text:?} names a session: give SESSION and TEXT, or --keys enter"
-                ))
-                .into());
+                )));
             }
             let mut chunks = match rest.into_iter().next() {
                 _ if bytes => {
@@ -1528,12 +1495,8 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                 }
                 _ if !keys.is_empty() => vec![Chunk::Keys(keys)],
                 Some(text) => vec![Chunk::Text(text)],
-                None if enter => Vec::new(),
-                None => {
-                    return Err(
-                        Error::Usage("send takes TEXT, --enter, --keys or --bytes".into()).into(),
-                    );
-                }
+                // `--enter` alone: check_args refused a send of nothing.
+                None => Vec::new(),
             };
             if enter {
                 // Enter after a paste, not inside it.
@@ -1558,12 +1521,9 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             }
         }
         Command::Wait { session, wait } => {
-            let Some(until) = wait.until()? else {
-                return Err(Error::Usage(
-                    "wait for something: --exit, --match, --status, --prompt or --quiet".into(),
-                )
-                .into());
-            };
+            let until = wait
+                .until()?
+                .expect("check_args refused a wait for nothing");
             let session = resolve(&conn, here, session).await?;
             let (reply, waited) = wait_request(
                 &conn,
@@ -1631,7 +1591,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                 tokio::select! {
                     event = events.recv() => match event {
                         Some(event) => emit(&format!("{}\n", serde_json::to_string(&event).unwrap())),
-                        None => return Err(conn.closed().await.into()),
+                        None => return Err(conn.ended().unwrap_or(Error::Closed).into()),
                     },
                     _ = tokio::signal::ctrl_c() => break,
                 }
@@ -1654,7 +1614,7 @@ async fn main() {
         Ok(code) => code,
         Err(fail) => {
             let (message, code) = match fail {
-                Fail::Client(Error::Usage(message)) => (message, EXIT_USAGE),
+                Fail::Usage(message) => (message, EXIT_USAGE),
                 Fail::Client(err) => (err.to_string(), 1),
                 Fail::Target(message) => (message, EXIT_TARGET),
                 Fail::Unreachable(message) => (message, EXIT_UNREACHABLE),
@@ -1666,4 +1626,40 @@ async fn main() {
     };
     // The stdin reader thread of an attach must not keep the process up.
     std::process::exit(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// README.md and the guide carry the same exit-code table, and its
+    /// codes are the ones the CLI exits with.
+    #[test]
+    fn the_exit_code_tables_are_the_cli_s() {
+        let table = |doc: &'static str| -> Vec<&'static str> {
+            doc.lines()
+                .skip_while(|line| !line.ends_with("| Meaning |"))
+                .skip(2)
+                .take_while(|line| line.starts_with('|'))
+                .collect()
+        };
+        let readme = table(include_str!("../../../README.md"));
+        assert_eq!(readme, table(SKILL), "skill.md's table is README.md's");
+        let codes: Vec<&str> = readme
+            .iter()
+            .map(|row| row.split('|').nth(1).unwrap().trim())
+            .collect();
+        let expected = [
+            0,
+            1,
+            EXIT_USAGE,
+            EXIT_TARGET,
+            EXIT_UNREACHABLE,
+            EXIT_TIMEOUT,
+            EXIT_INTERRUPTED,
+        ]
+        .map(|code| code.to_string());
+        assert_eq!(codes[..expected.len()], expected);
+        assert_eq!(codes[expected.len()..], ["child's"]);
+    }
 }

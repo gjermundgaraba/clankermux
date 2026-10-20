@@ -18,7 +18,6 @@ const MIN_VALIDITY: Duration = Duration::from_secs(7 * 24 * 3600);
 const RENEW_EVERY: Duration = Duration::from_secs(12 * 3600);
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(3600);
 
-#[derive(Debug, Clone)]
 pub enum Source {
     /// PEM files, re-read at every renewal.
     Files { cert: PathBuf, key: PathBuf },

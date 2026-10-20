@@ -573,36 +573,32 @@ class Mount {
       ...(this.active && { viewport: this.viewport, profile: this.profile }),
       ...(resume && { resume }),
     };
-    try {
-      conn.open(channel, open, (frame) => {
-        if (this.attachment !== attachment) return;
-        let actions: Action[];
-        try {
-          actions = attachment.handle(frame);
-        } catch (err) {
-          // A lost place in the stream: CLOSE and OPEN again, afresh. Any
-          // other fault would only repeat.
-          this.status(String(err));
-          const desync = err instanceof ClientError && err.kind === "desync";
-          this.link(endedWith(err, desync));
-          if (desync) this.reopen();
-          else this.giveUp();
-          return;
+    conn.open(channel, open, (frame) => {
+      if (this.attachment !== attachment) return;
+      let actions: Action[];
+      try {
+        actions = attachment.handle(frame);
+      } catch (err) {
+        // A lost place in the stream: CLOSE and OPEN again, afresh. Any
+        // other fault would only repeat.
+        this.status(String(err));
+        const desync = err instanceof ClientError && err.kind === "desync";
+        this.link(endedWith(err, desync));
+        if (desync) this.reopen();
+        else this.giveUp();
+        return;
+      }
+      if (frame.header.type === FrameType.Attached && actions.length === 0) {
+        // Resumed: the terminal shows the stream already, and an exit
+        // still to come arrives as EXITED. A snapshot's screen comes
+        // later, as an action.
+        if (attachment.resume()) {
+          this.status("resumed");
+          this.link({ state: "connected", session: attachment.session });
         }
-        if (frame.header.type === FrameType.Attached && actions.length === 0) {
-          // Resumed: the terminal shows the stream already, and an exit
-          // still to come arrives as EXITED. A snapshot's screen comes
-          // later, as an action.
-          if (attachment.resume()) {
-            this.status("resumed");
-            this.link({ state: "connected", session: attachment.session });
-          }
-        }
-        for (const action of actions) this.apply(action);
-      });
-    } catch (err) {
-      this.status(String(err));
-    }
+      }
+      for (const action of actions) this.apply(action);
+    });
   }
 
   /** The screen of `session` is shown: `connected`, and at once `ended
@@ -809,13 +805,7 @@ class Mount {
     const conn = this.hub.conn;
     if (conn) {
       conn.release(this.channel);
-      if (!this.attachment.closed()) {
-        try {
-          conn.send(FrameType.Close, this.channel, new Uint8Array());
-        } catch {
-          // The connection is gone; nothing to close.
-        }
-      }
+      if (!this.attachment.closed()) conn.send(FrameType.Close, this.channel, new Uint8Array());
     }
     this.attachment.free();
     this.attachment = undefined;
@@ -866,7 +856,7 @@ class Mount {
       return;
     }
     this.claim();
-    this.live();
+    this.backToLive();
     this.unselect();
     // Each request's base64 fits the control body with room for the rest,
     // and its bytes fit the input queue (at least one byte, so the loop
@@ -931,7 +921,7 @@ class Mount {
   view(rows: number | "live"): void {
     const term = this.attachment?.term();
     if (!term || term.alternate) return;
-    if (rows === "live") this.live();
+    if (rows === "live") this.backToLive();
     else if (rows !== 0) {
       term.scroll(rows);
       this.paint();
@@ -939,7 +929,7 @@ class Mount {
   }
 
   /** Back to the live screen before input, as any terminal does. */
-  private live(): void {
+  private backToLive(): void {
     const term = this.attachment?.term();
     if (!term) return;
     const { total, offset, len } = term.scrollbar;
@@ -977,11 +967,7 @@ class Mount {
 
   private report(): void {
     this.reclaim = false;
-    try {
-      this.hub.conn?.sendJson(FrameType.Viewport, this.channel, { ...this.viewport, profile: this.profile });
-    } catch {
-      // Reported through onEnd.
-    }
+    this.hub.conn?.sendJson(FrameType.Viewport, this.channel, { ...this.viewport, profile: this.profile });
   }
 
   /** Input from the page in use: its size again if another client took it. */

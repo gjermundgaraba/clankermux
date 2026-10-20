@@ -4,83 +4,28 @@
  * Schemas, and a params object with a field the protocol does not define
  * fails them. The TS types are generated from the same catalog.
  */
-import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
-import { connect as netConnect, type Socket } from "node:net";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { afterAll, beforeAll, expect, test } from "vitest";
 
 import pkg from "../../package.json" with { type: "json" };
-import { type Catalog, StreamFramer, VERSION } from "../../src/proto/index.ts";
-import { Connection, type Transport, hello } from "../../src/client/index.ts";
+import { type Catalog, VERSION } from "../../src/proto/index.ts";
+import { Connection, hello } from "../../src/client/connection.ts";
 import { vectors } from "../proto/messages.ts";
+import { type Served, StreamTransport, serve } from "./server.ts";
 
-const here = fileURLToPath(new URL(".", import.meta.url));
-const binary = `${here}../../../../../target/debug/clankermux`;
-if (!existsSync(binary)) throw new Error(`${binary} is missing: run cargo build first`);
-
-class StreamTransport implements Transport {
-  private readonly framer = new StreamFramer(1 << 30);
-  onMessage: ((bytes: Uint8Array) => void) | undefined;
-  onClose: (() => void) | undefined;
-
-  constructor(private readonly socket: Socket) {
-    socket.on("data", (chunk: Buffer) => {
-      for (const frame of this.framer.feed(chunk)) this.onMessage?.(frame);
-    });
-    socket.on("close", () => this.onClose?.());
-    socket.on("error", () => {});
-  }
-
-  send(bytes: Uint8Array): void {
-    this.socket.write(bytes);
-  }
-
-  close(): void {
-    this.socket.destroy();
-  }
-}
-
-function dial(path: string): Promise<StreamTransport> {
-  return new Promise((resolve, reject) => {
-    const socket = netConnect(path);
-    socket.once("connect", () => resolve(new StreamTransport(socket)));
-    socket.once("error", reject);
-  });
-}
-
-let dir: string;
-let server: ReturnType<typeof spawn>;
+let served: Served;
 let conn: Connection;
 let catalog: Catalog;
 
 beforeAll(async () => {
-  dir = mkdtempSync(join(tmpdir(), "cmx-"));
-  const socket = join(dir, "sock");
-  server = spawn(binary, ["--socket", socket, "serve"], {
-    stdio: "ignore",
-    env: { ...process.env, XDG_STATE_HOME: join(dir, "state") },
-  });
-  const deadline = Date.now() + 10_000;
-  for (;;) {
-    try {
-      conn = await Connection.connect(await dial(socket), hello("test"));
-      break;
-    } catch {
-      if (Date.now() > deadline) throw new Error("server did not listen");
-      await new Promise((r) => setTimeout(r, 20));
-    }
-  }
+  served = await serve();
+  conn = await Connection.connect(await StreamTransport.connect(served.socket), hello("test"));
   catalog = await conn.describe();
 });
 
 afterAll(async () => {
   conn?.close();
-  if (server && server.exitCode === null) await new Promise((resolve) => (server.once("exit", resolve), server.kill()));
-  if (dir) rmSync(dir, { recursive: true, force: true });
+  await served?.stop();
 });
 
 /** Validates against one of the catalog's schemas, its `$defs` beside it. */

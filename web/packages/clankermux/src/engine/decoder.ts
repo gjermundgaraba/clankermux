@@ -1,4 +1,4 @@
-import { type Engine, EngineError, Terminal } from "./index.ts";
+import { type Engine, Terminal } from "./index.ts";
 
 /** Bytes before the first record: the 8-byte magic and the u16 version. */
 const ENVELOPE_LEN = 10;
@@ -115,14 +115,10 @@ export class Decoder {
   nextPage(): boolean {
     const end = stepEnd(this.source, this.consumed, this.filled);
     if (end === undefined) throw new Error("next page not buffered");
-    const code = this.engine.call("ghostty_snapshot_decoder_next", this.decoder);
+    const page = this.engine.present("ghostty_snapshot_decoder_next", this.decoder);
     this.consumed = end;
-    if (code === this.engine.result.NO_VALUE) {
-      this.complete = true;
-      return false;
-    }
-    if (code !== this.engine.result.SUCCESS) throw new EngineError("ghostty_snapshot_decoder_next", code);
-    return true;
+    if (!page) this.complete = true;
+    return page;
   }
 
   terminal(): Terminal | undefined {

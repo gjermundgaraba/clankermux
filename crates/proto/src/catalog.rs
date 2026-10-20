@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use crate::*;
 
 /// The shared message vectors; the examples come from them.
-pub const VECTORS: &str = include_str!("../vectors/messages.json");
+pub(crate) const VECTORS: &str = include_str!("../vectors/messages.json");
 
 /// What a method does to the server's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -182,25 +182,14 @@ macro_rules! methods {
             }),*]
         }
 
-        /// Per method, whether a params value and a result value are its
-        /// types, unchanged by a round trip.
+        /// Per method, the checks that a value is its params type and its
+        /// result type.
         #[cfg(test)]
-        pub(crate) fn typed() -> Vec<(&'static str, fn(&Value, &Value) -> Result<(), String>)> {
-            vec![$(($name, |params, result| {
-                same::<$params>(params)?;
-                same::<$result>(result)
-            })),*]
+        pub(crate) fn typed() -> Vec<(&'static str, crate::tests::Check, crate::tests::Check)> {
+            use crate::tests::same;
+            vec![$(($name, same::<$params>, same::<$result>)),*]
         }
     };
-}
-
-#[cfg(test)]
-fn same<T: Serialize + serde::de::DeserializeOwned>(value: &Value) -> Result<(), String> {
-    let typed: T = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-    let back = serde_json::to_value(typed).map_err(|e| e.to_string())?;
-    (&back == value)
-        .then_some(())
-        .ok_or_else(|| format!("{value} came back as {back}"))
 }
 
 methods! {

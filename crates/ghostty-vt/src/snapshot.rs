@@ -203,7 +203,8 @@ impl<H: Handler> Decoder<H> {
     }
 
     /// Bytes pushed but not yet consumed.
-    pub fn buffered(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn buffered(&self) -> usize {
         let source = self.source();
         source.data.len() - source.pos
     }
@@ -247,7 +248,7 @@ impl<H: Handler> Decoder<H> {
 
     /// Decodes a complete snapshot in one call; the engine refuses it
     /// after `ready`.
-    pub fn decode(&mut self) -> Result<&mut Terminal<H>> {
+    fn decode(&mut self) -> Result<&mut Terminal<H>> {
         let mut raw = ptr::null_mut();
         // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_decode(self.raw, &mut raw) };

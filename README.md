@@ -32,12 +32,12 @@ A session argument is resolved in order: the full id; the label, ignoring case; 
 | --- | --- |
 | 0 | Done |
 | 1 | Failed: the server refused the request, or the connection broke |
-| 2 | Usage: arguments clap or the command could not use, or no session given outside a session |
+| 2 | Usage: arguments clap or the command cannot use, or no session given outside a session |
 | 3 | The session argument named no session, or several |
 | 4 | The server cannot be reached |
 | 124 | A wait timed out |
 | 130 | A wait was cancelled with Ctrl-C |
-| child's | A wait that ended with the session's exit (`wait --exit`, `create --wait`): its code, or 128 plus the signal's number; 1 for a `restored` session, which has none |
+| child's | A wait that ended with the session's exit (`--exit`, `create --wait`): its code, or 128 plus the signal's number; 1 for a `restored` session, which has none |
 
 `send` writes text as typed (`--enter` presses Enter after it), named keys (`--keys ctrl+c up enter`, encoded as the program's modes expect), a paste (`--paste`) or stdin's bytes (`--bytes`). `wait` waits for the session to exit, its output to match a regex, a program status, the next prompt or a quiet spell, with `--timeout`; `send` takes the same flags (`--wait-match` and so on), and its wait starts before the bytes are written; a `--status` wait there counts only a status set after the send. The terminal's echo of what you typed is output too, so match on what only the program prints. With one argument, `send` takes it as TEXT for the session it runs in, and refuses one that names a session (give SESSION and TEXT). `create --wait` runs a program to its end; with `--json` it prints `{session, wait}`.
 

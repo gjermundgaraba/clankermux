@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use proto::{
-    ClosedReason, ErrorCode, Event, Exit, FrameType, Limits, OnExit, Page, Status, StatusReason,
-    SubscribeParams, Subscribed, encode_json_frame,
+    ClosedReason, ErrorCode, Event, Exit, FrameType, Limits, Numbered, OnExit, Page, Status,
+    StatusReason, SubscribeParams, Subscribed, encode_json_frame,
 };
 use rustix::process::Signal;
 use tokio::io::unix::AsyncFd;
@@ -120,15 +120,6 @@ impl State {
     }
 }
 
-/// `EVENT`: the event and its `seq`, as `proto::Numbered` but borrowing
-/// the event, which is encoded once for every subscriber.
-#[derive(serde::Serialize)]
-struct Numbered<'a> {
-    seq: u64,
-    #[serde(flatten)]
-    event: &'a Event,
-}
-
 impl Registry {
     /// Locks the state directory (another server holding it is an error),
     /// loads the parked sessions and starts the park timer. Needs a tokio
@@ -223,8 +214,19 @@ impl Registry {
             snapshot_path,
         } = loaded;
         let info = file.session;
-        let limits = &self.config.limits;
         let (records, dropped) = Records::load(info.program_status.unwrap_or_default());
+        let body = Body::Parked(Parked {
+            engine: file.engine,
+            cols: info.cols,
+            rows: info.rows,
+            title: info.title,
+            pwd: info.pwd,
+            offset: info.offset,
+            marker: info.marker,
+            screen,
+            history_lines: file.history_lines as usize,
+            snapshot_path,
+        });
         let mut session = Session {
             id: info.id.clone(),
             label: info.label,
@@ -234,37 +236,10 @@ impl Registry {
             created_at: info.created_at,
             exited_at: info.exited_at,
             exit: info.exit,
-            wake: Arc::new(Notify::new()),
-            text_limit: limits.text as usize,
-            records_limit: limits.records as usize,
-            commands_limit: limits.commands as usize,
-            attached: Vec::new(),
             size_policy: info.size.policy,
-            size_owner: None,
             records,
             commands: Commands::load(file.commands),
-            events: Vec::new(),
-            removed: false,
-            announced: Default::default(),
-            last_bell: None,
-            park_lock: Default::default(),
-            unparked: None,
-            parked_at: None,
-            park_due: Arc::new(Notify::new()),
-            send_chain: None,
-            last_generation: 0,
-            body: Body::Parked(Parked {
-                engine: file.engine,
-                cols: info.cols,
-                rows: info.rows,
-                title: info.title,
-                pwd: info.pwd,
-                offset: info.offset,
-                marker: info.marker,
-                screen,
-                history_lines: file.history_lines as usize,
-                snapshot_path,
-            }),
+            ..Session::blank(&self.config.limits, body)
         };
         // What the clients of this incarnation are shown first.
         session.announced = crate::session::announced(&session.to_proto(false));
@@ -274,7 +249,7 @@ impl Registry {
             .sessions
             .insert(info.id.clone(), Arc::new(Mutex::new(session)));
         if !dropped.is_empty() {
-            self.emit(&Event::ProgramStatusRemoved {
+            self.emit(Event::ProgramStatusRemoved {
                 id: info.id,
                 record_ids: dropped,
                 reason: StatusReason::Restore,
@@ -522,7 +497,7 @@ impl Registry {
     /// The retained events are at most `limits.events`, and at most
     /// `RETAINED_FRAMES` frames' worth of bytes, so a replay stays well
     /// within what a connection may queue.
-    pub fn emit(&self, event: &Event) {
+    pub fn emit(&self, event: Event) {
         let mut state = self.state.lock().unwrap();
         state.seq += 1;
         let seq = state.seq;
@@ -542,7 +517,7 @@ impl Registry {
     }
 
     pub fn emit_all(&self, events: Vec<Event>) {
-        for event in &events {
+        for event in events {
             self.emit(event);
         }
     }
@@ -552,7 +527,7 @@ impl Registry {
     pub fn emit_session(&self, events: Vec<Event>, changed: Option<proto::Session>) {
         self.emit_all(events);
         if let Some(session) = changed {
-            self.emit(&Event::SessionChanged { session });
+            self.emit(Event::SessionChanged { session });
         }
     }
 
@@ -644,6 +619,20 @@ impl Registry {
         let master = Arc::new(unsafe { AsyncFd::register(pty.master) }.map_err(internal)?);
         let (input, input_rx) = InputQueue::new(limits.input_queue as usize);
         let created = Instant::now();
+        let body = Body::Live(Box::new(Live {
+            pid: Some(pid),
+            pgid: pid,
+            term,
+            stream: Stream::new(limits.ring as usize, limits.markers as usize),
+            master: master.clone(),
+            slave_path: pty.slave_path,
+            input,
+            pty_eof: false,
+            pending: None,
+            timer_running: false,
+            prompts: Default::default(),
+            last_output: created,
+        }));
         let session = Session {
             id,
             label,
@@ -651,43 +640,10 @@ impl Registry {
             cwd,
             on_exit: params.on_exit.unwrap_or(OnExit::Remove),
             created_at: now(),
-            exited_at: None,
-            exit: None,
-            wake: Arc::new(Notify::new()),
-            text_limit: limits.text as usize,
-            records_limit: limits.records as usize,
-            commands_limit: limits.commands as usize,
-            attached: Vec::new(),
-            size_policy: proto::SizePolicy::Latest,
-            size_owner: None,
-            records: Records::default(),
-            commands: Commands::default(),
-            events: Vec::new(),
-            removed: false,
-            announced: Default::default(),
-            last_bell: None,
-            park_lock: Default::default(),
             // Created is changed: parked within `quiet` even if the
             // program never writes.
             unparked: Some((created, created)),
-            parked_at: None,
-            park_due: Arc::new(Notify::new()),
-            send_chain: None,
-            last_generation: 0,
-            body: Body::Live(Box::new(Live {
-                pid: Some(pid),
-                pgid: pid,
-                term,
-                stream: Stream::new(limits.ring as usize, limits.markers as usize),
-                master: master.clone(),
-                slave_path: pty.slave_path,
-                input,
-                pty_eof: false,
-                pending: None,
-                timer_running: false,
-                prompts: Default::default(),
-                last_output: created,
-            })),
+            ..Session::blank(limits, body)
         };
         let id = session.id.clone();
         let snapshot = session.to_proto(false);
@@ -698,7 +654,7 @@ impl Registry {
             .unwrap()
             .sessions
             .insert(id.clone(), shared.clone());
-        self.emit(&Event::SessionCreated {
+        self.emit(Event::SessionCreated {
             session: snapshot.clone(),
         });
         tokio::spawn(park_when_due(
@@ -797,7 +753,7 @@ impl Registry {
         self.emit_all(events);
         let remove = snapshot.on_exit == OnExit::Remove;
         let id = snapshot.id.clone();
-        self.emit(&Event::SessionExited { session: snapshot });
+        self.emit(Event::SessionExited { session: snapshot });
         if self.is_stopping() {
             return;
         }
@@ -913,7 +869,7 @@ impl Registry {
             s.wake.notify_waiters();
         }
         park::remove(&self.sessions_dir(), id);
-        self.emit(&Event::SessionRemoved { id: id.to_string() });
+        self.emit(Event::SessionRemoved { id: id.to_string() });
     }
 }
 

@@ -36,7 +36,7 @@ struct Response {
 }
 
 /// The parts of `/localapi/v0/status` the server uses.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Status {
     #[serde(rename = "Self")]
     pub this: Node,
@@ -44,7 +44,7 @@ pub struct Status {
     pub cert_domains: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Node {
     #[serde(rename = "TailscaleIPs", default)]
     pub tailscale_ips: Vec<IpAddr>,

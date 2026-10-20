@@ -185,9 +185,13 @@ async fn bootstrap_stream_and_resume() {
     // id and closes, which the connection reports.
     conn.send_json(FrameType::Hello, 0, &hello("test", None))
         .unwrap();
-    let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
-        .await
-        .unwrap();
+    // The event stream ends with the connection, which says why.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while events.recv().await.is_some() {}
+    })
+    .await
+    .unwrap();
+    let closed = conn.ended().expect("ended before its events");
     assert!(
         matches!(&closed, client::Error::Server(e) if e.code == ErrorCode::ProtocolError),
         "{closed}"
