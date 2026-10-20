@@ -177,7 +177,9 @@ fn message_vectors() {
             ("acked", _) => round_trip::<Acked>(name, json),
             ("params", "create") => round_trip::<CreateParams>(name, json),
             ("params", "list") => round_trip::<ListParams>(name, json),
-            ("params", "inspect") => round_trip::<SessionParams>(name, json),
+            ("params", "inspect" | "end" | "remove") => round_trip::<SessionParams>(name, json),
+            ("params", "describe") => round_trip::<catalog::DescribeParams>(name, json),
+            ("empty", _) => round_trip::<Empty>(name, json),
             ("params", "signal") => round_trip::<SignalParams>(name, json),
             ("params", "label") => round_trip::<LabelParams>(name, json),
             ("params", "resize") => round_trip::<ResizeParams>(name, json),
@@ -238,4 +240,221 @@ fn client_payloads_refuse_unknown_fields_and_server_payloads_ignore_them() {
     assert_eq!(reply.id, 1);
     let gap: Gap = serde_json::from_str(r#"{"from":1,"to":2,"future":true}"#).unwrap();
     assert_eq!(gap.to, 2);
+}
+
+fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
+    let mut names = Vec::new();
+    catalog::refs(schema, &mut names);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![schema.clone()];
+    while let Some(name) = names.pop() {
+        if seen.insert(name.clone()) {
+            let def = defs[&name].clone();
+            catalog::refs(&def, &mut names);
+            stack.push(def);
+        }
+    }
+    fn walk(schema: &Value, out: &mut Vec<String>) {
+        match schema {
+            Value::Object(map) => {
+                if map.contains_key("properties") {
+                    out.push(format!(
+                        "{}",
+                        map.get("additionalProperties") == Some(&Value::Bool(false))
+                    ));
+                }
+                map.values().for_each(|v| walk(v, out));
+            }
+            Value::Array(items) => items.iter().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    stack.iter().for_each(|s| walk(s, out));
+}
+
+#[test]
+fn params_schemas_are_closed_and_the_server_s_are_open() {
+    let catalog = catalog::catalog("0");
+    for method in &catalog.methods {
+        let mut params = Vec::new();
+        closed_objects(&method.params, &catalog.defs, &mut params);
+        assert!(!params.is_empty(), "{}: no object", method.name);
+        assert!(
+            params.iter().all(|c| c == "true"),
+            "{}: params open",
+            method.name
+        );
+        let mut result = Vec::new();
+        closed_objects(&method.result, &catalog.defs, &mut result);
+        assert!(
+            result.iter().all(|c| c == "false"),
+            "{}: result closed",
+            method.name
+        );
+    }
+    for event in &catalog.events {
+        let mut fields = Vec::new();
+        closed_objects(&event.schema, &catalog.defs, &mut fields);
+        assert!(fields.iter().all(|c| c == "false"), "{}", event.name);
+    }
+    for frame in &catalog.frames {
+        let Some(schema) = &frame.schema else {
+            continue;
+        };
+        let mut fields = Vec::new();
+        closed_objects(schema, &catalog.defs, &mut fields);
+        // `HELLO.client` and `REQUEST.params` are objects of their own.
+        let closed = frame.direction == catalog::Direction::Client;
+        assert!(
+            fields.iter().all(|c| *c == closed.to_string()),
+            "{}: {fields:?}",
+            frame.name
+        );
+    }
+}
+
+#[test]
+fn every_method_has_typed_examples_and_known_errors() {
+    let catalog = catalog::catalog("0");
+    let typed = catalog::typed();
+    assert_eq!(typed.len(), catalog.methods.len());
+    let codes: Vec<ErrorCode> = catalog.errors.iter().map(|e| e.code).collect();
+    for (method, (name, check)) in catalog.methods.iter().zip(typed) {
+        assert_eq!(method.name, name);
+        assert!(!method.examples.is_empty(), "{name}: no example");
+        for example in &method.examples {
+            check(&example.params, &example.result).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        assert!(!method.summary.is_empty(), "{name}");
+        assert!(method.errors.contains(&ErrorCode::InvalidRequest), "{name}");
+        assert!(method.errors.iter().all(|e| codes.contains(e)), "{name}");
+    }
+    let names: std::collections::BTreeSet<&str> =
+        catalog.methods.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names.len(), catalog.methods.len(), "names are unique");
+    // Every code, each once, with its meaning.
+    assert_eq!(codes.len(), 17);
+    assert_eq!(
+        codes
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        codes.len()
+    );
+    assert!(catalog.errors.iter().all(|e| !e.summary.is_empty()));
+    assert!(catalog.events.iter().all(|e| !e.summary.is_empty()));
+    assert_eq!(catalog.frames.len(), FrameType::ALL.len());
+    assert!(
+        catalog
+            .frames
+            .iter()
+            .all(|f| f.schema.is_some() == (f.payload == catalog::Payload::Json))
+    );
+}
+
+#[test]
+fn every_reference_resolves_and_nothing_is_null() {
+    let catalog = catalog::catalog("0");
+    let json = serde_json::to_value(&catalog).unwrap();
+    let mut names = Vec::new();
+    catalog::refs(&json, &mut names);
+    assert!(!names.is_empty());
+    for name in names {
+        assert!(catalog.defs.contains_key(&name), "{name}");
+    }
+    let text = serde_json::to_string(&json).unwrap();
+    assert!(!text.contains(r#""null""#), "a schema allows null");
+    // Well inside a reply.
+    assert!(
+        (text.len() as u64) < Limits::default().max_frame / 4,
+        "{}",
+        text.len()
+    );
+}
+
+#[test]
+fn describe_one_method_carries_what_it_refers_to() {
+    let catalog = catalog::catalog("1.2.3");
+    for method in &catalog.methods {
+        let one = catalog.describe(&method.name).unwrap();
+        assert_eq!((one.protocol, one.version.as_str()), (VERSION, "1.2.3"));
+        assert_eq!(&one.method, method);
+        // The examples are values, not schemas: `describe`'s holds a
+        // Description with `$defs` of its own.
+        let mut names = Vec::new();
+        catalog::refs(&one.method.params, &mut names);
+        catalog::refs(&one.method.result, &mut names);
+        catalog::refs(&serde_json::to_value(&one.defs).unwrap(), &mut names);
+        for name in names {
+            assert!(one.defs.contains_key(&name), "{}: {name}", method.name);
+        }
+        assert!(one.defs.len() < catalog.defs.len(), "{}", method.name);
+    }
+    assert!(catalog.describe("write").is_none());
+    // Both answers read back as `Described`, each as its own shape.
+    let whole: catalog::Described =
+        serde_json::from_value(serde_json::to_value(&catalog).unwrap()).unwrap();
+    assert!(matches!(whole, catalog::Described::Catalog(c) if c == catalog));
+    let one = catalog.describe("send").unwrap();
+    let back: catalog::Described =
+        serde_json::from_value(serde_json::to_value(&one).unwrap()).unwrap();
+    assert!(matches!(back, catalog::Described::Method(d) if d == one));
+}
+
+#[test]
+fn protocol_md_is_rendered_from_the_catalog() {
+    let doc = include_str!("../../../PROTOCOL.md");
+    let rendered = render::splice(doc, &catalog::catalog("")).unwrap();
+    assert!(
+        rendered == doc,
+        "PROTOCOL.md is stale: run `cargo xtask protocol`"
+    );
+}
+
+#[test]
+fn splice_renders_regions_and_keeps_the_rest() {
+    let catalog = catalog::catalog("");
+    let doc = "Prose.\n<!-- generated: type Cancelled -->\nold\n<!-- end generated -->\nMore.\n";
+    let once = render::splice(doc, &catalog).unwrap();
+    assert_eq!(
+        once,
+        "Prose.\n<!-- generated: type Cancelled -->\n\
+         | Field       | Type | Meaning |\n\
+         | ----------- | ---- | ------- |\n\
+         | `cancelled` | bool | |\n\
+         <!-- end generated -->\nMore.\n"
+    );
+    assert_eq!(render::splice(&once, &catalog).unwrap(), once);
+    for bad in [
+        "<!-- generated: methods -->\nno end\n",
+        "stray\n<!-- end generated -->\n",
+        "<!-- generated: nothing -->\n<!-- end generated -->\n",
+        "<!-- generated: type Nothing -->\n<!-- end generated -->\n",
+        "<!-- generated: methods -->\n<!-- generated: events -->\n<!-- end generated -->\n",
+    ] {
+        assert!(render::splice(bad, &catalog).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn one_method_renders_with_the_types_it_uses() {
+    let catalog = catalog::catalog("");
+    let send = render::method(&catalog.describe("send").unwrap());
+    for part in [
+        "# send\n",
+        "(mutation)",
+        "| `wait`    | {until, timeout_ms?}?",
+        "## Result: Sent",
+        "## Waited",
+        "## SendWait",
+        "## Until",
+        "## OutputMatch",
+        "`input_overflow`",
+        r#"{"method": "send", "params": {"session":"#,
+    ] {
+        assert!(send.contains(part), "{part:?} in\n{send}");
+    }
+    let end = render::method(&catalog.describe("end").unwrap());
+    assert!(end.contains("## Result: `{}`"), "{end}");
 }

@@ -7,7 +7,7 @@ The browser client of [clankermux](https://github.com/gjermundgaraba/clankermux)
 | `.` | `mountTerminal` and its types, `ClientError` |
 | `./worker` | `runWorker`, for the worker module; no DOM types |
 | `./ghostty-vt.wasm` | the engine build the server's engine id names |
-| `./proto`, `./engine`, `./renderer` | the protocol messages, the engine and the canvas renderer |
+| `./proto`, `./engine`, `./renderer` | the protocol messages, the engine and the canvas renderer; `Methods` maps each method to its params and result types, and `Catalog` is what `Connection.describe()` answers: the server's methods, events, frames and error codes with their JSON Schemas |
 
 ```ts
 // worker.ts, started as a module worker

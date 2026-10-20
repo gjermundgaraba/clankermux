@@ -7,6 +7,7 @@ check: check-rust check-web
 check-rust:
     cargo fmt --all --check
     cargo xtask bindings --check
+    cargo xtask protocol --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
 
@@ -24,6 +25,10 @@ fixtures:
 # Regenerate the committed bindings.
 bindings:
     cargo xtask bindings
+
+# Render PROTOCOL.md's tables from the protocol types.
+protocol:
+    cargo xtask protocol
 
 # Re-pin libghostty-vt to an upstream main commit.
 pin sha:

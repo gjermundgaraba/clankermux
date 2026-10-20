@@ -746,7 +746,13 @@ async fn the_guide_is_printed_without_a_server() {
     assert_eq!(code, 0);
     let (code, flag, _) = run_status(&["--skill"], &[]).await;
     assert_eq!((code, &flag), (0, &shown));
-    for needle in ["CLANKERMUX_SESSION", "CLANKERMUX_SOCKET", "--json", "| 3 |"] {
+    for needle in [
+        "CLANKERMUX_SESSION",
+        "CLANKERMUX_SOCKET",
+        "--json",
+        "| 3 |",
+        "api describe",
+    ] {
         assert!(shown.contains(needle), "{needle}");
     }
 }
@@ -1136,4 +1142,150 @@ async fn detach_and_resize_policy_from_the_command_line() {
         run_status(&["--socket", socket, "detach", &session.id, &channel], &[]).await;
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("no_such_attachment"), "{err}");
+}
+
+/// `api`: the server's catalog, one method of it, and requests as they
+/// are, failing with the CLI's exit codes.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_lists_describes_and_calls_as_the_server_answers() {
+    let server = start();
+    let socket = server.socket.to_str().unwrap();
+    let api = |args: &'static [&'static str]| {
+        let mut all = vec!["--socket", socket];
+        all.extend_from_slice(args);
+        async move { run_status(&all, &[]).await }
+    };
+    let catalog = proto::catalog::catalog(&server.registry.config.version);
+
+    let (code, listed, err) = api(&["api", "list"]).await;
+    assert_eq!(code, 0, "{err}");
+    for method in &catalog.methods {
+        assert!(
+            listed.lines().any(
+                |l| l.starts_with(&format!("{} ", method.name)) && l.ends_with(&method.summary)
+            ),
+            "{} in\n{listed}",
+            method.name
+        );
+    }
+    let (_, listed, _) = api(&["--json", "api", "list"]).await;
+    let listed: Vec<serde_json::Value> = serde_json::from_str(&listed).unwrap();
+    let names: Vec<&str> = listed.iter().map(|m| m["name"].as_str().unwrap()).collect();
+    let expected: Vec<&str> = catalog.methods.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, expected);
+    assert_eq!(listed[0]["class"], "mutation");
+
+    let (code, shown, _) = api(&["api", "describe", "send"]).await;
+    assert_eq!(code, 0);
+    assert_eq!(
+        shown,
+        proto::render::method(&catalog.describe("send").unwrap())
+    );
+    let (_, shown, _) = api(&["--json", "api", "describe", "send"]).await;
+    let one: proto::catalog::Description = serde_json::from_str(&shown).unwrap();
+    assert_eq!(one, catalog.describe("send").unwrap());
+    let (code, _, err) = api(&["api", "describe", "write"]).await;
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("invalid_request"), "{err}");
+
+    // A call prints the result as the server sent it.
+    let (code, created, err) = api(&[
+        "api",
+        "call",
+        "create",
+        r#"{"argv": ["/bin/cat"], "label": "raw"}"#,
+    ])
+    .await;
+    assert_eq!(code, 0, "{err}");
+    let created: Session = serde_json::from_str(&created).unwrap();
+    assert_eq!(created.label, "raw");
+    let (code, page, _) = api(&["api", "call", "list"]).await;
+    assert_eq!(code, 0);
+    let page: Page = serde_json::from_str(&page).unwrap();
+    assert_eq!(page.sessions.len(), 1);
+    // No session is assumed, and a timeout is a result.
+    let wait = format!(
+        r#"{{"session": "{}", "until": {{"quiet_ms": 60000}}, "timeout_ms": 50}}"#,
+        created.id
+    );
+    let (code, waited, err) = run_status(
+        &["--socket", socket, "api", "call", "wait", &wait],
+        &[("CLANKERMUX_SESSION", "elsewhere")],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    let waited: Waited = serde_json::from_str(&waited).unwrap();
+    assert_eq!(waited.reason, WaitReason::Timeout);
+    // Params from stdin.
+    let mut piped = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
+        .args(["--socket", socket, "api", "call", "inspect", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use tokio::io::AsyncWriteExt as _;
+    let mut stdin = piped.stdin.take().unwrap();
+    stdin
+        .write_all(format!(r#"{{"session": "{}"}}"#, created.id).as_bytes())
+        .await
+        .unwrap();
+    drop(stdin);
+    let output = piped.wait_with_output().await.unwrap();
+    assert!(output.status.success());
+    let inspected: Session = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(inspected.id, created.id);
+
+    // Failures: a target the server does not know, a refused request, a
+    // method it does not know, params that are not JSON.
+    let (code, out, err) = api(&["api", "call", "inspect", r#"{"session": "nope"}"#]).await;
+    assert_eq!((code, out.as_str()), (3, ""), "{err}");
+    assert!(err.contains("no_such_session"), "{err}");
+    let (code, _, err) = api(&["api", "call", "list", r#"{"extra": 1}"#]).await;
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("invalid_request"), "{err}");
+    let (code, _, err) = api(&["api", "call", "write", "{}"]).await;
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("unknown method write"), "{err}");
+    let dead = tempfile::tempdir().unwrap();
+    let dead = dead.path().join("sock");
+    let (code, _, err) = run_status(
+        &[
+            "--socket",
+            dead.to_str().unwrap(),
+            "api",
+            "call",
+            "list",
+            "{",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(code, 2, "usage before connecting: {err}");
+    let (code, _, _) = run_status(&["--socket", dead.to_str().unwrap(), "api", "list"], &[]).await;
+    assert_eq!(code, 4);
+}
+
+/// `serve` reports the release, in `WELCOME` and in `describe`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_server_reports_its_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let _server = serve(dir.path());
+    let conn = connect_when_up(dir.path()).await;
+    assert_eq!(conn.welcome.server.version, env!("CARGO_PKG_VERSION"));
+    let socket = dir.path().join("sock");
+    let (code, shown, err) = run_status(
+        &[
+            "--socket",
+            socket.to_str().unwrap(),
+            "--json",
+            "api",
+            "describe",
+            "describe",
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    let one: proto::catalog::Description = serde_json::from_str(&shown).unwrap();
+    assert_eq!(one.version, env!("CARGO_PKG_VERSION"));
 }

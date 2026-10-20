@@ -14,7 +14,8 @@ A terminal multiplexer server with CLI and browser clients; the wire protocol is
 
 | Command | Does |
 | --- | --- |
-| `just check` | fmt, bindings, clippy, Rust and web tests, web builds; required for every commit |
+| `just check` | fmt, bindings, PROTOCOL.md's generated tables, clippy, Rust and web tests, web builds; required for every commit |
+| `just protocol` | renders PROTOCOL.md's tables (between `generated` marks) from the protocol types in `crates/proto` |
 | `just release-build` | `target/release/clankermux` |
 | `just dev-serve` | release server: state and socket in `target/dev/`, `wss://127.0.0.1:7438/` with a self-signed certificate, origins `http://app.clankerspace-dev.localhost:10094` and `http://127.0.0.1:8787` |
 | `just pack-web` | `web/dist-packages/gjermundgaraba-clankermux-<version>.tgz`, checked, and `COMMIT` |
@@ -47,6 +48,8 @@ A program reports its status with OSC 7501 (PROTOCOL.md, "Program status"). `lis
 `read` takes `--format text|vt|html` and `--scope screen|history|alternate|last_command`; `last_command` needs a shell that marks its prompts and commands with OSC 133 (shell integration), and fails without one. `tail S [--after OFFSET] [--follow]` prints the session's output stream as plain text from a stream offset (by default the oldest byte kept) up to where the stream was when it began; `--follow` instead keeps going, with a `wait` for more output at the end of each page, until the stream ends.
 
 `inspect` shows a session's attachments: who is attached (each connection's `HELLO` client), read-only or not, the size each last reported, and when each last typed. `clankermux detach S CHANNEL [--reason TEXT]` closes one of them by its `channel`; a CLI attach so closed prints the reason and exits 0, and a web page shows it and does not attach that session again by itself. `clankermux resize S [COLSxROWS] [--policy latest|smallest|fixed]` sets the size, the size policy, or both: `latest` (the default) takes the most recent report, `smallest` the smallest columns and rows among the attachments' reports, `fixed` only what `resize` sets.
+
+`clankermux api list` lists the methods the server speaks, from its `describe` (the catalog PROTOCOL.md's tables are rendered from): each with its class (`read`, `mutation` or `stream`) and what it does. `clankermux api describe METHOD` shows one: every field of its params and result with its type and meaning, the error codes it can answer, and examples; `--json` prints the catalog entry with its JSON Schemas. `clankermux api call METHOD [JSON]` sends one request as it is (params `{}` when left out, `-` reads them from stdin) and prints the result as JSON; it assumes no session, a server error exits 1, or 3 for a session or attachment the server does not know, and Ctrl-C cancels a call that waits.
 
 `clankermux skill show` (or `--skill`) prints a guide for agents: what a session is, the variables above, each command with an example, the exit codes, and the rules for sessions an agent did not create.
 

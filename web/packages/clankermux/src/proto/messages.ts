@@ -433,3 +433,101 @@ export interface Closed {
   /** The reason a `detach` gave. */
   message?: string;
 }
+
+/** The result of a method that answers with success alone. */
+export type Empty = Record<string, never>;
+
+/** `describe`: one method, or the whole catalog. */
+export interface DescribeParams {
+  method?: string;
+}
+
+/** A JSON Schema (2020-12); `$ref`s point into the catalog's `$defs`. */
+export type JsonSchema = { [key: string]: unknown } | boolean;
+
+/** `read` answers from the server's state; `mutation` changes it;
+ * `stream` starts frames that follow the reply. */
+export type Class = "read" | "mutation" | "stream";
+
+/** One method of `REQUEST`. */
+export interface MethodInfo {
+  name: string;
+  class: Class;
+  summary: string;
+  /** Objects refuse undefined fields. */
+  params: JsonSchema;
+  /** Objects may gain fields. */
+  result: JsonSchema;
+  /** The codes its `ERROR` can carry. */
+  errors: ErrorCode[];
+  examples: { params: unknown; result: unknown }[];
+}
+
+/** One kind of `EVENT`. */
+export interface EventInfo {
+  name: string;
+  summary: string;
+  /** The event without `seq`. */
+  schema: JsonSchema;
+  /** `EVENT` payloads, with `seq`. */
+  examples: unknown[];
+}
+
+export interface FrameInfo {
+  name: string;
+  type: number;
+  direction: "client" | "server";
+  /** `0`, `n`, or `0 or n`. */
+  channel: string;
+  payload: "json" | "raw" | "empty";
+  summary: string;
+  schema?: JsonSchema;
+}
+
+export interface ErrorInfo {
+  code: ErrorCode;
+  summary: string;
+}
+
+/** The `describe {}` result. */
+export interface Catalog {
+  protocol: number;
+  /** The server's release. */
+  version: string;
+  methods: MethodInfo[];
+  events: EventInfo[];
+  frames: FrameInfo[];
+  errors: ErrorInfo[];
+  $defs: Record<string, JsonSchema>;
+}
+
+/** The `describe {method}` result: the method and the schemas it refers to. */
+export interface Description {
+  protocol: number;
+  version: string;
+  method: MethodInfo;
+  $defs: Record<string, JsonSchema>;
+}
+
+/** Each method's params and result, as the catalog lists them. */
+export interface Methods {
+  create: { params: CreateParams; result: Session };
+  list: { params: ListParams; result: Page };
+  inspect: { params: SessionParams; result: Session };
+  end: { params: SessionParams; result: Empty };
+  signal: { params: SignalParams; result: Empty };
+  remove: { params: SessionParams; result: Empty };
+  label: { params: LabelParams; result: Session };
+  resize: { params: ResizeParams; result: Empty };
+  read: { params: ReadParams; result: Read };
+  tail: { params: TailParams; result: Tail };
+  send: { params: SendParams; result: Sent };
+  wait: { params: WaitParams; result: Waited };
+  cancel: { params: CancelParams; result: Cancelled };
+  detach: { params: DetachParams; result: Empty };
+  subscribe: { params: SubscribeParams; result: Subscribed };
+  ack: { params: AckParams; result: Acked };
+  describe: { params: DescribeParams; result: Description | Catalog };
+}
+
+export type Method = keyof Methods;

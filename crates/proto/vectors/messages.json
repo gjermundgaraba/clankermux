@@ -704,13 +704,19 @@
   "params/inspect": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001"
   },
+  "params/end": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001"
+  },
+  "params/remove": {
+    "session": "0f1e2d3c-0000-4000-8000-000000000001"
+  },
   "params/signal": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001",
     "signal": "TERM"
   },
   "params/label": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001",
-    "label": "deploy"
+    "label": "build"
   },
   "params/resize": {
     "session": "0f1e2d3c-0000-4000-8000-000000000001",
@@ -889,5 +895,10 @@
   },
   "cancelled/yes": {
     "cancelled": true
+  },
+  "empty/basic": {},
+  "params/describe": {},
+  "params/describe-method": {
+    "method": "cancel"
   }
 }

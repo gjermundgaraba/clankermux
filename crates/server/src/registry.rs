@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use proto::{
@@ -97,6 +97,8 @@ pub struct Registry {
     pub(crate) connections: TaskTracker,
     /// The exclusive lock on the state directory, held until `stop`.
     lock: File,
+    /// What `describe` answers, built at its first request.
+    catalog: OnceLock<proto::catalog::Catalog>,
 }
 
 #[derive(Default)]
@@ -162,6 +164,7 @@ impl Registry {
             attachments: TaskTracker::new(),
             connections: TaskTracker::new(),
             lock,
+            catalog: OnceLock::new(),
         });
         for loaded in park::load(&registry.sessions_dir()) {
             registry.restore(loaded);
@@ -386,6 +389,12 @@ impl Registry {
         // Nothing of this registry touches the directory from here on, so
         // the next server may take it.
         let _ = rustix::fs::flock(&self.lock, rustix::fs::FlockOperation::Unlock);
+    }
+
+    /// The protocol's catalog, with this server's release.
+    pub fn catalog(&self) -> &proto::catalog::Catalog {
+        self.catalog
+            .get_or_init(|| proto::catalog::catalog(&self.config.version))
     }
 
     pub fn get(&self, id: &str) -> Result<Shared, Fail> {

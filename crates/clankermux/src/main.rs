@@ -12,6 +12,7 @@ use base64::Engine as _;
 use clap::{Args, Parser, Subcommand};
 use client::connection::hello;
 use client::{Connection, Endpoint, Error};
+use proto::catalog::{Catalog, DescribeParams, Description};
 use proto::{
     AckParams, Acked, CancelParams, CreateParams, CursorParams, DetachParams, LabelParams,
     ListParams, OnExit, OutputMatch, Page, Read, ReadFormat, ReadParams, ReadScope, ResizeParams,
@@ -258,6 +259,27 @@ enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+    /// The protocol itself: the server's methods, and requests as they
+    /// are.
+    Api {
+        #[command(subcommand)]
+        command: ApiCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApiCommand {
+    /// The server's methods: name, class and what each does.
+    List,
+    /// One method: its params, result, errors and examples.
+    Describe { method: String },
+    /// Send one request as it is and print its result; no session is
+    /// assumed.
+    Call {
+        method: String,
+        /// The params as JSON, `-` for stdin; `{}` when left out.
+        params: Option<String>,
+    },
 }
 
 /// What to wait for; the first to happen ends the wait.
@@ -351,6 +373,20 @@ enum SkillCommand {
 
 /// The guide `skill show` prints, built into the binary so it matches it.
 const SKILL: &str = include_str!("skill.md");
+
+/// `api call`'s params: JSON as given, or read from stdin for `-`.
+fn api_params(params: Option<&str>) -> Result<serde_json::Value, Error> {
+    let text = match params {
+        None => return Ok(serde_json::json!({})),
+        Some("-") => {
+            let mut text = String::new();
+            std::io::stdin().read_to_string(&mut text)?;
+            text
+        }
+        Some(text) => text.to_string(),
+    };
+    serde_json::from_str(&text).map_err(|e| Error::Usage(format!("params are not JSON: {e}")))
+}
 
 /// Why the CLI failed, by exit code: a client error (1, or 2 for a
 /// usage error), a session argument that names no session or several (3),
@@ -624,6 +660,8 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
     if let Some(park) = park_timing {
         config.park = park;
     }
+    // The release, which `WELCOME`, XTVERSION and `describe` report.
+    config.version = env!("CARGO_PKG_VERSION").into();
     // Children run elsewhere: they get the socket as an absolute path.
     config.socket = std::path::absolute(&socket)?;
     let registry = server::Registry::new(config)?;
@@ -1051,6 +1089,11 @@ fn check_args(command: &Command) -> Result<(), Error> {
                 ));
             }
         }
+        Command::Api {
+            command: ApiCommand::Call { params, .. },
+        } if params.as_deref() != Some("-") => {
+            api_params(params.as_deref())?;
+        }
         Command::Wait { wait, .. } if wait.until()?.is_none() => {
             return Err(Error::Usage(
                 "wait for something: --exit, --match, --status, --prompt or --quiet".into(),
@@ -1158,6 +1201,65 @@ async fn tail(
     }
 }
 
+/// `api`: the catalog the server answers to `describe`, and raw calls.
+async fn api(conn: &Connection, command: ApiCommand, json: bool) -> Result<i32, Fail> {
+    match command {
+        ApiCommand::List => {
+            let catalog: Catalog = conn.call("describe", DescribeParams::default()).await?;
+            let methods: Vec<serde_json::Value> = catalog
+                .methods
+                .iter()
+                .map(
+                    |m| serde_json::json!({"name": m.name, "class": m.class, "summary": m.summary}),
+                )
+                .collect();
+            print(json, &methods, |_| {
+                let width = catalog.methods.iter().map(|m| m.name.len()).max();
+                for m in &catalog.methods {
+                    let class = serde_json::to_value(m.class).unwrap();
+                    emit(&format!(
+                        "{:<width$}  {:<8}  {}\n",
+                        m.name,
+                        class.as_str().unwrap_or_default(),
+                        m.summary,
+                        width = width.unwrap_or(0)
+                    ));
+                }
+            });
+        }
+        ApiCommand::Describe { method } => {
+            let params = DescribeParams {
+                method: Some(method),
+            };
+            let one: Description = conn.call("describe", params).await?;
+            print(json, &one, |one| emit(&proto::render::method(one)));
+        }
+        ApiCommand::Call { method, params } => {
+            let params = api_params(params.as_deref())?;
+            // As `wait`: Ctrl-C cancels a request that waits.
+            let (id, reply) = conn.begin(&method, params)?;
+            let result = finish_wait(conn, id, reply)
+                .await
+                .map_err(|fail| match fail {
+                    Fail::Client(Error::Server(e))
+                        if matches!(
+                            e.code,
+                            proto::ErrorCode::NoSuchSession | proto::ErrorCode::NoSuchAttachment
+                        ) =>
+                    {
+                        Fail::Target(format!("{}: {}", e.code, e.message))
+                    }
+                    other => other,
+                })?;
+            emit(&format!(
+                "{}\n",
+                serde_json::to_string_pretty(&result).unwrap()
+            ));
+        }
+    }
+    Ok(0)
+}
+
 async fn run(cli: Cli) -> Result<i32, Fail> {
     let json = cli.json;
     if cli.skill
@@ -1220,6 +1322,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
     })?;
     match command {
         Command::Serve(_) | Command::Skill { .. } => unreachable!(),
+        Command::Api { command } => return api(&conn, command, json).await,
         Command::Create {
             label,
             cwd,

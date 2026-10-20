@@ -61,6 +61,9 @@ the human-readable listing.
     clankermux events                        # session events as JSON lines, each with its seq
     clankermux events --after 41 --incarnation ID   # the events after seq 41, then the live ones
     clankermux attach build                  # attach this terminal (people, not agents)
+    clankermux api list                      # the protocol's methods, from the server
+    clankermux api describe send             # one method: params, result, errors, examples
+    clankermux api call inspect '{"session": "ID"}'   # one request as it is; prints the result
 
 Inside a session, leave the session out: `clankermux label building`.
 `events` names the server's incarnation on stderr; `seq` counts from 1
@@ -76,6 +79,17 @@ also matches the echo of `echo done`). Ctrl-C cancels a wait.
 `send` with one argument types it into the session you are in; when that
 argument names a session, it refuses: give both SESSION and TEXT. Outside
 a session, or with `--connect` or `--ssh`, name the session.
+
+## The protocol underneath
+
+Every command above is made of requests the server answers. When no
+command does what you need, ask the server: `api list` names its
+methods, and `api describe METHOD` shows one with every field of its
+params and result, the errors it can answer and an example (`--json` for
+its JSON Schemas). `api call METHOD JSON` sends one request as it is
+(`-` reads the JSON from stdin) and prints the result as JSON. It never
+assumes the session you are in: put `session` in the JSON. A refused
+request exits 1, and a session the server does not know exits 3.
 
 ## Program status
 

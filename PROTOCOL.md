@@ -22,6 +22,9 @@ terminal. The server is the only writer to a PTY.
 - The engine id is an opaque string naming the libghostty-vt build, compared
   for exact equality. Recommended form: `ghostty-vt@<upstream commit>`, with
   any suffix for local changes.
+- The tables between `generated` marks are rendered from the protocol's
+  types in `crates/proto` (`cargo xtask protocol`), the same catalog that
+  `describe` answers; the prose around them is written by hand.
 
 ## Framing
 
@@ -36,27 +39,29 @@ Every frame is a 10-byte header followed by `length` payload bytes.
 
 The high bit of `type` is set on frames the server sends.
 
-| Type   | Direction | Channel | Payload   | Name             |
-| ------ | --------- | ------- | --------- | ---------------- |
-| `0x01` | client    | 0       | JSON      | `HELLO`          |
-| `0x02` | client    | 0       | JSON      | `REQUEST`        |
-| `0x10` | client    | n       | JSON      | `OPEN`           |
-| `0x11` | client    | n       | raw       | `INPUT`          |
-| `0x12` | client    | n       | JSON      | `VIEWPORT`       |
-| `0x13` | client    | n       | empty     | `CLOSE`          |
-| `0x81` | server    | 0       | JSON      | `WELCOME`        |
-| `0x82` | server    | 0       | JSON      | `REPLY`          |
-| `0x83` | server    | 0       | JSON      | `EVENT`          |
-| `0x8F` | server    | 0 or n  | JSON      | `ERROR`          |
-| `0x90` | server    | n       | JSON      | `ATTACHED`       |
-| `0x91` | server    | n       | raw       | `SNAPSHOT`       |
-| `0x92` | server    | n       | empty     | `SNAPSHOT_READY` |
-| `0x93` | server    | n       | empty     | `SNAPSHOT_END`   |
-| `0x94` | server    | n       | raw       | `OUTPUT`         |
-| `0x95` | server    | n       | JSON      | `RESIZED`        |
-| `0x96` | server    | n       | JSON      | `EXITED`         |
-| `0x97` | server    | n       | JSON      | `GAP`            |
-| `0x99` | server    | n       | JSON      | `CLOSED`         |
+<!-- generated: frames -->
+| Type   | Direction | Channel | Payload | Name |
+| ------ | --------- | ------- | ------- | ---- |
+| `0x01` | client    | 0       | JSON    | `HELLO` |
+| `0x02` | client    | 0       | JSON    | `REQUEST` |
+| `0x10` | client    | n       | JSON    | `OPEN` |
+| `0x11` | client    | n       | raw     | `INPUT` |
+| `0x12` | client    | n       | JSON    | `VIEWPORT` |
+| `0x13` | client    | n       | empty   | `CLOSE` |
+| `0x81` | server    | 0       | JSON    | `WELCOME` |
+| `0x82` | server    | 0       | JSON    | `REPLY` |
+| `0x83` | server    | 0       | JSON    | `EVENT` |
+| `0x8F` | server    | 0 or n  | JSON    | `ERROR` |
+| `0x90` | server    | n       | JSON    | `ATTACHED` |
+| `0x91` | server    | n       | raw     | `SNAPSHOT` |
+| `0x92` | server    | n       | empty   | `SNAPSHOT_READY` |
+| `0x93` | server    | n       | empty   | `SNAPSHOT_END` |
+| `0x94` | server    | n       | raw     | `OUTPUT` |
+| `0x95` | server    | n       | JSON    | `RESIZED` |
+| `0x96` | server    | n       | JSON    | `EXITED` |
+| `0x97` | server    | n       | JSON    | `GAP` |
+| `0x99` | server    | n       | JSON    | `CLOSED` |
+<!-- end generated -->
 
 Channels `1` to `2^32-1` are chosen by the client, one per attachment. A
 channel is in use from `OPEN` until the server's `CLOSED`, or an `ERROR`
@@ -80,23 +85,27 @@ connection closes.
 
 `HELLO`
 
-| Field          | Type     | Meaning                                    |
-| -------------- | -------- | ------------------------------------------ |
-| `version`      | int      | 1                                          |
-| `client`       | object   | `{name, version}`, informational           |
-| `engine`       | string?  | Engine id; absent for control-only clients |
-| `capabilities` | string[] | Capability ids; version 1 defines none     |
+<!-- generated: type Hello -->
+| Field          | Type            | Meaning |
+| -------------- | --------------- | ------- |
+| `version`      | int             | Always 1. |
+| `client`       | {name, version} | Informational. |
+| `engine`       | string?         | Engine id; absent for control-only clients. |
+| `capabilities` | string[]?       | Capability ids; version 1 defines none. |
+<!-- end generated -->
 
 `WELCOME`
 
-| Field          | Type     | Meaning                                  |
-| -------------- | -------- | ---------------------------------------- |
-| `version`      | int      | 1                                        |
-| `server`       | object   | `{name, version}`                        |
-| `engine`       | string   | Engine id of the server                  |
-| `incarnation`  | string   | UUID, new on every server start          |
-| `capabilities` | string[] | Unknown ids are ignored                  |
-| `limits`       | object   | See Limits                               |
+<!-- generated: type Welcome -->
+| Field          | Type            | Meaning |
+| -------------- | --------------- | ------- |
+| `version`      | int             | Always 1. |
+| `server`       | {name, version} | |
+| `engine`       | string          | Engine id of the server. |
+| `incarnation`  | string          | UUID, new on every server start. |
+| `capabilities` | string[]        | Unknown ids are ignored. |
+| `limits`       | Limits          | See Limits. |
+<!-- end generated -->
 
 The engine id is compared at `OPEN`, not at `HELLO`.
 
@@ -110,24 +119,27 @@ server produced them. The exception is a wait: a `wait`, or a `send` with
 `wait`, holds its id until the wait ends, while the requests after it are
 processed and answered.
 
-| Method      | Params                                              | Result                  |
-| ----------- | --------------------------------------------------- | ----------------------- |
-| `create`    | `label?, argv?, cwd?, env?, cols?, rows?, on_exit?` | Session                 |
-| `list`      | `after?`                                            | Page                    |
-| `inspect`   | `session`                                           | Session with records    |
-| `end`       | `session`                                           | `{}`                    |
-| `signal`    | `session, signal`                                   | `{}`                    |
-| `remove`    | `session`                                           | `{}`                    |
-| `label`     | `session, label`                                    | Session                 |
-| `resize`    | `session, cols?, rows?, policy?`                    | `{}`                    |
-| `read`      | `session, scrollback?, format?, scope?`             | Read                    |
-| `tail`      | `session, after, max_bytes?`                        | Tail                    |
-| `send`      | `session, text? \| keys? \| data?, paste?, wait?`    | Sent                    |
-| `wait`      | `session, until, after?, timeout_ms?`               | Waited                  |
-| `cancel`    | `id`                                                | `{cancelled}`           |
-| `detach`    | `session, channel, reason?`                         | `{}`                    |
-| `subscribe` | `after?, incarnation?`                              | Subscribed              |
-| `ack`       | `session, record_ids?`                              | `{record_ids}`          |
+<!-- generated: methods -->
+| Method      | Class    | Params                                              | Result                 | Errors |
+| ----------- | -------- | --------------------------------------------------- | ---------------------- | ------ |
+| `create`    | mutation | `label?, argv?, cwd?, env?, cols?, rows?, on_exit?` | Session                | `invalid_request`, `limit_exceeded`, `internal` |
+| `list`      | read     | `after?`                                            | Page                   | `invalid_request` |
+| `inspect`   | read     | `session`                                           | Session                | `invalid_request`, `no_such_session` |
+| `end`       | mutation | `session`                                           | `{}`                   | `invalid_request`, `no_such_session`, `not_running`, `signal_failed` |
+| `signal`    | mutation | `session, signal`                                   | `{}`                   | `invalid_request`, `no_such_session`, `not_running`, `signal_failed` |
+| `remove`    | mutation | `session`                                           | `{}`                   | `invalid_request`, `no_such_session`, `running`, `internal` |
+| `label`     | mutation | `session, label`                                    | Session                | `invalid_request`, `no_such_session`, `limit_exceeded` |
+| `resize`    | mutation | `session, cols?, rows?, policy?`                    | `{}`                   | `invalid_request`, `no_such_session`, `not_running` |
+| `read`      | read     | `session, scrollback?, format?, scope?`             | Read                   | `invalid_request`, `no_such_session`, `scope_unavailable`, `engine_mismatch`, `internal` |
+| `tail`      | read     | `session, after, max_bytes?`                        | Tail                   | `invalid_request`, `no_such_session` |
+| `send`      | mutation | `session, text?, keys?, data?, paste?, wait?`       | Sent                   | `invalid_request`, `no_such_session`, `not_running`, `input_overflow`, `cancelled`, `internal` |
+| `wait`      | read     | `session, until, after?, timeout_ms?`               | Waited                 | `invalid_request`, `no_such_session`, `not_running`, `cancelled` |
+| `cancel`    | mutation | `id`                                                | `{cancelled}`          | `invalid_request` |
+| `detach`    | mutation | `session, channel, reason?`                         | `{}`                   | `invalid_request`, `no_such_session`, `no_such_attachment`, `limit_exceeded` |
+| `subscribe` | stream   | `after?, incarnation?`                              | Subscribed             | `invalid_request` |
+| `ack`       | mutation | `session, record_ids?`                              | `{record_ids}`         | `invalid_request`, `no_such_session` |
+| `describe`  | read     | `method?`                                           | Description \| Catalog | `invalid_request` |
+<!-- end generated -->
 
 - `create`: `argv` defaults to the user's login shell, `cwd` to the server
   user's home directory, `cols` to 80, `rows` to 24, `on_exit` to `remove`.
@@ -282,7 +294,7 @@ processed and answered.
   `cancel` replies `{cancelled: true}`. After that reply the cancelled
   request sends nothing more. An `id` that is not pending replies
   `{cancelled: false}`.
-- `detach` ends the attachment whose `channel` (see Attachment) is
+- `detach` ends the attachment whose `channel` (see AttachmentInfo) is
   given, with `CLOSED {reason: "detached", message}`, `message` being
   `reason` when given, at most `limits.text` bytes, else
   `limit_exceeded`. Any connection may detach any attachment, of a
@@ -310,6 +322,20 @@ processed and answered.
   connection subscribes once: a later `subscribe` with `{}` returns
   Subscribed with the first page and changes nothing, one with `after`
   is `invalid_request`.
+- `describe` answers the catalog of the protocol this server speaks:
+  each method with its class, the JSON Schemas (2020-12) of its `params`
+  and `result`, the codes its `ERROR` can carry and examples, then the
+  events, the frames and the error codes. A schema refers to the shared
+  definitions as `#/$defs/NAME`, `$defs` being a field of the reply, so a
+  validator takes the schema with the reply's `$defs` beside it. Params
+  schemas set `additionalProperties: false` on every object, as the
+  server refuses undefined fields; result and event schemas leave it
+  unset, as a client ignores fields it does not know. An optional field
+  is absent, never `null`. With `method`, the reply is a Description:
+  that method and the definitions it refers to; a name that is not a
+  method is `invalid_request`. A class is `read` (answers from the
+  server's state and changes nothing), `mutation` or `stream` (starts
+  frames that follow the reply).
 - `ack` marks `done` and `error` records of the session seen: those
   named by `record_ids`, every one when it is absent. The reply lists the
   records it marked; ids that name no such record, or one already seen,
@@ -319,20 +345,24 @@ processed and answered.
 
 Sent
 
-| Field  | Type    | Meaning                                                    |
-| ------ | ------- | ---------------------------------------------------------- |
-| `at`   | object  | `{offset, marker}`: the session's cursor when the bytes were queued |
-| `wait` | Waited? | With `send.wait`                                           |
+<!-- generated: type Sent -->
+| Field  | Type             | Meaning |
+| ------ | ---------------- | ------- |
+| `at`   | {offset, marker} | The session's cursor when the bytes were queued. |
+| `wait` | Waited?          | With `send.wait`: its result. |
+<!-- end generated -->
 
 Waited
 
-| Field    | Type    | Meaning                                                      |
-| -------- | ------- | ------------------------------------------------------------ |
-| `reason` | string  | `exited`, `matched`, `status`, `prompt`, `quiet` or `timeout` |
-| `at`     | object  | `{offset, marker}`: just past the match; after the output holding the prompt; at the end of the stream; else the cursor when it ended |
-| `exit`   | object? | `exited`: the session's `exit`                               |
-| `match`  | object? | `matched`: `{text, offset}`, the plain text that matched and the stream offset of its first byte |
-| `record` | object? | `status`: the record, as `inspect` shows it                  |
+<!-- generated: type Waited -->
+| Field    | Type                                                                  | Meaning |
+| -------- | --------------------------------------------------------------------- | ------- |
+| `reason` | `exited` \| `matched` \| `status` \| `prompt` \| `quiet` \| `timeout` | |
+| `at`     | {offset, marker}                                                      | Just past the match; after the output holding the prompt; at the end of the stream; else the cursor when it ended. |
+| `exit`   | ({code} \| {signal})?                                                 | `exited`: the session's `exit`. |
+| `match`  | {text, offset}?                                                       | `matched`: the plain text that matched and the stream offset of its first byte. |
+| `record` | StatusRecord?                                                         | `status`: the record, as `inspect` shows it. |
+<!-- end generated -->
 
 Keys
 
@@ -349,61 +379,109 @@ modes when it is handled, and written as one unit.
 
 Read
 
-| Field    | Type    | Meaning                                                            |
-| -------- | ------- | ------------------------------------------------------------------ |
-| `text`   | string  |                                                                    |
-| `cols`   | int     |                                                                    |
-| `rows`   | int     |                                                                    |
-| `cursor` | object? | `{x, y}`, zero-based; absent for a session loaded from a park file |
-| `offset` | int     | Stream offset at the time of the read                              |
-| `status` | string  |                                                                    |
-| `truncated` | bool? | Present and true when lines were left out                         |
+<!-- generated: type Read -->
+| Field       | Type                                | Meaning |
+| ----------- | ----------------------------------- | ------- |
+| `text`      | string                              | |
+| `cols`      | int                                 | |
+| `rows`      | int                                 | |
+| `cursor`    | {x, y}?                             | Zero-based; absent for a session loaded from a park file. |
+| `offset`    | int                                 | Stream offset at the time of the read. |
+| `status`    | `running` \| `exited` \| `restored` | |
+| `truncated` | bool?                               | Present and true when lines were left out: cut to fit `max_frame`, or, for `last_command`, bytes the stream no longer holds. |
+<!-- end generated -->
 
 Tail
 
-| Field          | Type   | Meaning                                                  |
-| -------------- | ------ | -------------------------------------------------------- |
-| `text`         | string | Plain text, by the filter above                          |
-| `start_offset` | int    | Where the text starts: `after`, or later when truncated |
-| `next_offset`  | int    | Where it ends; the next `after`                          |
-| `complete`     | bool   | `next_offset` is the current stream offset               |
-| `truncated`    | bool?  | Present and true when `start_offset` is above `after`    |
+<!-- generated: type Tail -->
+| Field          | Type   | Meaning |
+| -------------- | ------ | ------- |
+| `text`         | string | Plain text, by the filter under `tail`. |
+| `start_offset` | int    | Where the text starts: `after`, or later when truncated. |
+| `next_offset`  | int    | Where it ends; the next `after`. |
+| `complete`     | bool   | Nothing more to read now: `next_offset` is the current stream offset, or what follows it is unfinished. |
+| `truncated`    | bool?  | Present and true when `start_offset` is above `after`. |
+<!-- end generated -->
+
+Catalog
+
+<!-- generated: type Catalog -->
+| Field      | Type                                                          | Meaning |
+| ---------- | ------------------------------------------------------------- | ------- |
+| `protocol` | int                                                           | The protocol version, as in `WELCOME`. |
+| `version`  | string                                                        | The server's release. |
+| `methods`  | MethodInfo[]                                                  | |
+| `events`   | {name, summary, schema, examples}[]                           | |
+| `frames`   | {name, type, direction, channel, payload, summary, schema?}[] | |
+| `errors`   | {code, summary}[]                                             | |
+| `$defs`    | object                                                        | The schemas the others refer to, as `#/$defs/NAME`. |
+<!-- end generated -->
+
+Description
+
+<!-- generated: type Description -->
+| Field      | Type       | Meaning |
+| ---------- | ---------- | ------- |
+| `protocol` | int        | The protocol version, as in `WELCOME`. |
+| `version`  | string     | The server's release. |
+| `method`   | MethodInfo | |
+| `$defs`    | object     | The schemas `method` refers to, as `#/$defs/NAME`. |
+<!-- end generated -->
+
+MethodInfo
+
+<!-- generated: type MethodInfo -->
+| Field      | Type                             | Meaning |
+| ---------- | -------------------------------- | ------- |
+| `name`     | string                           | |
+| `class`    | `read` \| `mutation` \| `stream` | |
+| `summary`  | string                           | |
+| `params`   | any                              | JSON Schema of `params`; objects refuse undefined fields. |
+| `result`   | any                              | JSON Schema of `REPLY.result`; objects may gain fields. |
+| `errors`   | ErrorCode[]                      | The codes its `ERROR` can carry. |
+| `examples` | {params, result}[]               | |
+<!-- end generated -->
 
 ### Session
 
-| Field            | Type     | Meaning                                                 |
-| ---------------- | -------- | ------------------------------------------------------- |
-| `id`             | string   | UUID assigned by the server, never reused               |
-| `label`          | string   | At most `limits.label` bytes                            |
-| `status`         | string   | `running`, `exited`, `restored`                         |
-| `argv`           | string[] |                                                         |
-| `cwd`            | string   | Working directory at creation                           |
-| `pid`            | int?     | While the child is alive                                |
-| `cols`, `rows`   | int      | Current size                                            |
-| `title`          | string   | From the program, OSC 0 or 2                            |
-| `pwd`            | string   | From the program, OSC 7; the path only, host dropped, percent-decoded |
-| `on_exit`        | string   | `remove` or `keep`                                      |
-| `created_at`     | string   | RFC 3339                                                |
-| `exited_at`      | string?  |                                                         |
-| `exit`           | object?  | `{code}` or `{signal}`, signal by name                  |
-| `offset`         | int      | Current stream offset                                   |
-| `marker`         | int      | Sequence number of the latest marker, 0 if none         |
-| `attachments`    | Attachment[] | Open attachments, in the order they opened          |
-| `command`        | object?  | The command running or the last that ran, `{start, output?, end?, exit?}`; see Commands |
-| `program_status` | Record[] | Only in `inspect`; see Program status                   |
-| `attention`      | object?  | The record that most wants the user; see Program status |
-| `size`           | object   | `{policy, owner?}`: the size policy, and under `latest` the `channel` of the attachment whose report is current; see Size |
+<!-- generated: type Session -->
+| Field            | Type                                | Meaning |
+| ---------------- | ----------------------------------- | ------- |
+| `id`             | string                              | UUID assigned by the server, never reused. |
+| `label`          | string                              | At most `limits.label` bytes. |
+| `status`         | `running` \| `exited` \| `restored` | |
+| `argv`           | string[]                            | |
+| `cwd`            | string                              | Working directory at creation. |
+| `pid`            | int?                                | While the child is alive. |
+| `cols`           | int                                 | Current size. |
+| `rows`           | int                                 | Current size. |
+| `title`          | string                              | From the program, OSC 0 or 2. |
+| `pwd`            | string                              | From the program, OSC 7; the path only, host dropped, percent-decoded. |
+| `on_exit`        | `remove` \| `keep`                  | |
+| `created_at`     | string                              | RFC 3339. |
+| `exited_at`      | string?                             | RFC 3339. |
+| `exit`           | ({code} \| {signal})?               | The signal by name. |
+| `offset`         | int                                 | Current stream offset. |
+| `marker`         | int                                 | Sequence number of the latest marker, 0 if none. |
+| `attachments`    | AttachmentInfo[]                    | Open attachments, in the order they opened. |
+| `command`        | {start, output?, end?, exit?}?      | The command running or the last that ran; see Commands. |
+| `program_status` | StatusRecord[]?                     | Only in `inspect`; see Program status. |
+| `attention`      | {state, kind?, app?, msg?, record}? | The record that most wants the user; see Program status. |
+| `size`           | {policy, owner?}                    | The size policy, and under `latest` the `channel` of the attachment whose report is current; see Size. |
+<!-- end generated -->
 
-Attachment
+AttachmentInfo
 
-| Field        | Type    | Meaning                                                      |
-| ------------ | ------- | ------------------------------------------------------------ |
-| `channel`    | int     | Assigned by the server at `OPEN`, unique on it and never reused while it runs; not the frame channel, which only its connection knows |
-| `client`     | object  | `{name, version}` from the connection's `HELLO.client`, each cut to 32 bytes with control characters replaced by `?` |
-| `read_only`  | bool    |                                                              |
-| `viewport`   | object? | `{cols, rows}` of its latest viewport report, in `OPEN` or `VIEWPORT`; absent until it makes one |
-| `since`      | string  | When it opened, RFC 3339                                     |
-| `last_input` | string? | When it last sent `INPUT` the server accepted, RFC 3339      |
+<!-- generated: type AttachmentInfo -->
+| Field        | Type            | Meaning |
+| ------------ | --------------- | ------- |
+| `channel`    | int             | Assigned by the server at `OPEN`, unique on it and never reused while it runs; not the frame channel, which only its connection knows. `detach` takes it. |
+| `client`     | {name, version} | From the connection's `HELLO.client`, each cut to 32 bytes with control characters replaced by `?`. |
+| `read_only`  | bool            | |
+| `viewport`   | {cols, rows}?   | Its latest viewport report, in `OPEN` or `VIEWPORT`; absent until it makes one. |
+| `since`      | string          | When it opened, RFC 3339. |
+| `last_input` | string?         | When it last sent `INPUT` the server accepted, RFC 3339. |
+<!-- end generated -->
 
 `restored` means the session was running when a previous server
 incarnation stopped. It has a screen but no process and no exit.
@@ -420,21 +498,23 @@ them. The server retains the latest `limits.events` events in memory for
 `subscribe {after}`, fewer when they would exceed twice
 `limits.max_frame` bytes as frames.
 
-| Event                    | Fields                             | When                                            |
-| ------------------------ | ---------------------------------- | ----------------------------------------------- |
-| `session_created`        | `session`                          |                                                 |
-| `session_changed`        | `session`                          | Label, `cols`/`rows`, `size` (policy or owner), title, pwd, `attachments`, `attention` or `command` changed; not `last_input` alone |
-| `session_exited`         | `session`                          | The stream ended; `exit` is set                 |
-| `session_removed`        | `id`                               | Removed by request, or by `on_exit: remove`     |
-| `program_status_changed` | `id, record, reason`               | One record was set; see Program status          |
-| `program_status_removed` | `id, record_ids, reason`           | Records were dropped or cleared                 |
-| `bell`                   | `id`                               | BEL, at most one per session per 100 ms         |
-| `notification`           | `id, title, body`                  | OSC 9 or OSC 777 `notify`; `title` empty when the sequence has none |
-| `progress`               | `id, state, progress?`             | OSC 9;4                                         |
-| `command_started`        | `id, offset`                       | OSC 133 `C`: the command's output starts        |
-| `command_ended`          | `id, offset, exit?`                | OSC 133 `D`, with the exit code the shell sent  |
-| `attachment_opened`      | `id, channel, client, read_only`   | An `OPEN` attached                              |
-| `attachment_closed`      | `id, channel, reason`              | The attachment ended                            |
+<!-- generated: events -->
+| Event                    | Fields                           | When |
+| ------------------------ | -------------------------------- | ---- |
+| `session_created`        | `session`                        | A session was created. |
+| `session_changed`        | `session`                        | Label, `cols`/`rows`, `size` (policy or owner), title, pwd, `attachments`, `attention` or `command` changed; not `last_input` alone. |
+| `session_exited`         | `session`                        | The stream ended; `exit` is set. |
+| `session_removed`        | `id`                             | Removed by request, or by `on_exit: remove`. |
+| `program_status_changed` | `id, record, reason`             | One record was set; see Program status. |
+| `program_status_removed` | `id, record_ids, reason`         | Records were dropped or cleared. |
+| `bell`                   | `id`                             | BEL, at most one per session per 100 ms. |
+| `notification`           | `id, title, body`                | OSC 9 or OSC 777 `notify`; `title` empty when the sequence has none. |
+| `progress`               | `id, state, progress?`           | OSC 9;4. |
+| `command_started`        | `id, offset`                     | OSC 133 `C`: the command's output starts. |
+| `command_ended`          | `id, offset, exit?`              | OSC 133 `D`, with the exit code the shell sent. |
+| `attachment_opened`      | `id, channel, client, read_only` | An `OPEN` attached. |
+| `attachment_closed`      | `id, channel, reason`            | The attachment ended. |
+<!-- end generated -->
 
 `id` is the session id in every event that carries it.
 
@@ -448,7 +528,7 @@ them. The server retains the latest `limits.events` events in memory for
   just after the sequence's terminator (BEL or ST, also when an ST is
   split across two reads of the PTY), the same as in `Session.command`.
 - `attachment_opened`: `channel` and `client` are as in the session's
-  `attachments` (see Attachment): the server's own number for the
+  `attachments` (see AttachmentInfo): the server's own number for the
   attachment, which `detach` takes, not the frame channel.
 - `attachment_closed`: `reason` is the `CLOSED` reason (`closed`,
   `removed`, `stopping`, `detached`) when the attachment got one, the error code when
@@ -471,17 +551,19 @@ relies on the engine's program-status and semantic-prompt effects, both on
 upstream `main` as of 2026-10-18, and on its bell, desktop-notification
 and progress-report effects for the events of the same names.
 
-| Field        | Type    |
-| ------------ | ------- |
-| `id`         | string  |
-| `state`      | string  |
-| `kind`       | string? |
-| `app`        | string? |
-| `title`      | string? |
-| `msg`        | string? |
-| `progress`   | int?    |
-| `updated_at` | string  |
-| `seen`       | bool?   |
+<!-- generated: type StatusRecord -->
+| Field        | Type    | Meaning |
+| ------------ | ------- | ------- |
+| `id`         | string  | The record id; `""` for the root. |
+| `state`      | string  | `idle`, `working`, `done`, `blocked` or `error`. |
+| `kind`       | string? | |
+| `app`        | string? | In `inspect`, resolved from the nearest ancestor when the record has none. |
+| `title`      | string? | |
+| `msg`        | string? | |
+| `progress`   | int?    | 0 to 100. |
+| `updated_at` | string  | RFC 3339. |
+| `seen`       | bool?   | On `done` and `error` records only: false until `ack`. |
+<!-- end generated -->
 
 `seen` is on `done` and `error` records only: false when reported, true
 once `ack` marked it. A new report on the id replaces the record, so it is
@@ -561,13 +643,15 @@ reads them.
 
 ### OPEN
 
-| Field       | Type    | Meaning                                                  |
-| ----------- | ------- | -------------------------------------------------------- |
-| `session`   | string  |                                                          |
-| `read_only` | bool?   | Default false                                            |
-| `viewport`  | object? | `{cols, rows, cell_width?, cell_height?}`                |
-| `profile`   | object? | `{fg?, bg?, cursor?, scheme?}`, see below                |
-| `resume`    | object? | `{incarnation, offset, marker}`                          |
+<!-- generated: type Open -->
+| Field       | Type                                     | Meaning |
+| ----------- | ---------------------------------------- | ------- |
+| `session`   | string                                   | The session's id. |
+| `read_only` | bool?                                    | Default false. |
+| `viewport`  | {cols, rows, cell_width?, cell_height?}? | |
+| `profile`   | {fg?, bg?, cursor?, scheme?}?            | See below. |
+| `resume`    | {incarnation, offset, marker}?           | |
+<!-- end generated -->
 
 Profile colours are `#rrggbb`; `scheme` is `light` or `dark`.
 
@@ -591,15 +675,17 @@ before the session check.
 
 ### ATTACHED
 
-| Field     | Type    | Meaning                                                 |
-| --------- | ------- | ------------------------------------------------------- |
-| `mode`    | string  | `snapshot` or `resume`                                  |
-| `offset`  | int     | Cursor offset the attachment continues from            |
-| `marker`  | int     | Cursor marker: latest `seq` reflected in the snapshot, or in the client's terminal when resuming |
-| `cols`    | int     |                                                         |
-| `rows`    | int     |                                                         |
-| `session` | Session |                                                         |
-| `snapshot_bytes` | int? | Required in mode `snapshot`, absent otherwise: the total length of the snapshot that follows (the sum of the `SNAPSHOT` payloads), so a client can size its buffer |
+<!-- generated: type Attached -->
+| Field            | Type                   | Meaning |
+| ---------------- | ---------------------- | ------- |
+| `mode`           | `snapshot` \| `resume` | |
+| `offset`         | int                    | Cursor offset the attachment continues from. |
+| `marker`         | int                    | Cursor marker: latest `seq` reflected in the snapshot, or in the client's terminal when resuming. |
+| `cols`           | int                    | |
+| `rows`           | int                    | |
+| `session`        | Session                | |
+| `snapshot_bytes` | int?                   | Required in mode `snapshot`, absent otherwise: the total length of the snapshot that follows (the sum of the `SNAPSHOT` payloads), so a client can size its buffer. |
+<!-- end generated -->
 
 `resume` is chosen when `OPEN.resume.incarnation` equals the server's
 incarnation, `OPEN.resume.offset` lies within the retained stream, and
@@ -738,7 +824,7 @@ open attachment, finished or not, gets `CLOSED removed`.
 
 A session has one size. Writable attachments report their viewport in
 `OPEN` and `VIEWPORT`; each attachment's latest report is recorded as its
-`viewport` (see Attachment), and a read-only one makes none. The session's
+`viewport` (see AttachmentInfo), and a read-only one makes none. The session's
 size policy, `Session.size.policy`, decides what the reports do:
 
 | Policy     | Size                                                                 |
@@ -944,30 +1030,32 @@ request. On channel 0 without `id` it precedes closing the connection. On
 an attachment channel it ends the attachment, except `read_only`,
 `not_running` and `input_overflow`.
 
-| Code               | Meaning                                                   |
-| ------------------ | --------------------------------------------------------- |
-| `protocol_error`   | A connection error under Framing; the connection closes   |
-| `version_mismatch` | `HELLO.version` is not 1; the connection closes           |
-| `invalid_request`  | Malformed payload, a field the protocol does not define, unknown method, a resume marker above the session's latest, a `subscribe` `after` above the latest event, `read` with `scrollback` and a scope other than `screen`, or `tail` from past the stream's end or with `max_bytes` 0 |
-| `limit_exceeded`   | `label`, `text` or `attachments` exceeded, or a snapshot failed |
-| `no_such_session`  |                                                           |
-| `no_such_attachment` | `detach` named no open attachment of the session        |
-| `not_running`      | `status` is not `running`, or the stream has ended; for a wait, nothing matched before the stream ended |
-| `running`          | `remove` on a running session                             |
-| `signal_failed`    | `end` or `signal` found no process to signal              |
-| `engine_mismatch`  | Engine ids differ                                         |
-| `channel_in_use`   | `OPEN` on a channel already in use                        |
-| `read_only`        | `INPUT` or `VIEWPORT` on a read-only attachment           |
-| `input_overflow`   | The frame would exceed `limits.input_queue`               |
-| `too_slow`         | Second gap during a bootstrap                             |
-| `cancelled`        | A `cancel` ended the request                              |
-| `scope_unavailable`| `read` of `alternate` off the alternate screen, or of `last_command` with no command output marked |
-| `internal`         |                                                           |
+<!-- generated: errors -->
+| Code                 | Meaning |
+| -------------------- | ------- |
+| `protocol_error`     | A connection error under Framing; the connection closes. |
+| `version_mismatch`   | `HELLO.version` is not 1; the connection closes. |
+| `invalid_request`    | Malformed payload, a field the protocol does not define, unknown method, a resume marker above the session's latest, a `subscribe` `after` above the latest event, `read` with `scrollback` and a scope other than `screen`, or `tail` from past the stream's end or with `max_bytes` 0. |
+| `limit_exceeded`     | `label`, `text` or `attachments` exceeded, or a snapshot failed. |
+| `no_such_session`    | No session has the id. |
+| `no_such_attachment` | `detach` named no open attachment of the session. |
+| `not_running`        | `status` is not `running`, or the stream has ended; for a wait, nothing matched before the stream ended. |
+| `running`            | `remove` on a running session. |
+| `signal_failed`      | `end` or `signal` found no process to signal. |
+| `engine_mismatch`    | Engine ids differ. |
+| `channel_in_use`     | `OPEN` on a channel already in use. |
+| `read_only`          | `INPUT` or `VIEWPORT` on a read-only attachment. |
+| `input_overflow`     | The input would exceed `limits.input_queue`. |
+| `too_slow`           | Second gap during a bootstrap. |
+| `cancelled`          | A `cancel` ended the request. |
+| `scope_unavailable`  | `read` of `alternate` off the alternate screen, or of `last_command` with no command output marked. |
+| `internal`           | The server failed, or is stopping. |
+<!-- end generated -->
 
 ## Not in version 1
 
 Process survival across a server restart; encryption of parked state;
 authentication beyond socket ownership and tailnet policy; a WebTransport
-carrier; idle parking that frees a live terminal; a
-self-describing API; images from before an attach; OSC 52 reads; input acknowledgements on attachment
+carrier; idle parking that frees a live terminal;
+images from before an attach; OSC 52 reads; input acknowledgements on attachment
 channels.

@@ -74,6 +74,8 @@ async fn an_unknown_field_in_a_request_is_invalid() {
         ("send", json!({"session": id, "data": ""})),
         ("ack", json!({"session": id})),
         ("subscribe", json!({"after": 0, "incarnation": "x"})),
+        ("describe", json!({})),
+        ("describe", json!({"method": "send"})),
     ];
     for (method, params) in requests {
         assert_eq!(

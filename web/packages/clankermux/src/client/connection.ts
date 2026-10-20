@@ -1,4 +1,6 @@
 import {
+  type Catalog,
+  type Description,
   type ErrorMessage,
   type Event,
   type Frame,
@@ -124,6 +126,13 @@ export class Connection {
         reject(err);
       }
     });
+  }
+
+  /** The server's catalog (`describe {}`), or one method of it. */
+  describe(): Promise<Catalog>;
+  describe(method: string): Promise<Description>;
+  describe(method?: string): Promise<Catalog | Description> {
+    return this.call("describe", method === undefined ? {} : { method });
   }
 
   /** Opens `channel`; its frames go to `receive` until `release` or the

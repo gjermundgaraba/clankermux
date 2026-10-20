@@ -436,6 +436,17 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
             }
             Ok(json!({}))
         }
+        "describe" => {
+            let p: proto::catalog::DescribeParams = params(p)?;
+            let catalog = registry.catalog();
+            match p.method {
+                None => Ok(json!(catalog)),
+                Some(name) => catalog
+                    .describe(&name)
+                    .map(|one| json!(one))
+                    .ok_or((ErrorCode::InvalidRequest, format!("no method {name}"))),
+            }
+        }
         "read" => Ok(json!(read::read(registry, params(p)?)?)),
         "tail" => Ok(json!(read::tail(registry, params(p)?)?)),
         other => Err((ErrorCode::InvalidRequest, format!("unknown method {other}"))),
