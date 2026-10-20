@@ -365,7 +365,7 @@ fn route(routes: &Mutex<Routes>, frame: Frame) -> Result<(), Ended> {
 
 /// Where a server is reached: the local socket, a tailnet address, or a
 /// relay over SSH.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Endpoint {
     Unix(std::path::PathBuf),
     /// `host:port`, plaintext.
