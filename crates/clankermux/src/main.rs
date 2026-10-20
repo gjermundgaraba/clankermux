@@ -32,7 +32,8 @@ const SOCKET_ENV: &str = "CLANKERMUX_SOCKET";
 const SESSION_HELP: &str = "Id, label, or four or more characters from either end of the id; \
                             `$CLANKERMUX_SESSION` when left out";
 
-/// Exit codes besides 0, 1 and clap's 2.
+/// Exit codes besides 0 and 1, as README.md and skill.md tabulate them
+/// (a test holds both tables to these).
 const EXIT_USAGE: i32 = 2;
 const EXIT_TARGET: i32 = 3;
 const EXIT_UNREACHABLE: i32 = 4;
@@ -1625,4 +1626,61 @@ async fn main() {
     };
     // The stdin reader thread of an attach must not keep the process up.
     std::process::exit(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// README.md and the guide list the same exit codes, and the codes
+    /// are the ones the CLI exits with.
+    #[test]
+    fn the_exit_code_tables_are_the_cli_s() {
+        let rows = [
+            ("0", "Done"),
+            (
+                "1",
+                "Failed: the server refused the request, or the connection broke",
+            ),
+            (
+                &EXIT_USAGE.to_string(),
+                "Usage: arguments clap or the command cannot use, or no session given outside a \
+                 session",
+            ),
+            (
+                &EXIT_TARGET.to_string(),
+                "The session argument named no session, or several",
+            ),
+            (
+                &EXIT_UNREACHABLE.to_string(),
+                "The server cannot be reached",
+            ),
+            (&EXIT_TIMEOUT.to_string(), "A wait timed out"),
+            (
+                &EXIT_INTERRUPTED.to_string(),
+                "A wait was cancelled with Ctrl-C",
+            ),
+            (
+                "child's",
+                "A wait that ended with the session's exit (`--exit`, `create --wait`): its \
+                 code, or 128 plus the signal's number; 1 for a `restored` session, which has none",
+            ),
+        ];
+        let expected: Vec<String> = rows
+            .iter()
+            .map(|(code, meaning)| format!("| {code} | {meaning} |"))
+            .collect();
+        for (name, doc) in [
+            ("README.md", include_str!("../../../README.md")),
+            ("skill.md", SKILL),
+        ] {
+            let table: Vec<&str> = doc
+                .lines()
+                .skip_while(|line| !line.ends_with("| Meaning |"))
+                .skip(2)
+                .take_while(|line| line.starts_with('|'))
+                .collect();
+            assert_eq!(table, expected, "{name}");
+        }
+    }
 }
