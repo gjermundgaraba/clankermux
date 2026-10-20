@@ -30,8 +30,6 @@ pub enum Error {
     Server(ErrorMessage),
     /// The connection is closed.
     Closed,
-    /// A caller's mistake, reported as given.
-    Usage(String),
 }
 
 impl fmt::Display for Error {
@@ -42,7 +40,6 @@ impl fmt::Display for Error {
             Error::Desync(m) => write!(f, "out of sync: {m}"),
             Error::Server(e) => write!(f, "{}: {}", e.code, e.message),
             Error::Closed => write!(f, "connection closed"),
-            Error::Usage(m) => write!(f, "{m}"),
         }
     }
 }

@@ -315,7 +315,7 @@ struct WaitArgs {
 impl WaitArgs {
     /// The `until` these flags name, if any; a timeout alone is a usage
     /// error.
-    fn until(&self) -> Result<Option<Until>, Error> {
+    fn until(&self) -> Result<Option<Until>, Fail> {
         let until = Until {
             exited: self.exit.then_some(true),
             output: self.matching.clone().map(|regex| OutputMatch {
@@ -331,7 +331,7 @@ impl WaitArgs {
         };
         if until == Until::default() {
             return match self.timeout {
-                Some(_) => Err(Error::Usage("--timeout needs something to wait for".into())),
+                Some(_) => Err(Fail::Usage("--timeout needs something to wait for".into())),
                 None => Ok(None),
             };
         }
@@ -375,7 +375,7 @@ enum SkillCommand {
 const SKILL: &str = include_str!("skill.md");
 
 /// `api call`'s params: JSON as given, or read from stdin for `-`.
-fn api_params(params: Option<&str>) -> Result<serde_json::Value, Error> {
+fn api_params(params: Option<&str>) -> Result<serde_json::Value, Fail> {
     let text = match params {
         None => return Ok(serde_json::json!({})),
         Some("-") => {
@@ -385,14 +385,16 @@ fn api_params(params: Option<&str>) -> Result<serde_json::Value, Error> {
         }
         Some(text) => text.to_string(),
     };
-    serde_json::from_str(&text).map_err(|e| Error::Usage(format!("params are not JSON: {e}")))
+    serde_json::from_str(&text).map_err(|e| Fail::Usage(format!("params are not JSON: {e}")))
 }
 
-/// Why the CLI failed, by exit code: a client error (1, or 2 for a
-/// usage error), a session argument that names no session or several (3),
-/// or a server that cannot be reached (4).
+/// Why the CLI failed, by exit code: a client error (1), a usage error
+/// (2), a session argument that names no session or several (3), or a
+/// server that cannot be reached (4).
 enum Fail {
     Client(Error),
+    /// Arguments the command cannot use, reported as given.
+    Usage(String),
     Target(String),
     Unreachable(String),
     /// Ctrl-C cancelled a wait.
@@ -411,15 +413,15 @@ impl From<std::io::Error> for Fail {
     }
 }
 
-fn parse_detach_key(spec: &str) -> Result<u8, Error> {
+fn parse_detach_key(spec: &str) -> Result<u8, Fail> {
     attach::parse_key(spec).ok_or_else(|| {
-        Error::Usage(format!(
+        Fail::Usage(format!(
             "unusable detach key {spec:?}: use C-<letter> or C-<@ [ \\ ] ^ _ ?>"
         ))
     })
 }
 
-fn parse_env(entries: &[String]) -> Result<BTreeMap<String, String>, Error> {
+fn parse_env(entries: &[String]) -> Result<BTreeMap<String, String>, Fail> {
     entries
         .iter()
         .map(|entry| {
@@ -428,7 +430,7 @@ fn parse_env(entries: &[String]) -> Result<BTreeMap<String, String>, Error> {
                 .filter(|(name, _)| !name.is_empty())
                 .map(|(name, value)| (name.to_string(), value.to_string()))
                 .ok_or_else(|| {
-                    Error::Usage(format!("environment entry {entry:?} is not NAME=value"))
+                    Fail::Usage(format!("environment entry {entry:?} is not NAME=value"))
                 })
         })
         .collect()
@@ -496,15 +498,15 @@ async fn resolve(conn: &Connection, here: bool, needle: Option<String>) -> Resul
     let needle = match needle.or_else(|| here_session(here)) {
         Some(needle) => needle,
         None if std::env::var_os(SESSION_ENV).is_some_and(|v| !v.is_empty()) => {
-            return Err(Fail::Client(Error::Usage(format!(
+            return Err(Fail::Usage(format!(
                 "a session is needed: ${SESSION_ENV} is a session of the server in \
                  ${SOCKET_ENV}, not of this one"
-            ))));
+            )));
         }
         None => {
-            return Err(Fail::Client(Error::Usage(format!(
+            return Err(Fail::Usage(format!(
                 "a session is needed: name one, or run inside a session (${SESSION_ENV})"
-            ))));
+            )));
         }
     };
     let exact = SessionParams {
@@ -551,8 +553,8 @@ fn target_and(mut args: Vec<String>, rest: usize) -> (Option<String>, Vec<String
 type Sides = (Option<u16>, Option<u16>);
 
 /// `COLSxROWS`, `COLSx` or `xROWS`.
-fn parse_size(spec: &str) -> Result<Sides, Error> {
-    let bad = || Error::Usage(format!("{spec:?} is not COLSxROWS, COLSx or xROWS"));
+fn parse_size(spec: &str) -> Result<Sides, Fail> {
+    let bad = || Fail::Usage(format!("{spec:?} is not COLSxROWS, COLSx or xROWS"));
     let (cols, rows) = spec.split_once('x').ok_or_else(bad)?;
     let side = |s: &str| {
         (!s.is_empty())
@@ -625,7 +627,7 @@ fn session_line(s: &Session) {
 
 /// Binds the carriers `serve` was asked for and runs them with the Unix
 /// socket until a signal; then parks every running session.
-async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
+async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Fail> {
     let Carriers {
         tcp,
         ws,
@@ -636,7 +638,7 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
     } = carriers;
     let origins = origin
         .iter()
-        .map(|o| server::ws::origin(o).map_err(Error::Usage))
+        .map(|o| server::ws::origin(o).map_err(Fail::Usage))
         .collect::<Result<Vec<_>, _>>()?;
     let ws_bind = ws
         .as_deref()
@@ -644,7 +646,7 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Error> {
             Ok(port) => Ok(WsBind::Port(port)),
             Err(_) => match bind.parse::<SocketAddr>() {
                 Ok(addr) if addr.ip().is_loopback() => Ok(WsBind::Loopback(addr)),
-                _ => Err(Error::Usage(format!(
+                _ => Err(Fail::Usage(format!(
                     "--ws takes a port on the tailnet address or a loopback address, not {bind:?}"
                 ))),
             },
@@ -1020,9 +1022,9 @@ async fn names_session(conn: &Connection, text: &str) -> Result<bool, Error> {
 fn resize_args(
     mut args: Vec<String>,
     policy: Option<SizePolicy>,
-) -> Result<(Option<String>, Option<Sides>), Error> {
+) -> Result<(Option<String>, Option<Sides>), Fail> {
     let size = match (args.len(), policy) {
-        (0, None) => return Err(Error::Usage("resize takes SIZE, --policy or both".into())),
+        (0, None) => return Err(Fail::Usage("resize takes SIZE, --policy or both".into())),
         (0, Some(_)) => None,
         (1, Some(_)) => match parse_size(&args[0]) {
             Ok(size) => {
@@ -1037,17 +1039,17 @@ fn resize_args(
 }
 
 /// `detach`'s session and channel.
-fn detach_args(args: Vec<String>) -> Result<(Option<String>, u64), Error> {
+fn detach_args(args: Vec<String>) -> Result<(Option<String>, u64), Fail> {
     let (session, rest) = target_and(args, 1);
     let channel = rest[0]
         .parse::<u64>()
-        .map_err(|_| Error::Usage(format!("{:?} is not a channel number", rest[0])))?;
+        .map_err(|_| Fail::Usage(format!("{:?} is not a channel number", rest[0])))?;
     Ok((session, channel))
 }
 
 /// Checks a command's arguments before connecting, so a usage error is
 /// one whatever the server's state.
-fn check_args(command: &Command) -> Result<(), Error> {
+fn check_args(command: &Command) -> Result<(), Fail> {
     match command {
         Command::Create {
             env, detach_key, ..
@@ -1077,14 +1079,14 @@ fn check_args(command: &Command) -> Result<(), Error> {
                 .iter()
                 .find(|k| ghostty_vt::keys::KeyPress::parse(k).is_none())
             {
-                return Err(Error::Usage(format!("unknown key {key:?}")));
+                return Err(Fail::Usage(format!("unknown key {key:?}")));
             }
             let payload = !keys.is_empty() || *bytes;
             if payload && args.len() > 1 {
-                return Err(Error::Usage("--keys and --bytes take no TEXT".into()));
+                return Err(Fail::Usage("--keys and --bytes take no TEXT".into()));
             }
             if !payload && args.is_empty() && !enter {
-                return Err(Error::Usage(
+                return Err(Fail::Usage(
                     "send takes TEXT, --enter, --keys or --bytes".into(),
                 ));
             }
@@ -1095,7 +1097,7 @@ fn check_args(command: &Command) -> Result<(), Error> {
             api_params(params.as_deref())?;
         }
         Command::Wait { wait, .. } if wait.until()?.is_none() => {
-            return Err(Error::Usage(
+            return Err(Fail::Usage(
                 "wait for something: --exit, --match, --status, --prompt or --quiet".into(),
             ));
         }
@@ -1269,18 +1271,17 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
     }
     let command = match (cli.stdio, cli.command) {
         (true, None) => None,
-        (true, Some(_)) => return Err(Error::Usage("--stdio takes no command".into()).into()),
+        (true, Some(_)) => return Err(Fail::Usage("--stdio takes no command".into())),
         (false, None) => {
-            return Err(Error::Usage("a command is required; see --help".into()).into());
+            return Err(Fail::Usage("a command is required; see --help".into()));
         }
         (false, Some(command)) => Some(command),
     };
     if let Some(Command::Serve(carriers)) = command {
         if cli.connect.is_some() || cli.ssh.is_some() {
-            return Err(Error::Usage(
+            return Err(Fail::Usage(
                 "serve runs locally; --connect and --ssh do not apply".into(),
-            )
-            .into());
+            ));
         }
         let socket = cli.socket.unwrap_or_else(server::socket_path);
         return Ok(status_of(serve(socket, carriers).await?));
@@ -1509,16 +1510,15 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             let payload = !keys.is_empty() || bytes;
             let (session, rest) = target_and(args, if payload { 0 } else { 1 });
             if payload && !rest.is_empty() {
-                return Err(Error::Usage("--keys and --bytes take no TEXT".into()).into());
+                return Err(Fail::Usage("--keys and --bytes take no TEXT".into()));
             }
             // `send build --enter` means the session `build`, not the text.
             if let (None, [text]) = (&session, rest.as_slice())
                 && names_session(&conn, text).await?
             {
-                return Err(Error::Usage(format!(
+                return Err(Fail::Usage(format!(
                     "{text:?} names a session: give SESSION and TEXT, or --keys enter"
-                ))
-                .into());
+                )));
             }
             let mut chunks = match rest.into_iter().next() {
                 _ if bytes => {
@@ -1530,9 +1530,9 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                 Some(text) => vec![Chunk::Text(text)],
                 None if enter => Vec::new(),
                 None => {
-                    return Err(
-                        Error::Usage("send takes TEXT, --enter, --keys or --bytes".into()).into(),
-                    );
+                    return Err(Fail::Usage(
+                        "send takes TEXT, --enter, --keys or --bytes".into(),
+                    ));
                 }
             };
             if enter {
@@ -1559,10 +1559,9 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
         }
         Command::Wait { session, wait } => {
             let Some(until) = wait.until()? else {
-                return Err(Error::Usage(
+                return Err(Fail::Usage(
                     "wait for something: --exit, --match, --status, --prompt or --quiet".into(),
-                )
-                .into());
+                ));
             };
             let session = resolve(&conn, here, session).await?;
             let (reply, waited) = wait_request(
@@ -1654,7 +1653,7 @@ async fn main() {
         Ok(code) => code,
         Err(fail) => {
             let (message, code) = match fail {
-                Fail::Client(Error::Usage(message)) => (message, EXIT_USAGE),
+                Fail::Usage(message) => (message, EXIT_USAGE),
                 Fail::Client(err) => (err.to_string(), 1),
                 Fail::Target(message) => (message, EXIT_TARGET),
                 Fail::Unreachable(message) => (message, EXIT_UNREACHABLE),
