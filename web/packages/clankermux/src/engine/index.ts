@@ -89,6 +89,15 @@ export class Engine {
     if (code !== this.result.SUCCESS) throw new EngineError(name, code);
   }
 
+  /** Calls a function returning GhosttyResult: true for a value, false
+   * for `NO_VALUE`; throws on failure. */
+  present(name: string, ...args: number[]): boolean {
+    const code = this.call(name, ...args);
+    if (code === this.result.NO_VALUE) return false;
+    if (code !== this.result.SUCCESS) throw new EngineError(name, code);
+    return true;
+  }
+
   alloc(len: number): number {
     const ptr = this.call("ghostty_wasm_alloc", len);
     if (ptr === 0) throw new Error("wasm allocation failed");
@@ -397,17 +406,11 @@ export class Terminal {
 
   get title(): string {
     const size = this.engine.sizeOf("GhosttyString");
-    return this.engine.scratch(size, (out) => {
-      const code = this.engine.call(
-        "ghostty_terminal_get",
-        this.handle,
-        this.engine.enumValue("GhosttyTerminalData", "TITLE"),
-        out,
-      );
-      if (code === this.engine.result.NO_VALUE) return "";
-      if (code !== this.engine.result.SUCCESS) throw new EngineError("ghostty_terminal_get", code);
-      return this.engine.readString(out);
-    });
+    return this.engine.scratch(size, (out) =>
+      this.engine.present("ghostty_terminal_get", this.handle, this.engine.enumValue("GhosttyTerminalData", "TITLE"), out)
+        ? this.engine.readString(out)
+        : "",
+    );
   }
 
   /** An untracked `GhosttyGridRef` to the viewport cell at `at`, valid
@@ -454,9 +457,7 @@ export class Terminal {
         e.view.setUint32(out, 0, true);
         e.view.setUint32(out + 4, 0, true);
         // The options are passed by value, which the wasm ABI passes by address.
-        const code = e.call("ghostty_terminal_selection_format_alloc", this.handle, 0, optionsPtr, out, out + 4);
-        if (code === e.result.NO_VALUE) return undefined;
-        if (code !== e.result.SUCCESS) throw new EngineError("ghostty_terminal_selection_format_alloc", code);
+        if (!e.present("ghostty_terminal_selection_format_alloc", this.handle, 0, optionsPtr, out, out + 4)) return undefined;
         const ptr = e.view.getUint32(out, true);
         const len = e.view.getUint32(out + 4, true);
         try {
@@ -474,10 +475,7 @@ export class Terminal {
     const size = e.sizeOf("GhosttySelection");
     return e.scratch(size, (out) => {
       e.view.setUint32(out, size, true);
-      const code = e.call("ghostty_terminal_get", this.handle, e.enumValue("GhosttyTerminalData", "SELECTION"), out);
-      if (code === e.result.NO_VALUE) return false;
-      if (code !== e.result.SUCCESS) throw new EngineError("ghostty_terminal_get", code);
-      return true;
+      return e.present("ghostty_terminal_get", this.handle, e.enumValue("GhosttyTerminalData", "SELECTION"), out);
     });
   }
 

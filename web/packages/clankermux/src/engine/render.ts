@@ -1,4 +1,4 @@
-import { type BitField, type Engine, type Scrollbar, type Terminal } from "./index.ts";
+import { type BitField, type Engine, EngineError, type Scrollbar, type Terminal } from "./index.ts";
 
 /** Style flag bits of a [`Cell`]. */
 export const FLAG = {
@@ -182,9 +182,7 @@ export class RenderState {
     const size = e.sizeOf("GhosttyRenderStateRowSelection");
     return e.scratch(size, (out) => {
       e.view.setUint32(out, size, true);
-      const code = e.call("ghostty_render_state_row_get", this.iterator, this.keys.row["SELECTION"]!, out);
-      if (code === e.result.NO_VALUE) return undefined;
-      if (code !== e.result.SUCCESS) throw new Error(`row selection: ${code}`);
+      if (!e.present("ghostty_render_state_row_get", this.iterator, this.keys.row["SELECTION"]!, out)) return undefined;
       const field = (key: string) => e.field("GhosttyRenderStateRowSelection", out, key);
       return [field("start_x"), field("end_x")];
     });
@@ -249,7 +247,7 @@ export class RenderState {
     const e = this.engine;
     const code = e.call("ghostty_render_state_row_cells_get", this.cells, key, out);
     if (code === e.result.INVALID_VALUE) return NO_COLOR;
-    if (code !== e.result.SUCCESS) throw new Error(`cell colour: ${code}`);
+    if (code !== e.result.SUCCESS) throw new EngineError("ghostty_render_state_row_cells_get", code);
     return e.readRgb(out);
   }
 
@@ -263,7 +261,7 @@ export class RenderState {
       const len = e.field("GhosttyBuffer", buffer, "len");
       return new TextDecoder().decode(e.memory.slice(utf8, utf8 + len));
     }
-    if (code !== e.result.OUT_OF_SPACE) throw new Error(`cell graphemes: ${code}`);
+    if (code !== e.result.OUT_OF_SPACE) throw new EngineError("ghostty_render_state_row_cells_get", code);
     // The buffer struct reports the needed length; retry through it.
     const needed = e.field("GhosttyBuffer", buffer, "len");
     return new TextDecoder().decode(

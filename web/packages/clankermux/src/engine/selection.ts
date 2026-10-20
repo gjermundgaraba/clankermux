@@ -100,9 +100,7 @@ export class SelectionGesture {
     return e.scratch(size, (out) => {
       e.memory.fill(0, out, out + size);
       e.view.setUint32(out, size, true);
-      const code = e.call("ghostty_selection_gesture_event", this.gesture, term.handle, event, out);
-      if (code === e.result.NO_VALUE) return undefined;
-      if (code !== e.result.SUCCESS) throw new Error(`selection gesture: ${code}`);
+      if (!e.present("ghostty_selection_gesture_event", this.gesture, term.handle, event, out)) return undefined;
       return e.memory.slice(out, out + size);
     });
   }
