@@ -234,7 +234,7 @@ impl Term {
 
     /// Whether row `y` of the active screen, counted from the top of its
     /// scrollback, continues the soft-wrapped row above it.
-    pub fn row_continues(&self, y: u32) -> Result<bool> {
+    pub(crate) fn row_continues(&self, y: u32) -> Result<bool> {
         let point = sys::GhosttyPoint {
             tag: sys::GHOSTTY_POINT_TAG_SCREEN,
             value: sys::GhosttyPointValue {
