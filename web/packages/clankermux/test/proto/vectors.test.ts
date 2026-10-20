@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 
-import { FrameError, FrameType, StreamFramer, encodeFrame, parseFrame, parseOutput } from "../../src/proto/index.ts";
+import { FrameError, FrameType, HEADER_LEN, StreamFramer, encodeFrame, parseFrame, parseOutput } from "../../src/proto/index.ts";
 import type { Limits } from "../../src/proto/index.ts";
 import { vectors as messages } from "./messages.ts";
 
@@ -68,11 +68,13 @@ test("message vectors equal the typed literals", () => {
   expect(file).toEqual(messages);
 });
 
-test("a stream is split into frames at any chunk boundary", () => {
+// framing.test.ts cuts streams at random; the edges of a header and of a
+// frame it reaches only by chance.
+test("a stream cut at a header's or a frame's edge splits into the same frames", () => {
   const a = encodeFrame(FrameType.Input, 1, new TextEncoder().encode("abc"));
   const b = encodeFrame(FrameType.Close, 1, new Uint8Array());
   const all = new Uint8Array([...a, ...b]);
-  for (const cut of [0, 1, 9, 10, 12, 13, 20, all.length]) {
+  for (const cut of [HEADER_LEN - 1, HEADER_LEN, a.length]) {
     const framer = new StreamFramer(1 << 20);
     const frames = [...framer.feed(all.subarray(0, cut)), ...framer.feed(all.subarray(cut))];
     expect(frames.map((f) => [...f])).toEqual([[...a], [...b]]);
