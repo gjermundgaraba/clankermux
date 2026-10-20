@@ -3,20 +3,12 @@ import { fileURLToPath } from "node:url";
 import { beforeAll, expect, test } from "vitest";
 
 import { Engine, readyEnd } from "../../src/engine/index.ts";
-import {
-  type Attached,
-  type ErrorMessage,
-  type Frame,
-  FrameType,
-  type Limits,
-  type Session,
-  type Welcome,
-} from "../../src/proto/index.ts";
+import { type Attached, type ErrorMessage, type Frame, FrameType } from "../../src/proto/index.ts";
 
 import { Attachment } from "../../src/client/attachment.ts";
+import { output, session, welcome } from "./bodies.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
-const limits: Limits = JSON.parse(readFileSync(`${here}../../../../../crates/proto/vectors/limits.json`, "utf8"));
 let engine: Engine;
 beforeAll(async () => {
   engine = await Engine.load(readFileSync(`${here}../../ghostty-vt.wasm`));
@@ -30,44 +22,7 @@ function json(type: FrameType, body: unknown): Frame {
   return frame(type, new TextEncoder().encode(JSON.stringify(body)));
 }
 
-function output(offset: number, text: string): Frame {
-  const bytes = new TextEncoder().encode(text);
-  const payload = new Uint8Array(8 + bytes.length);
-  new DataView(payload.buffer).setBigUint64(0, BigInt(offset), true);
-  payload.set(bytes, 8);
-  return frame(FrameType.Output, payload);
-}
-
-function welcome(incarnation: string): Welcome {
-  return {
-    version: 1,
-    server: { name: "test", version: "0" },
-    engine: "x",
-    incarnation,
-    capabilities: [],
-    limits,
-  };
-}
-
-function session(cols: number, rows: number): Session {
-  return {
-    id: "s",
-    label: "",
-    status: "running",
-    argv: [],
-    cwd: "",
-    cols,
-    rows,
-    title: "",
-    pwd: "",
-    on_exit: "keep",
-    created_at: "",
-    offset: 0,
-    marker: 0,
-    attachments: [],
-    size: { policy: "latest" },
-  };
-}
+const outputFrame = (offset: number, text: string) => frame(FrameType.Output, output(offset, text));
 
 function attached(offset: number, marker: number, bytes: Uint8Array): Frame {
   const body: Attached = {
@@ -76,7 +31,7 @@ function attached(offset: number, marker: number, bytes: Uint8Array): Frame {
     marker,
     cols: 10,
     rows: 3,
-    session: session(10, 3),
+    session: session("s"),
     snapshot_bytes: bytes.length,
   };
   return json(FrameType.Attached, body);
@@ -100,9 +55,9 @@ test("bootstraps, holds after a resize, and resumes", () => {
   expect(a.handle(frame(FrameType.Snapshot, bytes.subarray(ready - 1, ready)))).toEqual([{ type: "screen" }]);
   expect(a.handle(frame(FrameType.SnapshotReady, new Uint8Array()))).toEqual([]);
   expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo");
-  expect(a.handle(output(100, "x"))).toEqual([{ type: "output", bytes: new TextEncoder().encode("x") }]);
+  expect(a.handle(outputFrame(100, "x"))).toEqual([{ type: "output", bytes: new TextEncoder().encode("x") }]);
   expect(a.handle(json(FrameType.Resized, { seq: 3, offset: 101, cols: 20, rows: 5 }))).toEqual([]);
-  expect(a.handle(output(101, "y"))).toEqual([]);
+  expect(a.handle(outputFrame(101, "y"))).toEqual([]);
   expect(a.handle(frame(FrameType.Snapshot, bytes.subarray(ready)))).toEqual([]);
   expect(a.handle(frame(FrameType.SnapshotEnd, new Uint8Array()))).toEqual([
     { type: "resized", cols: 20, rows: 5 },
@@ -111,7 +66,7 @@ test("bootstraps, holds after a resize, and resumes", () => {
   expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo\nxy");
   expect(a.term()!.cols).toBe(20);
   expect(a.resume()).toEqual({ incarnation: "inc", offset: 102, marker: 3 });
-  expect(() => a.handle(output(5, "z"))).toThrow(expect.objectContaining({ kind: "desync", message: expect.stringMatching(/OUTPUT at 5/) }));
+  expect(() => a.handle(outputFrame(5, "z"))).toThrow(expect.objectContaining({ kind: "desync", message: expect.stringMatching(/OUTPUT at 5/) }));
   expect(() => a.handle(json(FrameType.Resized, { seq: 9, offset: 102, cols: 1, rows: 1 }))).toThrow(
     expect.objectContaining({ kind: "desync" }),
   );
@@ -123,7 +78,7 @@ test("bootstraps, holds after a resize, and resumes", () => {
   expect(a.resume()).toBeUndefined();
   // The terminal stays for display but takes no more of the stream.
   expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo\nxy");
-  expect(() => a.handle(output(102, "late"))).toThrow(/outside the stream/);
+  expect(() => a.handle(outputFrame(102, "late"))).toThrow(/outside the stream/);
   expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo\nxy");
   a.free();
 });
