@@ -1175,7 +1175,7 @@ async fn api_lists_describes_and_calls_as_the_server_answers() {
     let (_, shown, _) = api(&["--json", "api", "describe", "send"]).await;
     let one: proto::catalog::Description = serde_json::from_str(&shown).unwrap();
     assert_eq!(one, catalog.describe("send").unwrap());
-    let (code, _, err) = api(&["api", "describe", "write"]).await;
+    let (code, _, err) = api(&["api", "describe", "no_such_method"]).await;
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("invalid_request"), "{err}");
 
@@ -1242,9 +1242,9 @@ async fn api_lists_describes_and_calls_as_the_server_answers() {
     let (code, _, err) = api(&["api", "call", "list", r#"{"extra": 1}"#]).await;
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("invalid_request"), "{err}");
-    let (code, _, err) = api(&["api", "call", "write", "{}"]).await;
+    let (code, _, err) = api(&["api", "call", "no_such_method", "{}"]).await;
     assert_eq!(code, 1, "{err}");
-    assert!(err.contains("unknown method write"), "{err}");
+    assert!(err.contains("unknown method no_such_method"), "{err}");
     let dead = tempfile::tempdir().unwrap();
     let dead = dead.path().join("sock");
     let (code, _, err) = run_status(

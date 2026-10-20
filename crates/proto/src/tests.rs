@@ -404,7 +404,7 @@ fn describe_one_method_carries_what_it_refers_to() {
         }
         assert!(one.defs.len() < catalog.defs.len(), "{}", method.name);
     }
-    assert!(catalog.describe("write").is_none());
+    assert!(catalog.describe("no_such_method").is_none());
     // Both answers read back as `Described`, each as its own shape.
     let whole: catalog::Described =
         serde_json::from_value(serde_json::to_value(&catalog).unwrap()).unwrap();
