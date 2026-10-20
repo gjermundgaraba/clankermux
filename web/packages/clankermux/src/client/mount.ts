@@ -5,7 +5,7 @@ import type { Scheme, Size } from "../proto/index.ts";
 import { CanvasRenderer, type Metrics } from "../renderer/index.ts";
 
 import { type Copy, Copier } from "./copy.ts";
-import { type Keyboard, type Typed, Typing } from "./keyboard.ts";
+import { type Keyboard, type Typed, Typing, composing } from "./keyboard.ts";
 import { Listeners } from "./listeners.ts";
 import { profileFrom, schemeOf } from "./profile.ts";
 import type { Link, ToPage, ToWorker } from "./worker.ts";
@@ -322,7 +322,7 @@ export function mountOn(
       if (key) {
         send({ type: "key", input: key });
         e.preventDefault();
-      } else if (e.isComposing || e.key === "Dead" || e.keyCode === 229) {
+      } else if (composing(e)) {
         // At the cursor before the input method opens its window; shown
         // once a composition starts.
         placeInput(false);

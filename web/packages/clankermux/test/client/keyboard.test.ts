@@ -101,6 +101,12 @@ test("an input method's composition is sent once, when it ends", () => {
   expect(typing.compositionend("")).toBeUndefined();
 });
 
+test("a key the input method processes is its own, with key code 229 or without", () => {
+  const typing = new Typing(layout);
+  expect(typing.keydown(event({ key: "Process" }))).toBeUndefined();
+  expect(typing.keydown(event({ keyCode: 229 }))).toBeUndefined();
+});
+
 test("text and edits that no key sent reach the session", () => {
   const typing = new Typing(layout);
   // The emoji picker, dictation, a virtual keyboard.
