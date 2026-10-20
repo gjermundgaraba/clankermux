@@ -23,6 +23,7 @@ import type {
 } from "../proto/index.ts";
 
 import { ClientError } from "./connection.ts";
+import { Listeners } from "./listeners.ts";
 import { type MountHost, type MountOptions, type Terminal, mountOn } from "./mount.ts";
 import type { Failure, Link, ToPage, ToWorker } from "./worker.ts";
 
@@ -95,11 +96,9 @@ export class Client {
   >();
   private readonly mounts = new Map<number, (message: ToPage) => void>();
   private readonly terminals = new Set<Terminal>();
-  private readonly sessionListeners = new Set<(sessions: Session[]) => void>();
+  private readonly sessionListeners = new Listeners<Session[]>();
+  private readonly linkListeners = new Listeners<Link>();
   private readonly eventListeners = new Set<(event: Event | EventGap) => void>();
-  private readonly linkListeners = new Set<(link: Link) => void>();
-  private latest: Session[] | undefined;
-  private link: Link | undefined;
   private started = false;
   private closed = false;
 
@@ -114,7 +113,7 @@ export class Client {
     // reports it, and the client goes on.
     worker.onerror = (e) => {
       if (this.started) return;
-      e.preventDefault?.();
+      e.preventDefault();
       started(new Error(`the worker failed: ${e.message || "it did not load"}`));
       this.close();
     };
@@ -138,11 +137,10 @@ export class Client {
           break;
         }
         case "connection":
-          this.setLink(message.link);
+          this.linkListeners.emit(message.link);
           break;
         case "sessions":
-          this.latest = message.sessions;
-          for (const listener of this.sessionListeners) listener(message.sessions);
+          this.sessionListeners.emit(message.sessions);
           break;
         case "event":
           for (const listener of this.eventListeners) listener(message.event);
@@ -154,11 +152,6 @@ export class Client {
           this.mounts.get(message.mount)?.(message);
       }
     };
-  }
-
-  private setLink(link: Link): void {
-    this.link = link;
-    for (const listener of this.linkListeners) listener(link);
   }
 
   /** @internal */
@@ -281,17 +274,13 @@ export class Client {
    * `onLink` reports the connection-level changes. Requests need
    * `connected`. A listener added later gets the latest at once. */
   onLink(listener: (link: Link) => void): () => void {
-    this.linkListeners.add(listener);
-    if (this.link) listener(this.link);
-    return () => void this.linkListeners.delete(listener);
+    return this.linkListeners.add(listener);
   }
 
   /** Every session on the server, at each change; a listener added once
    * the list is known gets it at once. */
   onSessions(listener: (sessions: Session[]) => void): () => void {
-    this.sessionListeners.add(listener);
-    if (this.latest) listener(this.latest);
-    return () => void this.sessionListeners.delete(listener);
+    return this.sessionListeners.add(listener);
   }
 
   /** Each server event, in `seq` order, without loss across reconnects:
