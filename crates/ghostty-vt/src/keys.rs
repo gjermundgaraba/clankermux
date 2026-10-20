@@ -200,10 +200,6 @@ pub struct KeyEncoder {
     event: sys::GhosttyKeyEvent,
 }
 
-// SAFETY: the encoder and event are plain heap objects with no thread
-// affinity; `&mut self` serializes their use.
-unsafe impl Send for KeyEncoder {}
-
 impl KeyEncoder {
     pub fn new() -> Result<Self> {
         let mut encoder = ptr::null_mut();
