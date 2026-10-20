@@ -177,6 +177,21 @@ const PERMANENT = new Set<ErrorMessage["code"]>(["no_such_session", "engine_mism
 /** The records `ack` marks seen. */
 const ACKED = new Set(["done", "error"]);
 
+/** Delays before trying again, doubling up to the maximum. */
+class Backoff {
+  private ms = BACKOFF_MIN_MS;
+
+  next(): number {
+    const delay = this.ms;
+    this.ms = Math.min(this.ms * 2, BACKOFF_MAX_MS);
+    return delay;
+  }
+
+  reset(): void {
+    this.ms = BACKOFF_MIN_MS;
+  }
+}
+
 /** A WebSocket as the client's message transport. */
 class SocketTransport implements Transport {
   onMessage: ((bytes: Uint8Array) => void) | undefined;
@@ -239,7 +254,7 @@ class Hub {
   private statusText = "connecting";
   /** Connection attempts since a server last answered. */
   private attempt = 0;
-  private backoff = BACKOFF_MIN_MS;
+  private readonly backoff = new Backoff();
   /** The connection ended for good with the server's refusal or error;
    * an `attach` connects again. */
   private refused = false;
@@ -267,12 +282,6 @@ class Hub {
     this.keys = new KeyEncoder(this.engine);
     this.post({ type: "ready" });
     await this.connect();
-  }
-
-  private delay(): number {
-    const delay = this.backoff;
-    this.backoff = Math.min(this.backoff * 2, BACKOFF_MAX_MS);
-    return delay;
   }
 
   /** A connection-level change, to the page and every terminal. A
@@ -312,11 +321,11 @@ class Hub {
         this.refuse(err);
         return;
       }
-      setTimeout(() => void this.connect(), this.delay());
+      setTimeout(() => void this.connect(), this.backoff.next());
       return;
     }
     this.attempt = 0;
-    this.backoff = BACKOFF_MIN_MS;
+    this.backoff.reset();
     this.conn = conn;
     conn.onEnd = (err) => {
       if (this.conn !== conn) return;
@@ -325,7 +334,7 @@ class Hub {
         this.refuse(err);
       } else {
         this.linkAll({ state: "ended", reason: "closed", retry: true });
-        setTimeout(() => void this.connect(), this.delay());
+        setTimeout(() => void this.connect(), this.backoff.next());
       }
     };
     conn.onEvent = (event) => this.event(event);
@@ -509,7 +518,7 @@ class Mount {
   private readonly clipboard = new Osc52Scanner();
   private paintTimer: ReturnType<typeof setTimeout> | undefined;
   /** Re-attaches after a failure; reset by a screen. */
-  private backoff = BACKOFF_MIN_MS;
+  private readonly backoff = new Backoff();
   private reopenTimer: ReturnType<typeof setTimeout> | undefined;
   private disposed = false;
 
@@ -538,12 +547,6 @@ class Mount {
 
   status(text: string): void {
     this.post({ type: "status", mount: this.id, text });
-  }
-
-  private delay(): number {
-    const delay = this.backoff;
-    this.backoff = Math.min(this.backoff * 2, BACKOFF_MAX_MS);
-    return delay;
   }
 
   /** The hub's connection is up: attach the session, if there is one. */
@@ -627,13 +630,13 @@ class Mount {
     this.reopenTimer ??= setTimeout(() => {
       this.reopenTimer = undefined;
       if (this.session !== undefined && !this.attachment) this.open();
-    }, this.delay());
+    }, this.backoff.next());
   }
 
   private apply(action: Action): void {
     switch (action.type) {
       case "screen": {
-        this.backoff = BACKOFF_MIN_MS;
+        this.backoff.reset();
         this.forgetSelection();
         this.clipboard.reset();
         this.applyProfile(this.attachment?.term());
@@ -746,14 +749,17 @@ class Mount {
 
   /** The mouse: a press clears the selection, or selects a word or a line
    * at once; a drag selects; the release copies what is selected. */
-  select(action: "press" | "drag" | "release", at: CellPoint, time: number, copy?: number): void {
+  select(message: Extract<ToWorker, { type: "select" }>): void {
+    const { at, time } = message;
     const term = this.attachment?.term();
     if (!term) {
       // Nothing to select: the page's copy waits for the answer even so.
-      if (copy !== undefined) this.post({ type: "selection", mount: this.id, text: undefined, copy });
+      if (message.action === "release") {
+        this.post({ type: "selection", mount: this.id, text: undefined, copy: message.copy });
+      }
       return;
     }
-    switch (action) {
+    switch (message.action) {
       case "press":
         this.claim();
         if (this.selected) this.unselected();
@@ -770,7 +776,7 @@ class Mount {
         // (trimmed to nothing) are no text to copy.
         const text = term.selectionText() || undefined;
         this.selected = text !== undefined;
-        this.post({ type: "selection", mount: this.id, text, ...(copy !== undefined ? { copy } : {}) });
+        this.post({ type: "selection", mount: this.id, text, copy: message.copy });
         break;
       }
     }
@@ -1034,26 +1040,24 @@ export function runWorker(port: WorkerPort): void {
   const hub = new Hub((message) => port.postMessage(message));
   port.onmessage = (e) => {
     const message = e.data;
-    if (message.type === "init") {
-      void hub.init(message);
-      return;
-    }
-    if (message.type === "request") {
-      void hub.request(message.id, message.method, message.params);
-      return;
-    }
-    if (message.type === "cancel") {
-      hub.cancel(message.id);
-      return;
-    }
-    if (message.type === "mount") {
-      const { type: _, mount, ...init } = message;
-      hub.mount(mount, init);
-      return;
-    }
-    if (message.type === "unmount") {
-      hub.unmount(message.mount);
-      return;
+    switch (message.type) {
+      case "init":
+        void hub.init(message);
+        return;
+      case "request":
+        void hub.request(message.id, message.method, message.params);
+        return;
+      case "cancel":
+        hub.cancel(message.id);
+        return;
+      case "mount": {
+        const { type: _, mount, ...init } = message;
+        hub.mount(mount, init);
+        return;
+      }
+      case "unmount":
+        hub.unmount(message.mount);
+        return;
     }
     const mount = hub.mounts.get(message.mount);
     if (!mount) return;
@@ -1074,7 +1078,7 @@ export function runWorker(port: WorkerPort): void {
         mount.text(message.text);
         break;
       case "select":
-        mount.select(message.action, message.at, message.time, message.action === "release" ? message.copy : undefined);
+        mount.select(message);
         break;
       case "wheel":
         mount.wheel(message.rows);

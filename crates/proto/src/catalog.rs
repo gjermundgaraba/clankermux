@@ -519,14 +519,14 @@ impl Catalog {
 }
 
 /// The names `#/$defs/NAME` references in `schema` lead to.
-pub(crate) fn refs(schema: &Value, out: &mut Vec<String>) {
+pub(crate) fn refs(schema: &Value, out: &mut impl Extend<String>) {
     match schema {
         Value::Object(map) => {
             for (key, value) in map {
                 match (key.as_str(), value) {
                     ("$ref", Value::String(r)) => {
                         if let Some(name) = r.strip_prefix("#/$defs/") {
-                            out.push(name.to_string());
+                            out.extend([name.to_string()]);
                         }
                     }
                     _ => refs(value, out),

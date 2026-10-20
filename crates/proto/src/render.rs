@@ -6,7 +6,8 @@ use std::collections::{BTreeSet, VecDeque};
 
 use serde_json::{Map, Value};
 
-use crate::catalog::{Catalog, Description, Payload};
+use crate::ErrorCode;
+use crate::catalog::{Catalog, Description, Payload, refs};
 
 const BEGIN: &str = "<!-- generated: ";
 const END: &str = "<!-- end generated -->";
@@ -113,11 +114,7 @@ pub fn render(what: &str, catalog: &Catalog) -> Result<String, String> {
                             format!("`{params}`")
                         },
                         code(&shape(&m.result, defs)),
-                        m.errors
-                            .iter()
-                            .map(|e| format!("`{}`", wire(e)))
-                            .collect::<Vec<_>>()
-                            .join(", "),
+                        codes(&m.errors),
                     ]
                 }),
             ),
@@ -172,7 +169,7 @@ pub fn method(description: &Description) -> String {
     let mut queue = VecDeque::new();
     for top in [&m.params, &m.result] {
         seen.extend(ref_name(top).map(String::from));
-        queue.extend(refs(resolve(top, defs)));
+        refs(resolve(top, defs), &mut queue);
     }
     while let Some(name) = queue.pop_front() {
         let Some(schema) = defs.get(&name) else {
@@ -187,16 +184,9 @@ pub fn method(description: &Description) -> String {
             out.push_str(&fields_table(schema, defs));
             out.push('\n');
         }
-        queue.extend(refs(schema));
+        refs(schema, &mut queue);
     }
-    out.push_str(&format!(
-        "## Errors\n\n{}\n",
-        m.errors
-            .iter()
-            .map(|e| format!("`{}`", wire(e)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
+    out.push_str(&format!("## Errors\n\n{}\n", codes(&m.errors)));
     for example in &m.examples {
         out.push_str(&format!(
             "\n## Example\n\n```json\n{{\"method\": {:?}, \"params\": {}}}\n{{\"result\": {}}}\n```\n",
@@ -216,6 +206,15 @@ fn wire<T: serde::Serialize>(value: &T) -> String {
     }
 }
 
+/// Error codes in code style, comma-separated.
+fn codes(errors: &[ErrorCode]) -> String {
+    errors
+        .iter()
+        .map(|e| format!("`{}`", wire(e)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// A shape in code style, unless it is names alone (`Session`,
 /// `Description | Catalog`).
 fn code(shape: &str) -> String {
@@ -228,12 +227,6 @@ fn code(shape: &str) -> String {
 
 fn ref_name(schema: &Value) -> Option<&str> {
     schema.get("$ref")?.as_str()?.strip_prefix("#/$defs/")
-}
-
-fn refs(schema: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    crate::catalog::refs(schema, &mut out);
-    out
 }
 
 /// The definition a `$ref` leads to, or the schema itself.

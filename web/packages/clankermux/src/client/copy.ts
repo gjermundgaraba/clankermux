@@ -31,7 +31,10 @@ export interface CopyHost {
 }
 
 /** How long a copy may take: the worker's answer and the write. */
-export const COPY_TIMEOUT_MS = 2000;
+const COPY_TIMEOUT_MS = 2000;
+
+/** How a clipboard write went. */
+type Written = { ok: true } | { ok: false; reason: CopyFailure; message?: string };
 
 /** Characters by code point, as a page counts them for display. */
 const length = (text: string) => [...text].length;
@@ -41,13 +44,12 @@ const length = (text: string) => [...text].length;
 class Attempt {
   private done = false;
   private chars: number | undefined;
-  private result: { ok: true } | { ok: false; reason: CopyFailure; message?: string } | undefined;
+  private result: Written | undefined;
   private readonly timer: ReturnType<typeof setTimeout>;
 
   constructor(
     private readonly source: CopySource,
     private readonly report: (copy: Copy) => void,
-    timeoutMs: number,
     /** Once, when it is reported or dropped. */
     private readonly ended: () => void,
     /** At the timeout, after the report. */
@@ -56,7 +58,7 @@ class Attempt {
     this.timer = setTimeout(() => {
       this.finish({ ok: false, reason: "timeout" });
       timedOut?.();
-    }, timeoutMs);
+    }, COPY_TIMEOUT_MS);
   }
 
   text(text: string): void {
@@ -64,7 +66,7 @@ class Attempt {
     this.settle();
   }
 
-  wrote(result: { ok: true } | { ok: false; reason: CopyFailure; message?: string }): void {
+  wrote(result: Written): void {
     this.result ??= result;
     this.settle();
   }
@@ -81,7 +83,7 @@ class Attempt {
     if (this.chars !== undefined && this.result) this.finish(this.result);
   }
 
-  private finish(result: { ok: true } | { ok: false; reason: CopyFailure; message?: string }): void {
+  private finish(result: Written): void {
     if (this.done) return;
     this.drop();
     const chars = this.chars;
@@ -113,10 +115,7 @@ export class Copier {
   /** Every copy not yet reported or dropped, for `dispose`. */
   private readonly live = new Set<Attempt>();
 
-  constructor(
-    private readonly host: CopyHost,
-    private readonly timeoutMs = COPY_TIMEOUT_MS,
-  ) {}
+  constructor(private readonly host: CopyHost) {}
 
   /** Starts the copy of what a release selected, and returns its number
    * for the worker's answer. Safari writes to the clipboard only within
@@ -195,7 +194,7 @@ export class Copier {
   }
 
   private attempt(source: CopySource, timedOut?: () => void): Attempt {
-    const attempt: Attempt = new Attempt(source, this.host.report, this.timeoutMs, () => this.live.delete(attempt), timedOut);
+    const attempt: Attempt = new Attempt(source, this.host.report, () => this.live.delete(attempt), timedOut);
     this.live.add(attempt);
     return attempt;
   }
