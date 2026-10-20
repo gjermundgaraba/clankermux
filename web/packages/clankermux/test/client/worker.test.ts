@@ -891,8 +891,9 @@ test("a drag selects and copies on release; a click, input or a new screen clear
   const channel = await server.opened("s");
   bootstrap(server, channel, session("s"), "one two\r\nthree four five");
   await vi.waitFor(() => expect(worker.scrollbar()).toBeDefined());
-  // A release is always answered, with undefined when nothing is selected.
-  const selections = () => worker.selections().filter((m) => m.text !== undefined || !m.copy);
+  // A release is always answered by its number, with undefined when
+  // nothing is selected.
+  const selections = () => worker.selections().filter((m) => m.text !== undefined || m.copy === undefined);
   const answer = () => worker.selections().at(-1);
   const selectedRows = () =>
     worker.posted.flatMap((m) => (m.type === "frame" ? [m.frame.lines.map((l) => l.selection)] : [])).at(-1);
@@ -901,33 +902,33 @@ test("a drag selects and copies on release; a click, input or a new screen clear
   worker.to(1, { type: "select", action: "drag", at: { x: 2.6, y: 1.5 }, time: 0 });
   expect(selectedRows()).toEqual([[4, 9], [0, 2], undefined]);
   expect(selections()).toEqual([]);
-  worker.to(1, { type: "select", action: "release", at: { x: 2.6, y: 1.5 }, time: 1100 });
-  expect(selections()).toEqual([{ type: "selection", mount: 1, text: "two\nthr", copy: true }]);
+  worker.to(1, { type: "select", action: "release", at: { x: 2.6, y: 1.5 }, time: 1100, copy: 1 });
+  expect(selections()).toEqual([{ type: "selection", mount: 1, text: "two\nthr", copy: 1 }]);
 
   // A key clears it, and the page forgets the text.
   worker.to(1, { type: "key", input: key("KeyA", { key: "a" }) });
-  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: undefined, copy: false });
+  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: undefined });
   expect(selectedRows()).toEqual([undefined, undefined, undefined]);
 
   // A double click selects the word at once; a single click clears it.
   worker.to(1, { type: "select", action: "press", at: { x: 1, y: 1.5 }, time: 5000 });
-  worker.to(1, { type: "select", action: "release", at: { x: 1, y: 1.5 }, time: 5050 });
+  worker.to(1, { type: "select", action: "release", at: { x: 1, y: 1.5 }, time: 5050, copy: 2 });
   worker.to(1, { type: "select", action: "press", at: { x: 1, y: 1.5 }, time: 5100 });
-  worker.to(1, { type: "select", action: "release", at: { x: 1, y: 1.5 }, time: 5150 });
-  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: "three", copy: true });
+  worker.to(1, { type: "select", action: "release", at: { x: 1, y: 1.5 }, time: 5150, copy: 3 });
+  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: "three", copy: 3 });
   worker.to(1, { type: "select", action: "press", at: { x: 1, y: 0.5 }, time: 9000 });
-  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: undefined, copy: false });
-  worker.to(1, { type: "select", action: "release", at: { x: 1, y: 0.5 }, time: 9050 });
+  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: undefined });
+  worker.to(1, { type: "select", action: "release", at: { x: 1, y: 0.5 }, time: 9050, copy: 4 });
   expect(selections()).toHaveLength(4);
-  expect(answer()).toEqual({ type: "selection", mount: 1, text: undefined, copy: true });
+  expect(answer()).toEqual({ type: "selection", mount: 1, text: undefined, copy: 4 });
 
   // Selected again, then a new screen: gone.
   worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 20000 });
   worker.to(1, { type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
-  worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 20100 });
-  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: "one t", copy: true });
+  worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 20100, copy: 5 });
+  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: "one t", copy: 5 });
   server.push(FrameType.Gap, channel, { from: 0, to: 10 });
-  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: undefined, copy: false });
+  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: undefined });
 
   // A press, then a new screen: the drag that follows is not anchored in
   // the freed terminal, and selects nothing until a new press.
@@ -935,12 +936,19 @@ test("a drag selects and copies on release; a click, input or a new screen clear
   bootstrap(server, channel, session("s"), "new screen");
   await vi.waitFor(() => expect(worker.links().filter((l) => l.state === "connected")).toHaveLength(2));
   worker.to(1, { type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
-  worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 30100 });
-  expect(answer()).toEqual({ type: "selection", mount: 1, text: undefined, copy: true });
+  worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 30100, copy: 6 });
+  expect(answer()).toEqual({ type: "selection", mount: 1, text: undefined, copy: 6 });
   worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 40000 });
   worker.to(1, { type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
-  worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 40100 });
-  expect(answer()).toEqual({ type: "selection", mount: 1, text: "new s", copy: true });
+  worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 40100, copy: 7 });
+  expect(answer()).toEqual({ type: "selection", mount: 1, text: "new s", copy: 7 });
+
+  // With no terminal (detached, or before its screen) a release is
+  // answered too.
+  worker.to(1, { type: "detach" });
+  worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 50000 });
+  worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 50100, copy: 8 });
+  expect(answer()).toEqual({ type: "selection", mount: 1, text: undefined, copy: 8 });
 });
 
 test("a page still in use takes the size back at its next input after another client resized the session", async () => {

@@ -76,8 +76,8 @@ export class KeyEncoder {
     // Shift that made the text is consumed, as a keyboard reports it, so
     // the kitty protocol's disambiguation sends the text (`:`, `A`) rather
     // than shift and the key. It made it when the text is not the key's
-    // own character; with no layout to say, when it is any text but a
-    // space.
+    // own character; with no layout to say (no map, or a key it does not
+    // cover, such as the numpad), when it is any text but a space.
     const shiftMade = input.shift && text !== "" && (input.unshifted !== undefined ? text !== input.unshifted : text !== " ");
     e.call("ghostty_key_event_set_consumed_mods", this.event, shiftMade ? MODS.SHIFT : 0);
     e.call("ghostty_key_event_set_composing", this.event, input.composing ? 1 : 0);

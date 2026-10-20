@@ -195,8 +195,18 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
   const copier = new Copier({
     clipboard: () => navigator.clipboard,
     item: typeof ClipboardItem === "undefined" ? undefined : (text) => new ClipboardItem({ "text/plain": text }),
+    // Told from a promise's callback: a listener's throw is reported as
+    // a listener's throw is elsewhere, and the rest are told.
     report: (copy) => {
-      for (const listener of copies) listener(copy);
+      for (const listener of copies) {
+        try {
+          listener(copy);
+        } catch (err) {
+          queueMicrotask(() => {
+            throw err;
+          });
+        }
+      }
     },
   });
   /** Rows the view is scrolled back, as `onScroll` last reported;
@@ -232,7 +242,7 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
         break;
       case "selection":
         selected = message.text;
-        if (message.copy) copier.answer(message.text);
+        if (message.copy !== undefined) copier.answer(message.copy, message.text);
         break;
     }
   });
@@ -440,8 +450,7 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
         window.removeEventListener("mousemove", move);
         window.removeEventListener("mouseup", up);
         endDrag = undefined;
-        copier.start();
-        send({ type: "select", action: "release", at, time });
+        send({ type: "select", action: "release", at, time, copy: copier.start() });
       };
       const move = (m: MouseEvent) => {
         if ((m.buttons & 1) === 0) return end(cellAt(m), m.timeStamp);

@@ -284,11 +284,12 @@ test("a server restart: the terminals come back to their restored sessions, and 
 
 test("under the kitty keyboard protocol, shifted symbols reach the program as typed", async () => {
   // Disambiguation, as neovim asks for it; the program prints the bytes
-  // of four keys in hex.
-  const session = await create("/bin/sh", "-c", "printf '\\033[>1u'; stty raw -echo; dd bs=1 count=4 2>/dev/null | od -An -tx1; exec cat");
+  // of four keys in hex, once the terminal is raw.
+  const session = await create("/bin/sh", "-c", "printf '\\033[>1u'; stty raw -echo; printf ready; dd bs=1 count=4 2>/dev/null | od -An -tx1; exec cat");
   const page = await opened();
   await page.evaluate((s) => harness().mount("only", s), session);
   await connectedTo(page, "only");
+  await eventually("the terminal raw", async () => ((await screenOf(session)).includes("ready") ? true : undefined));
   await page.click("#only");
   // Shift held, as a keyboard sends it: whatever the machine's layout has
   // on these keys unshifted, the text is what Shift made.

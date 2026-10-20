@@ -107,8 +107,10 @@ export type ToWorker =
   | { type: "key"; mount: number; input: KeyInput }
   | { type: "paste"; mount: number; text: string }
   /** The mouse on the canvas, `at` in cells of the viewport, fractions
-   * included; `time` in ms, for double and triple clicks. */
-  | { type: "select"; mount: number; action: "press" | "drag" | "release"; at: CellPoint; time: number }
+   * included; `time` in ms, for double and triple clicks. A release has
+   * the page's number for its copy, which the answer carries. */
+  | { type: "select"; mount: number; action: "press" | "drag"; at: CellPoint; time: number }
+  | { type: "select"; mount: number; action: "release"; at: CellPoint; time: number; copy: number }
   /** Text as typed, which no key sent: a composition's, the emoji picker's. */
   | { type: "text"; mount: number; text: string }
   /** The wheel: `rows` through the history, up when negative. */
@@ -146,9 +148,10 @@ export type ToPage =
   | { type: "link"; mount: number; link: Link }
   | { type: "frame"; mount: number; frame: Frame }
   | { type: "clipboard"; mount: number; text: string }
-  /** The selection's text, or undefined once there is none; `copy`: the
-   * answer to a release, so the text (if any) goes to the clipboard. */
-  | { type: "selection"; mount: number; text: string | undefined; copy: boolean };
+  /** The selection's text, or undefined once there is none; with `copy`,
+   * the answer to the release of that number, so the text (if any) goes
+   * to the clipboard. Every release is answered. */
+  | { type: "selection"; mount: number; text: string | undefined; copy?: number };
 
 /** The worker's end of the page's messages: `self` in a dedicated worker. */
 export interface WorkerPort {
@@ -743,9 +746,13 @@ class Mount {
 
   /** The mouse: a press clears the selection, or selects a word or a line
    * at once; a drag selects; the release copies what is selected. */
-  select(action: "press" | "drag" | "release", at: CellPoint, time: number): void {
+  select(action: "press" | "drag" | "release", at: CellPoint, time: number, copy?: number): void {
     const term = this.attachment?.term();
-    if (!term) return;
+    if (!term) {
+      // Nothing to select: the page's copy waits for the answer even so.
+      if (copy !== undefined) this.post({ type: "selection", mount: this.id, text: undefined, copy });
+      return;
+    }
     switch (action) {
       case "press":
         this.claim();
@@ -763,7 +770,7 @@ class Mount {
         // (trimmed to nothing) are no text to copy.
         const text = term.selectionText() || undefined;
         this.selected = text !== undefined;
-        this.post({ type: "selection", mount: this.id, text, copy: true });
+        this.post({ type: "selection", mount: this.id, text, ...(copy !== undefined ? { copy } : {}) });
         break;
       }
     }
@@ -781,7 +788,7 @@ class Mount {
 
   private unselected(): void {
     this.selected = false;
-    this.post({ type: "selection", mount: this.id, text: undefined, copy: false });
+    this.post({ type: "selection", mount: this.id, text: undefined });
   }
 
   /** The terminal goes, and its selection and the gesture's anchor with it. */
@@ -1067,7 +1074,7 @@ export function runWorker(port: WorkerPort): void {
         mount.text(message.text);
         break;
       case "select":
-        mount.select(message.action, message.at, message.time);
+        mount.select(message.action, message.at, message.time, message.action === "release" ? message.copy : undefined);
         break;
       case "wheel":
         mount.wheel(message.rows);

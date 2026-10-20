@@ -48,6 +48,8 @@ class Attempt {
     private readonly source: CopySource,
     private readonly report: (copy: Copy) => void,
     timeoutMs: number,
+    /** Once, when it is reported or dropped. */
+    private readonly ended: () => void,
     /** At the timeout, after the report. */
     timedOut?: () => void,
   ) {
@@ -55,10 +57,6 @@ class Attempt {
       this.finish({ ok: false, reason: "timeout" });
       timedOut?.();
     }, timeoutMs);
-  }
-
-  get settled(): boolean {
-    return this.done;
   }
 
   text(text: string): void {
@@ -73,8 +71,10 @@ class Attempt {
 
   /** Not a copy: nothing was selected, or a newer copy took its place. */
   drop(): void {
+    if (this.done) return;
     this.done = true;
     clearTimeout(this.timer);
+    this.ended();
   }
 
   private settle(): void {
@@ -107,27 +107,39 @@ interface Pending {
 
 /** A mounted terminal's copies. */
 export class Copier {
-  /** The releases' copies in the order the worker answers them. */
-  private readonly pending: Pending[] = [];
+  /** The releases' copies waiting for the worker's answer, by number. */
+  private readonly pending = new Map<number, Pending>();
+  private next = 1;
+  /** Every copy not yet reported or dropped, for `dispose`. */
+  private readonly live = new Set<Attempt>();
 
   constructor(
     private readonly host: CopyHost,
     private readonly timeoutMs = COPY_TIMEOUT_MS,
   ) {}
 
-  /** Starts the copy of what a release selected. Safari writes to the
-   * clipboard only within the user's gesture, which is over before the
-   * worker answers: the write starts here with the text to come, and
-   * fails, leaving the clipboard alone, when nothing was selected. Where
-   * the browser has no `ClipboardItem` the text is written once it
-   * arrives. An earlier release's copy still waiting is dropped, so the
-   * clipboard gets the latest. */
-  start(): void {
-    for (const earlier of this.pending) this.dropOne(earlier);
-    const pending: Pending = { attempt: new Attempt("release", this.host.report, this.timeoutMs, () => pending.text?.reject()) };
-    this.pending.push(pending);
+  /** Starts the copy of what a release selected, and returns its number
+   * for the worker's answer. Safari writes to the clipboard only within
+   * the user's gesture, which is over before the worker answers: the
+   * write starts here with the text to come, and fails, leaving the
+   * clipboard alone, when nothing was selected. Where the browser has no
+   * `ClipboardItem` the text is written once it arrives. An earlier
+   * release's copy still waiting is dropped, so the clipboard gets the
+   * latest. */
+  start(): number {
+    for (const earlier of this.pending.values()) this.dropOne(earlier);
+    this.pending.clear();
+    const id = this.next++;
+    const pending: Pending = {
+      // At the timeout the write is left without its text.
+      attempt: this.attempt("release", () => {
+        this.pending.delete(id);
+        pending.text?.reject();
+      }),
+    };
+    this.pending.set(id, pending);
     const clipboard = this.host.clipboard();
-    if (!this.host.item || !clipboard?.write) return;
+    if (!this.host.item || !clipboard?.write) return id;
     const text = new Promise<Blob>((resolve, reject) => {
       pending.text = {
         resolve: (value) => resolve(new Blob([value], { type: "text/plain" })),
@@ -144,17 +156,20 @@ export class Copier {
       // One whose `ClipboardItem` takes no text to come: written once
       // the text arrives.
       delete pending.text;
-      return;
+      return id;
     }
     pending.attempt.follow(clipboard.write([item]));
+    return id;
   }
 
-  /** The worker's answer to the earliest release waiting: the selected
-   * text, or undefined when nothing was selected, which is no copy. */
-  answer(text: string | undefined): void {
-    const pending = this.pending.shift();
+  /** The worker's answer to release `id`: the selected text, or undefined
+   * when nothing was selected, which is no copy. An answer to a copy that
+   * was dropped or timed out is ignored. */
+  answer(id: number, text: string | undefined): void {
+    const pending = this.pending.get(id);
     if (!pending) return;
-    if (text === undefined || pending.attempt.settled) return this.dropOne(pending);
+    this.pending.delete(id);
+    if (text === undefined) return this.dropOne(pending);
     pending.attempt.text(text);
     if (pending.text) pending.text.resolve(text);
     else this.writeText(pending.attempt, text);
@@ -162,7 +177,7 @@ export class Copier {
 
   /** Copies `text` known now. */
   write(text: string, source: CopySource): void {
-    const attempt = new Attempt(source, this.host.report, this.timeoutMs);
+    const attempt = this.attempt(source);
     attempt.text(text);
     this.writeText(attempt, text);
   }
@@ -172,9 +187,17 @@ export class Copier {
     this.host.report({ ok: true, source, chars: length(text) });
   }
 
-  /** Drops the copies waiting for their text, unreported. */
+  /** Drops every copy under way, unreported. */
   dispose(): void {
-    for (const pending of this.pending.splice(0)) this.dropOne(pending);
+    for (const pending of this.pending.values()) this.dropOne(pending);
+    this.pending.clear();
+    for (const attempt of this.live) attempt.drop();
+  }
+
+  private attempt(source: CopySource, timedOut?: () => void): Attempt {
+    const attempt: Attempt = new Attempt(source, this.host.report, this.timeoutMs, () => this.live.delete(attempt), timedOut);
+    this.live.add(attempt);
+    return attempt;
   }
 
   private dropOne(pending: Pending): void {
