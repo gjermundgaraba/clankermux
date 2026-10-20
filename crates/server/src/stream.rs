@@ -52,14 +52,13 @@ impl Stream {
     }
 
     pub fn append(&mut self, bytes: &[u8]) {
-        self.ring.extend(bytes);
-        if self.ring.len() > self.max_ring {
-            let drop = self.ring.len() - self.max_ring;
-            self.ring.drain(..drop);
-            self.start += drop as u64;
-            while self.markers.front().is_some_and(|m| m.offset < self.start) {
-                self.markers.pop_front();
-            }
+        let keep = bytes.len().min(self.max_ring);
+        let drop = self.ring.len().saturating_sub(self.max_ring - keep);
+        self.ring.drain(..drop);
+        self.start += (drop + bytes.len() - keep) as u64;
+        self.ring.extend(&bytes[bytes.len() - keep..]);
+        while self.markers.front().is_some_and(|m| m.offset < self.start) {
+            self.markers.pop_front();
         }
     }
 
@@ -150,5 +149,44 @@ mod tests {
         assert!(!s.markers_retained_after(0));
         assert!(s.markers_retained_after(1));
         assert!(s.markers_retained_after(3));
+    }
+
+    #[test]
+    fn full_ring_reuses_its_allocation() {
+        let limit = 4 * 1024 * 1024;
+        let mut s = Stream::new(limit, 8);
+        s.append(&vec![b'x'; limit]);
+        let capacity = s.ring.capacity();
+        s.append(&[b'y'; 24]);
+        assert_eq!(s.ring.capacity(), capacity);
+        assert_eq!(s.retained_start(), 24);
+        assert_eq!(s.offset(), (limit + 24) as u64);
+        assert_eq!(s.read(limit as u64, 24).unwrap(), [b'y'; 24]);
+    }
+
+    #[test]
+    fn oversized_appends_keep_suffix_and_lifetime_offsets() {
+        for limit in [0, 1, 3, 8] {
+            let mut s = Stream::new(limit, 8);
+            s.append(b"old");
+            s.add_marker(MarkerKind::Resized { cols: 1, rows: 1 });
+            let bytes = b"0123456789";
+            s.append(bytes);
+            assert_eq!(s.offset(), 13);
+            assert_eq!(s.retained_start(), 13 - limit as u64);
+            assert_eq!(
+                s.read(s.retained_start(), 100).unwrap(),
+                bytes[10 - limit..]
+            );
+            assert!(!s.markers_retained_after(0));
+            s.add_marker(MarkerKind::Resized { cols: 2, rows: 2 });
+            s.append(b"");
+            assert!(s.markers_retained_after(1));
+            assert_eq!(s.offset(), 13);
+            s.append(b"z");
+            assert_eq!(s.offset(), 14);
+            assert_eq!(s.retained_start(), 14 - limit as u64);
+            assert_eq!(s.markers_retained_after(1), limit != 0);
+        }
     }
 }
