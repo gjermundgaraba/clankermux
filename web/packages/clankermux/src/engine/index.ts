@@ -235,6 +235,12 @@ export class Engine {
 
   /** Reads a bit field of a 64-bit packed value at `ptr`. */
   readBits(ptr: number, field: BitField): number {
+    const bit = field.lsb % 32;
+    if (bit + field.width <= 32) {
+      const word = this.view.getUint32(ptr + 4 * Math.floor(field.lsb / 32), true) >>> bit;
+      // A 32-bit mask would be signed; preserve the unsigned full word.
+      return field.width === 32 ? word : word & (2 ** field.width - 1);
+    }
     const value = this.view.getBigUint64(ptr, true);
     return Number((value >> BigInt(field.lsb)) & ((1n << BigInt(field.width)) - 1n));
   }
