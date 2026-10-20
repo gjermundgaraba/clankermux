@@ -1,9 +1,7 @@
-//! Limits conformance: one check per row of PROTOCOL.md's Limits table
-//! that earlier suites do not already cover (`max_frame` both ways,
-//! `scrollback`, `continuation`, `label`, `text`, `markers`, and the
-//! default limits against the largest replies). `ring` and `input_queue`
-//! are in attach.rs, `page`, `hello_timeout`, `remove_grace` and
-//! `control_body` in control.rs, `records` in park.rs.
+//! Limits conformance: checks for the rows of PROTOCOL.md's Limits table
+//! that the suites of what each limit bounds do not already make
+//! (`max_frame` both ways, `scrollback`, `continuation`, `label`, `text`,
+//! `markers`, and the default limits against the largest replies).
 
 mod common;
 

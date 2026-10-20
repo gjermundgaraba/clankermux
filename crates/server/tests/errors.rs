@@ -1,10 +1,10 @@
 //! Errors conformance: the placement rule that an attachment-channel
 //! error ends the attachment and frees the channel. The codes
 //! themselves, request errors carrying their id, and id-less connection
-//! errors before a close are raised across the other suites (see the
-//! ledger's M7 table). `signal_failed` needs a running session whose
-//! process group is empty and whose PTY nobody holds, which cannot exist
-//! (an unheld PTY ends the stream), so it is not exercised.
+//! errors before a close are raised across the other suites.
+//! `signal_failed` needs a running session whose process group is empty
+//! and whose PTY nobody holds, which cannot exist (an unheld PTY ends the
+//! stream), so it is not exercised.
 
 mod common;
 
