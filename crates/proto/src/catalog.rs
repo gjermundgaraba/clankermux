@@ -2,7 +2,7 @@
 //! Schemas derived from the types of this crate. `describe` answers it,
 //! and PROTOCOL.md's tables are rendered from it (see `render`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, SchemaGenerator};
@@ -25,6 +25,8 @@ pub enum Class {
     /// Starts frames that follow the reply on the connection.
     Stream,
 }
+
+crate::message::wire_display!(Class);
 
 /// `describe`: one method, or the whole catalog.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -204,7 +206,7 @@ fn same<T: Serialize + serde::de::DeserializeOwned>(value: &Value) -> Result<(),
 methods! {
     "create" Mutation (CreateParams) -> Session,
         errors [InvalidRequest, LimitExceeded, Internal],
-        examples [("params/create", "session/running")],
+        examples [("params/create", "session/created")],
         "Starts a session: a program on a new PTY.";
     "list" Read (ListParams) -> Page,
         errors [InvalidRequest],
@@ -239,7 +241,7 @@ methods! {
         examples [("params/read", "read/running"), ("params/read-scoped", "read/truncated")],
         "The session's screen, history or last command, as text, VT or HTML.";
     "tail" Read (TailParams) -> Tail,
-        errors [InvalidRequest, NoSuchSession],
+        errors [InvalidRequest, NoSuchSession, Internal],
         examples [("params/tail", "tail/basic"), ("params/tail-from", "tail/truncated")],
         "The output stream as plain text, from a stream offset.";
     "send" Mutation (SendParams) -> Sent,
@@ -248,7 +250,7 @@ methods! {
         "Writes text, named keys or bytes to the PTY; with `wait`, answers when it ends.";
     "wait" Read (WaitParams) -> Waited,
         errors [InvalidRequest, NoSuchSession, NotRunning, Cancelled],
-        examples [("params/wait", "waited/status"), ("params/wait-output", "waited/timeout")],
+        examples [("params/wait", "waited/status-done"), ("params/wait-output", "waited/timeout")],
         "Answers when the session exits, its output matches, a record is in a state, a prompt shows or output stops.";
     "cancel" Mutation (CancelParams) -> Cancelled,
         errors [InvalidRequest],
@@ -408,21 +410,15 @@ pub fn catalog(version: &str) -> Catalog {
 
     ser.subschema_for::<Event>();
     ser.subschema_for::<ErrorCode>();
-    let mut defs = Map::new();
-    let mut names = BTreeSet::new();
+    let mut sorted = BTreeMap::new();
     for (name, schema) in de.definitions().iter().chain(ser.definitions()) {
-        if let Some(seen) = defs.get(name) {
+        if let Some(seen) = sorted.insert(name, schema) {
             assert_eq!(seen, schema, "{name} differs between params and results");
         }
-        names.insert(name.clone());
-        defs.insert(name.clone(), schema.clone());
     }
-    let mut defs: Map<String, Value> = names
+    let mut defs: Map<String, Value> = sorted
         .into_iter()
-        .map(|name| {
-            let schema = defs.remove(&name).expect("collected");
-            (name, schema)
-        })
+        .map(|(name, schema)| (name.clone(), schema.clone()))
         .collect();
     for schema in defs.values_mut() {
         tidy(schema);
@@ -492,7 +488,7 @@ impl Catalog {
     /// The entry for `name` with the definitions it refers to, directly
     /// or through others.
     pub fn describe(&self, name: &str) -> Option<Description> {
-        let method = self.methods.iter().find(|m| m.name == name)?.clone();
+        let method = self.method(name)?.clone();
         let mut wanted = Vec::new();
         refs(&method.params, &mut wanted);
         refs(&method.result, &mut wanted);

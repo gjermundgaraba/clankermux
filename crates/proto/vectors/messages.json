@@ -160,6 +160,29 @@
       "policy": "latest"
     }
   },
+  "session/created": {
+    "id": "0f1e2d3c-0000-4000-8000-000000000001",
+    "label": "build",
+    "status": "running",
+    "argv": [
+      "/bin/zsh",
+      "-l"
+    ],
+    "cwd": "/Users/me",
+    "pid": 4242,
+    "cols": 120,
+    "rows": 40,
+    "title": "",
+    "pwd": "",
+    "on_exit": "keep",
+    "created_at": "2026-10-18T12:00:00Z",
+    "offset": 0,
+    "marker": 0,
+    "attachments": [],
+    "size": {
+      "policy": "latest"
+    }
+  },
   "session/inspect": {
     "id": "0f1e2d3c-0000-4000-8000-000000000001",
     "label": "build",
@@ -884,6 +907,21 @@
       "msg": "Apply?",
       "progress": 42,
       "updated_at": "2026-10-18T12:01:00Z"
+    }
+  },
+  "waited/status-done": {
+    "reason": "status",
+    "at": {
+      "offset": 4096,
+      "marker": 3
+    },
+    "record": {
+      "id": "build",
+      "state": "done",
+      "title": "Build",
+      "msg": "Finished",
+      "updated_at": "2026-10-18T12:01:00Z",
+      "seen": false
     }
   },
   "waited/timeout": {

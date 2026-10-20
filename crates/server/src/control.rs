@@ -109,6 +109,14 @@ pub fn dispatch(
     request: Request,
 ) {
     let id = request.id;
+    // A method the catalog does not describe is not served.
+    if registry.catalog().method(&request.method).is_none() {
+        let fail = (
+            ErrorCode::InvalidRequest,
+            format!("unknown method {}", request.method),
+        );
+        return reply(writer, id, Err(fail));
+    }
     match request.method.as_str() {
         "send" => send(registry, writer, pending, id, request.params),
         "wait" => {

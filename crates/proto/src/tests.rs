@@ -426,6 +426,9 @@ fn splice_renders_regions_and_keeps_the_rest() {
          <!-- end generated -->\nMore.\n"
     );
     assert_eq!(render::splice(&once, &catalog).unwrap(), once);
+    // A mark inside a line is prose that shows one.
+    let quoted = "Write `<!-- generated: methods -->` and `<!-- end generated -->`.\n";
+    assert_eq!(render::splice(quoted, &catalog).unwrap(), quoted);
     for bad in [
         "<!-- generated: methods -->\nno end\n",
         "stray\n<!-- end generated -->\n",
@@ -445,6 +448,7 @@ fn one_method_renders_with_the_types_it_uses() {
         "# send\n",
         "(mutation)",
         "| `wait`    | {until, timeout_ms?}?",
+        "exactly one of `text`, `keys` and `data`",
         "## Result: Sent",
         "## Waited",
         "## SendWait",

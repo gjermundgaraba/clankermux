@@ -30,12 +30,13 @@ const NAMED: &[&str] = &[
     "ErrorCode",
 ];
 
-/// `doc` with every generated region rendered again from `catalog`.
+/// `doc` with every generated region rendered again from `catalog`. A
+/// mark counts only at the start of a line.
 pub fn splice(doc: &str, catalog: &Catalog) -> Result<String, String> {
     let mut out = String::new();
     let mut rest = doc;
-    while let Some(at) = rest.find(BEGIN) {
-        if rest[..at].contains(END) {
+    while let Some(at) = mark(rest, BEGIN) {
+        if mark(&rest[..at], END).is_some() {
             return Err(format!("{END} without a mark"));
         }
         let line_end = rest[at..]
@@ -47,11 +48,10 @@ pub fn splice(doc: &str, catalog: &Catalog) -> Result<String, String> {
             .strip_suffix("-->")
             .ok_or_else(|| format!("unclosed mark {:?}", &rest[at..line_end]))?
             .trim();
-        let end = rest[line_end..]
-            .find(END)
+        let end = mark(&rest[line_end..], END)
             .map(|i| line_end + i)
             .ok_or_else(|| format!("{what}: no {END}"))?;
-        if rest[line_end..end].contains(BEGIN) {
+        if mark(&rest[line_end..end], BEGIN).is_some() {
             return Err(format!("{what}: a mark inside the region"));
         }
         out.push_str(&rest[..line_end]);
@@ -59,11 +59,18 @@ pub fn splice(doc: &str, catalog: &Catalog) -> Result<String, String> {
         out.push_str(END);
         rest = &rest[end + END.len()..];
     }
-    if rest.contains(END) {
+    if mark(rest, END).is_some() {
         return Err(format!("{END} without a mark"));
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Where `text` has `mark` at the start of a line.
+fn mark(text: &str, mark: &str) -> Option<usize> {
+    text.match_indices(mark)
+        .map(|(at, _)| at)
+        .find(|&at| at == 0 || text[..at].ends_with('\n'))
 }
 
 /// One region: `frames`, `methods`, `events`, `errors`, or `type NAME`
@@ -124,7 +131,7 @@ pub fn render(what: &str, catalog: &Catalog) -> Result<String, String> {
                     vec![
                         format!("`{}`", e.name),
                         format!("`{}`", field_names(&fields)),
-                        e.summary.clone(),
+                        one_line(&e.summary),
                     ]
                 }),
             ),
@@ -133,7 +140,7 @@ pub fn render(what: &str, catalog: &Catalog) -> Result<String, String> {
                 catalog
                     .errors
                     .iter()
-                    .map(|e| vec![format!("`{}`", wire(&e.code)), e.summary.clone()]),
+                    .map(|e| vec![format!("`{}`", wire(&e.code)), one_line(&e.summary)]),
             ),
             _ => return Err(format!("nothing renders {what:?}")),
         },
@@ -147,13 +154,16 @@ pub fn method(description: &Description) -> String {
     let defs = &description.defs;
     let mut out = format!("# {}\n\n{} ({})\n\n", m.name, m.summary, wire(&m.class));
     out.push_str("## Params\n\n");
-    out.push_str(&fields_table(resolve(&m.params, defs), defs));
+    let params = resolve(&m.params, defs);
+    out.push_str(&about(params));
+    out.push_str(&fields_table(params, defs));
     out.push_str(&format!(
         "\n## Result: {}\n\n",
         code(&shape(&m.result, defs))
     ));
     let result = resolve(&m.result, defs);
     if result.get("properties").is_some() {
+        out.push_str(&about(result));
         out.push_str(&fields_table(result, defs));
         out.push('\n');
     }
@@ -173,9 +183,7 @@ pub fn method(description: &Description) -> String {
         }
         if schema.get("properties").is_some() {
             out.push_str(&format!("## {name}\n\n"));
-            if let Some(text) = schema.get("description").and_then(Value::as_str) {
-                out.push_str(&format!("{}\n\n", one_line(text)));
-            }
+            out.push_str(&about(schema));
             out.push_str(&fields_table(schema, defs));
             out.push('\n');
         }
@@ -233,6 +241,15 @@ fn resolve<'a>(schema: &'a Value, defs: &'a Map<String, Value>) -> &'a Value {
     ref_name(schema)
         .and_then(|name| defs.get(name))
         .unwrap_or(schema)
+}
+
+/// A type's own doc comment, as a paragraph, if it has one.
+fn about(schema: &Value) -> String {
+    schema
+        .get("description")
+        .and_then(Value::as_str)
+        .map(|text| format!("{}\n\n", one_line(text)))
+        .unwrap_or_default()
 }
 
 fn one_line(text: &str) -> String {

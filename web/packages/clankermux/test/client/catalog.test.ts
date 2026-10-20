@@ -1,8 +1,10 @@
 /**
  * The catalog a real server answers to `describe` against the TS types:
  * every method's example, typed here by its `Methods` entry, and every
- * shared vector pass the catalog's JSON Schemas, and a params object with
- * a field the protocol does not define fails them.
+ * shared vector pass the catalog's JSON Schemas, a params object with a
+ * field the protocol does not define fails them, and every field of every
+ * method is set by one of those values. A field only the TS type has goes
+ * unnoticed.
  */
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
@@ -97,7 +99,7 @@ type Examples = { [M in Method]: { params: Methods[M]["params"]; result: Methods
 /** Each method's examples, as the catalog lists them, through the TS types. */
 async function examples(): Promise<Examples> {
   return {
-    create: [{ params: vectors["params/create"], result: vectors["session/running"] }],
+    create: [{ params: vectors["params/create"], result: vectors["session/created"] }],
     list: [
       { params: vectors["params/list-first"], result: vectors["page/with-next"] },
       { params: vectors["params/list"], result: vectors["page/last"] },
@@ -124,7 +126,7 @@ async function examples(): Promise<Examples> {
       { params: vectors["params/send-text"], result: vectors["sent/wait"] },
     ],
     wait: [
-      { params: vectors["params/wait"], result: vectors["waited/status"] },
+      { params: vectors["params/wait"], result: vectors["waited/status-done"] },
       { params: vectors["params/wait-output"], result: vectors["waited/timeout"] },
     ],
     cancel: [{ params: vectors["params/cancel"], result: vectors["cancelled/yes"] }],
@@ -163,8 +165,13 @@ test("every method's typed examples pass its schemas, and an undefined field fai
   }
 });
 
-test("every shared vector passes the schema of its frame, method or type", () => {
-  const frames = new Map(catalog.frames.map((f) => [f.name.toLowerCase(), f.schema]));
+/** The schema of a shared vector: its frame's, its method's params, or its type's. */
+function schemaOf(name: string): JsonSchema | undefined {
+  // `params/list-first` is `list`'s params.
+  const [kind, variant] = name.split("/") as [string, string];
+  if (kind === "params") return catalog.methods.find((m) => m.name === variant.split("-")[0])?.params;
+  const frame = catalog.frames.find((f) => f.name.toLowerCase() === kind);
+  if (frame) return frame.schema;
   const types: Record<string, string> = {
     session: "Session",
     page: "Page",
@@ -177,13 +184,12 @@ test("every shared vector passes the schema of its frame, method or type", () =>
     acked: "Acked",
     empty: "Empty",
   };
+  return types[kind] === undefined ? undefined : { $ref: `#/$defs/${types[kind]}` };
+}
+
+test("every shared vector passes the schema of its frame, method or type", () => {
   for (const [name, value] of Object.entries(vectors)) {
-    // `params/list-first` is `list`'s params.
-    const [kind, variant] = name.split("/") as [string, string];
-    const schema =
-      kind === "params"
-        ? catalog.methods.find((m) => m.name === variant.split("-")[0])?.params
-        : (frames.get(kind) ?? (types[kind] === undefined ? undefined : { $ref: `#/$defs/${types[kind]}` }));
+    const schema = schemaOf(name);
     expect(schema, `${name} has a schema`).toBeTruthy();
     expect(validator(schema!)(value), name).toBe(true);
   }
@@ -194,4 +200,76 @@ test("every shared vector passes the schema of its frame, method or type", () =>
       expect(schema(body), event.name).toBe(true);
     }
   }
+});
+
+type Schema = { [key: string]: unknown };
+
+/** `DEF.field` for every field `schema` reaches, through `$ref`s. */
+function fields(schema: JsonSchema, at: string, out: Set<string>, done = new Set<string>()): Set<string> {
+  if (typeof schema === "boolean") return out;
+  const s = schema as Schema;
+  if (typeof s.$ref === "string") {
+    const name = s.$ref.slice("#/$defs/".length);
+    if (!done.has(name)) fields(catalog.$defs[name] as JsonSchema, name, out, done.add(name));
+    return out;
+  }
+  for (const key of ["anyOf", "oneOf", "allOf"]) {
+    for (const branch of (s[key] as JsonSchema[] | undefined) ?? []) fields(branch, at, out, done);
+  }
+  for (const [field, sub] of Object.entries((s.properties as Record<string, JsonSchema>) ?? {})) {
+    out.add(`${at}.${field}`);
+    fields(sub, `${at}.${field}`, out, done);
+  }
+  for (const key of ["items", "additionalProperties"]) {
+    if (typeof s[key] === "object") fields(s[key] as JsonSchema, at, out, done);
+  }
+  return out;
+}
+
+/** The fields of `schema` that `value` sets, as `fields` names them. */
+function set(schema: JsonSchema, value: unknown, at: string, out: Set<string>): void {
+  if (typeof schema === "boolean" || value === null || typeof value !== "object") return;
+  const s = schema as Schema;
+  if (typeof s.$ref === "string") {
+    const name = s.$ref.slice("#/$defs/".length);
+    return set(catalog.$defs[name] as JsonSchema, value, name, out);
+  }
+  for (const key of ["anyOf", "oneOf", "allOf"]) {
+    for (const branch of (s[key] as JsonSchema[] | undefined) ?? []) {
+      if (validator(branch)(value)) set(branch, value, at, out);
+    }
+  }
+  const record = value as Record<string, unknown>;
+  for (const [field, sub] of Object.entries((s.properties as Record<string, JsonSchema>) ?? {})) {
+    if (!(field in record)) continue;
+    out.add(`${at}.${field}`);
+    set(sub, record[field], `${at}.${field}`, out);
+  }
+  if (Array.isArray(value) && typeof s.items === "object") {
+    for (const item of value) set(s.items as JsonSchema, item, at, out);
+  }
+  if (!Array.isArray(value) && typeof s.additionalProperties === "object") {
+    for (const item of Object.values(record)) set(s.additionalProperties as JsonSchema, item, at, out);
+  }
+}
+
+// The TS types are written by hand: a field the schemas have reaches them
+// only through a value typed by them. So every field of every method's
+// params and result is set by some typed example or vector, which makes
+// `tsc` hold the TS type to that field and ajv hold the value to the schema.
+test("every field of every method is set by a value the TS types hold", async () => {
+  const all = new Set<string>();
+  const covered = new Set<string>();
+  const typed = await examples();
+  for (const method of catalog.methods) {
+    if (method.name === "describe") continue;
+    fields(method.params, "", all);
+    fields(method.result, "", all);
+    for (const example of typed[method.name as Method]) {
+      set(method.params, example.params, "", covered);
+      set(method.result, example.result, "", covered);
+    }
+  }
+  for (const [name, value] of Object.entries(vectors)) set(schemaOf(name)!, value, "", covered);
+  expect([...all].filter((field) => !covered.has(field))).toEqual([]);
 });

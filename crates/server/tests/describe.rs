@@ -56,7 +56,8 @@ async fn describe_with_a_method_answers_that_entry_alone() {
 }
 
 /// Every method the catalog lists reaches its handler, which refuses
-/// `null` params as malformed, and a name it does not list is unknown.
+/// `null` params as malformed, and a name it does not list is unknown:
+/// `dispatch` serves only the catalog's methods.
 #[tokio::test]
 async fn the_catalog_lists_exactly_the_methods_the_server_dispatches() {
     let server = start(fast_limits());

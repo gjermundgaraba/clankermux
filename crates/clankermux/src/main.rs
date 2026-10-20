@@ -1216,11 +1216,10 @@ async fn api(conn: &Connection, command: ApiCommand, json: bool) -> Result<i32, 
             print(json, &methods, |_| {
                 let width = catalog.methods.iter().map(|m| m.name.len()).max();
                 for m in &catalog.methods {
-                    let class = serde_json::to_value(m.class).unwrap();
                     emit(&format!(
                         "{:<width$}  {:<8}  {}\n",
                         m.name,
-                        class.as_str().unwrap_or_default(),
+                        m.class.to_string(),
                         m.summary,
                         width = width.unwrap_or(0)
                     ));
@@ -1241,12 +1240,7 @@ async fn api(conn: &Connection, command: ApiCommand, json: bool) -> Result<i32, 
             let result = finish_wait(conn, id, reply)
                 .await
                 .map_err(|fail| match fail {
-                    Fail::Client(Error::Server(e))
-                        if matches!(
-                            e.code,
-                            proto::ErrorCode::NoSuchSession | proto::ErrorCode::NoSuchAttachment
-                        ) =>
-                    {
+                    Fail::Client(Error::Server(e)) if e.code == proto::ErrorCode::NoSuchSession => {
                         Fail::Target(format!("{}: {}", e.code, e.message))
                     }
                     other => other,

@@ -104,7 +104,7 @@ connection closes.
 | `engine`       | string          | Engine id of the server. |
 | `incarnation`  | string          | UUID, new on every server start. |
 | `capabilities` | string[]        | Unknown ids are ignored. |
-| `limits`       | Limits          | See Limits. |
+| `limits`       | Limits          | The server's limits. |
 <!-- end generated -->
 
 The engine id is compared at `OPEN`, not at `HELLO`.
@@ -131,7 +131,7 @@ processed and answered.
 | `label`     | mutation | `session, label`                                    | Session                | `invalid_request`, `no_such_session`, `limit_exceeded` |
 | `resize`    | mutation | `session, cols?, rows?, policy?`                    | `{}`                   | `invalid_request`, `no_such_session`, `not_running` |
 | `read`      | read     | `session, scrollback?, format?, scope?`             | Read                   | `invalid_request`, `no_such_session`, `scope_unavailable`, `engine_mismatch`, `internal` |
-| `tail`      | read     | `session, after, max_bytes?`                        | Tail                   | `invalid_request`, `no_such_session` |
+| `tail`      | read     | `session, after, max_bytes?`                        | Tail                   | `invalid_request`, `no_such_session`, `internal` |
 | `send`      | mutation | `session, text?, keys?, data?, paste?, wait?`       | Sent                   | `invalid_request`, `no_such_session`, `not_running`, `input_overflow`, `cancelled`, `internal` |
 | `wait`      | read     | `session, until, after?, timeout_ms?`               | Waited                 | `invalid_request`, `no_such_session`, `not_running`, `cancelled` |
 | `cancel`    | mutation | `id`                                                | `{cancelled}`          | `invalid_request` |
@@ -328,10 +328,13 @@ processed and answered.
   events, the frames and the error codes. A schema refers to the shared
   definitions as `#/$defs/NAME`, `$defs` being a field of the reply, so a
   validator takes the schema with the reply's `$defs` beside it. Params
-  schemas set `additionalProperties: false` on every object, as the
-  server refuses undefined fields; result and event schemas leave it
-  unset, as a client ignores fields it does not know. An optional field
-  is absent, never `null`. With `method`, the reply is a Description:
+  schemas set `additionalProperties: false` on every object with fixed
+  fields, as the server refuses undefined fields; result and event
+  schemas leave it unset, as a client ignores fields it does not know.
+  An optional field is absent, never `null`. A schema holds the bounds
+  of a single field (`minimum`, `minLength`, `minItems`); a rule across
+  fields, such as `send`'s one payload, is in the type's description
+  and the text here. With `method`, the reply is a Description:
   that method and the definitions it refers to; a name that is not a
   method is `invalid_request`. A class is `read` (answers from the
   server's state and changes nothing), `mutation` or `stream` (starts
@@ -396,7 +399,7 @@ Tail
 <!-- generated: type Tail -->
 | Field          | Type   | Meaning |
 | -------------- | ------ | ------- |
-| `text`         | string | Plain text, by the filter under `tail`. |
+| `text`         | string | Plain text: the stream without escape sequences, and without controls but LF, CR and TAB; see `tail`. |
 | `start_offset` | int    | Where the text starts: `after`, or later when truncated. |
 | `next_offset`  | int    | Where it ends; the next `after`. |
 | `complete`     | bool   | Nothing more to read now: `next_offset` is the current stream offset, or what follows it is unfinished. |
@@ -460,7 +463,7 @@ MethodInfo
 | `on_exit`        | `remove` \| `keep`                  | |
 | `created_at`     | string                              | RFC 3339. |
 | `exited_at`      | string?                             | RFC 3339. |
-| `exit`           | ({code} \| {signal})?               | The signal by name. |
+| `exit`           | ({code} \| {signal})?               | `signal` by name. |
 | `offset`         | int                                 | Current stream offset. |
 | `marker`         | int                                 | Sequence number of the latest marker, 0 if none. |
 | `attachments`    | AttachmentInfo[]                    | Open attachments, in the order they opened. |
@@ -649,11 +652,9 @@ reads them.
 | `session`   | string                                   | The session's id. |
 | `read_only` | bool?                                    | Default false. |
 | `viewport`  | {cols, rows, cell_width?, cell_height?}? | |
-| `profile`   | {fg?, bg?, cursor?, scheme?}?            | See below. |
+| `profile`   | {fg?, bg?, cursor?, scheme?}?            | Colours as `#rrggbb`; `scheme` is `light` or `dark`. |
 | `resume`    | {incarnation, offset, marker}?           | |
 <!-- end generated -->
-
-Profile colours are `#rrggbb`; `scheme` is `light` or `dark`.
 
 Checks, in order, each failing with `ERROR` on the channel:
 

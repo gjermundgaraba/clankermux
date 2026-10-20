@@ -133,6 +133,18 @@ export const vectors = {
   "error/connection": { code: "protocol_error", message: "unknown frame type 0x98" } satisfies ErrorMessage,
   "session/running": running,
   "session/exited": exited,
+  "session/created": {
+    ...exitedBase,
+    status: "running",
+    pid: 4242,
+    title: "",
+    pwd: "",
+    on_exit: "keep",
+    offset: 0,
+    marker: 0,
+    attachments: [],
+    size: { policy: "latest" },
+  } satisfies Session,
   "session/inspect": {
     ...running,
     program_status: [
@@ -239,6 +251,11 @@ export const vectors = {
   } satisfies Sent,
   "waited/exited": { reason: "exited", at: { offset: 4096, marker: 3 }, exit: { code: 0 } } satisfies Waited,
   "waited/status": { reason: "status", at: { offset: 4096, marker: 3 }, record: blocked } satisfies Waited,
+  "waited/status-done": {
+    reason: "status",
+    at: { offset: 4096, marker: 3 },
+    record: { id: "build", state: "done", title: "Build", msg: "Finished", updated_at: "2026-10-18T12:01:00Z", seen: false },
+  } satisfies Waited,
   "waited/timeout": { reason: "timeout", at: { offset: 4096, marker: 3 } } satisfies Waited,
   "cancelled/yes": { cancelled: true } satisfies Cancelled,
   "empty/basic": {} satisfies Empty,

@@ -1203,16 +1203,24 @@ async fn api_lists_describes_and_calls_as_the_server_answers() {
     assert_eq!(code, 0);
     let page: Page = serde_json::from_str(&page).unwrap();
     assert_eq!(page.sessions.len(), 1);
-    // No session is assumed, and a timeout is a result.
+    // No session is assumed, even inside one of this server's.
+    let (code, _, err) = run_status(
+        &["--socket", socket, "api", "call", "inspect", "{}"],
+        &[
+            ("CLANKERMUX_SESSION", &created.id),
+            ("CLANKERMUX_SOCKET", socket),
+        ],
+    )
+    .await;
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("invalid_request"), "{err}");
+    // A timeout is a result.
     let wait = format!(
         r#"{{"session": "{}", "until": {{"quiet_ms": 60000}}, "timeout_ms": 50}}"#,
         created.id
     );
-    let (code, waited, err) = run_status(
-        &["--socket", socket, "api", "call", "wait", &wait],
-        &[("CLANKERMUX_SESSION", "elsewhere")],
-    )
-    .await;
+    let (code, waited, err) =
+        run_status(&["--socket", socket, "api", "call", "wait", &wait], &[]).await;
     assert_eq!(code, 0, "{err}");
     let waited: Waited = serde_json::from_str(&waited).unwrap();
     assert_eq!(waited.reason, WaitReason::Timeout);

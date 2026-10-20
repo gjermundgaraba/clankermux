@@ -51,7 +51,7 @@ pub struct Welcome {
     pub incarnation: String,
     /// Unknown ids are ignored.
     pub capabilities: Vec<String>,
-    /// See Limits.
+    /// The server's limits.
     pub limits: Limits,
 }
 
@@ -227,7 +227,7 @@ pub struct Session {
     /// RFC 3339.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exited_at: Option<String>,
-    /// The signal by name.
+    /// `signal` by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<Exit>,
     /// Current stream offset.
@@ -342,7 +342,8 @@ pub struct Read {
 /// `tail`'s result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Tail {
-    /// Plain text, by the filter under `tail`.
+    /// Plain text: the stream without escape sequences, and without
+    /// controls but LF, CR and TAB; see `tail`.
     pub text: String,
     /// Where the text starts: `after`, or later when truncated.
     pub start_offset: u64,
@@ -373,9 +374,11 @@ pub struct CreateParams {
     pub env: Option<BTreeMap<String, String>>,
     /// Default 80.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub cols: Option<u16>,
     /// Default 24.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub rows: Option<u16>,
     /// Default `remove`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -455,8 +458,10 @@ pub struct ResizeParams {
     /// The session's id.
     pub session: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub cols: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub rows: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<SizePolicy>,
@@ -519,6 +524,7 @@ pub struct TailParams {
     pub after: u64,
     /// Stream bytes to cover, at least 1; default 65536.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub max_bytes: Option<u64>,
 }
 
@@ -581,6 +587,7 @@ pub struct Until {
 #[serde(deny_unknown_fields)]
 pub struct OutputMatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub text: Option<String>,
     /// Rust `regex` syntax, on bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -592,6 +599,7 @@ pub struct OutputMatch {
 #[serde(deny_unknown_fields)]
 pub struct StatusMatch {
     /// `idle`, `working`, `done`, `blocked`, `error`.
+    #[schemars(length(min = 1))]
     pub states: Vec<String>,
     /// Only the record with this id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -899,7 +907,7 @@ pub struct Open {
     pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewport: Option<Size>,
-    /// See below.
+    /// Colours as `#rrggbb`; `scheme` is `light` or `dark`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -963,6 +971,8 @@ macro_rules! wire_display {
         }
     )*};
 }
+
+pub(crate) use wire_display;
 
 wire_display!(
     ErrorCode,
