@@ -3,58 +3,19 @@
  * the test reframes the byte stream itself, and over the TLS WebSocket
  * carrier the browser uses, one frame per message.
  */
-import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { connect as netConnect, type Socket } from "node:net";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import WebSocket from "ws";
 
 import { ENGINE, Engine } from "../../src/engine/index.ts";
-import { type Event, type Frame, FrameType, type Read, type Session, StreamFramer } from "../../src/proto/index.ts";
+import { type Event, type Frame, FrameType, type Read, type Session } from "../../src/proto/index.ts";
 
 import { type Action, Attachment } from "../../src/client/attachment.ts";
 import { Connection, type Transport, hello } from "../../src/client/connection.ts";
+import { type Served, StreamTransport, serve } from "./server.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
-const root = `${here}../../../../../`;
-const binary = `${root}target/debug/clankermux`;
-// `just check` builds the binary before the web suites run; a missing one
-// is a failure, not a reason to skip.
-if (!existsSync(binary)) throw new Error(`${binary} is missing: run cargo build first`);
-
-/** Frames over a stream socket, one `onMessage` per frame. */
-class StreamTransport implements Transport {
-  private readonly framer = new StreamFramer(1 << 30);
-  onMessage: ((bytes: Uint8Array) => void) | undefined;
-  onClose: (() => void) | undefined;
-
-  constructor(private readonly socket: Socket) {
-    socket.on("data", (chunk: Buffer) => {
-      for (const frame of this.framer.feed(chunk)) this.onMessage?.(frame);
-    });
-    socket.on("close", () => this.onClose?.());
-    socket.on("error", () => {});
-  }
-
-  static connect(path: string): Promise<StreamTransport> {
-    return new Promise((resolve, reject) => {
-      const socket = netConnect(path);
-      socket.once("connect", () => resolve(new StreamTransport(socket)));
-      socket.once("error", reject);
-    });
-  }
-
-  send(bytes: Uint8Array): void {
-    this.socket.write(bytes);
-  }
-
-  close(): void {
-    this.socket.destroy();
-  }
-}
 
 /** Frames over a WebSocket, as the browser carries them. */
 class WsTransport implements Transport {
@@ -85,55 +46,20 @@ class WsTransport implements Transport {
   }
 }
 
-let dir: string;
-let socket: string;
-let wsUrl: string;
-let server: ReturnType<typeof spawn>;
+let served: Served;
 let engine: Engine;
 
 const ORIGIN = "http://page.test";
 
 beforeAll(async () => {
   engine = await Engine.load(readFileSync(`${here}../../ghostty-vt.wasm`));
-  dir = mkdtempSync(join(tmpdir(), "cmx-"));
-  socket = join(dir, "sock");
-  const tls = `${here}fixtures/tls/`;
-  server = spawn(
-    binary,
-    ["--socket", socket, "serve", "--ws", "127.0.0.1:0", "--origin", ORIGIN, "--tls-cert", `${tls}cert.pem`, "--tls-key", `${tls}key.pem`],
-    { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, XDG_STATE_HOME: join(dir, "state") } },
-  );
-  // The bound port is announced on stderr.
-  wsUrl = await new Promise((resolve, reject) => {
-    let seen = "";
-    server.stderr!.on("data", (chunk: Buffer) => {
-      process.stderr.write(chunk);
-      seen += chunk;
-      const m = /listening on (wss:\/\/\S+)/.exec(seen);
-      if (m) resolve(m[1]!);
-    });
-    server.once("exit", (code) => reject(new Error(`server exited: ${code}`)));
-  });
-  const deadline = Date.now() + 10_000;
-  for (;;) {
-    try {
-      (await StreamTransport.connect(socket)).close();
-      return;
-    } catch {
-      if (Date.now() > deadline) throw new Error("server did not listen");
-      await new Promise((r) => setTimeout(r, 20));
-    }
-  }
+  served = await serve({ origin: ORIGIN });
 });
 
-afterAll(async () => {
-  // A graceful stop parks into the state directory; wait before removing it.
-  if (server && server.exitCode === null) await new Promise((resolve) => (server.once("exit", resolve), server.kill()));
-  if (dir) rmSync(dir, { recursive: true, force: true });
-});
+afterAll(() => served?.stop());
 
 async function connect(): Promise<Connection> {
-  return Connection.connect(await StreamTransport.connect(socket), hello("test", ENGINE));
+  return Connection.connect(await StreamTransport.connect(served.socket), hello("test", ENGINE));
 }
 
 /** Opens channel 1 and queues its frames. */
@@ -236,8 +162,8 @@ test("bootstraps, streams, resumes and sees the exit", async () => {
 });
 
 test("the TLS WebSocket carrier checks the origin and carries one frame per message", async () => {
-  await expect(WsTransport.connect(wsUrl, "http://elsewhere.test")).rejects.toThrow(/403/);
-  const conn = await Connection.connect(await WsTransport.connect(wsUrl, ORIGIN), hello("test", ENGINE));
+  await expect(WsTransport.connect(served.wsUrl!, "http://elsewhere.test")).rejects.toThrow(/403/);
+  const conn = await Connection.connect(await WsTransport.connect(served.wsUrl!, ORIGIN), hello("test", ENGINE));
   expect(conn.welcome.engine).toBe(ENGINE);
   const session = await conn.call<Session>("create", { argv: ["/bin/cat"], cols: 20, rows: 5 });
   const a = new Attachment(engine);
