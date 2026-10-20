@@ -6,7 +6,6 @@ use std::process::Command;
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let vendored = manifest.join("../../vendor/libghostty-vt");
-    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", vendored.display());
     println!("cargo:rerun-if-env-changed=ZIG");
 
