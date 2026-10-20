@@ -584,12 +584,16 @@ fn emit(text: &str) {
     }
 }
 
+fn emit_json<T: Serialize>(value: &T) {
+    emit(&format!(
+        "{}\n",
+        serde_json::to_string_pretty(value).unwrap()
+    ));
+}
+
 fn print<T: Serialize>(json: bool, value: &T, human: impl FnOnce(&T)) {
     if json {
-        emit(&format!(
-            "{}\n",
-            serde_json::to_string_pretty(value).unwrap()
-        ));
+        emit_json(value);
     } else {
         human(value);
     }
@@ -977,14 +981,7 @@ fn wait_line(waited: &Waited) -> String {
 /// Prints a finished wait (`--json`: the whole reply) and returns its
 /// exit status.
 fn report_wait(json: bool, reply: &serde_json::Value, waited: &Waited) -> i32 {
-    if json {
-        emit(&format!(
-            "{}\n",
-            serde_json::to_string_pretty(reply).unwrap()
-        ));
-    } else {
-        emit(&wait_line(waited));
-    }
+    print(json, reply, |_| emit(&wait_line(waited)));
     wait_status(waited)
 }
 
@@ -1240,10 +1237,7 @@ async fn api(conn: &Connection, command: ApiCommand, json: bool) -> Result<i32, 
                     }
                     other => other,
                 })?;
-            emit(&format!(
-                "{}\n",
-                serde_json::to_string_pretty(&result).unwrap()
-            ));
+            emit_json(&result);
         }
     }
     Ok(0)
@@ -1368,16 +1362,8 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                     },
                 )
                 .await?;
-                if json {
-                    let both = serde_json::json!({"session": created, "wait": reply});
-                    emit(&format!(
-                        "{}\n",
-                        serde_json::to_string_pretty(&both).unwrap()
-                    ));
-                } else {
-                    emit(&wait_line(&waited));
-                }
-                return Ok(wait_status(&waited));
+                let both = serde_json::json!({"session": created, "wait": reply});
+                return Ok(report_wait(json, &both, &waited));
             }
             print(json, &created, |s| emit(&format!("{}\n", s.id)));
         }
@@ -1390,10 +1376,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
         Command::Inspect { session } => {
             let session = resolve(&conn, here, session).await?;
             let value = conn.request("inspect", SessionParams { session }).await?;
-            emit(&format!(
-                "{}\n",
-                serde_json::to_string_pretty(&value).unwrap()
-            ));
+            emit_json(&value);
         }
         Command::Attach {
             session,
