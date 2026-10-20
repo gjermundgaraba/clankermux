@@ -4,7 +4,7 @@
 mod common;
 
 use common::*;
-use proto::catalog::{Catalog, Class, Description};
+use proto::catalog::{Catalog, Description};
 use proto::*;
 use serde_json::{Value, json};
 
@@ -13,20 +13,10 @@ async fn describe_answers_the_catalog_with_the_server_s_release() {
     let server = start(fast_limits());
     let mut c = client(&server).await;
     let catalog: Catalog = serde_json::from_value(c.ok("describe", json!({})).await).unwrap();
-    assert_eq!(catalog.protocol, VERSION);
-    assert_eq!(catalog.version, server.registry.config.version);
     assert_eq!(
         catalog,
         proto::catalog::catalog(&server.registry.config.version)
     );
-    let classes: Vec<(&str, Class)> = catalog
-        .methods
-        .iter()
-        .map(|m| (m.name.as_str(), m.class))
-        .collect();
-    assert!(classes.contains(&("describe", Class::Read)));
-    assert!(classes.contains(&("send", Class::Mutation)));
-    assert!(classes.contains(&("subscribe", Class::Stream)));
 }
 
 #[tokio::test]

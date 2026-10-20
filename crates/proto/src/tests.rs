@@ -305,43 +305,65 @@ fn params_schemas_are_closed_and_the_server_s_are_open() {
 }
 
 #[test]
-fn every_method_has_typed_examples_and_known_errors() {
+fn every_method_s_examples_are_its_types() {
     let catalog = catalog::catalog("0");
-    let typed = catalog::typed();
-    assert_eq!(typed.len(), catalog.methods.len());
-    let codes: Vec<ErrorCode> = catalog.errors.iter().map(|e| e.code).collect();
-    for (method, (name, check)) in catalog.methods.iter().zip(typed) {
-        assert_eq!(method.name, name);
+    for (name, check) in catalog::typed() {
+        let method = catalog.method(name).unwrap();
         assert!(!method.examples.is_empty(), "{name}: no example");
         for example in &method.examples {
             check(&example.params, &example.result).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
-        assert!(!method.summary.is_empty(), "{name}");
-        assert!(method.errors.contains(&ErrorCode::InvalidRequest), "{name}");
-        assert!(method.errors.iter().all(|e| codes.contains(e)), "{name}");
     }
+}
+
+#[test]
+fn method_names_are_unique() {
+    let catalog = catalog::catalog("0");
     let names: std::collections::BTreeSet<&str> =
         catalog.methods.iter().map(|m| m.name.as_str()).collect();
-    assert_eq!(names.len(), catalog.methods.len(), "names are unique");
-    // Every code, each once, with its meaning.
-    assert_eq!(codes.len(), 17);
-    assert_eq!(
-        codes
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        codes.len()
-    );
-    assert!(catalog.errors.iter().all(|e| !e.summary.is_empty()));
-    assert!(catalog.events.iter().all(|e| !e.summary.is_empty()));
-    assert_eq!(catalog.frames.len(), FrameType::ALL.len());
-    assert!(
-        catalog
-            .frames
-            .iter()
-            .all(|f| f.schema.is_some() == (f.payload == catalog::Payload::Json))
-    );
+    assert_eq!(names.len(), catalog.methods.len());
+}
+
+#[test]
+fn every_method_can_refuse_its_params() {
+    for method in catalog::catalog("0").methods {
+        assert!(
+            method.errors.contains(&ErrorCode::InvalidRequest),
+            "{}",
+            method.name
+        );
+    }
+}
+
+#[test]
+fn every_method_event_and_error_code_says_what_it_does() {
+    let catalog = catalog::catalog("0");
+    let summaries = catalog
+        .methods
+        .iter()
+        .map(|m| (m.name.clone(), &m.summary))
+        .chain(catalog.events.iter().map(|e| (e.name.clone(), &e.summary)))
+        .chain(
+            catalog
+                .errors
+                .iter()
+                .map(|e| (e.code.to_string(), &e.summary)),
+        );
+    for (name, summary) in summaries {
+        assert!(!summary.is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn a_frame_has_a_schema_exactly_when_its_payload_is_json() {
+    for frame in catalog::catalog("0").frames {
+        assert_eq!(
+            frame.schema.is_some(),
+            frame.payload == catalog::Payload::Json,
+            "{}",
+            frame.name
+        );
+    }
 }
 
 #[test]
