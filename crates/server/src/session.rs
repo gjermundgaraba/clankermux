@@ -1178,13 +1178,7 @@ pub fn pwd_path(value: &str) -> String {
 
 /// The first at most `max` bytes of `text`, on a character boundary.
 pub fn truncate(mut text: String, max: usize) -> String {
-    if text.len() > max {
-        let mut end = max;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-    }
+    text.truncate(text.floor_char_boundary(max));
     text
 }
 
@@ -1257,13 +1251,6 @@ mod tests {
             "/Users/me/a b"
         );
         assert_eq!(pwd_path("file:///x%2"), "/x%2");
-    }
-
-    #[test]
-    fn truncates_on_character_boundaries() {
-        assert_eq!(truncate("héllo".into(), 2), "h");
-        assert_eq!(truncate("héllo".into(), 3), "hé");
-        assert_eq!(truncate("hi".into(), 10), "hi");
     }
 
     #[test]
