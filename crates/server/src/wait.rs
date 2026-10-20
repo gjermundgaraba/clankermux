@@ -7,11 +7,9 @@ use proto::{CursorParams, ErrorCode, Match, StreamCursor, Until, WaitReason, Wai
 use regex::bytes::Regex;
 use tokio::time::Instant;
 
+use crate::records::STATES;
 use crate::registry::Fail;
 use crate::session::{Body, Session, Shared};
-
-/// The OSC 7501 states a status wait may name.
-const STATES: [&str; 5] = ["idle", "working", "done", "blocked", "error"];
 
 /// Plain text kept for an output match: older text is dropped half at a
 /// time.
