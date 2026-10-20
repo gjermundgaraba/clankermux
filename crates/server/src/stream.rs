@@ -5,13 +5,11 @@ use std::collections::VecDeque;
 
 use proto::Exit;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerKind {
     Resized { cols: u16, rows: u16 },
     Exited { exit: Exit },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Marker {
     pub seq: u64,
     pub offset: u64,
@@ -49,11 +47,6 @@ impl Stream {
         self.start
     }
 
-    /// The last retained byte.
-    pub fn last_byte(&self) -> Option<u8> {
-        self.ring.back().copied()
-    }
-
     pub fn latest_seq(&self) -> u64 {
         self.latest_seq
     }
@@ -70,18 +63,16 @@ impl Stream {
         }
     }
 
-    pub fn add_marker(&mut self, kind: MarkerKind) -> Marker {
+    pub fn add_marker(&mut self, kind: MarkerKind) {
         self.latest_seq += 1;
-        let marker = Marker {
+        self.markers.push_back(Marker {
             seq: self.latest_seq,
             offset: self.offset(),
             kind,
-        };
-        self.markers.push_back(marker.clone());
+        });
         if self.markers.len() > self.max_markers {
             self.markers.pop_front();
         }
-        marker
     }
 
     /// Up to `max` retained bytes from `offset`, or `None` when the
@@ -102,11 +93,10 @@ impl Stream {
         self.latest_seq - later as u64
     }
 
-    /// The retained bytes from `offset` on, or `None` when the stream
-    /// does not retain `offset`.
-    pub fn bytes_from(&self, offset: u64) -> Option<impl Iterator<Item = u8> + '_> {
-        let skip = usize::try_from(offset.checked_sub(self.start)?).ok()?;
-        (skip <= self.ring.len()).then(|| self.ring.range(skip..).copied())
+    /// The bytes from `offset` on, which is retained: from
+    /// `retained_start` up to `offset()`.
+    pub fn bytes_from(&self, offset: u64) -> impl Iterator<Item = u8> + '_ {
+        self.ring.range((offset - self.start) as usize..).copied()
     }
 
     /// Whether every marker with `seq` above `after` is still retained.
@@ -127,7 +117,8 @@ mod tests {
     fn ring_drops_oldest_bytes_and_markers() {
         let mut s = Stream::new(4, 8);
         s.append(b"abc");
-        let m1 = s.add_marker(MarkerKind::Resized { cols: 1, rows: 1 });
+        s.add_marker(MarkerKind::Resized { cols: 1, rows: 1 });
+        let m1 = s.markers_after(0).next().unwrap();
         assert_eq!((m1.seq, m1.offset), (1, 3));
         s.append(b"defg");
         assert_eq!(s.offset(), 7);

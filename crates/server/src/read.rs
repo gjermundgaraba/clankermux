@@ -299,9 +299,7 @@ pub fn tail(registry: &Registry, p: TailParams) -> Result<proto::Tail, Fail> {
         .checked_sub(1)
         .and_then(|at| stream.read(at, 1))
         .and_then(|b| b.first().copied());
-    let bytes = stream
-        .bytes_from(start)
-        .ok_or_else(|| internal("start not retained"))?;
+    let bytes = stream.bytes_from(start);
     let mut filter = Filter::new(previous, start > p.after);
     let (consumed, unfinished) = blocking(|| {
         filter.run(
