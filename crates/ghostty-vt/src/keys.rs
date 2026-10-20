@@ -66,21 +66,6 @@ const NAMED: &[(&str, sys::GhosttyKey)] = &[
     ("delete", sys::GHOSTTY_KEY_DELETE),
 ];
 
-const FUNCTION: [sys::GhosttyKey; 12] = [
-    sys::GHOSTTY_KEY_F1,
-    sys::GHOSTTY_KEY_F2,
-    sys::GHOSTTY_KEY_F3,
-    sys::GHOSTTY_KEY_F4,
-    sys::GHOSTTY_KEY_F5,
-    sys::GHOSTTY_KEY_F6,
-    sys::GHOSTTY_KEY_F7,
-    sys::GHOSTTY_KEY_F8,
-    sys::GHOSTTY_KEY_F9,
-    sys::GHOSTTY_KEY_F10,
-    sys::GHOSTTY_KEY_F11,
-    sys::GHOSTTY_KEY_F12,
-];
-
 /// The US layout's punctuation keys: the character unshifted, shifted,
 /// and the key.
 const PUNCTUATION: &[(char, char, sys::GhosttyKey)] = &[
@@ -139,29 +124,18 @@ impl KeyPress {
         }
         let lower = key.to_ascii_lowercase();
         if let Some((_, code)) = NAMED.iter().find(|(n, _)| *n == lower) {
-            return Some(KeyPress {
-                key: *code,
-                mods,
-                text: String::new(),
-                unshifted: None,
-                shift_consumed: false,
-            });
+            return Some(Self::textless(*code, mods));
         }
-        if lower == "space" {
+        if lower == "space" || key == " " {
             return Some(Self::character(sys::GHOSTTY_KEY_SPACE, mods, ' ', ' '));
         }
         if let Some(n) = lower
             .strip_prefix('f')
-            .and_then(|n| n.parse::<usize>().ok())
-            && (1..=FUNCTION.len()).contains(&n)
+            .and_then(|n| n.parse::<sys::GhosttyKey>().ok())
+            && (1..=12).contains(&n)
         {
-            return Some(KeyPress {
-                key: FUNCTION[n - 1],
-                mods,
-                text: String::new(),
-                unshifted: None,
-                shift_consumed: false,
-            });
+            // The engine numbers F1 to F12 in order.
+            return Some(Self::textless(sys::GHOSTTY_KEY_F1 + n - 1, mods));
         }
         let mut chars = key.chars();
         let (Some(c), None) = (chars.next(), chars.next()) else {
@@ -189,9 +163,6 @@ impl KeyPress {
             let text = if mods.shift { shifted } else { plain };
             return Some(Self::character(code, mods, text, plain));
         }
-        if c == ' ' {
-            return Some(Self::character(sys::GHOSTTY_KEY_SPACE, mods, ' ', ' '));
-        }
         // Any other character is text with no key of its own.
         Some(KeyPress {
             key: sys::GHOSTTY_KEY_UNIDENTIFIED,
@@ -200,6 +171,16 @@ impl KeyPress {
             unshifted: Some(c),
             shift_consumed: false,
         })
+    }
+
+    fn textless(key: sys::GhosttyKey, mods: Mods) -> KeyPress {
+        KeyPress {
+            key,
+            mods,
+            text: String::new(),
+            unshifted: None,
+            shift_consumed: false,
+        }
     }
 
     fn character(key: sys::GhosttyKey, mods: Mods, text: char, unshifted: char) -> KeyPress {
