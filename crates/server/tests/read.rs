@@ -222,7 +222,7 @@ async fn replies_cut_to_max_frame_are_truncated() {
         ring: 4096,
         ..fast_limits()
     };
-    let budget = 8192 - 4096;
+    let budget = 8192 - READ_MARGIN;
     let server = start(limits);
     let mut c = client(&server).await;
     let session = c

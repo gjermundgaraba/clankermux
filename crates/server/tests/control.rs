@@ -10,9 +10,8 @@ use proto::*;
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 
-/// What `read` may return under `max_frame` 8192: the server keeps the
-/// rest for the JSON around the text.
-const TEXT_BUDGET: usize = 8192 - 4096;
+/// What `read` may return under `max_frame` 8192.
+const TEXT_BUDGET: usize = 8192 - READ_MARGIN;
 
 #[tokio::test]
 async fn handshake_and_protocol_errors() {

@@ -20,6 +20,10 @@ pub fn start_with(limits: Limits, state_dir: PathBuf) -> Server {
     Server::start_with_state(limits, state_dir)
 }
 
+/// What a `read` reply keeps of `max_frame` for the JSON around its
+/// text: the server's private `REPLY_MARGIN`.
+pub const READ_MARGIN: usize = 4096;
+
 /// Standard base64, as `send` takes its data.
 pub fn b64(data: impl AsRef<[u8]>) -> String {
     use base64::Engine as _;
