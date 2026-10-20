@@ -7,6 +7,7 @@ import {
   type Exited,
   type Frame,
   FrameType,
+  type Gap,
   type Resized,
   type Resume,
   type Session,
@@ -184,6 +185,8 @@ export class Attachment {
         this.stream(frame, actions);
         break;
       case FrameType.Gap:
+        // Nothing in it is read, but a malformed one is still refused.
+        this.json<Gap>(frame);
         this.discard();
         actions.push({ type: "gap" });
         break;

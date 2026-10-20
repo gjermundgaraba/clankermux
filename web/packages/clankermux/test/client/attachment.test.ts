@@ -139,6 +139,7 @@ test("a gap discards and errors classify", () => {
   const a = new Attachment(engine);
   expect(a.handle(json(FrameType.Gap, { from: 1, to: 9 }))).toEqual([{ type: "gap" }]);
   expect(a.ended()).toBe(false);
+  expect(() => a.handle(frame(FrameType.Gap, new TextEncoder().encode("{")))).toThrow(/malformed/);
   const soft: ErrorMessage = { code: "read_only", message: "" };
   expect(a.handle(json(FrameType.Error, soft))).toEqual([{ type: "error", error: soft }]);
   expect(a.ended()).toBe(false);
