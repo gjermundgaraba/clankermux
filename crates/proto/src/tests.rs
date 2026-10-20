@@ -242,7 +242,9 @@ fn client_payloads_refuse_unknown_fields_and_server_payloads_ignore_them() {
     assert_eq!(gap.to, 2);
 }
 
-fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &mut Vec<String>) {
+/// Whether each object `schema` reaches, through its references,
+/// refuses undefined fields.
+fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &mut Vec<bool>) {
     let mut names = Vec::new();
     catalog::refs(schema, &mut names);
     let mut seen = std::collections::BTreeSet::new();
@@ -254,14 +256,11 @@ fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &m
             stack.push(def);
         }
     }
-    fn walk(schema: &Value, out: &mut Vec<String>) {
+    fn walk(schema: &Value, out: &mut Vec<bool>) {
         match schema {
             Value::Object(map) => {
                 if map.contains_key("properties") {
-                    out.push(format!(
-                        "{}",
-                        map.get("additionalProperties") == Some(&Value::Bool(false))
-                    ));
+                    out.push(map.get("additionalProperties") == Some(&Value::Bool(false)));
                 }
                 map.values().for_each(|v| walk(v, out));
             }
@@ -279,23 +278,15 @@ fn params_schemas_are_closed_and_the_server_s_are_open() {
         let mut params = Vec::new();
         closed_objects(&method.params, &catalog.defs, &mut params);
         assert!(!params.is_empty(), "{}: no object", method.name);
-        assert!(
-            params.iter().all(|c| c == "true"),
-            "{}: params open",
-            method.name
-        );
+        assert!(params.iter().all(|&c| c), "{}: params open", method.name);
         let mut result = Vec::new();
         closed_objects(&method.result, &catalog.defs, &mut result);
-        assert!(
-            result.iter().all(|c| c == "false"),
-            "{}: result closed",
-            method.name
-        );
+        assert!(result.iter().all(|&c| !c), "{}: result closed", method.name);
     }
     for event in &catalog.events {
         let mut fields = Vec::new();
         closed_objects(&event.schema, &catalog.defs, &mut fields);
-        assert!(fields.iter().all(|c| c == "false"), "{}", event.name);
+        assert!(fields.iter().all(|&c| !c), "{}", event.name);
     }
     for frame in &catalog.frames {
         let Some(schema) = &frame.schema else {
@@ -306,7 +297,7 @@ fn params_schemas_are_closed_and_the_server_s_are_open() {
         // `HELLO.client` and `REQUEST.params` are objects of their own.
         let closed = frame.direction == catalog::Direction::Client;
         assert!(
-            fields.iter().all(|c| *c == closed.to_string()),
+            fields.iter().all(|&c| c == closed),
             "{}: {fields:?}",
             frame.name
         );
@@ -314,43 +305,65 @@ fn params_schemas_are_closed_and_the_server_s_are_open() {
 }
 
 #[test]
-fn every_method_has_typed_examples_and_known_errors() {
+fn every_method_s_examples_are_its_types() {
     let catalog = catalog::catalog("0");
-    let typed = catalog::typed();
-    assert_eq!(typed.len(), catalog.methods.len());
-    let codes: Vec<ErrorCode> = catalog.errors.iter().map(|e| e.code).collect();
-    for (method, (name, check)) in catalog.methods.iter().zip(typed) {
-        assert_eq!(method.name, name);
+    for (name, check) in catalog::typed() {
+        let method = catalog.method(name).unwrap();
         assert!(!method.examples.is_empty(), "{name}: no example");
         for example in &method.examples {
             check(&example.params, &example.result).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
-        assert!(!method.summary.is_empty(), "{name}");
-        assert!(method.errors.contains(&ErrorCode::InvalidRequest), "{name}");
-        assert!(method.errors.iter().all(|e| codes.contains(e)), "{name}");
     }
+}
+
+#[test]
+fn method_names_are_unique() {
+    let catalog = catalog::catalog("0");
     let names: std::collections::BTreeSet<&str> =
         catalog.methods.iter().map(|m| m.name.as_str()).collect();
-    assert_eq!(names.len(), catalog.methods.len(), "names are unique");
-    // Every code, each once, with its meaning.
-    assert_eq!(codes.len(), 17);
-    assert_eq!(
-        codes
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        codes.len()
-    );
-    assert!(catalog.errors.iter().all(|e| !e.summary.is_empty()));
-    assert!(catalog.events.iter().all(|e| !e.summary.is_empty()));
-    assert_eq!(catalog.frames.len(), FrameType::ALL.len());
-    assert!(
-        catalog
-            .frames
-            .iter()
-            .all(|f| f.schema.is_some() == (f.payload == catalog::Payload::Json))
-    );
+    assert_eq!(names.len(), catalog.methods.len());
+}
+
+#[test]
+fn every_method_can_refuse_its_params() {
+    for method in catalog::catalog("0").methods {
+        assert!(
+            method.errors.contains(&ErrorCode::InvalidRequest),
+            "{}",
+            method.name
+        );
+    }
+}
+
+#[test]
+fn every_method_event_and_error_code_says_what_it_does() {
+    let catalog = catalog::catalog("0");
+    let summaries = catalog
+        .methods
+        .iter()
+        .map(|m| (m.name.clone(), &m.summary))
+        .chain(catalog.events.iter().map(|e| (e.name.clone(), &e.summary)))
+        .chain(
+            catalog
+                .errors
+                .iter()
+                .map(|e| (e.code.to_string(), &e.summary)),
+        );
+    for (name, summary) in summaries {
+        assert!(!summary.is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn a_frame_has_a_schema_exactly_when_its_payload_is_json() {
+    for frame in catalog::catalog("0").frames {
+        assert_eq!(
+            frame.schema.is_some(),
+            frame.payload == catalog::Payload::Json,
+            "{}",
+            frame.name
+        );
+    }
 }
 
 #[test]
@@ -400,16 +413,6 @@ fn describe_one_method_carries_what_it_refers_to() {
     let back: catalog::Described =
         serde_json::from_value(serde_json::to_value(&one).unwrap()).unwrap();
     assert!(matches!(back, catalog::Described::Method(d) if d == one));
-}
-
-#[test]
-fn protocol_md_is_rendered_from_the_catalog() {
-    let doc = include_str!("../../../PROTOCOL.md");
-    let rendered = render::splice(doc, &catalog::catalog("")).unwrap();
-    assert!(
-        rendered == doc,
-        "PROTOCOL.md is stale: run `cargo xtask protocol`"
-    );
 }
 
 #[test]

@@ -380,13 +380,8 @@ async fn cancel_ends_a_wait_and_its_reply_comes_last() {
         json!({"cancelled": false})
     );
     // Nothing else arrives for them: the session ends and nothing fires.
-    c.ok("end", json!({"session": s.id})).await;
+    // Subscribed first: an exit before the subscription is not replayed.
     c.ok("subscribe", json!({})).await;
-    loop {
-        let (header, body) = c.recv_json().await;
-        assert_eq!(header.frame_type, FrameType::Event, "{body}");
-        if body["event"] == "session_exited" {
-            break;
-        }
-    }
+    c.ok("end", json!({"session": s.id})).await;
+    c.wait_exit(&s.id).await;
 }

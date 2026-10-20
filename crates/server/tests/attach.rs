@@ -378,11 +378,13 @@ async fn exit_ends_the_stream_and_removal_closes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gap_when_the_client_falls_behind() {
-    // The first burst (1.05 MB with CRLFs) fits the ring but not what the
-    // connection holds in flight (its queue and the socket buffer, which
-    // is larger on Linux), so the cursor stops in it; the second, larger
-    // than the ring, evicts the stopped cursor, not one the server is
-    // still forwarding.
+    // The first burst (1.05 MB) fits the ring but not what the connection
+    // holds in flight (its queue and the socket buffer, which is larger
+    // on Linux), so the cursor stops in it; the second, larger than the
+    // ring, evicts the stopped cursor, not one the server is still
+    // forwarding. Each burst is one line: a PTY passes short lines a few
+    // bytes per read, so a megabyte of them takes seconds, and under load
+    // longer than the events connection waits for a frame.
     let server = start(Limits {
         ring: 1536 * 1024,
         ..fast_limits()
@@ -390,8 +392,8 @@ async fn gap_when_the_client_falls_behind() {
     let mut c = client(&server).await;
     let mut events = client(&server).await;
     events.ok("subscribe", json!({})).await;
-    let script = "read go; yes | head -c 700000; echo FIRST-DONE; \
-                  read go; yes | head -c 1500000";
+    let script = "read go; head -c 1050000 /dev/zero | tr '\\0' y; echo; echo FIRST-DONE; \
+                  read go; head -c 2250000 /dev/zero | tr '\\0' y";
     let session = c
         .create(
             json!({"argv": ["/bin/sh", "-c", script], "on_exit": "keep", "cols": 20, "rows": 5}),

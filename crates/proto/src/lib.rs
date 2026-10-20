@@ -6,6 +6,7 @@ mod frame;
 mod limits;
 mod message;
 pub mod render;
+pub mod typescript;
 
 pub use frame::*;
 pub use limits::Limits;

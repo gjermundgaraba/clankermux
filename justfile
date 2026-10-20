@@ -26,7 +26,7 @@ fixtures:
 bindings:
     cargo xtask bindings
 
-# Render PROTOCOL.md's tables from the protocol types.
+# Render PROTOCOL.md's tables and the web package's protocol types from the catalog.
 protocol:
     cargo xtask protocol
 

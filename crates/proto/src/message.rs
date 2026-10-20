@@ -793,6 +793,8 @@ pub enum Event {
 
 /// `EVENT`: an event and its number, from 1 per incarnation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+// The schema has the payload's name; `Event` is only flattened into it.
+#[schemars(rename = "Event")]
 pub struct Numbered {
     pub seq: u64,
     #[serde(flatten)]

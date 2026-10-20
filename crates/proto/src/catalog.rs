@@ -408,7 +408,6 @@ pub fn catalog(version: &str) -> Catalog {
         })
         .collect();
 
-    ser.subschema_for::<Event>();
     ser.subschema_for::<ErrorCode>();
     let mut sorted = BTreeMap::new();
     for (name, schema) in de.definitions().iter().chain(ser.definitions()) {
