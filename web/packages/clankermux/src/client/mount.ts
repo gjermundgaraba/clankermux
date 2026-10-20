@@ -410,7 +410,7 @@ export function mountOn(host: MountHost, id: number, options: MountOptions): Ter
       if (selected === undefined || !e.clipboardData) return;
       e.clipboardData.setData("text/plain", selected);
       e.preventDefault();
-      copier.copied(selected, "browser");
+      copier.copied(selected);
     },
     { signal },
   );
