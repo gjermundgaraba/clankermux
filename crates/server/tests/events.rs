@@ -3,8 +3,6 @@
 
 mod common;
 
-use std::time::Duration;
-
 use common::*;
 use proto::*;
 use serde_json::{Value, json};
@@ -574,7 +572,8 @@ async fn seen_survives_park_and_restore() {
         }
     );
 
-    // An ack of the restored session is announced and reaches its files.
+    // An ack of the restored session is announced and reaches its files
+    // before the stop, which writes nothing for a session not live.
     c.ok("ack", json!({"session": id})).await;
     let (record, reason) = status_event(&mut c).await;
     assert_eq!(
@@ -582,19 +581,10 @@ async fn seen_survives_park_and_restore() {
         ("e", StatusReason::Ack)
     );
     assert_eq!(attention_changed(&mut c).await, None);
-    let generation = std::fs::read_dir(state.join("sessions").join(&id))
-        .unwrap()
-        .flatten()
-        .find(|g| g.path().join("session.json").is_file())
-        .unwrap()
-        .path();
-    for _ in 0..500 {
-        let json = std::fs::read_to_string(generation.join("session.json")).unwrap();
-        if !json.contains("\"seen\":false") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let generation = wait_parked(&state, &id, "session.json", |json| {
+        !json.contains("\"seen\":false")
+    })
+    .await;
     // Still readable by a server that counts attachments.
     let json = std::fs::read_to_string(generation.join("session.json")).unwrap();
     assert!(json.contains("\"attachments\":0"), "{json}");
