@@ -13,7 +13,7 @@ use ghostty_vt::{
 };
 use proto::{
     AttachmentInfo, Attention, Cells, Closed, ClosedReason, ErrorCode, Event, Exit, OnExit, Peer,
-    Profile, Scheme, Size, SizeInfo, SizePolicy, Status, StatusReason, Viewport,
+    Profile, Scheme, Size, SizeInfo, SizePolicy, Status, StatusReason, StreamCursor, Viewport,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -521,16 +521,28 @@ impl Session {
         }
     }
 
+    /// The cursor now: the end of the stream, or where the park left it.
+    pub fn cursor(&self) -> StreamCursor {
+        match &self.body {
+            Body::Live(live) => StreamCursor {
+                offset: live.stream.offset(),
+                marker: live.stream.latest_seq(),
+            },
+            Body::Parked(parked) => StreamCursor {
+                offset: parked.offset,
+                marker: parked.marker,
+            },
+        }
+    }
+
     pub fn to_proto(&self, with_records: bool) -> proto::Session {
-        let (pid, cols, rows, title, pwd, offset, marker) = match &self.body {
+        let (pid, cols, rows, title, pwd) = match &self.body {
             Body::Live(live) => (
                 live.pid,
                 live.term.cols(),
                 live.term.rows(),
                 live.term.title(),
                 pwd_path(&live.term.pwd()),
-                live.stream.offset(),
-                live.stream.latest_seq(),
             ),
             Body::Parked(parked) => (
                 None,
@@ -538,10 +550,9 @@ impl Session {
                 parked.rows,
                 parked.title.clone(),
                 parked.pwd.clone(),
-                parked.offset,
-                parked.marker,
             ),
         };
+        let StreamCursor { offset, marker } = self.cursor();
         proto::Session {
             id: self.id.clone(),
             label: self.label.clone(),

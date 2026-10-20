@@ -220,7 +220,7 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
         };
         // Where the bytes are accepted: the reply's `at`, and where a
         // wait is armed.
-        let at = wait::cursor_of(&s);
+        let at = s.cursor();
         let armed = facts.map(|(facts, timeout)| {
             (
                 Waiter::for_send(facts, &s),

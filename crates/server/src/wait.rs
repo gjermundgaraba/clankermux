@@ -87,23 +87,9 @@ impl Facts {
     }
 }
 
-/// The session's cursor now.
-pub fn cursor_of(s: &Session) -> StreamCursor {
-    match &s.body {
-        Body::Live(live) => StreamCursor {
-            offset: live.stream.offset(),
-            marker: live.stream.latest_seq(),
-        },
-        Body::Parked(parked) => StreamCursor {
-            offset: parked.offset,
-            marker: parked.marker,
-        },
-    }
-}
-
 /// `after` checked against the session: not past its cursor.
 pub fn anchor(s: &Session, after: Option<CursorParams>) -> Result<StreamCursor, Fail> {
-    let now = cursor_of(s);
+    let now = s.cursor();
     let Some(after) = after else {
         return Ok(now);
     };
@@ -309,7 +295,7 @@ impl Waiter {
     pub fn for_send(facts: Facts, s: &Session) -> Self {
         Waiter {
             status_since: s.records.tick(),
-            ..Waiter::new(facts, cursor_of(s))
+            ..Waiter::new(facts, s.cursor())
         }
     }
 
@@ -356,10 +342,7 @@ impl Waiter {
             matched: None,
             record: None,
         };
-        let live = match &s.body {
-            Body::Live(live) => Some(live),
-            Body::Parked(_) => None,
-        };
+        let live = s.live();
         if let Some((start, end)) = found {
             let offset = self.plain.offset_of(start);
             let after = if end > start {
@@ -393,7 +376,7 @@ impl Waiter {
         {
             return Ok(Check::Fired(Box::new(Waited {
                 record: Some(record),
-                ..fired(WaitReason::Status, cursor_of(s))
+                ..fired(WaitReason::Status, s.cursor())
             })));
         }
         // Output that came after the scan is scanned before anything
@@ -408,7 +391,7 @@ impl Waiter {
         if self.facts.exited && ended {
             return Ok(Check::Fired(Box::new(Waited {
                 exit: s.exit.clone(),
-                ..fired(WaitReason::Exited, cursor_of(s))
+                ..fired(WaitReason::Exited, s.cursor())
             })));
         }
         if ended && (self.facts.output.is_some() || self.facts.prompt || self.facts.quiet.is_some())
@@ -421,10 +404,7 @@ impl Waiter {
         if let (Some(quiet), Some(live)) = (self.facts.quiet, live) {
             let due = self.started.max(live.last_output) + quiet;
             if Instant::now() >= due {
-                return Ok(Check::Fired(Box::new(fired(
-                    WaitReason::Quiet,
-                    cursor_of(s),
-                ))));
+                return Ok(Check::Fired(Box::new(fired(WaitReason::Quiet, s.cursor()))));
             }
             return Ok(Check::Pending(Some(due)));
         }
@@ -439,7 +419,7 @@ fn at(s: &Session, offset: u64) -> StreamCursor {
             offset,
             marker: live.stream.seq_at(offset),
         },
-        Body::Parked(_) => cursor_of(s),
+        Body::Parked(_) => s.cursor(),
     }
 }
 
@@ -465,7 +445,7 @@ pub async fn run(
                 Check::Pending(_) if deadline.is_some_and(|d| Instant::now() >= d) => {
                     return Ok(Waited {
                         reason: WaitReason::Timeout,
-                        at: cursor_of(&s),
+                        at: s.cursor(),
                         exit: None,
                         matched: None,
                         record: None,

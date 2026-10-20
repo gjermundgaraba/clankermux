@@ -277,7 +277,7 @@ pub fn tail(registry: &Registry, p: TailParams) -> Result<proto::Tail, Fail> {
     };
     let Body::Live(live) = &s.body else {
         // A park keeps no stream bytes.
-        let end = s.to_proto(false).offset;
+        let end = s.cursor().offset;
         if p.after > end {
             return Err(past());
         }
