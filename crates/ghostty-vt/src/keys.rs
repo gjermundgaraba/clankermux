@@ -48,13 +48,11 @@ pub struct KeyPress {
     shift_consumed: bool,
 }
 
-/// Named keys that produce no text, and their aliases.
+/// Named keys that produce no text.
 const NAMED: &[(&str, sys::GhosttyKey)] = &[
     ("enter", sys::GHOSTTY_KEY_ENTER),
-    ("return", sys::GHOSTTY_KEY_ENTER),
     ("tab", sys::GHOSTTY_KEY_TAB),
     ("esc", sys::GHOSTTY_KEY_ESCAPE),
-    ("escape", sys::GHOSTTY_KEY_ESCAPE),
     ("backspace", sys::GHOSTTY_KEY_BACKSPACE),
     ("up", sys::GHOSTTY_KEY_ARROW_UP),
     ("down", sys::GHOSTTY_KEY_ARROW_DOWN),
@@ -129,10 +127,10 @@ impl KeyPress {
         let mut mods = Mods::default();
         for part in parts {
             let held = match part.to_ascii_lowercase().as_str() {
-                "ctrl" | "control" => &mut mods.ctrl,
+                "ctrl" => &mut mods.ctrl,
                 "shift" => &mut mods.shift,
-                "alt" | "meta" | "opt" | "option" => &mut mods.alt,
-                "super" | "cmd" | "command" => &mut mods.super_,
+                "alt" => &mut mods.alt,
+                "super" => &mut mods.super_,
                 _ => return None,
             };
             if std::mem::replace(held, true) {

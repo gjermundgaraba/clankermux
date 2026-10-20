@@ -482,6 +482,15 @@ mod keys {
             "enterr",
             "ab",
             "\n",
+            // Only the protocol's names: no aliases.
+            "return",
+            "escape",
+            "control+a",
+            "meta+a",
+            "opt+a",
+            "option+a",
+            "cmd+a",
+            "command+a",
         ] {
             assert!(KeyPress::parse(bad).is_none(), "{bad:?}");
         }
