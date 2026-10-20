@@ -1509,9 +1509,6 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             let until = wait.until()?;
             let payload = !keys.is_empty() || bytes;
             let (session, rest) = target_and(args, if payload { 0 } else { 1 });
-            if payload && !rest.is_empty() {
-                return Err(Fail::Usage("--keys and --bytes take no TEXT".into()));
-            }
             // `send build --enter` means the session `build`, not the text.
             if let (None, [text]) = (&session, rest.as_slice())
                 && names_session(&conn, text).await?
@@ -1528,12 +1525,8 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                 }
                 _ if !keys.is_empty() => vec![Chunk::Keys(keys)],
                 Some(text) => vec![Chunk::Text(text)],
-                None if enter => Vec::new(),
-                None => {
-                    return Err(Fail::Usage(
-                        "send takes TEXT, --enter, --keys or --bytes".into(),
-                    ));
-                }
+                // `--enter` alone: check_args refused a send of nothing.
+                None => Vec::new(),
             };
             if enter {
                 // Enter after a paste, not inside it.
@@ -1558,11 +1551,9 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             }
         }
         Command::Wait { session, wait } => {
-            let Some(until) = wait.until()? else {
-                return Err(Fail::Usage(
-                    "wait for something: --exit, --match, --status, --prompt or --quiet".into(),
-                ));
-            };
+            let until = wait
+                .until()?
+                .expect("check_args refused a wait for nothing");
             let session = resolve(&conn, here, session).await?;
             let (reply, waited) = wait_request(
                 &conn,
