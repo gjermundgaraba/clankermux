@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::ExitCode;
 
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand};
@@ -627,7 +626,7 @@ fn session_line(s: &Session) {
 
 /// Binds the carriers `serve` was asked for and runs them with the Unix
 /// socket until a signal; then parks every running session.
-async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Fail> {
+async fn serve(socket: PathBuf, carriers: Carriers) -> Result<(), Fail> {
     let Carriers {
         tcp,
         ws,
@@ -750,8 +749,7 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<ExitCode, Fail> {
     // A graceful stop parks every running session and delivers `CLOSED
     // stopping` before the process ends.
     registry.stop().await;
-    result?;
-    Ok(ExitCode::SUCCESS)
+    Ok(result?)
 }
 
 #[derive(Args)]
@@ -834,11 +832,6 @@ async fn relay(socket: PathBuf) -> Result<i32, Fail> {
     tokio::io::copy(&mut from_server, &mut stdout).await?;
     stdout.flush().await?;
     Ok(0)
-}
-
-/// An attach's outcome as an exit status.
-fn status_of(code: ExitCode) -> i32 {
-    if code == ExitCode::SUCCESS { 0 } else { 1 }
 }
 
 /// One `send` request's worth of input.
@@ -1284,7 +1277,8 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             ));
         }
         let socket = cli.socket.unwrap_or_else(server::socket_path);
-        return Ok(status_of(serve(socket, carriers).await?));
+        serve(socket, carriers).await?;
+        return Ok(0);
     }
     // Inside a session, the server that holds it.
     let socket = cli
@@ -1353,7 +1347,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                     conn,
                 )
                 .await?;
-                return Ok(status_of(code));
+                return Ok(code);
             }
             if wait {
                 // From the first byte, so an exit before this request
@@ -1418,7 +1412,7 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
                 conn,
             )
             .await?;
-            return Ok(status_of(code));
+            return Ok(code);
         }
         Command::End { session } => {
             let session = resolve(&conn, here, session).await?;

@@ -4,7 +4,6 @@
 use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
-use std::process::ExitCode;
 use std::time::Duration;
 
 use client::expect::Expect;
@@ -414,8 +413,9 @@ fn open(shell: &mut Shell, conn: &Connection) -> Result<mpsc::UnboundedReceiver<
     )
 }
 
-/// Attaches over `conn`, reconnecting to the endpoint when it is lost.
-pub async fn run(opts: Options, conn: Connection) -> Result<ExitCode, Error> {
+/// Attaches over `conn`, reconnecting to the endpoint when it is lost;
+/// the exit status.
+pub async fn run(opts: Options, conn: Connection) -> Result<i32, Error> {
     let raw = Raw::enter()?;
     let mut shell = Shell::new(opts, outer_size());
     let frames = open(&mut shell, &conn)?;
@@ -522,26 +522,20 @@ pub async fn run(opts: Options, conn: Connection) -> Result<ExitCode, Error> {
     write_out(&[RESET_MODES, SHOW_CURSOR].concat());
     drop(raw);
     let (message, code) = match outcome {
-        Outcome::Detached => ("detached".to_string(), ExitCode::SUCCESS),
+        Outcome::Detached => ("detached".to_string(), 0),
         Outcome::Exited(Exit::Code { code }) => (
             format!("session exited with code {code}"),
-            if code == 0 {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            },
+            if code == 0 { 0 } else { 1 },
         ),
-        Outcome::Exited(Exit::Signal { signal }) => {
-            (format!("session killed by SIG{signal}"), ExitCode::FAILURE)
-        }
+        Outcome::Exited(Exit::Signal { signal }) => (format!("session killed by SIG{signal}"), 1),
         Outcome::Restored => (
             "session restored from a previous server; no process".to_string(),
-            ExitCode::SUCCESS,
+            0,
         ),
         Outcome::Closed(Closed {
             reason: ClosedReason::Removed,
             ..
-        }) => ("session removed".to_string(), ExitCode::SUCCESS),
+        }) => ("session removed".to_string(), 0),
         Outcome::Closed(Closed {
             reason: ClosedReason::Detached,
             message,
@@ -550,10 +544,10 @@ pub async fn run(opts: Options, conn: Connection) -> Result<ExitCode, Error> {
                 Some(message) => format!("detached by another client: {message}"),
                 None => "detached by another client".to_string(),
             },
-            ExitCode::SUCCESS,
+            0,
         ),
-        Outcome::Closed(Closed { reason, .. }) => (format!("closed: {reason}"), ExitCode::SUCCESS),
-        Outcome::Failed(message) => (message, ExitCode::FAILURE),
+        Outcome::Closed(Closed { reason, .. }) => (format!("closed: {reason}"), 0),
+        Outcome::Failed(message) => (message, 1),
     };
     eprintln!("\r\n[clankermux: {message}]");
     Ok(code)
