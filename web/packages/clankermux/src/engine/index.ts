@@ -46,6 +46,8 @@ export class EngineError extends Error {
 /** A loaded ghostty-vt.wasm instance. */
 export class Engine {
   private readonly types: Record<string, TypeInfo>;
+  private memoryView: Uint8Array | undefined;
+  private dataView: DataView | undefined;
   /** The `GhosttyResult` members the wrapper branches on. */
   readonly result: { SUCCESS: number; OUT_OF_SPACE: number; NO_VALUE: number; INVALID_VALUE: number };
 
@@ -68,13 +70,17 @@ export class Engine {
     return new Engine(instance.exports as Engine["exports"]);
   }
 
-  /** The current linear memory; reacquired on every access because it may grow. */
+  /** Cached views are valid only until wasm grows its linear memory. */
   get memory(): Uint8Array {
-    return new Uint8Array(this.exports.memory.buffer);
+    const buffer = this.exports.memory.buffer;
+    if (this.memoryView?.buffer !== buffer) this.memoryView = new Uint8Array(buffer);
+    return this.memoryView;
   }
 
   get view(): DataView {
-    return new DataView(this.exports.memory.buffer);
+    const buffer = this.exports.memory.buffer;
+    if (this.dataView?.buffer !== buffer) this.dataView = new DataView(buffer);
+    return this.dataView;
   }
 
   call(name: string, ...args: number[]): number {

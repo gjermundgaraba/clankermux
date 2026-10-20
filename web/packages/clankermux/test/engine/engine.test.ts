@@ -15,6 +15,35 @@ beforeAll(async () => {
 const utf8 = (s: string) => new TextEncoder().encode(s);
 const text = (bytes: Uint8Array) => new TextDecoder().decode(bytes);
 
+test("memory views are reused and refreshed after an allocation forces wasm growth", async () => {
+  const e = await Engine.load(readFileSync(`${here}../../ghostty-vt.wasm`));
+  const term = e.terminalNew(6, 2);
+  term.write(utf8("\x1b[1;31mhi 漢"));
+  const before = new RenderState(e);
+  const expected = before.update(term);
+  const memory = e.memory;
+  const view = e.view;
+  expect(e.memory).toBe(memory);
+  expect(e.view).toBe(view);
+  // Larger than the entire current memory, so the allocator must grow it.
+  e.scratch(memory.byteLength + 65536, (ptr) => {
+    expect(e.memory.buffer).not.toBe(memory.buffer);
+    expect(e.view === view).toBe(false);
+    expect(e.view.buffer).toBe(e.memory.buffer);
+    e.view.setUint32(ptr, 0x12345678, true);
+    expect(Array.from(e.memory.subarray(ptr, ptr + 4))).toEqual([0x78, 0x56, 0x34, 0x12]);
+    const grownMemory = e.memory;
+    const grownView = e.view;
+    expect(e.memory).toBe(grownMemory);
+    expect(e.view).toBe(grownView);
+  });
+  const after = new RenderState(e);
+  expect(after.update(term)).toEqual(expected);
+  after.free();
+  before.free();
+  term.free();
+});
+
 test("the decoder steps through a snapshot as its bytes arrive", () => {
   const bytes = readFileSync(`${here}fixtures/history.ghostsnp`);
   const decoder = new Decoder(engine, bytes.length);
