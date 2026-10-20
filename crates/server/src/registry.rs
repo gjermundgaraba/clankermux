@@ -223,8 +223,19 @@ impl Registry {
             snapshot_path,
         } = loaded;
         let info = file.session;
-        let limits = &self.config.limits;
         let (records, dropped) = Records::load(info.program_status.unwrap_or_default());
+        let body = Body::Parked(Parked {
+            engine: file.engine,
+            cols: info.cols,
+            rows: info.rows,
+            title: info.title,
+            pwd: info.pwd,
+            offset: info.offset,
+            marker: info.marker,
+            screen,
+            history_lines: file.history_lines as usize,
+            snapshot_path,
+        });
         let mut session = Session {
             id: info.id.clone(),
             label: info.label,
@@ -234,37 +245,10 @@ impl Registry {
             created_at: info.created_at,
             exited_at: info.exited_at,
             exit: info.exit,
-            wake: Arc::new(Notify::new()),
-            text_limit: limits.text as usize,
-            records_limit: limits.records as usize,
-            commands_limit: limits.commands as usize,
-            attached: Vec::new(),
             size_policy: info.size.policy,
-            size_owner: None,
             records,
             commands: Commands::load(file.commands),
-            events: Vec::new(),
-            removed: false,
-            announced: Default::default(),
-            last_bell: None,
-            park_lock: Default::default(),
-            unparked: None,
-            parked_at: None,
-            park_due: Arc::new(Notify::new()),
-            send_chain: None,
-            last_generation: 0,
-            body: Body::Parked(Parked {
-                engine: file.engine,
-                cols: info.cols,
-                rows: info.rows,
-                title: info.title,
-                pwd: info.pwd,
-                offset: info.offset,
-                marker: info.marker,
-                screen,
-                history_lines: file.history_lines as usize,
-                snapshot_path,
-            }),
+            ..Session::blank(&self.config.limits, body)
         };
         // What the clients of this incarnation are shown first.
         session.announced = crate::session::announced(&session.to_proto(false));
@@ -644,6 +628,20 @@ impl Registry {
         let master = Arc::new(unsafe { AsyncFd::register(pty.master) }.map_err(internal)?);
         let (input, input_rx) = InputQueue::new(limits.input_queue as usize);
         let created = Instant::now();
+        let body = Body::Live(Box::new(Live {
+            pid: Some(pid),
+            pgid: pid,
+            term,
+            stream: Stream::new(limits.ring as usize, limits.markers as usize),
+            master: master.clone(),
+            slave_path: pty.slave_path,
+            input,
+            pty_eof: false,
+            pending: None,
+            timer_running: false,
+            prompts: Default::default(),
+            last_output: created,
+        }));
         let session = Session {
             id,
             label,
@@ -651,43 +649,10 @@ impl Registry {
             cwd,
             on_exit: params.on_exit.unwrap_or(OnExit::Remove),
             created_at: now(),
-            exited_at: None,
-            exit: None,
-            wake: Arc::new(Notify::new()),
-            text_limit: limits.text as usize,
-            records_limit: limits.records as usize,
-            commands_limit: limits.commands as usize,
-            attached: Vec::new(),
-            size_policy: proto::SizePolicy::Latest,
-            size_owner: None,
-            records: Records::default(),
-            commands: Commands::default(),
-            events: Vec::new(),
-            removed: false,
-            announced: Default::default(),
-            last_bell: None,
-            park_lock: Default::default(),
             // Created is changed: parked within `quiet` even if the
             // program never writes.
             unparked: Some((created, created)),
-            parked_at: None,
-            park_due: Arc::new(Notify::new()),
-            send_chain: None,
-            last_generation: 0,
-            body: Body::Live(Box::new(Live {
-                pid: Some(pid),
-                pgid: pid,
-                term,
-                stream: Stream::new(limits.ring as usize, limits.markers as usize),
-                master: master.clone(),
-                slave_path: pty.slave_path,
-                input,
-                pty_eof: false,
-                pending: None,
-                timer_running: false,
-                prompts: Default::default(),
-                last_output: created,
-            })),
+            ..Session::blank(limits, body)
         };
         let id = session.id.clone();
         let snapshot = session.to_proto(false);

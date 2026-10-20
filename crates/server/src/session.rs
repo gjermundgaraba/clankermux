@@ -440,6 +440,42 @@ pub struct Session {
 }
 
 impl Session {
+    /// A session around `body` with nothing yet: no attachments, records,
+    /// commands or events, policy `latest`, nothing since a park. The
+    /// identity is left empty for the caller to set.
+    pub fn blank(limits: &proto::Limits, body: Body) -> Session {
+        Session {
+            id: String::new(),
+            label: String::new(),
+            argv: Vec::new(),
+            cwd: String::new(),
+            on_exit: OnExit::Remove,
+            created_at: String::new(),
+            exited_at: None,
+            exit: None,
+            wake: Arc::new(Notify::new()),
+            text_limit: limits.text as usize,
+            records_limit: limits.records as usize,
+            commands_limit: limits.commands as usize,
+            attached: Vec::new(),
+            size_policy: SizePolicy::Latest,
+            size_owner: None,
+            records: Records::default(),
+            commands: Commands::default(),
+            events: Vec::new(),
+            removed: false,
+            announced: Default::default(),
+            last_bell: None,
+            park_lock: Default::default(),
+            unparked: None,
+            parked_at: None,
+            park_due: Arc::new(Notify::new()),
+            send_chain: None,
+            last_generation: 0,
+            body,
+        }
+    }
+
     /// `running` while live and not ended, `exited` once ended, `restored`
     /// for a parked session that had not.
     pub fn status(&self) -> Status {
