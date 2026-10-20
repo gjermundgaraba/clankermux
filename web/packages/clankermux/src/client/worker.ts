@@ -248,16 +248,14 @@ class Hub {
   private client: Peer | string = "clankermux-web";
   conn: Connection | undefined;
   /** The connection-level link, as a terminal mounted now first sees it:
-   * `connecting`, `connected` (to no session), or `ended` for good. */
+   * `connecting`, `connected` (to no session), or `ended` for good, with
+   * the server's refusal or error, when an `attach` connects again. */
   private state: Link = { state: "connecting", attempt: 1 };
   /** The latest connection-level status text, for a terminal mounted later. */
   private statusText = "connecting";
   /** Connection attempts since a server last answered. */
   private attempt = 0;
   private readonly backoff = new Backoff();
-  /** The connection ended for good with the server's refusal or error;
-   * an `attach` connects again. */
-  private refused = false;
   /** Frame channels, shared by the terminals of the one connection. */
   private channel = 0;
   readonly mounts = new Map<number, Mount>();
@@ -304,7 +302,6 @@ class Hub {
 
   /** The connection ended for good with `err`. */
   private refuse(err: unknown): void {
-    this.refused = true;
     this.statusAll(err instanceof Error ? err.message : String(err));
     this.linkAll(endedWith(err, false));
   }
@@ -459,7 +456,7 @@ class Hub {
     const mount = new Mount(this, id, init);
     this.mounts.set(id, mount);
     mount.status(this.statusText);
-    if (this.refused) this.reattach(mount);
+    if (this.state.state === "ended") this.reattach(mount);
     else if (this.live()) mount.connected();
     else mount.link(this.state);
   }
@@ -473,8 +470,7 @@ class Hub {
    * otherwise opens `mount`'s session, or leaves it to the connection
    * coming up. */
   reattach(mount: Mount): void {
-    if (this.refused) {
-      this.refused = false;
+    if (this.state.state === "ended") {
       this.attempt = 0;
       void this.connect();
     } else {
