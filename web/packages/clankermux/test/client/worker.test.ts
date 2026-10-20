@@ -1,7 +1,9 @@
 /**
  * The worker as the page drives it, against a server played by the test:
- * the page's requests become the right protocol requests, their outcomes
- * come back by id, and the link reports what happened to the session.
+ * the page's requests become the right protocol requests on the one
+ * connection, their outcomes come back by id, each mounted terminal has
+ * its own attachment on that connection, and its link reports what
+ * happened to its session.
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -71,19 +73,26 @@ class FakeSocket {
     return found!;
   }
 
-  /** Answers `HELLO` and the `subscribe` with `sessions`. */
-  async serve(sessions: Session[] = []): Promise<void> {
+  /** Answers `HELLO` and the `subscribe`: with `sessions` as its first
+   * page, or, for a `subscribe` after a reconnect, with `gap`. */
+  async serve(sessions: Session[] = [], { incarnation = "i", latest = 0, gap = false } = {}): Promise<void> {
     await vi.waitFor(() => expect(this.bodies(FrameType.Hello)).toHaveLength(1));
     this.push(FrameType.Welcome, 0, {
       version: 1,
       server: { name: "test", version: "0" },
       engine: "x",
-      incarnation: "i",
+      incarnation,
       capabilities: [],
       limits,
     });
     const subscribe = await this.request("subscribe");
-    this.push(FrameType.Reply, 0, { id: subscribe.id, result: { sessions } });
+    const result =
+      subscribe.params.after === undefined ? { sessions, oldest: 1, latest } : { oldest: 1, latest, gap };
+    this.push(FrameType.Reply, 0, { id: subscribe.id, result });
+    if (subscribe.params.after !== undefined && gap) {
+      const list = await this.request("list", subscribe.id);
+      this.push(FrameType.Reply, 0, { id: list.id, result: { sessions } });
+    }
   }
 
   /** The channel of the latest `OPEN` for `session`. */
@@ -140,8 +149,17 @@ function bootstrap(socket: FakeSocket, channel: number, s: Session, text = "hell
   socket.pushRaw(encodeFrame(FrameType.SnapshotEnd, channel, new Uint8Array()));
 }
 
-/** A worker started as `mountTerminal` starts it, and what it posted. */
-function start(attach?: string, active = true) {
+type Message<T extends ToPage["type"]> = Extract<ToPage, { type: T }>;
+/** A message for one terminal, without its number. */
+type ToMount = Extract<ToWorker, { mount: number }> extends infer M
+  ? M extends unknown
+    ? Omit<M, "mount">
+    : never
+  : never;
+
+/** A worker started as `connect` starts it, once its engine is loaded,
+ * and what it posted. */
+async function start() {
   const posted: ToPage[] = [];
   const port = {
     postMessage: (message: ToPage) => posted.push(message),
@@ -149,29 +167,53 @@ function start(attach?: string, active = true) {
   };
   runWorker(port);
   const send = (message: ToWorker) => port.onmessage!({ data: message } as MessageEvent<ToWorker>);
-  send({
-    type: "init",
-    wasm: "ghostty-vt.wasm",
-    url: "wss://127.0.0.1:7438/",
-    viewport: { cols: 80, rows: 24 },
-    profile: {},
-    active,
-    session: attach,
-  });
+  send({ type: "init", wasm: "ghostty-vt.wasm", url: "wss://127.0.0.1:7438/", client: undefined });
+  await vi.waitFor(() => expect(posted).toContainEqual({ type: "ready" }), { timeout: 5000 });
+  let nextId = 100;
+  const of = <T extends ToPage["type"]>(type: T) => posted.filter((m): m is Message<T> => m.type === type);
   return {
     send,
     posted,
-    /** The latest frame's scrollbar, once one was posted. */
-    scrollbar: () => posted.flatMap((m) => (m.type === "frame" ? [m.frame.scrollbar] : [])).at(-1),
-    links: () => posted.flatMap((m) => (m.type === "link" ? [m.link] : [])),
-    async done(id: number) {
-      let found: Extract<ToPage, { type: "done" }> | undefined;
-      await vi.waitFor(() => {
-        found = posted.find((m): m is Extract<ToPage, { type: "done" }> => m.type === "done" && m.id === id);
-        expect(found).toBeDefined();
+    /** Mounts terminal `mount`, as `client.mount` does. */
+    mount(mount: number, session?: string, extra: { active?: boolean; readOnly?: boolean; ackOnFocus?: boolean } = {}) {
+      send({
+        type: "mount",
+        mount,
+        session,
+        viewport: { cols: 80, rows: 24 },
+        profile: {},
+        active: extra.active ?? true,
+        readOnly: extra.readOnly ?? false,
+        ackOnFocus: extra.ackOnFocus ?? false,
       });
-      return found!;
     },
+    /** A message for terminal `mount`. */
+    to(mount: number, message: ToMount) {
+      send({ ...message, mount } as ToWorker);
+    },
+    /** A request as `Client` sends it; its reply, once posted. */
+    request(method: string, params: unknown) {
+      const id = nextId++;
+      send({ type: "request", id, method, params });
+      return {
+        id,
+        reply: async () => {
+          let found: Message<"reply"> | undefined;
+          await vi.waitFor(() => {
+            found = of("reply").find((m) => m.id === id);
+            expect(found).toBeDefined();
+          });
+          return found!;
+        },
+      };
+    },
+    /** The latest frame's scrollbar of terminal `mount`, once one was posted. */
+    scrollbar: (mount = 1) => of("frame").filter((m) => m.mount === mount).at(-1)?.frame.scrollbar,
+    links: (mount = 1) => of("link").flatMap((m) => (m.mount === mount ? [m.link] : [])),
+    screens: (mount = 1) => of("status").flatMap((m) => (m.mount === mount ? [m.text] : [])),
+    selections: (mount = 1) => of("selection").filter((m) => m.mount === mount),
+    events: () => of("event").map((m) => m.event),
+    sessions: () => of("sessions").at(-1)?.sessions,
   };
 }
 
@@ -206,73 +248,250 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-test("create sends on_exit only when asked to, answers with the session and attaches it", async () => {
-  const worker = start();
+test("a request goes as the protocol request of the same name, and its result or error comes back by id", async () => {
+  const worker = await start();
   const server = await socket(0);
   await server.serve();
-  await vi.waitFor(() => expect(worker.links()).toContainEqual({ state: "connected", session: undefined }));
 
-  worker.send({ type: "create", id: 1, onExit: "keep" });
-  const keep = await server.request("create");
-  expect(keep.params).toEqual({ cols: 80, rows: 24, on_exit: "keep" });
-  server.push(FrameType.Reply, 0, { id: keep.id, result: session("a") });
-  expect(await worker.done(1)).toEqual({ type: "done", id: 1, session: session("a") });
-  await server.opened("a");
+  const create = worker.request("create", { argv: ["/bin/cat"], on_exit: "keep" });
+  const asked = await server.request("create");
+  expect(asked.params).toEqual({ argv: ["/bin/cat"], on_exit: "keep" });
+  server.push(FrameType.Reply, 0, { id: asked.id, result: session("a") });
+  expect(await create.reply()).toEqual({ type: "reply", id: create.id, result: session("a") });
 
-  worker.send({ type: "create", id: 2 });
-  const plain = await server.request("create", keep.id);
-  expect(plain.params).toEqual({ cols: 80, rows: 24 });
-  server.push(FrameType.Error, 0, { id: plain.id, code: "invalid_request", message: "no" });
-  expect((await worker.done(2)).error).toEqual({
+  const end = worker.request("end", { session: "a" });
+  const ended = await server.request("end", asked.id);
+  server.push(FrameType.Error, 0, { id: ended.id, code: "not_running", message: "session is not running" });
+  expect((await end.reply()).error).toEqual({
     kind: "server",
-    message: "invalid_request: no",
-    server: { id: plain.id, code: "invalid_request", message: "no" },
+    message: "not_running: session is not running",
+    server: { id: ended.id, code: "not_running", message: "session is not running" },
   });
 });
 
-test("end and remove name the attached session; not_running ends nothing and is no failure", async () => {
-  const worker = start("s");
-  const server = await socket(0);
-  await server.serve([session("s")]);
-  await server.opened("s");
-
-  worker.send({ type: "end", id: 1 });
-  const end = await server.request("end");
-  expect(end.params).toEqual({ session: "s" });
-  server.push(FrameType.Error, 0, { id: end.id, code: "not_running", message: "session is not running" });
-  expect(await worker.done(1)).toEqual({ type: "done", id: 1 });
-
-  worker.send({ type: "end", id: 2 });
-  const failed = await server.request("end", end.id);
-  server.push(FrameType.Error, 0, { id: failed.id, code: "signal_failed", message: "nobody" });
-  expect((await worker.done(2)).error?.server?.code).toBe("signal_failed");
-
-  worker.send({ type: "remove", id: 3 });
-  const running = await server.request("remove");
-  expect(running.params).toEqual({ session: "s" });
-  server.push(FrameType.Error, 0, { id: running.id, code: "running", message: "session is running" });
-  expect((await worker.done(3)).error?.server?.code).toBe("running");
-
-  worker.send({ type: "remove", id: 4 });
-  const removed = await server.request("remove", running.id);
-  server.push(FrameType.Reply, 0, { id: removed.id, result: {} });
-  expect(await worker.done(4)).toEqual({ type: "done", id: 4 });
-});
-
-test("a request with no session or no connection fails without asking the server", async () => {
-  const worker = start();
-  worker.send({ type: "end", id: 1 });
-  expect((await worker.done(1)).error).toEqual({ kind: "closed", message: "not connected" });
+test("a request with no connection fails without asking the server", async () => {
+  const worker = await start();
+  const request = worker.request("inspect", { session: "s" });
+  expect((await request.reply()).error).toEqual({ kind: "closed", message: "not connected" });
   const server = await socket(0);
   await server.serve();
-  await vi.waitFor(() => expect(worker.links()).toContainEqual({ state: "connected", session: undefined }));
-  worker.send({ type: "remove", id: 2 });
-  expect((await worker.done(2)).error).toEqual({ message: "no session is attached" });
   expect(server.bodies(FrameType.Request).map((r) => r.body.method)).toEqual(["subscribe"]);
 });
 
+test("a wait cancelled by the page is cancelled on the server by its own request id, and rejects with cancelled", async () => {
+  const worker = await start();
+  const server = await socket(0);
+  await server.serve();
+  const wait = worker.request("wait", { session: "s", until: { exited: true } });
+  const waiting = await server.request("wait");
+  expect(waiting.params).toEqual({ session: "s", until: { exited: true } });
+
+  worker.send({ type: "cancel", id: wait.id });
+  const cancel = await server.request("cancel");
+  expect(cancel.params).toEqual({ id: waiting.id });
+  server.push(FrameType.Error, 0, { id: waiting.id, code: "cancelled", message: "cancelled" });
+  server.push(FrameType.Reply, 0, { id: cancel.id, result: { cancelled: true } });
+  expect((await wait.reply()).error?.server?.code).toBe("cancelled");
+
+  // A request no longer pending is not cancelled again.
+  worker.send({ type: "cancel", id: wait.id });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(server.bodies(FrameType.Request).filter((r) => r.body.method === "cancel")).toHaveLength(1);
+});
+
+test("two terminals share the one connection, each with its own channel, screen and input", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  worker.mount(2, "t");
+  const server = await socket(0);
+  await server.serve([session("s"), session("t")]);
+  const s = await server.opened("s");
+  const t = await server.opened("t");
+  expect(s).not.toBe(t);
+  bootstrap(server, s, session("s"), "left");
+  bootstrap(server, t, session("t"), "right");
+  await vi.waitFor(() => {
+    expect(worker.links(1).at(-1)).toEqual({ state: "connected", session: session("s") });
+    expect(worker.links(2).at(-1)).toEqual({ state: "connected", session: session("t") });
+  });
+
+  server.pushRaw(encodeFrame(FrameType.Output, t, output(0, "\r\nmore")));
+  await vi.waitFor(() => expect(worker.scrollbar(2)).toEqual({ total: 3, offset: 0, len: 3 }));
+  worker.to(1, { type: "key", input: key("KeyA", { key: "a" }) });
+  worker.to(2, { type: "key", input: key("KeyB", { key: "b" }) });
+  await vi.waitFor(() =>
+    expect(server.sent.filter((f) => f.header.type === FrameType.Input).map((f) => [f.header.channel, new TextDecoder().decode(f.payload)])).toEqual([
+      [s, "a"],
+      [t, "b"],
+    ]),
+  );
+  expect(FakeSocket.all).toHaveLength(1);
+
+  // One terminal's end leaves the other attached.
+  worker.send({ type: "unmount", mount: 1 });
+  await vi.waitFor(() => expect(server.sent.some((f) => f.header.type === FrameType.Close && f.header.channel === s)).toBe(true));
+  server.push(FrameType.Exited, t, { seq: 1, offset: 6, exit: { code: 0 } });
+  await vi.waitFor(() => expect(worker.links(2).at(-1)).toEqual({ state: "ended", reason: "exited", exit: { code: 0 }, retry: false }));
+  expect(worker.links(1).at(-1)).toEqual({ state: "connected", session: session("s") });
+});
+
+test("a terminal mounted later sees the connection as it is, up or retrying, and connects again one that ended for good", async () => {
+  const worker = await start();
+  worker.mount(1);
+  const first = await socket(0);
+  await vi.waitFor(() => expect(first.bodies(FrameType.Hello)).toHaveLength(1));
+  first.close();
+  await vi.waitFor(() => expect(worker.links(1).at(-1)).toEqual({ state: "connecting", attempt: 2 }));
+  worker.mount(2);
+  expect(worker.links(2)).toEqual([{ state: "connecting", attempt: 2 }]);
+
+  await (await socket(1)).serve([session("s")]);
+  await vi.waitFor(() => expect(worker.links(1).at(-1)).toEqual({ state: "connected", session: undefined }));
+  worker.mount(3, "s");
+  const channel = await FakeSocket.all[1]!.opened("s");
+  bootstrap(FakeSocket.all[1]!, channel, session("s"));
+  await vi.waitFor(() => expect(worker.links(3)).toEqual([{ state: "connected", session: session("s") }]));
+
+  FakeSocket.all[1]!.push(FrameType.Error, 0, { code: "protocol_error", message: "bad frame" });
+  const refused = { state: "ended", reason: "error", code: "protocol_error", message: "bad frame", retry: false };
+  await vi.waitFor(() => expect(worker.links(1).at(-1)).toEqual(refused));
+  expect(worker.links(3).at(-1)).toEqual(refused);
+  // A terminal mounted now connects again, for every terminal.
+  worker.mount(4);
+  expect(worker.links(4)).toEqual([{ state: "connecting", attempt: 1 }]);
+  expect(worker.links(1).at(-1)).toEqual({ state: "connecting", attempt: 1 });
+  await (await socket(2)).serve();
+  await vi.waitFor(() => expect(worker.links(4).at(-1)).toEqual({ state: "connected", session: undefined }));
+});
+
+test("after a reconnect each terminal resumes its stream and the events missed meanwhile are replayed", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  worker.mount(2, "t");
+  const server = await socket(0);
+  await server.serve([session("s"), session("t")], { latest: 5 });
+  bootstrap(server, await server.opened("s"), session("s"), "one");
+  bootstrap(server, await server.opened("t"), session("t"), "two");
+  await vi.waitFor(() => expect(worker.links(2).at(-1)?.state).toBe("connected"));
+  const bell = { seq: 6, event: "bell", id: "s" };
+  server.push(FrameType.Event, 0, bell);
+  await vi.waitFor(() => expect(worker.events()).toEqual([bell]));
+
+  server.close();
+  const next = await socket(1);
+  const replayed = { seq: 7, event: "bell", id: "t" };
+  const done = next.serve([session("s"), session("t")], { latest: 7 });
+  const subscribe = await next.request("subscribe");
+  expect(subscribe.params).toEqual({ after: 6, incarnation: "i" });
+  await done;
+  next.push(FrameType.Event, 0, replayed);
+  await vi.waitFor(() => expect(worker.events()).toEqual([bell, replayed]));
+  expect(next.bodies(FrameType.Request).map((r) => r.body.method)).toEqual(["subscribe"]);
+
+  for (const [mount, id] of [[1, "s"], [2, "t"]] as const) {
+    const channel = await next.opened(id);
+    expect(next.bodies(FrameType.Open).find((o) => o.channel === channel)?.body.resume).toEqual({
+      incarnation: "i",
+      offset: 0,
+      marker: 0,
+    });
+    next.push(FrameType.Attached, channel, { mode: "resume", offset: 0, marker: 0, cols: 10, rows: 3, session: session(id) });
+    await vi.waitFor(() => expect(worker.links(mount).slice(-3)).toEqual<Link[]>([
+      { state: "ended", reason: "closed", retry: true },
+      { state: "connecting", attempt: 1 },
+      { state: "connected", session: session(id) },
+    ]));
+    expect(worker.screens(mount).at(-1)).toBe("resumed");
+  }
+});
+
+test("after a restart the events cannot be replayed: the gap is posted and the sessions paged again", async () => {
+  const worker = await start();
+  const server = await socket(0);
+  await server.serve([session("s"), session("t")], { latest: 3 });
+  await vi.waitFor(() => expect(worker.sessions()).toEqual([session("s"), session("t")]));
+  server.close();
+  const next = await socket(1);
+  await next.serve([session("t", "restored")], { incarnation: "j", latest: 2, gap: true });
+  await vi.waitFor(() => expect(worker.posted.at(-1)).toEqual({ type: "gap", incarnation: "j" }));
+  expect(worker.sessions()).toEqual([session("t", "restored")]);
+  expect(next.bodies(FrameType.Request).at(0)?.body.params).toEqual({ after: 3, incarnation: "i" });
+
+  // The next reconnect replays from the new incarnation.
+  next.close();
+  const third = await socket(2);
+  void third.serve([], { incarnation: "j", latest: 2 });
+  expect((await third.request("subscribe")).params).toEqual({ after: 2, incarnation: "j" });
+});
+
+test("ack on focus: only when the page opted in, the terminal has the focus and its session wants the user with done or error", async () => {
+  const worker = await start();
+  worker.mount(1, "s", { ackOnFocus: true });
+  worker.mount(2, "t");
+  const server = await socket(0);
+  const done = { ...session("s"), attention: { state: "done", record: "" } };
+  const t = { ...session("t"), attention: { state: "done", record: "" } };
+  await server.serve([done, t], { latest: 1 });
+  bootstrap(server, await server.opened("s"), done);
+  bootstrap(server, await server.opened("t"), t);
+  await vi.waitFor(() => expect(worker.links(2).at(-1)?.state).toBe("connected"));
+  const acks = () => server.bodies(FrameType.Request).filter((r) => r.body.method === "ack").map((r) => r.body.params);
+
+  worker.to(2, { type: "focus", focused: true });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(acks()).toEqual([]);
+  worker.to(1, { type: "focus", focused: true });
+  await vi.waitFor(() => expect(acks()).toEqual([{ session: "s" }]));
+
+  // A record that wants the user while the terminal has the focus is
+  // seen at once; a blocked one is not a record ack marks.
+  const blocked = { ...session("s"), attention: { state: "blocked", record: "q" } };
+  server.push(FrameType.Event, 0, { seq: 2, event: "session_changed", session: blocked });
+  const error = { ...session("s"), attention: { state: "error", record: "e" } };
+  server.push(FrameType.Event, 0, { seq: 3, event: "session_changed", session: error });
+  await vi.waitFor(() => expect(acks()).toEqual([{ session: "s" }, { session: "s" }]));
+
+  // Blurred: no more.
+  worker.to(1, { type: "focus", focused: false });
+  server.push(FrameType.Event, 0, { seq: 4, event: "session_changed", session: done });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(acks()).toHaveLength(2);
+});
+
+test("a read-only terminal opens read-only and sends no input", async () => {
+  const worker = await start();
+  worker.mount(1, "s", { readOnly: true });
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const channel = await server.opened("s");
+  expect(server.bodies(FrameType.Open).at(-1)!.body).toMatchObject({ session: "s", read_only: true });
+  bootstrap(server, channel, session("s"));
+  await vi.waitFor(() => expect(worker.scrollbar()).toBeDefined());
+  worker.to(1, { type: "key", input: key("KeyA", { key: "a" }) });
+  worker.to(1, { type: "paste", text: "pasted" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(server.sent.filter((f) => f.header.type === FrameType.Input)).toEqual([]);
+  expect(server.bodies(FrameType.Request).map((r) => r.body.method)).toEqual(["subscribe"]);
+});
+
+test("detach leaves the terminal attached to none until it attaches again", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const channel = await server.opened("s");
+  bootstrap(server, channel, session("s"));
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+  worker.to(1, { type: "detach" });
+  expect(server.sent.some((f) => f.header.type === FrameType.Close && f.header.channel === channel)).toBe(true);
+  expect(worker.links().at(-1)).toEqual({ state: "connected", session: undefined });
+  worker.to(1, { type: "attach", session: "s" });
+  expect(await server.opened("s")).not.toBe(channel);
+});
+
 test("the link: connected to a session, its exit, then removed for good", async () => {
-  const worker = start("s");
+  const worker = await start();
+  worker.mount(1, "s");
   const server = await socket(0);
   await server.serve([session("s")]);
   const channel = await server.opened("s");
@@ -291,7 +510,8 @@ test("the link: connected to a session, its exit, then removed for good", async 
 });
 
 test("the link: detached by another client, for good", async () => {
-  const worker = start("s");
+  const worker = await start();
+  worker.mount(1, "s");
   const server = await socket(0);
   await server.serve([session("s")]);
   const channel = await server.opened("s");
@@ -310,7 +530,8 @@ test("the link: detached by another client, for good", async () => {
 });
 
 test("only a page in use reports its size: OPEN and VIEWPORT carry none until it is active", async () => {
-  const worker = start("s", false);
+  const worker = await start();
+  worker.mount(1, "s", { active: false });
   const server = await socket(0);
   await server.serve([session("s")]);
   const channel = await server.opened("s");
@@ -319,48 +540,39 @@ test("only a page in use reports its size: OPEN and VIEWPORT carry none until it
   await vi.waitFor(() => expect(worker.links()).toContainEqual({ state: "connected", session: session("s") }));
 
   const size = { cols: 100, rows: 30 };
-  worker.send({ type: "viewport", size, profile: { scheme: "dark" }, active: false });
+  worker.to(1, { type: "viewport", size, profile: { scheme: "dark" }, active: false });
   expect(server.bodies(FrameType.Viewport)).toEqual([]);
   // Focused again with the same size: reported, to take the size back.
-  worker.send({ type: "viewport", size, profile: { scheme: "dark" }, active: true });
+  worker.to(1, { type: "viewport", size, profile: { scheme: "dark" }, active: true });
   expect(server.bodies(FrameType.Viewport)).toEqual([{ channel, body: { ...size, profile: { scheme: "dark" } } }]);
-  // A size made while blurred is the one `create` asks for.
-  worker.send({ type: "viewport", size: { cols: 50, rows: 10 }, profile: {}, active: false });
-  expect(server.bodies(FrameType.Viewport)).toHaveLength(1);
-  worker.send({ type: "create", id: 1 });
-  expect((await server.request("create")).params).toEqual({ cols: 50, rows: 10 });
 });
 
 test("a program's title and working directory reach the page as they change", async () => {
-  const worker = start("s");
+  const worker = await start();
   const server = await socket(0);
   await server.serve([session("s")]);
   const changed = { ...session("s"), title: "vim notes.md", pwd: "/tmp/work" };
-  server.push(FrameType.Event, 0, { event: "session_changed", session: changed });
-  await vi.waitFor(() =>
-    expect(worker.posted.at(-1)).toEqual({ type: "sessions", sessions: [changed], current: "s" }),
-  );
+  const event = { seq: 1, event: "session_changed", session: changed };
+  server.push(FrameType.Event, 0, event);
+  await vi.waitFor(() => expect(worker.posted.slice(-2)).toEqual([{ type: "sessions", sessions: [changed] }, { type: "event", event }]));
 });
 
-test("the attached session's events reach the page, with attention on its session", async () => {
-  const worker = start("s");
+test("every event reaches the page, whichever session it is of", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
   const server = await socket(0);
   await server.serve([session("s"), session("t")]);
-  const bell = { seq: 3, event: "bell", id: "s" };
-  server.push(FrameType.Event, 0, { seq: 2, event: "bell", id: "t" });
-  server.push(FrameType.Event, 0, bell);
-  await vi.waitFor(() => expect(worker.posted.at(-1)).toEqual({ type: "event", event: bell }));
-  expect(worker.posted.filter((m) => m.type === "event")).toHaveLength(1);
-  const attention = { state: "blocked", kind: "question", record: "" };
-  const changed = { ...session("s"), attention };
-  server.push(FrameType.Event, 0, { seq: 4, event: "session_changed", session: changed });
-  await vi.waitFor(() =>
-    expect(worker.posted.at(-1)).toEqual({ type: "sessions", sessions: [changed, session("t")], current: "s" }),
-  );
+  const bells = [
+    { seq: 2, event: "bell", id: "t" },
+    { seq: 3, event: "bell", id: "s" },
+  ];
+  for (const bell of bells) server.push(FrameType.Event, 0, bell);
+  await vi.waitFor(() => expect(worker.events()).toEqual(bells));
 });
 
 test("the link: an exited or refused session ends it, a server stopping is retried", async () => {
-  const worker = start("old");
+  const worker = await start();
+  worker.mount(1, "old");
   const server = await socket(0);
   await server.serve([session("old", "exited")]);
   const exited = { ...session("old", "exited"), exit: { signal: "HUP" } };
@@ -372,7 +584,7 @@ test("the link: an exited or refused session ends it, a server stopping is retri
     ]),
   );
 
-  worker.send({ type: "attach", session: "gone" });
+  worker.to(1, { type: "attach", session: "gone" });
   server.push(FrameType.Error, await server.opened("gone"), { code: "no_such_session", message: "no session gone" });
   await vi.waitFor(() =>
     expect(worker.links().at(-1)).toEqual({
@@ -384,7 +596,7 @@ test("the link: an exited or refused session ends it, a server stopping is retri
     }),
   );
 
-  worker.send({ type: "attach", session: "s" });
+  worker.to(1, { type: "attach", session: "s" });
   const channel = await server.opened("s");
   bootstrap(server, channel, session("s"));
   server.push(FrameType.Closed, channel, { reason: "stopping" });
@@ -398,15 +610,16 @@ test("the link: an exited or refused session ends it, a server stopping is retri
   );
   // The reconnect attaches the same session again.
   const next = await socket(1);
-  await next.serve([session("s", "restored")]);
+  await next.serve([session("s", "restored")], { incarnation: "j", gap: true });
   bootstrap(next, await next.opened("s"), session("s", "restored"));
   await vi.waitFor(() =>
     expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s", "restored") }),
   );
 });
 
-test("the link: an answered connection's error ends it, and nothing reconnects", async () => {
-  const worker = start("s");
+test("the link: an answered connection's error ends it, and nothing reconnects until a terminal attaches", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
   const server = await socket(0);
   await server.serve([session("s")]);
   bootstrap(server, await server.opened("s"), session("s"));
@@ -426,7 +639,7 @@ test("the link: an answered connection's error ends it, and nothing reconnects",
   expect(FakeSocket.all).toHaveLength(1);
   expect(worker.links().at(-1)?.state).toBe("ended");
   // Until the page attaches: that connects again.
-  worker.send({ type: "attach", session: "s" });
+  worker.to(1, { type: "attach", session: "s" });
   const next = await socket(1);
   await next.serve([session("s")]);
   bootstrap(next, await next.opened("s"), session("s"));
@@ -439,7 +652,8 @@ test("the link: an answered connection's error ends it, and nothing reconnects",
 });
 
 test("the link: a refused subscription closes the connection for good", async () => {
-  const worker = start();
+  const worker = await start();
+  worker.mount(1);
   const server = await socket(0);
   await vi.waitFor(() => expect(server.bodies(FrameType.Hello)).toHaveLength(1));
   server.push(FrameType.Welcome, 0, {
@@ -467,7 +681,8 @@ test("the link: a refused subscription closes the connection for good", async ()
 });
 
 test("the link: a resume onto a session that exited meanwhile ends once, at its EXITED", async () => {
-  const worker = start("s");
+  const worker = await start();
+  worker.mount(1, "s");
   const server = await socket(0);
   await server.serve([session("s")]);
   bootstrap(server, await server.opened("s"), session("s"));
@@ -490,7 +705,8 @@ test("the link: a resume onto a session that exited meanwhile ends once, at its 
 });
 
 test("the link: a server refusing the handshake ends it; a lost one is tried again", async () => {
-  const refused = start();
+  const refused = await start();
+  refused.mount(1);
   const server = await socket(0);
   await vi.waitFor(() => expect(server.bodies(FrameType.Hello)).toHaveLength(1));
   server.push(FrameType.Error, 0, { code: "version_mismatch", message: "version 2 only" });
@@ -501,7 +717,8 @@ test("the link: a server refusing the handshake ends it; a lost one is tried aga
     ]),
   );
 
-  const lost = start();
+  const lost = await start();
+  lost.mount(1);
   const first = await socket(1);
   await vi.waitFor(() => expect(first.bodies(FrameType.Hello)).toHaveLength(1));
   first.close();
@@ -515,8 +732,30 @@ test("the link: a server refusing the handshake ends it; a lost one is tried aga
   await vi.waitFor(() => expect(lost.links().at(-1)).toEqual({ state: "connected", session: undefined }));
 });
 
+test("the HELLO names the client the page gave", async () => {
+  const posted: ToPage[] = [];
+  const port = { postMessage: (m: ToPage) => posted.push(m), onmessage: null as ((e: MessageEvent<ToWorker>) => void) | null };
+  runWorker(port);
+  port.onmessage!({
+    data: { type: "init", wasm: "w", url: "wss://127.0.0.1:7438/", client: { name: "clankerspace", version: "9" } },
+  } as MessageEvent<ToWorker>);
+  const server = await socket(0);
+  await vi.waitFor(() => expect(server.bodies(FrameType.Hello).at(0)?.body.client).toEqual({ name: "clankerspace", version: "9" }));
+});
+
+test("an engine that does not load fails the client", async () => {
+  vi.stubGlobal("fetch", async () => ({ arrayBuffer: async () => new ArrayBuffer(8) }));
+  const posted: ToPage[] = [];
+  const port = { postMessage: (m: ToPage) => posted.push(m), onmessage: null as ((e: MessageEvent<ToWorker>) => void) | null };
+  runWorker(port);
+  port.onmessage!({ data: { type: "init", wasm: "w", url: "wss://127.0.0.1:7438/", client: undefined } } as MessageEvent<ToWorker>);
+  await vi.waitFor(() => expect(posted.at(0)?.type).toBe("failed"));
+  expect(FakeSocket.all).toEqual([]);
+});
+
 test("the wheel and Shift+PageUp scroll the history; input goes back to the live screen", async () => {
-  const worker = start("s");
+  const worker = await start();
+  worker.mount(1, "s");
   const server = await socket(0);
   await server.serve([session("s")]);
   const channel = await server.opened("s");
@@ -524,17 +763,25 @@ test("the wheel and Shift+PageUp scroll the history; input goes back to the live
   await vi.waitFor(() => expect(worker.scrollbar()).toEqual({ total: 6, offset: 3, len: 3 }));
   const inputs = () => server.sent.filter((f) => f.header.type === FrameType.Input).map((f) => new TextDecoder().decode(f.payload));
 
-  worker.send({ type: "scroll", rows: -1 });
+  worker.to(1, { type: "wheel", rows: -1 });
   expect(worker.scrollbar()).toEqual({ total: 6, offset: 2, len: 3 });
-  worker.send({ type: "key", input: key("PageUp", { shift: true }) });
-  worker.send({ type: "key", input: key("PageUp", { shift: true, action: "release" }) });
+  worker.to(1, { type: "key", input: key("PageUp", { shift: true }) });
+  worker.to(1, { type: "key", input: key("PageUp", { shift: true, action: "release" }) });
   expect(worker.scrollbar()).toEqual({ total: 6, offset: 0, len: 3 });
-  worker.send({ type: "key", input: key("End", { shift: true }) });
+  worker.to(1, { type: "key", input: key("End", { shift: true }) });
   expect(worker.scrollbar()).toEqual({ total: 6, offset: 3, len: 3 });
-  worker.send({ type: "key", input: key("Home", { shift: true }) });
+  worker.to(1, { type: "key", input: key("Home", { shift: true }) });
   expect(worker.scrollbar()).toEqual({ total: 6, offset: 0, len: 3 });
   // A modifier alone encodes to nothing and stays where it is.
-  worker.send({ type: "key", input: key("ShiftLeft", { key: "Shift", shift: true }) });
+  worker.to(1, { type: "key", input: key("ShiftLeft", { key: "Shift", shift: true }) });
+  expect(worker.scrollbar()).toEqual({ total: 6, offset: 0, len: 3 });
+
+  // The page's own scrolling: by rows, and back to the live screen.
+  worker.to(1, { type: "view", rows: 2 });
+  expect(worker.scrollbar()).toEqual({ total: 6, offset: 2, len: 3 });
+  worker.to(1, { type: "view", rows: "live" });
+  expect(worker.scrollbar()).toEqual({ total: 6, offset: 3, len: 3 });
+  worker.to(1, { type: "view", rows: -3 });
   expect(worker.scrollbar()).toEqual({ total: 6, offset: 0, len: 3 });
 
   // Output while scrolled back leaves the view where it is.
@@ -544,16 +791,17 @@ test("the wheel and Shift+PageUp scroll the history; input goes back to the live
 
   // Typing goes back to the live screen, and is sent; so does composed
   // text, as UTF-8.
-  worker.send({ type: "key", input: key("KeyA", { key: "a" }) });
+  worker.to(1, { type: "key", input: key("KeyA", { key: "a" }) });
   expect(worker.scrollbar()).toEqual({ total: 7, offset: 4, len: 3 });
-  worker.send({ type: "scroll", rows: -1 });
-  worker.send({ type: "text", text: "\u65e5\u672c" });
+  worker.to(1, { type: "wheel", rows: -1 });
+  worker.to(1, { type: "text", text: "日本" });
   expect(worker.scrollbar()).toEqual({ total: 7, offset: 4, len: 3 });
-  await vi.waitFor(() => expect(inputs()).toEqual(["a", "\u65e5\u672c"]));
+  await vi.waitFor(() => expect(inputs()).toEqual(["a", "日本"]));
 });
 
 test("on the alternate screen the wheel is arrow keys and Shift+PageUp is a key", async () => {
-  const worker = start("s");
+  const worker = await start();
+  worker.mount(1, "s");
   const server = await socket(0);
   await server.serve([session("s")]);
   const channel = await server.opened("s");
@@ -561,97 +809,99 @@ test("on the alternate screen the wheel is arrow keys and Shift+PageUp is a key"
   await vi.waitFor(() => expect(worker.scrollbar()).toEqual({ total: 3, offset: 0, len: 3 }));
   const inputs = () => server.sent.filter((f) => f.header.type === FrameType.Input).map((f) => new TextDecoder().decode(f.payload));
 
-  worker.send({ type: "scroll", rows: -2 });
-  worker.send({ type: "scroll", rows: 1 });
-  worker.send({ type: "key", input: key("PageUp", { shift: true }) });
+  worker.to(1, { type: "wheel", rows: -2 });
+  worker.to(1, { type: "wheel", rows: 1 });
+  worker.to(1, { type: "key", input: key("PageUp", { shift: true }) });
   await vi.waitFor(() => expect(inputs()).toEqual(["\x1b[A\x1b[A", "\x1b[B", "\x1b[5;2~"]));
   expect(worker.scrollbar()).toEqual({ total: 3, offset: 0, len: 3 });
 
   // Without alternate scroll (mode 1007) the wheel does nothing.
   server.pushRaw(encodeFrame(FrameType.Output, channel, output(0, "\x1b[?1007l")));
-  worker.send({ type: "scroll", rows: -2 });
+  worker.to(1, { type: "wheel", rows: -2 });
   await new Promise((resolve) => setTimeout(resolve, 50));
   expect(inputs()).toHaveLength(3);
 });
 
 test("a drag selects and copies on release; a click, input or a new screen clears it", async () => {
-  const worker = start("s");
+  const worker = await start();
+  worker.mount(1, "s");
   const server = await socket(0);
   await server.serve([session("s")]);
   const channel = await server.opened("s");
   bootstrap(server, channel, session("s"), "one two\r\nthree four five");
   await vi.waitFor(() => expect(worker.scrollbar()).toBeDefined());
   // A release is always answered, with undefined when nothing is selected.
-  const selections = () => worker.posted.filter((m) => m.type === "selection" && (m.text !== undefined || !m.copy));
-  const answer = () => worker.posted.filter((m) => m.type === "selection").at(-1);
+  const selections = () => worker.selections().filter((m) => m.text !== undefined || !m.copy);
+  const answer = () => worker.selections().at(-1);
   const selectedRows = () =>
     worker.posted.flatMap((m) => (m.type === "frame" ? [m.frame.lines.map((l) => l.selection)] : [])).at(-1);
 
-  worker.send({ type: "select", action: "press", at: { x: 4.2, y: 0.5 }, time: 1000 });
-  worker.send({ type: "select", action: "drag", at: { x: 2.6, y: 1.5 }, time: 0 });
+  worker.to(1, { type: "select", action: "press", at: { x: 4.2, y: 0.5 }, time: 1000 });
+  worker.to(1, { type: "select", action: "drag", at: { x: 2.6, y: 1.5 }, time: 0 });
   expect(selectedRows()).toEqual([[4, 9], [0, 2], undefined]);
   expect(selections()).toEqual([]);
-  worker.send({ type: "select", action: "release", at: { x: 2.6, y: 1.5 }, time: 1100 });
-  expect(selections()).toEqual([{ type: "selection", text: "two\nthr", copy: true }]);
+  worker.to(1, { type: "select", action: "release", at: { x: 2.6, y: 1.5 }, time: 1100 });
+  expect(selections()).toEqual([{ type: "selection", mount: 1, text: "two\nthr", copy: true }]);
 
   // A key clears it, and the page forgets the text.
-  worker.send({ type: "key", input: key("KeyA", { key: "a" }) });
-  expect(selections().at(-1)).toEqual({ type: "selection", text: undefined, copy: false });
+  worker.to(1, { type: "key", input: key("KeyA", { key: "a" }) });
+  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: undefined, copy: false });
   expect(selectedRows()).toEqual([undefined, undefined, undefined]);
 
   // A double click selects the word at once; a single click clears it.
-  worker.send({ type: "select", action: "press", at: { x: 1, y: 1.5 }, time: 5000 });
-  worker.send({ type: "select", action: "release", at: { x: 1, y: 1.5 }, time: 5050 });
-  worker.send({ type: "select", action: "press", at: { x: 1, y: 1.5 }, time: 5100 });
-  worker.send({ type: "select", action: "release", at: { x: 1, y: 1.5 }, time: 5150 });
-  expect(selections().at(-1)).toEqual({ type: "selection", text: "three", copy: true });
-  worker.send({ type: "select", action: "press", at: { x: 1, y: 0.5 }, time: 9000 });
-  expect(selections().at(-1)).toEqual({ type: "selection", text: undefined, copy: false });
-  worker.send({ type: "select", action: "release", at: { x: 1, y: 0.5 }, time: 9050 });
+  worker.to(1, { type: "select", action: "press", at: { x: 1, y: 1.5 }, time: 5000 });
+  worker.to(1, { type: "select", action: "release", at: { x: 1, y: 1.5 }, time: 5050 });
+  worker.to(1, { type: "select", action: "press", at: { x: 1, y: 1.5 }, time: 5100 });
+  worker.to(1, { type: "select", action: "release", at: { x: 1, y: 1.5 }, time: 5150 });
+  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: "three", copy: true });
+  worker.to(1, { type: "select", action: "press", at: { x: 1, y: 0.5 }, time: 9000 });
+  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: undefined, copy: false });
+  worker.to(1, { type: "select", action: "release", at: { x: 1, y: 0.5 }, time: 9050 });
   expect(selections()).toHaveLength(4);
-  expect(answer()).toEqual({ type: "selection", text: undefined, copy: true });
+  expect(answer()).toEqual({ type: "selection", mount: 1, text: undefined, copy: true });
 
   // Selected again, then a new screen: gone.
-  worker.send({ type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 20000 });
-  worker.send({ type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
-  worker.send({ type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 20100 });
-  expect(selections().at(-1)).toEqual({ type: "selection", text: "one t", copy: true });
+  worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 20000 });
+  worker.to(1, { type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
+  worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 20100 });
+  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: "one t", copy: true });
   server.push(FrameType.Gap, channel, { from: 0, to: 10 });
-  expect(selections().at(-1)).toEqual({ type: "selection", text: undefined, copy: false });
+  expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: undefined, copy: false });
 
   // A press, then a new screen: the drag that follows is not anchored in
   // the freed terminal, and selects nothing until a new press.
-  worker.send({ type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 30000 });
+  worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 30000 });
   bootstrap(server, channel, session("s"), "new screen");
   await vi.waitFor(() => expect(worker.links().filter((l) => l.state === "connected")).toHaveLength(2));
-  worker.send({ type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
-  worker.send({ type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 30100 });
-  expect(answer()).toEqual({ type: "selection", text: undefined, copy: true });
-  worker.send({ type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 40000 });
-  worker.send({ type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
-  worker.send({ type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 40100 });
-  expect(answer()).toEqual({ type: "selection", text: "new s", copy: true });
+  worker.to(1, { type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
+  worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 30100 });
+  expect(answer()).toEqual({ type: "selection", mount: 1, text: undefined, copy: true });
+  worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 40000 });
+  worker.to(1, { type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
+  worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 40100 });
+  expect(answer()).toEqual({ type: "selection", mount: 1, text: "new s", copy: true });
 });
 
 test("a page still in use takes the size back at its next input after another client resized the session", async () => {
-  const worker = start("s");
+  const worker = await start();
+  worker.mount(1, "s");
   const server = await socket(0);
   await server.serve([session("s")]);
   const channel = await server.opened("s");
   bootstrap(server, channel, session("s"));
   await vi.waitFor(() => expect(worker.scrollbar()).toBeDefined());
   const size = { cols: 10, rows: 3 };
-  worker.send({ type: "viewport", size, profile: {}, active: true });
+  worker.to(1, { type: "viewport", size, profile: {}, active: true });
   expect(server.bodies(FrameType.Viewport)).toHaveLength(1);
   // Its own size coming back changes nothing.
   server.push(FrameType.Resized, channel, { seq: 1, offset: 0, cols: 10, rows: 3 });
-  worker.send({ type: "key", input: key("KeyA", { key: "a" }) });
+  worker.to(1, { type: "key", input: key("KeyA", { key: "a" }) });
   await vi.waitFor(() => expect(server.sent.filter((f) => f.header.type === FrameType.Input)).toHaveLength(1));
   expect(server.bodies(FrameType.Viewport)).toHaveLength(1);
   // Another client's: the next input reports this page's size first, once.
   server.push(FrameType.Resized, channel, { seq: 2, offset: 0, cols: 20, rows: 5 });
-  worker.send({ type: "scroll", rows: -1 });
-  worker.send({ type: "key", input: key("KeyB", { key: "b" }) });
+  worker.to(1, { type: "wheel", rows: -1 });
+  worker.to(1, { type: "key", input: key("KeyB", { key: "b" }) });
   expect(server.bodies(FrameType.Viewport)).toEqual([
     { channel, body: { ...size, profile: {} } },
     { channel, body: { ...size, profile: {} } },

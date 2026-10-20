@@ -14,7 +14,7 @@ A terminal multiplexer server with CLI and browser clients; the wire protocol is
 
 | Command | Does |
 | --- | --- |
-| `just check` | fmt, bindings, PROTOCOL.md's generated tables, clippy, Rust and web tests, web builds; required for every commit |
+| `just check` | fmt, bindings, PROTOCOL.md's generated tables, clippy, Rust and web tests (the web package in the installed Chrome among them; `CHROME` names another), web builds; required for every commit |
 | `just protocol` | renders PROTOCOL.md's tables (between `generated` marks) from the protocol types in `crates/proto` |
 | `just release-build` | `target/release/clankermux` |
 | `just dev-serve` | release server: state and socket in `target/dev/`, `wss://127.0.0.1:7438/` with a self-signed certificate, origins `http://app.clankerspace-dev.localhost:10094` and `http://127.0.0.1:8787` |
@@ -89,7 +89,7 @@ The last line, or the package's settings on npmjs.com, names this repository and
 
 ## The web package
 
-`@gjermundgaraba/clankermux` exports the page mount at `.` (`mountTerminal` and its types), the worker at `./worker` (`runWorker`, with no DOM types), the engine build at `./ghostty-vt.wasm`, and `./proto`, `./engine` and `./renderer` beneath them. Its [README](web/packages/clankermux/README.md) describes the mounted terminal's methods (`create`, `end`, `remove`, ...), the link changes `onLink` reports, and the terminal's keys, composed text, selection, scrollback, size between clients and colour scheme.
+`@gjermundgaraba/clankermux` exports the client at `.` (`connect`, `Client`, the `Terminal` a client mounts, and their types), the worker at `./worker` (`runWorker`, with no DOM types), the engine build at `./ghostty-vt.wasm`, and `./proto`, `./engine` and `./renderer` beneath them. A page holds one client, one worker and one WebSocket, whose methods are the protocol's (`create`, `list`, `send`, `wait`, `read`, `tail`, `ack`, ...), and mounts its terminals from it: each is one attachment on that connection. Its [README](web/packages/clankermux/README.md) describes the client's methods and events, the terminal's methods and the link changes `onLink` reports, and the terminal's keys, composed text, selection, scrollback, size between clients and colour scheme.
 
 ```ts
 // worker.ts, started as a module worker
@@ -97,11 +97,14 @@ import { runWorker } from "@gjermundgaraba/clankermux/worker";
 runWorker(self);
 
 // page
-import { mountTerminal } from "@gjermundgaraba/clankermux";
+import { connect } from "@gjermundgaraba/clankermux";
 import wasm from "@gjermundgaraba/clankermux/ghostty-vt.wasm?url";
-const terminal = mountTerminal({
+const client = await connect({
   worker: new Worker(new URL("./worker.ts", import.meta.url), { type: "module" }),
-  canvas, container, wasm, url: "wss://127.0.0.1:7438/", session,
+  wasm, url: "wss://127.0.0.1:7438/",
+});
+const terminal = client.mount({
+  canvas, container, session,
   font: "14px monospace", colors: () => ({ fg: "#d8dee9", bg: "#282c34", cursor: "#ffffff" }),
 });
 ```

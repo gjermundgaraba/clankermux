@@ -1,0 +1,91 @@
+/** The browser suite's page: one client, terminals mounted from it by
+ * name, and what they reported, for the suite to drive and read. */
+import {
+  type Client,
+  ClientError,
+  type Event,
+  type EventGap,
+  type Link,
+  type Terminal,
+  type Until,
+  type Waited,
+  connect,
+} from "@gjermundgaraba/clankermux";
+
+interface Mounted {
+  terminal: Terminal;
+  canvas: HTMLCanvasElement;
+  links: Link[];
+  statuses: string[];
+}
+
+let client: Client | undefined;
+const mounted = new Map<string, Mounted>();
+const events: (Event | EventGap)[] = [];
+
+const harness = {
+  async connect(url: string): Promise<void> {
+    client = await connect({ url, worker: new Worker("./worker.js", { type: "module" }), wasm: "./ghostty-vt.wasm" });
+    client.onEvent((event) => events.push(event));
+  },
+
+  mount(name: string, session: string, options: { ackOnFocus?: boolean } = {}): void {
+    const container = document.createElement("div");
+    container.className = "terminal";
+    const canvas = document.createElement("canvas");
+    canvas.id = name;
+    canvas.tabIndex = 0;
+    container.append(canvas);
+    document.body.append(container);
+    const terminal = client!.mount({
+      canvas,
+      container,
+      session,
+      font: "14px monospace",
+      colors: () => ({ fg: "#24292e", bg: "#ffffff", cursor: "#24292e" }),
+      ...options,
+    });
+    const entry: Mounted = { terminal, canvas, links: [], statuses: [] };
+    terminal.onLink((link) => entry.links.push(link));
+    terminal.onStatus((text) => entry.statuses.push(text));
+    mounted.set(name, entry);
+  },
+
+  link: (name: string): Link | undefined => mounted.get(name)?.links.at(-1),
+  statuses: (name: string): string[] => mounted.get(name)?.statuses ?? [],
+  events: (): (Event | EventGap)[] => events,
+
+  /** A wait through the client; aborted after `abortMs` when given, and
+   * before it starts when that is 0. */
+  async wait(
+    session: string,
+    until: Until,
+    abortMs?: number,
+  ): Promise<{ waited: Waited } | { error: { name: string; kind: string; code: string | undefined } }> {
+    const abort = new AbortController();
+    if (abortMs === 0) abort.abort();
+    else if (abortMs !== undefined) setTimeout(() => abort.abort(), abortMs);
+    try {
+      return { waited: await client!.wait(session, until, { signal: abort.signal }) };
+    } catch (err) {
+      if (!(err instanceof ClientError)) throw err;
+      return { error: { name: err.name, kind: err.kind, code: err.code } };
+    }
+  },
+
+  /** A wait started now, its outcome kept for `waited`. */
+  waiting: undefined as Promise<Waited> | undefined,
+  startWait(session: string, until: Until): void {
+    harness.waiting = client!.wait(session, until);
+  },
+  waited: (): Promise<Waited> => harness.waiting!,
+};
+
+export type Harness = typeof harness;
+
+declare global {
+  /** The page's harness, as the suite's `page.evaluate` calls it. */
+  var harness: () => Harness;
+}
+
+globalThis.harness = () => harness;

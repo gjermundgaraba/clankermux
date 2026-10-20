@@ -852,7 +852,7 @@ follows when the size, `owner` or a recorded viewport changed.
 
 Under `latest`, a client with a person in front of it reports only while
 it is in use, so the session takes the size of the client being looked
-at. The web client (`mountTerminal`) reports, in `OPEN` and `VIEWPORT`,
+at. The web client (each terminal of `client.mount`) reports, in `OPEN` and `VIEWPORT`,
 only while its page is visible and its window has the focus
 (`document.visibilityState` and `document.hasFocus()`), and reports again
 as soon as it is shown or focused, whether or not its size changed, and

@@ -1,5 +1,5 @@
-/** The page: the session bar around a mounted terminal. */
-import { type Link, type Session, mountTerminal } from "@gjermundgaraba/clankermux";
+/** The page: the session bar around a terminal mounted from a client. */
+import { type Link, type Session, connect } from "@gjermundgaraba/clankermux";
 
 const canvas = document.getElementById("screen") as HTMLCanvasElement;
 const container = document.getElementById("terminal") as HTMLElement;
@@ -20,28 +20,37 @@ const wsUrl = params.get("ws") ?? `wss://${location.hostname}:7438/`;
 
 const style = getComputedStyle(document.documentElement);
 
-const terminal = mountTerminal({
+const client = await connect({
   worker: new Worker("./worker.js", { type: "module" }),
-  canvas,
-  container,
   wasm: "./ghostty-vt.wasm",
   url: wsUrl,
-  session: params.get("session") ?? undefined,
+});
+/** The session shown, as the page last attached or created it. */
+let current = params.get("session") ?? undefined;
+const terminal = client.mount({
+  canvas,
+  container,
+  session: current,
   font: style.getPropertyValue("--font").trim() || "14px monospace",
   colors: () => ({
     fg: style.getPropertyValue("--fg"),
     bg: style.getPropertyValue("--bg"),
     cursor: style.getPropertyValue("--cursor"),
   }),
-  onStatus: (text) => (status.textContent = text),
-  onLink: (link) => (linkText.textContent = describeLink(link)),
-  onSessions: showSessions,
-  // Scrolled back with the wheel or Shift+PageUp: how far above the live
-  // screen the view ends.
-  onScroll: (rows) => {
-    scrolled.hidden = rows === 0;
-    scrolled.textContent = `\u2191 ${rows} rows`;
-  },
+  ackOnFocus: true,
+});
+terminal.onStatus((text) => (status.textContent = text));
+terminal.onLink((link) => (linkText.textContent = describeLink(link)));
+// Scrolled back with the wheel or Shift+PageUp: how far above the live
+// screen the view ends.
+terminal.onScroll((rows) => {
+  scrolled.hidden = rows === 0;
+  scrolled.textContent = `\u2191 ${rows} rows`;
+});
+let listed: Session[] = [];
+client.onSessions((sessions) => {
+  listed = sessions;
+  showSessions();
 });
 
 /** The link in a few words, so the page shows what a consumer would
@@ -59,10 +68,10 @@ function describeLink(link: Link): string {
 
 const failed = (err: unknown) => (status.textContent = String(err));
 
-function showSessions(sessions: Session[], current: string | undefined): void {
+function showSessions(): void {
   sessionsSelect.replaceChildren(
     new Option("choose a session", "", current === undefined, current === undefined),
-    ...sessions.map((s) => {
+    ...listed.map((s) => {
       const text = `${s.id.slice(0, 8)} ${s.label || s.title || s.argv.join(" ")} (${s.status})`;
       return new Option(text, s.id, s.id === current, s.id === current);
     }),
@@ -70,25 +79,39 @@ function showSessions(sessions: Session[], current: string | undefined): void {
   // The status line: `sessions` follows the program's title (OSC 0/2),
   // working directory (OSC 7) and the session's size as they change. The
   // size is the one of the page last visible and focused.
-  const attached = sessions.find((s) => s.id === current);
+  const attached = listed.find((s) => s.id === current);
   where.textContent = attached
     ? [attached.title, attached.pwd, `${attached.cols}\u00d7${attached.rows}`].filter(Boolean).join(" \u2014 ")
     : "";
 }
 
+function show(session: string): void {
+  current = session;
+  history.replaceState(null, "", `?${new URLSearchParams({ ...Object.fromEntries(params), session })}`);
+  terminal.attach(session);
+  showSessions();
+}
+
 sessionsSelect.onchange = () => {
   if (sessionsSelect.value) {
-    history.replaceState(null, "", `?${new URLSearchParams({ ...Object.fromEntries(params), session: sessionsSelect.value })}`);
-    terminal.attach(sessionsSelect.value);
+    show(sessionsSelect.value);
     canvas.focus();
   }
 };
 newButton.onclick = () => {
-  terminal.create().catch(failed);
+  client
+    .create(terminal.size())
+    .then((session) => show(session.id))
+    .catch(failed);
   canvas.focus();
 };
-endButton.onclick = () => terminal.end().catch(failed);
-removeButton.onclick = () => terminal.remove().catch(failed);
+// `not_running`: there is nothing left to end.
+endButton.onclick = () => {
+  if (current) client.end(current).catch((err) => err.code === "not_running" || failed(err));
+};
+removeButton.onclick = () => {
+  if (current) client.remove(current).catch(failed);
+};
 // Pins the page's scheme; the terminal notices the attribute and reports
 // the canvas's scheme and colours again.
 schemeSelect.onchange = () => {

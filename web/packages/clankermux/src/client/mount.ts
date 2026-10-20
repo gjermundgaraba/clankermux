@@ -1,13 +1,12 @@
 /** The page side of a terminal: canvas, keyboard, paste and resize, with
- * the engine in a worker running `runWorker`. */
+ * the engine in the client's worker. */
 import type { CellPoint } from "../engine/index.ts";
-import type { Event, OnExit, Scheme, Session, Size } from "../proto/index.ts";
+import type { Scheme, Size } from "../proto/index.ts";
 import { CanvasRenderer, type Metrics } from "../renderer/index.ts";
 
-import { ClientError } from "./connection.ts";
 import { type Keyboard, type Typed, Typing } from "./keyboard.ts";
 import { profileFrom, schemeOf } from "./profile.ts";
-import type { Failure, Link, ToPage, ToWorker } from "./worker.ts";
+import type { Link, ToPage, ToWorker } from "./worker.ts";
 
 /** The terminal's default colours as CSS colours (hex or `rgb()`). */
 export interface Colors {
@@ -17,18 +16,11 @@ export interface Colors {
 }
 
 export interface MountOptions {
-  /** A module worker whose script calls `runWorker(self)`; the terminal
-   * owns it from here. */
-  worker: Worker;
   /** Drawn on. Focusing it focuses the terminal's input element, a
    * textarea placed after it, which takes keys, paste and composed text. */
   canvas: HTMLCanvasElement;
   /** The element whose size sets the grid. */
   container: HTMLElement;
-  /** ghostty-vt.wasm, resolved against the page. */
-  wasm: string;
-  /** The server's WebSocket carrier, `wss://<node>:<port>/`. */
-  url: string;
   /** The session to attach at once. */
   session?: string | undefined;
   /** A CSS font shorthand with its size in px. */
@@ -40,57 +32,78 @@ export interface MountOptions {
    * of `light` and `dark`, else the page's preferred scheme. Read again
    * on every report. */
   scheme?: () => Scheme;
-  /** A line of text for each change, for display. */
-  onStatus?: (text: string) => void;
-  /** Each change of the link to the session, to switch on. */
-  onLink?: (link: Link) => void;
-  onSessions?: (sessions: Session[], current: string | undefined) => void;
-  /** The rows between the bottom of the view and the live screen's, when
-   * that changes: above 0 while the view is scrolled back into the
-   * history (and growing with output meanwhile), 0 when it shows the
-   * live screen again. The canvas draws a mark at its right edge too. */
-  onScroll?: (rows: number) => void;
-  /** Provisional, until the connection and the terminal are split: each
-   * event that carries the attached session's `id` (`bell`,
-   * `notification`, `progress`, `command_started`, `command_ended`,
-   * `attachment_opened`, `attachment_closed`, the `program_status_*`
-   * ones, `session_removed`). The others reach `onSessions`. */
-  onEvent?: (event: Event) => void;
+  /** Attach read-only: the session's screen, with no input to it. */
+  readOnly?: boolean;
+  /** Mark the session's `done` and `error` records seen (`ack`) while the
+   * terminal has the keyboard and its window the focus. */
+  ackOnFocus?: boolean;
 }
 
-export interface CreateOptions {
-  /** `keep`: the session stays listed as `exited` when its program
-   * exits; `remove`: it is removed `limits.remove_grace` after. The
-   * server's default (`remove`) when absent. */
-  onExit?: OnExit;
-}
-
-export interface MountedTerminal {
-  /** Detaches the current session and attaches `session`. */
+/** One mounted terminal: an attachment on its client's connection, drawn
+ * on a canvas. */
+export interface Terminal {
+  /** Detaches the current session and attaches `session`; after the
+   * client's connection ended for good, connects again first. */
   attach(session: string): void;
-  /** Creates a session at the current size and attaches it; resolves
-   * with it as created. Like `end` and `remove`, it needs a connection:
-   * call it after a `connected` link. */
-  create(options?: CreateOptions): Promise<Session>;
-  /** Hangs up the attached session's processes (SIGHUP); its exit
-   * follows as a link `ended` with reason `exited`. Resolves too when the
-   * session is not running (`exited` or `restored`). */
-  end(): Promise<void>;
-  /** Removes the attached session, which must be `exited` or `restored`
-   * (else `running`); the link ends with `removed`. */
-  remove(): Promise<void>;
+  /** Detaches the session; the terminal stays, attached to none. */
+  detach(): void;
   /** Focuses the terminal's input element, as focusing the canvas does. */
   focus(): void;
   /** The selected text, as the last selection made copied it; undefined
    * when nothing is selected. */
   selection(): string | undefined;
+  /** Pastes, bracketed when the program asked for it. */
+  paste(text: string): void;
+  /** Scrolls the view through the history by `rows`, up when negative. */
+  scroll(rows: number): void;
+  /** Back to the live screen. */
+  scrollToLive(): void;
   /** Reports the container's size, the colours and the scheme again;
    * to the session only while the page is visible and focused. */
   report(): void;
-  paste(text: string): void;
-  /** Removes the listeners and terminates the worker, which ends its
-   * connection; requests in flight reject. */
+  /** The grid the container holds now, for a `create` at this size. */
+  size(): { cols: number; rows: number };
+  /** Detaches, removes the listeners and the input element. */
   dispose(): void;
+  /** Each change of the link to the session, to switch on; a listener
+   * added later gets the latest at once. */
+  onLink(listener: (link: Link) => void): () => void;
+  /** The rows between the bottom of the view and the live screen's: on
+   * the first frame, and at each change after. Above 0 while the view is
+   * scrolled back into the history (and growing with output meanwhile),
+   * 0 when it shows the live screen. The canvas draws a mark at its
+   * right edge too. A listener added later gets the latest at once. */
+  onScroll(listener: (rows: number) => void): () => void;
+  /** A line of text for each change, for display; the latest at once. */
+  onStatus(listener: (text: string) => void): () => void;
+}
+
+/** The client's side of a terminal: its messages to the worker, and the
+ * worker's for it. */
+export interface MountHost {
+  send(message: ToWorker): void;
+  receive(handler: ((message: ToPage) => void) | undefined): void;
+}
+
+/** Listeners of one kind, and the latest value they were told. */
+class Listeners<T> {
+  private readonly all = new Set<(value: T) => void>();
+  private latest: { value: T } | undefined;
+
+  add(listener: (value: T) => void): () => void {
+    this.all.add(listener);
+    if (this.latest) listener(this.latest.value);
+    return () => void this.all.delete(listener);
+  }
+
+  emit(value: T): void {
+    this.latest = { value };
+    for (const listener of this.all) listener(value);
+  }
+
+  clear(): void {
+    this.all.clear();
+  }
 }
 
 /** Cell metrics from the font. */
@@ -112,8 +125,13 @@ function measure(font: string): Metrics {
   };
 }
 
-export function mountTerminal(options: MountOptions): MountedTerminal {
-  const { worker, canvas, container, colors } = options;
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+/** A message for this terminal's part of the worker. */
+type ToMount = DistributiveOmit<Extract<ToWorker, { mount: number }>, "mount">;
+
+/** Mounts a terminal as `id` of the client `host` serves. */
+export function mountOn(host: MountHost, id: number, options: MountOptions): Terminal {
+  const { canvas, container, colors } = options;
   const light = matchMedia("(prefers-color-scheme: light)");
   const scheme = options.scheme ?? (() => schemeOf(getComputedStyle(canvas).colorScheme, light.matches));
   const metrics = measure(options.font);
@@ -157,24 +175,13 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
     .then((map) => (keyboard.layout = map))
     .catch(() => {});
 
-  const send = (message: ToWorker) => worker.postMessage(message);
-
-  /** Requests waiting for their `done`, by id. They reject with a
-   * `ClientError` for a server's refusal, a lost connection or a
-   * disposed terminal, or an `Error` when no session is attached. */
-  const pending = new Map<number, { resolve: (session: Session | undefined) => void; reject: (err: Error) => void }>();
-  let nextId = 1;
   let disposed = false;
-  function request(message: (id: number) => ToWorker): Promise<Session | undefined> {
-    if (disposed) return Promise.reject(new ClientError("closed", "disposed"));
-    const id = nextId++;
-    return new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject });
-      send(message(id));
-    });
-  }
-  const failure = (error: Failure): Error =>
-    error.kind ? new ClientError(error.kind, error.message, error.server) : new Error(error.message);
+  const send = (message: ToMount) => {
+    if (!disposed) host.send({ ...message, mount: id } as ToWorker);
+  };
+  const links = new Listeners<Link>();
+  const scrolls = new Listeners<number>();
+  const statuses = new Listeners<string>();
 
   /** The selection's text, for a copy. */
   let selected: string | undefined;
@@ -209,30 +216,23 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
       },
     };
   }
-  /** Rows the view is scrolled back, as `onScroll` last reported. */
-  let scrolled = 0;
-  worker.onmessage = (e: MessageEvent<ToPage>) => {
-    const message = e.data;
+  /** Rows the view is scrolled back, as `onScroll` last reported;
+   * undefined before the first frame. */
+  let scrolled: number | undefined;
+  host.receive((message: ToPage) => {
     switch (message.type) {
       case "status":
-        options.onStatus?.(message.text);
+        statuses.emit(message.text);
         break;
       case "link":
-        options.onLink?.(message.link);
+        links.emit(message.link);
         break;
-      case "done": {
-        const waiter = pending.get(message.id);
-        pending.delete(message.id);
-        if (message.error) waiter?.reject(failure(message.error));
-        else waiter?.resolve(message.session);
-        break;
-      }
       case "frame": {
         if (message.frame.cursor) cursorAt = { x: message.frame.cursor.x, y: message.frame.cursor.y };
         const { total, offset, len } = message.frame.scrollbar;
         if (total - offset - len !== scrolled) {
           scrolled = total - offset - len;
-          options.onScroll?.(scrolled);
+          scrolls.emit(scrolled);
         }
         fitCanvas(message.frame.cols, message.frame.rows);
         if (fullNext && !message.frame.full) {
@@ -244,12 +244,6 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
         }
         break;
       }
-      case "sessions":
-        options.onSessions?.(message.sessions, message.current);
-        break;
-      case "event":
-        options.onEvent?.(message.event);
-        break;
       case "clipboard":
         navigator.clipboard?.writeText(message.text).catch(() => {});
         break;
@@ -264,7 +258,7 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
         break;
       }
     }
-  };
+  });
 
   /** Where the input element goes for a composition: the cursor's cell,
    * as the latest frame that had the cursor in view placed it. */
@@ -326,6 +320,19 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
     });
   }
   canvas.addEventListener("focus", () => input.focus({ preventScroll: true }), { signal });
+  // Whether the terminal has the keyboard and its window the focus, for
+  // `ackOnFocus`.
+  let focused = false;
+  const watchFocus = () => {
+    const now = document.activeElement === input && document.hasFocus();
+    if (now === focused) return;
+    focused = now;
+    send({ type: "focus", focused });
+  };
+  input.addEventListener("focus", watchFocus, { signal });
+  input.addEventListener("blur", watchFocus, { signal });
+  window.addEventListener("focus", watchFocus, { signal });
+  window.addEventListener("blur", watchFocus, { signal });
 
   const typing = new Typing(keyboard);
   const typed = (what: Typed) => send("text" in what ? { type: "text", text: what.text } : { type: "key", input: what.key });
@@ -490,7 +497,7 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
       const whole = Math.trunc(wheeled);
       if (whole === 0) return;
       wheeled -= whole;
-      send({ type: "scroll", rows: whole });
+      send({ type: "wheel", rows: whole });
     },
     { passive: false, signal },
   );
@@ -539,37 +546,43 @@ export function mountTerminal(options: MountOptions): MountedTerminal {
   watchRatio();
 
   send({
-    type: "init",
-    wasm: new URL(options.wasm, location.href).toString(),
-    url: options.url,
+    type: "mount",
+    session: options.session,
     viewport: viewport(),
     profile: profile(),
     active: active(),
-    session: options.session,
+    readOnly: options.readOnly ?? false,
+    ackOnFocus: options.ackOnFocus ?? false,
   });
 
   return {
     attach: (session) => send({ type: "attach", session }),
-    create: async (create) => {
-      const session = await request((id) => ({ type: "create", id, ...(create?.onExit && { onExit: create.onExit }) }));
-      return session!;
-    },
-    end: async () => void (await request((id) => ({ type: "end", id }))),
-    remove: async () => void (await request((id) => ({ type: "remove", id }))),
+    detach: () => send({ type: "detach" }),
     focus: () => input.focus({ preventScroll: true }),
     selection: () => selected,
-    report,
     paste: (text) => send({ type: "paste", text }),
+    scroll: (rows) => send({ type: "view", rows }),
+    scrollToLive: () => send({ type: "view", rows: "live" }),
+    report,
+    size: () => {
+      const { cols, rows } = viewport();
+      return { cols, rows };
+    },
     dispose: () => {
+      if (disposed) return;
+      host.send({ type: "unmount", mount: id });
       disposed = true;
+      host.receive(undefined);
       listening.abort();
       resizes.disconnect();
       restyles.disconnect();
       input.remove();
-      worker.onmessage = null;
-      worker.terminate();
-      for (const waiter of pending.values()) waiter.reject(new ClientError("closed", "disposed"));
-      pending.clear();
+      links.clear();
+      scrolls.clear();
+      statuses.clear();
     },
+    onLink: (listener) => links.add(listener),
+    onScroll: (listener) => scrolls.add(listener),
+    onStatus: (listener) => statuses.add(listener),
   };
 }

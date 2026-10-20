@@ -1,13 +1,13 @@
 # @gjermundgaraba/clankermux
 
-The browser client of [clankermux](https://github.com/gjermundgaraba/clankermux): a terminal on a canvas, its engine and connection in a module worker, speaking the clankermux protocol over the server's TLS WebSocket carrier.
+The browser client of [clankermux](https://github.com/gjermundgaraba/clankermux): one connection to a server, speaking the clankermux protocol over its TLS WebSocket carrier from a module worker, and terminals on canvases mounted from it, the engine in the same worker.
 
 | Subpath | Exports |
 | --- | --- |
-| `.` | `mountTerminal` and its types, `ClientError` |
+| `.` | `connect`, `Client`, the `Terminal` it mounts, their types, `ClientError` |
 | `./worker` | `runWorker`, for the worker module; no DOM types |
 | `./ghostty-vt.wasm` | the engine build the server's engine id names |
-| `./proto`, `./engine`, `./renderer` | the protocol messages, the engine and the canvas renderer; `Methods` maps each method to its params and result types, and `Catalog` is what `Connection.describe()` answers: the server's methods, events, frames and error codes with their JSON Schemas |
+| `./proto`, `./engine`, `./renderer` | the protocol messages, the engine and the canvas renderer; `Methods` maps each method to its params and result types, and `Catalog` is what `describe()` answers: the server's methods, events, frames and error codes with their JSON Schemas |
 
 ```ts
 // worker.ts, started as a module worker
@@ -15,35 +15,83 @@ import { runWorker } from "@gjermundgaraba/clankermux/worker";
 runWorker(self);
 
 // page
-import { mountTerminal } from "@gjermundgaraba/clankermux";
+import { connect } from "@gjermundgaraba/clankermux";
 import wasm from "@gjermundgaraba/clankermux/ghostty-vt.wasm?url";
-const terminal = mountTerminal({
+const client = await connect({
   worker: new Worker(new URL("./worker.ts", import.meta.url), { type: "module" }),
-  canvas, container, wasm, url: "wss://127.0.0.1:7438/", session,
-  font: "14px monospace", colors: () => ({ fg: "#d8dee9", bg: "#282c34", cursor: "#ffffff" }),
-  onLink: (link) => console.log(link),
+  wasm, url: "wss://127.0.0.1:7438/",
 });
+const terminal = client.mount({
+  canvas, container, session,
+  font: "14px monospace", colors: () => ({ fg: "#d8dee9", bg: "#282c34", cursor: "#ffffff" }),
+});
+terminal.onLink((link) => console.log(link));
+const { id } = await client.create({ ...terminal.size(), on_exit: "keep" });
+terminal.attach(id);
 ```
 
-## `MountedTerminal`
+A page holds one client: one worker, one WebSocket, the session list and the event stream. Every terminal it mounts is one attachment on that connection, so a page with many panes holds one connection, and the client's methods serve them all.
+
+## `connect`
+
+`connect({url, worker, wasm, client?})` starts the worker and resolves with the `Client` once the engine is loaded, before the connection is up: the worker connects, and after a loss reconnects, by itself, and each terminal's `onLink` says how that goes (below). It rejects when the engine cannot be loaded. `client` is the `{name, version}` the connection gives in `HELLO`, which the server lists in each session's `attachments`; `clankermux-web` and this package's version by default.
+
+## `Client`
+
+Each method is the protocol method of the same name (PROTOCOL.md has their params, results and errors):
+
+| Method | Protocol |
+| --- | --- |
+| `describe()`, `describe(method)` | `describe`: the catalog, or one method of it |
+| `create(params?)` | `create`, all its params (`label`, `argv`, `cwd`, `env`, `cols`, `rows`, `on_exit`); resolves with the session. It attaches nothing: `terminal.attach(id)` does. `terminal.size()` is the grid a terminal's container holds, to create at that size |
+| `sessions()` | `list`, paged to its end |
+| `list(after?)` | `list`, one page |
+| `inspect(id)` | `inspect` |
+| `end(id)`, `signal(id, name)`, `remove(id)` | `end` (SIGHUP), `signal`, `remove`; resolve with nothing |
+| `label(id, text)` | `label`; resolves with the session |
+| `resize(id, {cols?, rows?, policy?})` | `resize` |
+| `send(id, {text \| keys \| data, paste?, wait?}, {signal?})` | `send`; resolves with `{at, wait?}`. Aborting `signal` cancels its `wait` |
+| `wait(id, until, {after?, timeout_ms?, signal?})` | `wait`; resolves with `{reason, at, exit?, match?, record?}`, a timeout being a result. Aborting `signal` sends `cancel`, and the wait rejects with `cancelled` |
+| `read(id, {scrollback?, format?, scope?})` | `read` |
+| `tail(id, after, {max_bytes?})` | `tail` |
+| `ack(id, recordIds?)` | `ack` |
+| `detach(id, channel, reason?)` | `detach`: another attachment, by its `channel` in `attachments` |
+| `onSessions(listener)` | every session at each change (below) |
+| `onEvent(listener)` | each event, without loss across reconnects (below) |
+| `mount(options)` | a `Terminal` on this connection |
+| `close()` | disposes the terminals and terminates the worker, which ends the connection |
+
+A method rejects with a `ClientError`:
+
+- `kind: "server"` when the server refuses, with `code` (and `server`, its `ERROR`): `no_such_session`, `not_running`, `running`, `cancelled` for a cancelled wait, and the rest of PROTOCOL.md's codes;
+- `kind: "closed"` when there is no connection (before the first, between a loss and the reconnect, after the server ended it), when the connection is lost meanwhile, and after `close()`;
+- `kind: "protocol"` when the server sent a malformed frame meanwhile.
+
+A request is not retried across a reconnect. `end` rejects with `not_running` when the session is not running (`exited`, `restored`): there is nothing to end. Closing a pane for good is `end` for a running session, then `remove` once it has exited (`wait(id, {exited: true})` says when), and `remove` alone for one that has exited, or that a previous server left `restored`. With `on_exit: "remove"` an ended session removes itself.
+
+A cancelled wait is cancelled by the server, so it rejects with the server's `cancelled` also when its signal was aborted before the request was sent.
+
+## `Terminal`
+
+`client.mount({session?, canvas, container, font, colors, scheme?, readOnly?, ackOnFocus?})` draws on `canvas` the session `session`, if given, at the grid `container` holds. `readOnly` attaches read-only: the screen, and no input to the session. `ackOnFocus` marks the session's `done` and `error` records seen (`ack`) while the terminal has the keyboard and its window the focus: when it gets the focus, and when such a record wants the user meanwhile.
 
 | Method | Does |
 | --- | --- |
 | `attach(session)` | Detaches the current session and attaches `session`; after a connection-level end (below), connects again first. |
-| `create(options?)` | Creates a session at the current size, attaches it, and resolves with it. `options.onExit`: `"keep"` keeps it listed as `exited` when its program exits; `"remove"` removes it `limits.remove_grace` after. Without it the server's default (`remove`) applies. |
-| `end()` | Hangs up the attached session's processes (SIGHUP). Also resolves when the session is not running (`exited`, `restored`): there is nothing to end. |
-| `remove()` | Removes the attached session, which must be `exited` or `restored`; a running one rejects with `running`. |
-| `report()` | Reports the container's size, the colours and the scheme again. |
+| `detach()` | Detaches the session; the terminal stays, attached to none (`connected` with no session). |
+| `focus()` | Focuses the terminal's input element, as focusing the canvas does. |
+| `selection()` | The selected text, as the last selection made copied it. |
 | `paste(text)` | Pastes, bracketed when the program asked for it. |
-| `dispose()` | Removes the listeners and terminates the worker, which drops its connection; requests in flight reject. |
+| `scroll(rows)` | Scrolls the view through the history by `rows`, up when negative. |
+| `scrollToLive()` | Back to the live screen. |
+| `report()` | Reports the container's size, the colours and the scheme again. |
+| `size()` | `{cols, rows}`: the grid the container holds now. |
+| `dispose()` | Detaches, and removes the listeners and the input element; the client and its other terminals stay. |
+| `onLink(listener)` | Each change of the link to the session (below). |
+| `onScroll(listener)` | The rows between the bottom of the view and the live screen's (below), from the first frame on. |
+| `onStatus(listener)` | The same moments as `onLink`, and more, as text for display. |
 
-`create`, `end` and `remove` need a connection: call them after a `connected` link. They reject with a `ClientError`:
-
-- with `kind: "server"` and `server.code` when the server refuses;
-- with `kind: "closed"` when there is no connection, or after `dispose()`;
-- with `kind: "protocol"` when the server sent a malformed frame meanwhile (the connection then ends with `ended closed`, `retry: true`).
-
-`end` and `remove` reject with a plain `Error` when no session is attached. Since 0.1.1 `create` returns this promise, where it returned nothing and dropped a request it could not make; a caller that ignores it should `.catch` it. Closing a pane for good is `end()` for a running session and `remove()` for one that has exited, or that a previous server left `restored`. With `onExit: "remove"` an ended session also removes itself.
+The `on*` methods return a function that removes the listener; a listener added after a change gets the latest at once.
 
 ## Keys and composed text
 
@@ -60,17 +108,17 @@ Verified in headless Chrome on macOS through CDP (`Input.imeSetComposition`, `In
 
 ## `onSessions`
 
-`onSessions(sessions, current)` reports every session on the server, and which one the page shows, at each change: a session created, exited or removed, and a `session_changed`, which the server sends when a session's label, size, size policy, attachments, title, working directory or attention changes. `attachments` is the list of open attachments in the order they opened, each `{channel, client: {name, version}, read_only, viewport?: {cols, rows}, since, last_input?}`: `channel` is unique on the server, `client` the connecting page or program's own name, `viewport` its latest size report, `last_input` when it last typed (input alone sends no `session_changed`). `size` is `{policy, owner?}`, `owner` being the channel whose report sets the size under `latest`. The title is the program's (OSC 0 or 2), the working directory the one it reports (OSC 7, as a path), each empty until set, and both cleared by a full reset. A status line takes them from the session whose `id` is `current`; the `session` of a `connected` link is the one `ATTACHED` described, and does not follow these changes.
+`client.onSessions(listener)` reports every session on the server at each change: a session created, exited or removed, and a `session_changed`, which the server sends when a session's label, size, size policy, attachments, title, working directory or attention changes. A listener added once the list is known gets it at once. `attachments` is the list of open attachments in the order they opened, each `{channel, client: {name, version}, read_only, viewport?: {cols, rows}, since, last_input?}`: `channel` is unique on the server, `client` the connecting page or program's own name, `viewport` its latest size report, `last_input` when it last typed (input alone sends no `session_changed`). `size` is `{policy, owner?}`, `owner` being the channel whose report sets the size under `latest`. The title is the program's (OSC 0 or 2), the working directory the one it reports (OSC 7, as a path), each empty until set, and both cleared by a full reset. A status line takes them from the session its terminal shows; the `session` of a `connected` link is the one `ATTACHED` described, and does not follow these changes.
 
 A session's `attention`, when present, is the program status record that most wants the user (`{state, kind?, app?, msg?, record}`: `blocked`, then an unseen `error`, then an unseen `done`, then `working`), so a badge needs no request per session; a `session_changed` follows each change of it.
 
-## `onEvent` (provisional)
+## `onEvent`
 
-`onEvent(event)` reports each server event that carries the attached session's `id`: `bell`, `notification`, `progress`, `command_started`, `command_ended`, `attachment_opened`, `attachment_closed`, `program_status_changed`, `program_status_removed` and `session_removed`, as PROTOCOL.md describes them, `seq` included. The events that carry a whole session reach `onSessions` instead. It is provisional: when the connection and the mounted terminal become separate objects, events move to the connection's object.
+`client.onEvent(listener)` reports each server event, of every session, in `seq` order, as PROTOCOL.md describes them: `session_created`, `session_changed`, `session_exited`, `session_removed`, `program_status_changed`, `program_status_removed`, `bell`, `notification`, `progress`, `command_started`, `command_ended`, `attachment_opened` and `attachment_closed`. After a reconnect the client subscribes from the last event it saw (`subscribe {after, incarnation}`), so the events missed while the connection was down are reported then, in order, before any later one. When the server cannot replay them (it restarted, so `seq` counts from 1 again, or more happened meanwhile than it retains), the listener gets `{event: "gap", incarnation}` instead, and the session list is paged again: `onSessions` has the current state.
 
 ## `onLink`
 
-`onLink(link)` reports each change of the page's link to its session, through the connection and the attachment. `onStatus(text)` reports the same moments, and more, as text for display.
+`terminal.onLink(listener)` reports each change of the terminal's link to its session, through the client's connection and the terminal's attachment. A terminal mounted later first gets the connection as it is then: `connecting` with the current attempt, or `connected` (and its own screen, if it names a session); after a connection-level end it connects again, as `attach` does.
 
 ```ts
 type Link =
@@ -80,14 +128,13 @@ type Link =
 type LinkEnd = "closed" | "removed" | "stopping" | "detached" | "exited" | "no_such_session" | "engine_mismatch" | "error";
 ```
 
-`retry` means the worker reconnects or attaches again by itself, so a `connecting` or `connected` follows. Otherwise nothing follows until the page calls `attach` or `create`. After a connection-level end (the last three rows of the first table) there is no connection: `create` rejects, and `attach` connects again (`connecting` from attempt 1), so "Retry" can be `attach`. An engine that failed to load needs a new mount.
+`retry` means the worker reconnects or attaches again by itself, so a `connecting` or `connected` follows. Otherwise nothing follows until the page calls `attach`. The connection is the client's, so a connection-level change (the first table) reaches every terminal. After a connection-level end (the last three rows of the first table) there is no connection: the client's methods reject with `closed`, and a terminal's `attach`, or a terminal mounted then, connects again (`connecting` from attempt 1), so "Retry" can be `attach` or a new mount. An engine that failed to load rejects `connect`.
 
 | When | Link |
 | --- | --- |
-| A connection is opened: at mount, and at each reconnect | `connecting`, `attempt` from 1; it starts again at 1 once a server answers |
+| A connection is opened: at `connect`, and at each reconnect | `connecting`, `attempt` from 1; it starts again at 1 once a server answers |
 | A connection cannot be opened, or closes before `WELCOME` | nothing at once; the next `connecting` after a backoff |
 | The connection closes | `ended closed`, `retry: true`, then `connecting` |
-| The engine cannot be loaded | `ended error`, `retry: false` |
 | The server refuses the handshake (`ERROR` before `WELCOME`, e.g. `version_mismatch`), or sends something else first | `ended error` with the code when there is one, `retry: false` |
 | The server ends the connection (`ERROR` without an id, e.g. `protocol_error`) | `ended error` with the code, `retry: false` |
 | `subscribe` fails on a live connection | `ended error`, `retry: false`; the worker closes the connection |
@@ -97,7 +144,7 @@ Once connected:
 | When | Link |
 | --- | --- |
 | Connected with no session to attach | `connected`, `session: undefined` |
-| A session's screen is shown: a snapshot's first screen, a resume, again after a gap, a re-attach or a reconnect | `connected` with the session as `ATTACHED` described it; `status` tells `running`, `restored` or `exited` |
+| A session's screen is shown: a snapshot's first screen, a resume, again after a gap, a re-attach or a reconnect | `connected` with the session as `ATTACHED` described it; `status` tells `running`, `restored` or `exited`. A reconnect to the same server resumes from the terminal's place in the stream (`onStatus` says `resumed`); one to a restarted server shows the session `restored` |
 | A snapshot shows a session that has exited already | `connected`, then at once `ended exited` with its `exit`, `retry: false` (a resume onto such a session gets its `EXITED`, the next row, instead) |
 | The session's program exits (`EXITED`) | `ended exited` with `exit`, `retry: false` |
 | `CLOSED removed` | `ended removed`, `retry: false`; the worker forgets the session |
@@ -113,7 +160,7 @@ Nothing fires for:
 
 - the errors that keep an attachment (`read_only`, `not_running`, `input_overflow`);
 - a gap, until its new screen fires `connected`;
-- `attach` or `create` before their screen;
+- `attach` before its screen;
 - `dispose`.
 
 `reason: "closed"` is the connection's close. The worker detaches without waiting for the server's `CLOSED closed`, so that frame never shows up as a link change.
@@ -150,11 +197,11 @@ The terminal holds the session's history (the server sends what it keeps with th
 
 Output while the view is scrolled back leaves it where it is. Any input that sends something (a key, a paste, composed text) brings it back to the live screen first; a modifier alone does not. The alternate screen of full-screen programs (`vim`, `less`) has no history: there Shift+PageUp and the rest go to the program as keys, and the wheel sends the up and down arrow keys while the program leaves alternate scroll (mode 1007) on, as it is by default, or nothing.
 
-While the view is scrolled back the canvas draws a mark at its right edge, the view's share of the history and its place in it. `onScroll(rows)` reports the rows between the bottom of the view and the live screen's at each change: above 0 when scrolled back (it grows as output arrives meanwhile), 0 at the live screen.
+While the view is scrolled back the canvas draws a mark at its right edge, the view's share of the history and its place in it. `onScroll(rows)` reports, on the first frame and then at each change, the rows between the bottom of the view and the live screen's at each change: above 0 when scrolled back (it grows as output arrives meanwhile), 0 at the live screen.
 
 ## Size between clients
 
-A session has one size, and under the default size policy, `latest`, the server applies the latest report (PROTOCOL.md, "Size"); under `smallest` it takes the smallest columns and rows among the attachments' reports, and under `fixed` only a `resize` request changes it, the reports being recorded but not applied. The terminal reports its container's size, its colours and its scheme only while its page is visible and its window has the focus (`document.visibilityState === "visible"` and `document.hasFocus()`). It reports again when the page is shown or its window focused, even at an unchanged size, and when the session was resized to another client's size while the page kept its focus (the user went to another machine and came back), at the page's next input: a key or text that sends something, a paste, a click on the canvas, the wheel. So under `latest`, with the same session open in several tabs or on several machines, the session takes the size of the one you look at, and a hidden or unfocused one never resizes it: its `OPEN` carries no viewport, it sends no `VIEWPORT`, and its canvas shows the session's size, clipped or with a margin. `report()` follows the same rule. `create()` makes the session at the container's current size, focused or not. A headless browser counts only its newest page as visible and focused, and a terminal in an iframe has the focus only once the frame does; such a page does not size the session until then.
+A session has one size, and under the default size policy, `latest`, the server applies the latest report (PROTOCOL.md, "Size"); under `smallest` it takes the smallest columns and rows among the attachments' reports, and under `fixed` only a `resize` request changes it, the reports being recorded but not applied. The terminal reports its container's size, its colours and its scheme only while its page is visible and its window has the focus (`document.visibilityState === "visible"` and `document.hasFocus()`). It reports again when the page is shown or its window focused, even at an unchanged size, and when the session was resized to another client's size while the page kept its focus (the user went to another machine and came back), at the page's next input: a key or text that sends something, a paste, a click on the canvas, the wheel. So under `latest`, with the same session open in several tabs or on several machines, the session takes the size of the one you look at, and a hidden or unfocused one never resizes it: its `OPEN` carries no viewport, it sends no `VIEWPORT`, and its canvas shows the session's size, clipped or with a margin. `report()` follows the same rule. `size()` is the container's grid, focused or not, for a `create` at that size. A headless browser counts only its newest page as visible and focused, and a terminal in an iframe has the focus only once the frame does; such a page does not size the session until then.
 
 ## Colour scheme
 

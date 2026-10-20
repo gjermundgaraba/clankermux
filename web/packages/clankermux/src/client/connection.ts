@@ -1,12 +1,14 @@
 import {
   type Catalog,
   type Description,
+  type ErrorCode,
   type ErrorMessage,
   type Event,
   type Frame,
   FrameError,
   FrameType,
   type Hello,
+  type Peer,
   type Reply,
   type Welcome,
   encodeFrame,
@@ -28,13 +30,21 @@ export interface Transport {
  * OPEN recovers it, where any other fault would only repeat. */
 export type ErrorKind = "protocol" | "desync" | "server" | "closed";
 
+/** A failed request or connection. `kind: "server"` carries the server's
+ * `ERROR` as `server`, and its code as `code`: a refused request, or a
+ * `wait` that was cancelled (`cancelled`). */
 export class ClientError extends Error {
+  /** The protocol's error code, when the server sent one. */
+  readonly code: ErrorCode | undefined;
+
   constructor(
     readonly kind: ErrorKind,
     message: string,
     readonly server?: ErrorMessage,
   ) {
     super(message);
+    this.name = "ClientError";
+    this.code = server?.code;
   }
 
   static protocol(message: string): ClientError {
@@ -54,8 +64,11 @@ export class ClientError extends Error {
  * default `max_frame`, as the Rust client. */
 const HELLO_MAX_FRAME = 1024 * 1024;
 
-export function hello(name: string, engine?: string): Hello {
-  const h: Hello = { version: VERSION, client: { name, version: pkg.version }, capabilities: [] };
+/** `HELLO` for `client`: a name and version, or a name with this
+ * package's version. */
+export function hello(client: string | Peer, engine?: string): Hello {
+  const peer = typeof client === "string" ? { name: client, version: pkg.version } : client;
+  const h: Hello = { version: VERSION, client: peer, capabilities: [] };
   if (engine !== undefined) h.engine = engine;
   return h;
 }
@@ -116,8 +129,13 @@ export class Connection {
 
   /** A request; the reply's `result`, or a rejection with the server's error. */
   call<R>(method: string, params: unknown): Promise<R> {
+    return this.request<R>(method, params).reply;
+  }
+
+  /** A request and its id on this connection, which `cancel` takes. */
+  request<R>(method: string, params: unknown): { id: number; reply: Promise<R> } {
     const id = this.nextId++;
-    return new Promise((resolve, reject) => {
+    const reply = new Promise<R>((resolve, reject) => {
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
       try {
         this.sendJson(FrameType.Request, 0, { id, method, params });
@@ -126,6 +144,7 @@ export class Connection {
         reject(err);
       }
     });
+    return { id, reply };
   }
 
   /** The server's catalog (`describe {}`), or one method of it. */
