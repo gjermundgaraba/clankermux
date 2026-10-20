@@ -172,19 +172,9 @@ function schemaOf(name: string): JsonSchema | undefined {
   if (kind === "params") return catalog.methods.find((m) => m.name === variant.split("-")[0])?.params;
   const frame = catalog.frames.find((f) => f.name.toLowerCase() === kind);
   if (frame) return frame.schema;
-  const types: Record<string, string> = {
-    session: "Session",
-    page: "Page",
-    subscribed: "Subscribed",
-    read: "Read",
-    tail: "Tail",
-    sent: "Sent",
-    waited: "Waited",
-    cancelled: "Cancelled",
-    acked: "Acked",
-    empty: "Empty",
-  };
-  return types[kind] === undefined ? undefined : { $ref: `#/$defs/${types[kind]}` };
+  // `session/running` is a `Session`.
+  const type = kind.charAt(0).toUpperCase() + kind.slice(1);
+  return Object.hasOwn(catalog.$defs, type) ? { $ref: `#/$defs/${type}` } : undefined;
 }
 
 test("every shared vector passes the schema of its frame, method or type", () => {
