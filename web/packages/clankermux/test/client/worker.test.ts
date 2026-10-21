@@ -9,7 +9,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 
-import { Engine, type Frame as RenderFrame, type KeyInput, RenderState } from "../../src/engine/index.ts";
+import { Engine, type KeyInput, type PackedFrame, RenderState } from "../../src/engine/index.ts";
+import { PACKED_STRIDE, packedText } from "../../src/engine/render.ts";
 import { type Frame, FrameType, type Session, encodeFrame, parseFrame } from "../../src/proto/index.ts";
 
 import type { ToMount } from "../../src/client/mount.ts";
@@ -134,8 +135,8 @@ type Message<T extends ToPage["type"]> = Extract<ToPage, { type: T }>;
 function run(autoPaint = true) {
   const posted: ToPage[] = [];
   const port = {
-    postMessage: (message: ToPage) => {
-      posted.push(message);
+    postMessage: (message: ToPage, options?: StructuredSerializeOptions) => {
+      posted.push(structuredClone(message, options));
       if (autoPaint && message.type === "frame") {
         port.onmessage?.({ data: { type: "painted", mount: message.mount } } as MessageEvent<ToWorker>);
       }
@@ -938,7 +939,7 @@ test("one frame per mount waits for paint while burst rows accumulate in the eng
   worker.mount(2, "t");
   const channel = await server.opened("s");
   const other = await server.opened("t");
-  const extracts = vi.spyOn(RenderState.prototype, "update");
+  const extracts = vi.spyOn(RenderState.prototype, "updatePacked");
   const frames = (mount = 1) => worker.posted.flatMap((m) => m.type === "frame" && m.mount === mount ? [m.frame] : []);
   const term = engine.terminalNew(10, 3);
   term.write(new TextEncoder().encode("hello"));
@@ -964,10 +965,10 @@ test("one frame per mount waits for paint while burst rows accumulate in the eng
     worker.to(1, { type: "painted" });
     expect(frames()).toHaveLength(2);
     expect(frames()[1]!.full).toBe(false);
-    const screen: RenderFrame["lines"] = [];
+    const screen: PackedFrame["lines"] = [];
     for (const frame of frames()) for (const row of frame.lines) screen[row.y] = row;
     const expected = new RenderState(engine);
-    const final = expected.update(term);
+    const final = expected.updatePacked(term);
     expect(screen).toEqual(final.lines);
     expect(frames().at(-1)!.cursor).toEqual(final.cursor);
     expected.free();
@@ -978,7 +979,7 @@ test("one frame per mount waits for paint while burst rows accumulate in the eng
     worker.to(1, { type: "painted" });
     expect(frames()).toHaveLength(3);
     const resized = new RenderState(engine);
-    expect(frames().at(-1)).toEqual(resized.update(term));
+    expect(frames().at(-1)).toEqual(resized.updatePacked(term));
     resized.free();
     worker.to(1, { type: "painted" });
     expect(frames()).toHaveLength(3);
@@ -1014,7 +1015,7 @@ test("hidden mounts skip extraction and return with a full frame even without fo
   worker.mount(1, "s", { active: false, visible: false });
   const channel = await server.opened("s");
   const frames = () => worker.posted.flatMap((m) => m.type === "frame" ? [m.frame] : []);
-  const extracts = vi.spyOn(RenderState.prototype, "update");
+  const extracts = vi.spyOn(RenderState.prototype, "updatePacked");
   try {
     bootstrap(server, channel, session("s"));
     worker.to(1, { type: "repaint" });
@@ -1032,7 +1033,8 @@ test("hidden mounts skip extraction and return with a full frame even without fo
     worker.to(1, { type: "visibility", visible: true });
     expect(frames()).toHaveLength(2);
     expect(frames()[1]!.full).toBe(true);
-    expect(frames()[1]!.lines[1]!.cells.map((c) => c.text).join("")).toBe("new");
+    const cells = frames()[1]!.lines[1]!.cells;
+    expect(Array.from({ length: cells.data.length / PACKED_STRIDE }, (_, x) => packedText(cells, x)).join("")).toBe("new");
     worker.to(1, { type: "painted" });
     worker.to(1, { type: "viewport", size: { cols: 10, rows: 3 }, profile: {}, active: false });
     expect(frames()).toHaveLength(3);

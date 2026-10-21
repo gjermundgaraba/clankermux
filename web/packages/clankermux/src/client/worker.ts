@@ -9,7 +9,7 @@ import {
   type CellPoint,
   ENGINE,
   Engine,
-  type Frame,
+  type PackedFrame,
   KeyEncoder,
   type KeyInput,
   RenderState,
@@ -152,7 +152,7 @@ export type ToPage =
   | { type: "connection"; link: Link }
   | { type: "status"; mount: number; text: string }
   | { type: "link"; mount: number; link: Link }
-  | { type: "frame"; mount: number; frame: Frame }
+  | { type: "frame"; mount: number; frame: PackedFrame }
   | { type: "clipboard"; mount: number; text: string }
   /** The selection's text, or undefined once there is none; with `copy`,
    * the answer to the release of that number, so the text (if any) goes
@@ -161,7 +161,7 @@ export type ToPage =
 
 /** The worker's end of the page's messages: `self` in a dedicated worker. */
 export interface WorkerPort {
-  postMessage(message: ToPage): void;
+  postMessage(message: ToPage, options?: StructuredSerializeOptions): void;
   onmessage: ((e: MessageEvent<ToWorker>) => void) | null;
 }
 
@@ -246,7 +246,7 @@ function endedWith(err: unknown, retry: boolean): Link {
  * and event stream, the page's requests, and the mounted terminals.
  */
 class Hub {
-  constructor(readonly post: (message: ToPage) => void) {}
+  constructor(readonly post: WorkerPort["postMessage"]) {}
 
   engine!: Engine;
   keys!: KeyEncoder;
@@ -544,8 +544,8 @@ class Mount {
     this.gesture = new SelectionGesture(hub.engine);
   }
 
-  private post(message: ToPage): void {
-    if (!this.disposed) this.hub.post(message);
+  private post(message: ToPage, options?: StructuredSerializeOptions): void {
+    if (!this.disposed) this.hub.post(message, options);
   }
 
   link(link: Link): void {
@@ -763,13 +763,13 @@ class Mount {
       this.render = new RenderState(this.hub.engine);
       this.fullNext = false;
     }
-    const frame = this.render.update(term);
+    const frame = this.render.updatePacked(term);
     // Clean only the captured rows. While this frame is in flight, no
     // extraction runs, so subsequent changes accumulate in the engine.
     this.render.clean();
     this.paintPending = false;
     this.frameInFlight = true;
-    this.post({ type: "frame", mount: this.id, frame });
+    this.post({ type: "frame", mount: this.id, frame }, { transfer: frame.lines.map((row) => row.cells.data.buffer) });
     // A switch to the alternate screen or a full reset took the selection.
     if (this.selected && !term.selected) this.unselected();
   }
@@ -1054,7 +1054,7 @@ function describe(exit: Exit): string {
 /** Serves a page's `connect` on `port`: the worker module the page starts
  * calls `runWorker(self)`. */
 export function runWorker(port: WorkerPort): void {
-  const hub = new Hub((message) => port.postMessage(message));
+  const hub = new Hub((message, options) => port.postMessage(message, options));
   port.onmessage = (e) => {
     const message = e.data;
     switch (message.type) {

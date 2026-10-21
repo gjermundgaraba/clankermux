@@ -1,4 +1,6 @@
-import { FLAG, type Frame, type FrameRow, NO_COLOR } from "../engine/index.ts";
+import { type Cell, FLAG, type Frame, type FrameRow, NO_COLOR, PACKED_STRIDE, type PackedCells, packedText } from "../engine/render.ts";
+
+type Cells = Cell[] | PackedCells;
 
 /** The cell grid in CSS pixels and the fonts to draw with. */
 export interface Metrics {
@@ -41,7 +43,7 @@ const MARK_WIDTH = 3;
  * leaves can be redrawn.
  */
 export class CanvasRenderer {
-  private rows = new Map<number, FrameRow>();
+  private rows = new Map<number, FrameRow<Cells>>();
   private cursorRow: number | undefined;
   /** The scrollback mark drawn last, in pixels from the top. */
   private mark: { top: number; height: number } | undefined;
@@ -55,7 +57,7 @@ export class CanvasRenderer {
     private readonly palette: Palette,
   ) {}
 
-  draw(frame: Frame): void {
+  draw(frame: Frame<Cells>): void {
     // The frame always carries the default colours.
     this.background = hex(frame.background);
     this.foreground = hex(frame.foreground);
@@ -115,7 +117,7 @@ export class CanvasRenderer {
 
   /** The scrollback mark for `frame`: the viewport's share of the history
    * at the right edge, while the view is scrolled back. */
-  private markOf(frame: Frame): { top: number; height: number } | undefined {
+  private markOf(frame: Frame<Cells>): { top: number; height: number } | undefined {
     const { total, offset, len } = frame.scrollbar;
     if (offset + len >= total) return undefined;
     const height = frame.rows * this.metrics.cellHeight;
@@ -123,36 +125,48 @@ export class CanvasRenderer {
     return { top: Math.min(Math.round((height * offset) / total), height - size), height: size };
   }
 
-  private drawRow(row: FrameRow): void {
+  private drawRow(row: FrameRow<Cells>): void {
     const { cellWidth, cellHeight, baseline } = this.metrics;
     const y = row.y * cellHeight;
     this.ctx.globalAlpha = 1;
     this.ctx.fillStyle = this.background;
     this.ctx.fillRect(0, y, this.cols * cellWidth, cellHeight);
-    for (let x = 0; x < row.cells.length; x++) {
-      const cell = row.cells[x]!;
-      if (cell.flags & FLAG.SPACER) continue;
-      const width = cell.flags & FLAG.WIDE ? 2 : 1;
-      let fg = css(cell.fg, this.foreground);
-      let bg = css(cell.bg, this.background);
+    const cells = row.cells;
+    const count = Array.isArray(cells) ? cells.length : cells.data.length / PACKED_STRIDE;
+    for (let x = 0; x < count; x++) {
+      let text: string, foreground: number, background: number, flags: number, underline: number;
+      if (Array.isArray(cells)) {
+        ({ text, fg: foreground, bg: background, flags, underline } = cells[x]!);
+      } else {
+        const at = x * PACKED_STRIDE;
+        text = packedText(cells, x);
+        foreground = cells.data[at + 1]!;
+        background = cells.data[at + 2]!;
+        flags = cells.data[at + 3]! & 0xffff;
+        underline = cells.data[at + 3]! >>> 16;
+      }
+      if (flags & FLAG.SPACER) continue;
+      const width = flags & FLAG.WIDE ? 2 : 1;
+      let fg = css(foreground, this.foreground);
+      let bg = css(background, this.background);
       // A selected cell is drawn inverted, an inverse one the other way.
       const selected = row.selection !== undefined && x >= row.selection[0] && x <= row.selection[1];
-      if (((cell.flags & FLAG.INVERSE) !== 0) !== selected) [fg, bg] = [bg, fg];
+      if (((flags & FLAG.INVERSE) !== 0) !== selected) [fg, bg] = [bg, fg];
       if (bg !== this.background) {
         this.ctx.fillStyle = bg;
         this.ctx.fillRect(x * cellWidth, y, width * cellWidth, cellHeight);
       }
-      if (cell.flags & FLAG.INVISIBLE) continue;
-      this.ctx.globalAlpha = cell.flags & FLAG.FAINT ? 0.6 : 1;
+      if (flags & FLAG.INVISIBLE) continue;
+      this.ctx.globalAlpha = flags & FLAG.FAINT ? 0.6 : 1;
       this.ctx.fillStyle = fg;
-      if (cell.text !== "" && cell.text !== " ") {
-        this.ctx.font = this.font(cell.flags);
-        this.ctx.fillText(cell.text, x * cellWidth, y + baseline);
+      if (text !== "" && text !== " ") {
+        this.ctx.font = this.font(flags);
+        this.ctx.fillText(text, x * cellWidth, y + baseline);
       }
-      if (cell.underline !== 0) {
+      if (underline !== 0) {
         this.ctx.fillRect(x * cellWidth, y + cellHeight - 2, width * cellWidth, 1);
       }
-      if (cell.flags & FLAG.STRIKETHROUGH) {
+      if (flags & FLAG.STRIKETHROUGH) {
         this.ctx.fillRect(x * cellWidth, y + Math.floor(cellHeight / 2), width * cellWidth, 1);
       }
     }
@@ -191,11 +205,19 @@ export class CanvasRenderer {
       default: {
         this.ctx.fillRect(x, y, cellWidth, cellHeight);
         // The cell's text in the background colour, over the block.
-        const cell = this.rows.get(cursor.y)?.cells[cursor.x];
-        if (cell && cell.text !== "" && cell.text !== " ") {
+        const cells = this.rows.get(cursor.y)?.cells;
+        let text = "", flags = 0;
+        if (Array.isArray(cells)) {
+          const cell = cells[cursor.x];
+          if (cell) ({ text, flags } = cell);
+        } else if (cells && cursor.x < cells.data.length / PACKED_STRIDE) {
+          text = packedText(cells, cursor.x);
+          flags = cells.data[cursor.x * PACKED_STRIDE + 3]! & 0xffff;
+        }
+        if (text !== "" && text !== " ") {
           this.ctx.fillStyle = this.background;
-          this.ctx.font = this.font(cell.flags);
-          this.ctx.fillText(cell.text, x, y + baseline);
+          this.ctx.font = this.font(flags);
+          this.ctx.fillText(text, x, y + baseline);
         }
       }
     }

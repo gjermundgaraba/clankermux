@@ -34,14 +34,14 @@ export interface Cell {
 const CURSOR_STYLES = ["bar", "block", "underline", "block_hollow"] as const;
 type CursorStyle = (typeof CURSOR_STYLES)[number];
 
-export interface FrameRow {
+export interface FrameRow<Cells = Cell[]> {
   y: number;
-  cells: Cell[];
+  cells: Cells;
   /** The selected cells of the row, first and last inclusive. */
   selection?: [number, number];
 }
 
-export interface Frame {
+export interface Frame<Cells = Cell[]> {
   cols: number;
   rows: number;
   /** Every row is included and the renderer should clear first. */
@@ -59,10 +59,26 @@ export interface Frame {
       }
     | undefined;
   /** The rows that changed, or every row when `full`. */
-  lines: FrameRow[];
+  lines: FrameRow<Cells>[];
   /** Where the viewport is in the history: scrolled back when it ends
    * above the last row (`offset + len < total`). */
   scrollbar: Scrollbar;
+}
+
+/** Four signed words per cell: text code, foreground, background, style.
+ * Text is a Unicode scalar (0 for blank), or -(grapheme index + 1).
+ * Style holds flags in its low 16 bits and underline in its high 16. */
+export const PACKED_STRIDE = 4;
+export interface PackedCells {
+  data: Int32Array<ArrayBuffer>;
+  /** Only multi-codepoint cells need strings; these are cloned on transfer. */
+  graphemes: string[];
+}
+export type PackedFrame = Frame<PackedCells>;
+
+export function packedText(cells: PackedCells, x: number): string {
+  const code = cells.data[x * PACKED_STRIDE]!;
+  return code < 0 ? cells.graphemes[-code - 1]! : code === 0 ? "" : String.fromCodePoint(code);
 }
 
 /**
@@ -118,6 +134,33 @@ export class RenderState {
 
   /** Captures the terminal and returns the rows that changed since the last `clean`. */
   update(term: Terminal): Frame {
+    return this.frame(term, (cols) => {
+      const cells: Cell[] = [];
+      this.readRow(cols, (codepoint, text, fg, bg, flags, underline) => {
+        cells.push({ text: codepoint ? String.fromCodePoint(codepoint) : text, fg, bg, flags, underline });
+      });
+      return cells;
+    });
+  }
+
+  /** Captures transferable cell buffers without allocating Cell objects.
+   * Each row owns its buffer so the renderer can retain rows independently. */
+  updatePacked(term: Terminal): PackedFrame {
+    return this.frame(term, (cols) => {
+      const data = new Int32Array(cols * PACKED_STRIDE);
+      const graphemes: string[] = [];
+      let at = 0;
+      this.readRow(cols, (codepoint, text, fg, bg, flags, underline) => {
+        data[at++] = text === "" ? codepoint : -graphemes.push(text);
+        data[at++] = fg;
+        data[at++] = bg;
+        data[at++] = flags | (underline << 16);
+      });
+      return { data: data.subarray(0, at), graphemes };
+    });
+  }
+
+  private frame<Cells>(term: Terminal, readRow: (cols: number) => Cells): Frame<Cells> {
     const e = this.engine;
     e.check("ghostty_render_state_update", this.state, term.handle);
     // Read with the update: the render state does not keep the scroll position.
@@ -160,14 +203,14 @@ export class RenderState {
         : undefined;
     });
 
-    const lines: FrameRow[] = [];
+    const lines: FrameRow<Cells>[] = [];
     // Iterator and cells containers are passed by address of their handle.
     e.scratch(8, (out) => {
       e.view.setUint32(out, this.iterator, true);
       e.check("ghostty_render_state_get", this.state, this.keys.data["ROW_ITERATOR"]!, out);
       while (e.call("ghostty_render_state_row_iterator_next_dirty", this.iterator, out + 4)) {
         const y = e.view.getUint16(out + 4, true);
-        const row: FrameRow = { y, cells: this.readRow(cols) };
+        const row: FrameRow<Cells> = { y, cells: readRow(cols) };
         const selection = this.rowSelection();
         if (selection) row.selection = selection;
         lines.push(row);
@@ -188,14 +231,17 @@ export class RenderState {
     });
   }
 
-  private readRow(cols: number): Cell[] {
+  private readRow(
+    cols: number,
+    write: (codepoint: number, text: string, fg: number, bg: number, flags: number, underline: number) => void,
+  ): void {
     const e = this.engine;
     e.scratch(4, (out) => {
       e.view.setUint32(out, this.cells, true);
       e.check("ghostty_render_state_row_get", this.iterator, this.keys.row["CELLS"]!, out);
     });
     const styleSize = e.sizeOf("GhosttyStyle");
-    const cells: Cell[] = [];
+    let count = 0;
     // Scratch: raw cell (8), colour (3, padded to 8), the 8-aligned style,
     // a UTF-8 buffer struct and its bytes.
     const utf8Cap = 64;
@@ -205,14 +251,14 @@ export class RenderState {
       const style = scratch + 16;
       const buffer = style + styleSize;
       const utf8 = buffer + e.sizeOf("GhosttyBuffer");
-      while (e.call("ghostty_render_state_row_cells_next", this.cells) && cells.length < cols) {
+      while (e.call("ghostty_render_state_row_cells_next", this.cells) && count < cols) {
         e.check("ghostty_render_state_row_cells_get", this.cells, this.keys.cell["RAW"]!, raw);
         const tag = e.readBits(raw, this.cell.tag);
         const wide = e.readBits(raw, this.cell.wide);
+        let codepoint = 0;
         let text = "";
         if (tag === this.tags.codepoint) {
-          const cp = e.readBits(raw, this.cell.codepoint);
-          if (cp !== 0) text = String.fromCodePoint(cp);
+          codepoint = e.readBits(raw, this.cell.codepoint);
         } else if (tag === this.tags.grapheme) {
           text = this.graphemes(buffer, utf8, utf8Cap);
         }
@@ -237,10 +283,10 @@ export class RenderState {
           if (f("overline")) flags |= FLAG.OVERLINE;
           underline = e.field("GhosttyStyle", style, "underline");
         }
-        cells.push({ text, fg, bg, flags, underline });
+        write(codepoint, text, fg, bg, flags, underline);
+        count++;
       }
     });
-    return cells;
   }
 
   private color(key: number, out: number): number {

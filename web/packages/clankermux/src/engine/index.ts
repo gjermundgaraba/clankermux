@@ -2,7 +2,7 @@ export { Decoder, readyEnd } from "./decoder.ts";
 export { KeyEncoder, isText, keyName } from "./keys.ts";
 export type { KeyInput } from "./keys.ts";
 export { FLAG, NO_COLOR, RenderState } from "./render.ts";
-export type { Cell, Frame, FrameRow } from "./render.ts";
+export type { Cell, Frame, FrameRow, PackedCells, PackedFrame } from "./render.ts";
 export { ENGINE } from "./pin.ts";
 export { SelectionGesture } from "./selection.ts";
 export type { CellPoint } from "./selection.ts";

@@ -1,6 +1,6 @@
 /** The page side of a terminal: canvas, keyboard, paste and resize, with
  * the engine in the client's worker. */
-import type { CellPoint, Frame } from "../engine/index.ts";
+import type { CellPoint, PackedFrame } from "../engine/index.ts";
 import type { Scheme, Size } from "../proto/index.ts";
 import { CanvasRenderer, type Metrics } from "../renderer/index.ts";
 
@@ -198,7 +198,7 @@ export function mountOn(
    * undefined before the first frame. */
   let scrolled: number | undefined;
   const visible = () => document.visibilityState === "visible";
-  let pendingFrame: Frame | undefined;
+  let pendingFrame: PackedFrame | undefined;
   let paintRequest = 0;
   const paint = () => {
     paintRequest = 0;
