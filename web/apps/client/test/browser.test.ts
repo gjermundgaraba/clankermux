@@ -433,3 +433,55 @@ test("the client's link, the latest values a late listener gets, and close rejec
   expect(await page.evaluate((s) => harness().closedWhileWaiting(s), session)).toEqual({ kind: "closed" });
   await eventually("the attachment closed", async () => ((await listed(session))?.attachments.length === 0 ? true : undefined));
 });
+
+test("frames wait for animation paints, hidden pages stop, and unfocused pages refresh", async () => {
+  const session = await create("/bin/sh", "-c", "printf first; exec cat");
+  const page = await opened();
+  await page.evaluate((s) => {
+    // Keep the page visible without focus: it must still render.
+    Object.defineProperty(document, "hasFocus", { configurable: true, value: () => false });
+    harness().holdPaints();
+    harness().mount("only", s);
+    const canvas = document.querySelector<HTMLCanvasElement>("#only")!;
+    const ctx = canvas.getContext("2d")!;
+    const fill = ctx.fillText;
+    ctx.fillText = function (...args) {
+      canvas.dataset.draws = String(Number(canvas.dataset.draws ?? 0) + 1);
+      fill.apply(this, args);
+    };
+  }, session);
+  await connectedTo(page, "only");
+  await eventually("one held frame", async () => await page.evaluate(() => harness().frames().length === 1 ? true : undefined));
+  const draws = () => page.locator("#only").getAttribute("data-draws").then((n) => Number(n ?? 0));
+  expect(await draws()).toBe(0);
+  expect(await page.evaluate(() => harness().pendingPaints())).toBe(1);
+  await cli("send", session, "second", "--enter");
+  await page.waitForTimeout(100);
+  expect(await page.evaluate(() => harness().frames().length)).toBe(1);
+  expect(await draws()).toBe(0);
+  await page.evaluate(() => harness().paint());
+  expect(await draws()).toBeGreaterThan(0);
+  await eventually("the frame after paint acknowledgement", async () => await page.evaluate(() => harness().frames().length === 2 ? true : undefined));
+
+  // Hide with a frame waiting for an animation callback. Hiding must
+  // release it without drawing; otherwise showing can deadlock the worker.
+  const before = await draws();
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  expect(await page.evaluate(() => harness().pendingPaints())).toBe(0);
+  await cli("send", session, "third", "--enter");
+  await page.waitForTimeout(100);
+  expect(await page.evaluate(() => harness().frames().length)).toBe(2);
+  expect(await draws()).toBe(before);
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await eventually("a full refresh without focus", async () => await page.evaluate(() => harness().frames().length === 3 ? true : undefined));
+  expect(await page.evaluate(() => harness().frames().at(-1)!.frame.full)).toBe(true);
+  expect(await draws()).toBe(before);
+  await page.evaluate(() => harness().paint());
+  expect(await draws()).toBeGreaterThan(before);
+});

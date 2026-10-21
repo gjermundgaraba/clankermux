@@ -275,7 +275,7 @@ export class RenderState {
     );
   }
 
-  /** Marks the frame as drawn. */
+  /** Clears the captured dirty rows; later terminal writes remain dirty. */
   clean(): void {
     this.engine.check("ghostty_render_state_clean", this.state);
   }
