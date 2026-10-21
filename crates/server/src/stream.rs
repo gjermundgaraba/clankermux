@@ -77,12 +77,22 @@ impl Stream {
     /// Up to `max` retained bytes from `offset`, or `None` when the
     /// stream no longer retains `offset`.
     pub fn read(&self, offset: u64, max: usize) -> Option<Vec<u8>> {
+        let (first, second) = self.read_slices(offset, max)?;
+        Some([first, second].concat())
+    }
+
+    /// A retained range as the ring's (possibly wrapped) borrowed slices.
+    pub fn read_slices(&self, offset: u64, max: usize) -> Option<(&[u8], &[u8])> {
         let skip = usize::try_from(offset.checked_sub(self.start)?).ok()?;
         if skip > self.ring.len() {
             return None;
         }
         let end = skip.saturating_add(max).min(self.ring.len());
-        Some(self.ring.range(skip..end).copied().collect())
+        let (first, second) = self.ring.as_slices();
+        Some((
+            &first[skip.min(first.len())..end.min(first.len())],
+            &second[skip.saturating_sub(first.len())..end.saturating_sub(first.len())],
+        ))
     }
 
     /// The latest marker `seq` at or before `offset`, as a cursor at
@@ -134,6 +144,27 @@ mod tests {
         s.append(b"h");
         assert!(!s.markers_retained_after(0));
         assert!(s.markers_retained_after(1));
+    }
+
+    #[test]
+    fn borrowed_ranges_cross_the_ring_wrap_with_exact_offsets() {
+        let mut s = Stream::new(8, 8);
+        s.append(b"abcdefgh");
+        s.append(b"ijklm");
+        let (first, second) = s.read_slices(5, 8).unwrap();
+        assert!(!first.is_empty() && !second.is_empty());
+        for offset in 5..=13 {
+            for max in [0, 1, 3, 8, usize::MAX] {
+                let (first, second) = s.read_slices(offset, max).unwrap();
+                let expected = &b"fghijklm"[(offset - 5) as usize..];
+                let expected = &expected[..max.min(expected.len())];
+                let frame = proto::encode_output_frame(1, offset, first, second);
+                let (_, payload) = proto::parse_frame(&frame, 1024).unwrap();
+                assert_eq!(proto::parse_output(payload), Some((offset, expected)));
+            }
+        }
+        assert!(s.read_slices(4, 1).is_none());
+        assert!(s.read_slices(14, 1).is_none());
     }
 
     #[test]

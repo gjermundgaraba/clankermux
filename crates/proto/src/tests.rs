@@ -470,3 +470,30 @@ fn one_method_renders_with_the_types_it_uses() {
     let end = render::method(&catalog.describe("end").unwrap());
     assert!(end.contains("## Result: `{}`"), "{end}");
 }
+
+#[test]
+fn output_frame_from_slices_is_one_complete_protocol_frame() {
+    for (first, second) in [
+        (&b"abc"[..], &b"def"[..]),
+        (b"", b"xyz"),
+        (b"x", b""),
+        (b"", b""),
+    ] {
+        let frame = encode_output_frame(7, 42, first, second);
+        let (header, payload) = parse_frame(&frame, 1024).unwrap();
+        assert_eq!(header.frame_type, FrameType::Output);
+        assert_eq!(header.channel, 7);
+        assert_eq!(
+            parse_output(payload),
+            Some((42, [first, second].concat().as_slice()))
+        );
+        assert_eq!(
+            frame,
+            encode_frame(
+                FrameType::Output,
+                7,
+                &encode_output(42, &[first, second].concat())
+            )
+        );
+    }
+}

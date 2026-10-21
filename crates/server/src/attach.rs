@@ -2,14 +2,16 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use ghostty_vt::snapshot;
 use proto::{
     AttachMode, Attached, ClientPeer, Closed, ClosedReason, ErrorCode, Event, Exited, FrameType,
     Gap, OUTPUT_OFFSET_LEN, Open, Peer, Resized, Resume, Status, Viewport, encode_frame,
-    encode_json_frame, encode_output,
+    encode_json_frame, encode_output_frame,
 };
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::connection::{Writer, error_frame};
 use crate::registry::{Fail, Registry};
@@ -26,6 +28,19 @@ const CLIENT_TEXT: usize = 32;
 
 /// Bytes pulled from the stream per lock hold.
 const PULL_BUDGET: usize = 64 * 1024;
+
+/// Only output following a recent send waits; the first after idle is immediate.
+const OUTPUT_COALESCE: Duration = Duration::from_millis(1);
+
+fn coalesce_until(
+    last: Option<Instant>,
+    now: Instant,
+    bytes: usize,
+    marker: bool,
+) -> Option<Instant> {
+    let until = last? + OUTPUT_COALESCE;
+    (bytes > 0 && bytes < PULL_BUDGET && !marker && now < until).then_some(until)
+}
 
 /// How an attachment ends, as the session or the connection decides it.
 /// The task sends the frame after whatever it had queued.
@@ -168,6 +183,7 @@ pub fn open(
             marker: 0,
         },
         snapshot: None,
+        last_output: None,
         done: false,
     };
     Ok(Handle {
@@ -207,6 +223,7 @@ type End = Option<Ending>;
 
 enum Pull {
     Sent,
+    Wait(Instant),
     Idle,
     Gap,
 }
@@ -223,6 +240,7 @@ struct Task {
     max_frame: usize,
     cursor: Cursor,
     snapshot: Option<PendingSnapshot>,
+    last_output: Option<Instant>,
     /// The final marker has been sent.
     done: bool,
 }
@@ -349,6 +367,13 @@ impl Task {
                         return None;
                     }
                 }
+                Pull::Wait(until) => {
+                    tokio::select! {
+                        ending = self.close.recv() => return ending,
+                        _ = notified => {},
+                        _ = tokio::time::sleep_until(until) => {}
+                    }
+                }
                 Pull::Gap => {
                     if self.snapshot.as_ref().is_some_and(|p| p.after_gap) {
                         return Some(Ending::Error(
@@ -412,6 +437,7 @@ impl Task {
     /// after.
     async fn bootstrap(&mut self, gap_from: Option<u64>) -> Result<(), End> {
         self.done = false;
+        self.last_output = None;
         let internal = |message: String| Some(Ending::Error(ErrorCode::Internal, message));
         let parked_path = {
             let s = self.session.lock().unwrap();
@@ -561,6 +587,14 @@ impl Task {
             let end = stream.offset();
             let chunk = self.max_frame - OUTPUT_OFFSET_LEN;
             let mut markers = stream.markers_after(self.cursor.marker).peekable();
+            if let Some(until) = coalesce_until(
+                self.last_output,
+                Instant::now(),
+                (end - self.cursor.offset) as usize,
+                markers.peek().is_some(),
+            ) {
+                return Pull::Wait(until);
+            }
             let mut budget = PULL_BUDGET;
             loop {
                 while let Some(m) = markers.next_if(|m| m.offset <= self.cursor.offset) {
@@ -596,16 +630,21 @@ impl Task {
                     .map_or(end, |m| m.offset)
                     .min(end)
                     .min(self.cursor.offset + chunk.min(budget) as u64);
-                let bytes = stream
-                    .read(self.cursor.offset, (limit - self.cursor.offset) as usize)
+                let (first, second) = stream
+                    .read_slices(self.cursor.offset, (limit - self.cursor.offset) as usize)
                     .expect("offset within the retained stream");
-                budget -= bytes.len();
-                frames.push(encode_frame(
-                    FrameType::Output,
+                let len = first.len() + second.len();
+                budget -= len;
+                frames.push(encode_output_frame(
                     self.channel,
-                    &encode_output(self.cursor.offset, &bytes),
+                    self.cursor.offset,
+                    first,
+                    second,
                 ));
-                self.cursor.offset += bytes.len() as u64;
+                self.cursor.offset += len as u64;
+            }
+            if budget < PULL_BUDGET {
+                self.last_output = Some(Instant::now());
             }
             self.done = s.status() != Status::Running && self.cursor.marker == stream.latest_seq();
         }
@@ -615,5 +654,28 @@ impl Task {
             self.writer.send(frame);
         }
         if sent { Pull::Sent } else { Pull::Idle }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_coalescing_keeps_idle_echo_immediate_and_bounds_bursts() {
+        let now = Instant::now();
+        assert_eq!(coalesce_until(None, now, 1, false), None);
+        assert_eq!(
+            coalesce_until(Some(now - OUTPUT_COALESCE), now, 1, false),
+            None
+        );
+        let last = now - OUTPUT_COALESCE / 2;
+        assert_eq!(
+            coalesce_until(Some(last), now, 1, false),
+            Some(last + OUTPUT_COALESCE)
+        );
+        assert_eq!(coalesce_until(Some(last), now, PULL_BUDGET, false), None);
+        assert_eq!(coalesce_until(Some(last), now, 1, true), None);
+        assert_eq!(coalesce_until(Some(last), now, 0, false), None);
     }
 }
