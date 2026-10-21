@@ -32,3 +32,34 @@ test("clipboard writes are found across chunks; queries and other OSCs are not",
     { selection: "", text: "k" },
   ]);
 });
+
+test("text skipping preserves OSC state at every chunk boundary", () => {
+  const stream = bytes(
+    "plain".repeat(100) + "\x1b\x1b]52;c;YQ==\x07" +
+    "text\x1b]5x;ignored\x07\x1b]52x;ignored\x1b\\" +
+    "\x1b]52;c;Yg==\x18\x1b]52;c;Yw==\x1a" +
+    "tail\x1b]52;;ZA==\x1b]52;p;ZQ==\x1b\\end",
+  );
+  const expected = [
+    { selection: "c", text: "a" },
+    { selection: "", text: "d" },
+    { selection: "p", text: "e" },
+  ];
+  for (let split = 0; split <= stream.length; split++) {
+    const scanner = new Osc52Scanner();
+    expect([...scanner.feed(stream.subarray(0, split)), ...scanner.feed(stream.subarray(split))]).toEqual(expected);
+  }
+  const scanner = new Osc52Scanner();
+  expect(Array.from(stream).flatMap((b) => scanner.feed(Uint8Array.of(b)))).toEqual(expected);
+});
+
+test("long clipboard payloads keep their prefix and oversized ones recover at the next OSC", () => {
+  const scanner = new Osc52Scanner();
+  const text = "clipboard".repeat(8192);
+  const encoded = bytes(`\x1b]52;c;${btoa(text)}\x07`);
+  expect(scanner.feed(encoded.subarray(0, 6))).toEqual([]);
+  expect(scanner.feed(encoded.subarray(6))).toEqual([{ selection: "c", text }]);
+  expect(scanner.feed(bytes(`\x1b]52;c;${"A".repeat(1 << 20)}\x07plain\x1b]52;c;eA==\x07`))).toEqual([
+    { selection: "c", text: "x" },
+  ]);
+});

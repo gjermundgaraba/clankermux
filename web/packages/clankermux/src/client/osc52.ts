@@ -40,10 +40,13 @@ export class Osc52Scanner {
   /** Feeds output bytes; returns the clipboard writes they completed. */
   feed(bytes: Uint8Array): ClipboardWrite[] {
     const writes: ClipboardWrite[] = [];
-    for (const b of bytes) {
+    for (let at = 0; at < bytes.length; at++) {
+      const b = bytes[at]!;
       switch (this.state) {
         case "text":
-          if (b === ESC) this.state = "esc";
+          at = bytes.indexOf(ESC, at);
+          if (at < 0) return writes;
+          this.state = "esc";
           break;
         case "esc":
           // The payload is empty: every way out of an OSC clears it.
@@ -60,11 +63,12 @@ export class Osc52Scanner {
           } else if (b === CAN || b === SUB) {
             this.reset();
           } else if (this.state === "osc") {
-            this.payload.push(b);
-            const head = String.fromCharCode(...this.payload.slice(0, PREFIX.length));
-            if (!PREFIX.startsWith(head) || this.payload.length > MAX_OSC) {
+            const length = this.payload.length;
+            if ((length < PREFIX.length && b !== PREFIX.charCodeAt(length)) || length === MAX_OSC) {
               this.state = "skip";
               this.payload = [];
+            } else {
+              this.payload.push(b);
             }
           }
           break;
