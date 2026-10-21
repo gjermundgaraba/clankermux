@@ -69,6 +69,13 @@ Inside a session, leave the session out: `clankermux label building`.
 `events` names the server's incarnation on stderr; `seq` counts from 1
 again when the server restarts, so keep both to resume.
 
+`send --keys` takes modifiers `ctrl`, `shift`, `alt` and `super`, joined
+with `+` to a key (`ctrl+c`, `shift+tab`). Use `enter` and `esc`, not
+`return` and `escape`; `control` is gone (use `ctrl`), as are `meta`,
+`opt` and `option` (use `alt`), and `cmd` and `command` (use `super`).
+An unknown key exits 2. The server's `send {keys}` accepts the same names
+and refuses an unknown one with `invalid_request`.
+
 A wait given with `send` starts before the text is written, so it cannot
 miss a quick answer; its `--status` counts only a status set after the
 send. `--match` sees the output as plain text, without colours or other
@@ -112,7 +119,7 @@ Ack what you have dealt with; leave others' reports alone unless asked.
 | 4 | The server cannot be reached |
 | 124 | A wait timed out |
 | 130 | A wait was cancelled with Ctrl-C |
-| child's | A wait that ended with the session's exit (`--exit`, `create --wait`): its code, or 128 plus the signal's number; 1 for a `restored` session, which has none |
+| child's | A wait that ended with the session's exit (`wait --exit`, `send --exit`, `create --wait`): its code, or 128 plus the signal's number; 1 for a `restored` session, which has none |
 
 ## Rules
 
