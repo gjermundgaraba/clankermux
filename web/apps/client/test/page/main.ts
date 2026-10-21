@@ -12,6 +12,7 @@ import {
   type Waited,
   connect,
 } from "@gjermundgaraba/clankermux";
+import type { ToPage } from "@gjermundgaraba/clankermux/worker";
 
 interface Mounted {
   terminal: Terminal;
@@ -25,10 +26,17 @@ let client: Client | undefined;
 const mounted = new Map<string, Mounted>();
 const events: (Event | EventGap)[] = [];
 const clientLinks: Link[] = [];
+const frames: Extract<ToPage, { type: "frame" }>[] = [];
+const paints = new Map<number, FrameRequestCallback>();
+let nextPaint = 0;
 
 const harness = {
   async connect(url: string): Promise<void> {
-    client = await connect({ url, worker: new Worker("./worker.js", { type: "module" }), wasm: "./ghostty-vt.wasm" });
+    const worker = new Worker("./worker.js", { type: "module" });
+    worker.addEventListener("message", ({ data }: MessageEvent<ToPage>) => {
+      if (data.type === "frame") frames.push(data);
+    });
+    client = await connect({ url, worker, wasm: "./ghostty-vt.wasm" });
     client.onEvent((event) => events.push(event));
     client.onLink((link) => clientLinks.push(link));
   },
@@ -54,6 +62,21 @@ const harness = {
     terminal.onCopy((copy) => entry.copies.push(copy));
     terminal.onStatus((text) => entry.statuses.push(text));
     mounted.set(name, entry);
+  },
+
+  frames: () => frames,
+  pendingPaints: () => paints.size,
+  holdPaints(): void {
+    window.requestAnimationFrame = (callback) => {
+      paints.set(++nextPaint, callback);
+      return nextPaint;
+    };
+    window.cancelAnimationFrame = (id) => { paints.delete(id); };
+  },
+  paint(): void {
+    const ready = [...paints.values()];
+    paints.clear();
+    for (const callback of ready) callback(performance.now());
   },
 
   link: (name: string): Link | undefined => mounted.get(name)?.links.at(-1),

@@ -2,7 +2,7 @@ export { Decoder, readyEnd } from "./decoder.ts";
 export { KeyEncoder, isText, keyName } from "./keys.ts";
 export type { KeyInput } from "./keys.ts";
 export { FLAG, NO_COLOR, RenderState } from "./render.ts";
-export type { Cell, Frame, FrameRow } from "./render.ts";
+export type { Cell, Frame, FrameRow, PackedCells, PackedFrame } from "./render.ts";
 export { ENGINE } from "./pin.ts";
 export { SelectionGesture } from "./selection.ts";
 export type { CellPoint } from "./selection.ts";
@@ -46,6 +46,8 @@ export class EngineError extends Error {
 /** A loaded ghostty-vt.wasm instance. */
 export class Engine {
   private readonly types: Record<string, TypeInfo>;
+  private memoryView: Uint8Array | undefined;
+  private dataView: DataView | undefined;
   /** The `GhosttyResult` members the wrapper branches on. */
   readonly result: { SUCCESS: number; OUT_OF_SPACE: number; NO_VALUE: number; INVALID_VALUE: number };
 
@@ -68,13 +70,17 @@ export class Engine {
     return new Engine(instance.exports as Engine["exports"]);
   }
 
-  /** The current linear memory; reacquired on every access because it may grow. */
+  /** Cached views are valid only until wasm grows its linear memory. */
   get memory(): Uint8Array {
-    return new Uint8Array(this.exports.memory.buffer);
+    const buffer = this.exports.memory.buffer;
+    if (this.memoryView?.buffer !== buffer) this.memoryView = new Uint8Array(buffer);
+    return this.memoryView;
   }
 
   get view(): DataView {
-    return new DataView(this.exports.memory.buffer);
+    const buffer = this.exports.memory.buffer;
+    if (this.dataView?.buffer !== buffer) this.dataView = new DataView(buffer);
+    return this.dataView;
   }
 
   call(name: string, ...args: number[]): number {
@@ -229,6 +235,12 @@ export class Engine {
 
   /** Reads a bit field of a 64-bit packed value at `ptr`. */
   readBits(ptr: number, field: BitField): number {
+    const bit = field.lsb % 32;
+    if (bit + field.width <= 32) {
+      const word = this.view.getUint32(ptr + 4 * Math.floor(field.lsb / 32), true) >>> bit;
+      // A 32-bit mask would be signed; preserve the unsigned full word.
+      return field.width === 32 ? word : word & (2 ** field.width - 1);
+    }
     const value = this.view.getBigUint64(ptr, true);
     return Number((value >> BigInt(field.lsb)) & ((1n << BigInt(field.width)) - 1n));
   }

@@ -9,7 +9,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 
-import { Engine, type KeyInput } from "../../src/engine/index.ts";
+import { Engine, type KeyInput, type PackedFrame, RenderState } from "../../src/engine/index.ts";
+import { PACKED_STRIDE, packedText } from "../../src/engine/render.ts";
 import { type Frame, FrameType, type Session, encodeFrame, parseFrame } from "../../src/proto/index.ts";
 
 import type { ToMount } from "../../src/client/mount.ts";
@@ -131,10 +132,15 @@ function bootstrap(socket: FakeSocket, channel: number, s: Session, text = "hell
 type Message<T extends ToPage["type"]> = Extract<ToPage, { type: T }>;
 
 /** A worker on a port as the page's: what it posted, and a send to it. */
-function run() {
+function run(autoPaint = true) {
   const posted: ToPage[] = [];
   const port = {
-    postMessage: (message: ToPage) => posted.push(message),
+    postMessage: (message: ToPage, options?: StructuredSerializeOptions) => {
+      posted.push(structuredClone(message, options));
+      if (autoPaint && message.type === "frame") {
+        port.onmessage?.({ data: { type: "painted", mount: message.mount } } as MessageEvent<ToWorker>);
+      }
+    },
     onmessage: null as ((e: MessageEvent<ToWorker>) => void) | null,
   };
   runWorker(port);
@@ -144,8 +150,8 @@ function run() {
 
 /** A worker started as `connect` starts it, once its engine is loaded,
  * and what it posted. */
-async function start() {
-  const { posted, send } = run();
+async function start(autoPaint = true) {
+  const { posted, send } = run(autoPaint);
   send({ type: "init", wasm: "ghostty-vt.wasm", url: "wss://127.0.0.1:7438/", client: undefined });
   await vi.waitFor(() => expect(posted).toContainEqual({ type: "ready" }), { timeout: 5000 });
   let nextId = 100;
@@ -154,7 +160,7 @@ async function start() {
     send,
     posted,
     /** Mounts terminal `mount`, as `client.mount` does. */
-    mount(mount: number, session?: string, extra: { active?: boolean; readOnly?: boolean; ackOnFocus?: boolean } = {}) {
+    mount(mount: number, session?: string, extra: { active?: boolean; visible?: boolean; readOnly?: boolean; ackOnFocus?: boolean } = {}) {
       send({
         type: "mount",
         mount,
@@ -162,6 +168,7 @@ async function start() {
         viewport: { cols: 80, rows: 24 },
         profile: {},
         active: extra.active ?? true,
+        visible: extra.visible ?? true,
         readOnly: extra.readOnly ?? false,
         ackOnFocus: extra.ackOnFocus ?? false,
       });
@@ -922,4 +929,118 @@ test("a page still in use takes the size back at its next input after another cl
     { channel, body: { ...size, profile: {} } },
     { channel, body: { ...size, profile: {} } },
   ]);
+});
+
+test("one frame per mount waits for paint while burst rows accumulate in the engine", async () => {
+  const worker = await start(false);
+  const server = await socket(0);
+  await server.serve([session("s"), session("t")]);
+  worker.mount(1, "s");
+  worker.mount(2, "t");
+  const channel = await server.opened("s");
+  const other = await server.opened("t");
+  const extracts = vi.spyOn(RenderState.prototype, "updatePacked");
+  const frames = (mount = 1) => worker.posted.flatMap((m) => m.type === "frame" && m.mount === mount ? [m.frame] : []);
+  const term = engine.terminalNew(10, 3);
+  term.write(new TextEncoder().encode("hello"));
+  try {
+    bootstrap(server, channel, session("s"));
+    bootstrap(server, other, session("t"));
+    expect(extracts).toHaveBeenCalledTimes(2);
+    let offset = 0;
+    for (let i = 0; i < 40; i++) {
+      const text = `\x1b[${i % 3 + 1};1Hrow-${i}`;
+      term.write(new TextEncoder().encode(text));
+      server.pushRaw(encodeFrame(FrameType.Output, channel, output(offset, text)));
+      offset += new TextEncoder().encode(text).length;
+      worker.to(1, { type: "viewport", size: { cols: 10, rows: 3 }, profile: {}, active: false });
+    }
+    expect(frames()).toHaveLength(1);
+    expect(extracts).toHaveBeenCalledTimes(2);
+    // The second mount can paint even while the first is waiting.
+    worker.to(2, { type: "painted" });
+    worker.to(2, { type: "repaint" });
+    expect(frames(2)).toHaveLength(2);
+    expect(frames()).toHaveLength(1);
+    worker.to(1, { type: "painted" });
+    expect(frames()).toHaveLength(2);
+    expect(frames()[1]!.full).toBe(false);
+    const screen: PackedFrame["lines"] = [];
+    for (const frame of frames()) for (const row of frame.lines) screen[row.y] = row;
+    const expected = new RenderState(engine);
+    const final = expected.updatePacked(term);
+    expect(screen).toEqual(final.lines);
+    expect(frames().at(-1)!.cursor).toEqual(final.cursor);
+    expected.free();
+    // Resizing during another in-flight frame replaces the whole grid.
+    server.push(FrameType.Resized, channel, { seq: 1, offset, cols: 12, rows: 4 });
+    term.resize(12, 4);
+    expect(frames()).toHaveLength(2);
+    worker.to(1, { type: "painted" });
+    expect(frames()).toHaveLength(3);
+    const resized = new RenderState(engine);
+    expect(frames().at(-1)).toEqual(resized.updatePacked(term));
+    resized.free();
+    worker.to(1, { type: "painted" });
+    expect(frames()).toHaveLength(3);
+  } finally {
+    extracts.mockRestore();
+    term.free();
+    worker.send({ type: "unmount", mount: 1 });
+    worker.send({ type: "unmount", mount: 2 });
+  }
+});
+
+test("output clears an invalidated selection while a frame is still waiting for paint", async () => {
+  const worker = await start(false);
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  worker.mount(1, "s");
+  const channel = await server.opened("s");
+  bootstrap(server, channel, session("s"));
+  worker.to(1, { type: "select", action: "press", at: { x: 0.2, y: 0.5 }, time: 1000 });
+  worker.to(1, { type: "select", action: "drag", at: { x: 2.6, y: 0.5 }, time: 0 });
+  worker.to(1, { type: "select", action: "release", at: { x: 2.6, y: 0.5 }, time: 1100, copy: 1 });
+  expect(worker.selections().at(-1)?.text).toBe("hel");
+  server.pushRaw(encodeFrame(FrameType.Output, channel, output(0, "\x1b[?1049h")));
+  expect(worker.selections().at(-1)).toEqual({ type: "selection", mount: 1, text: undefined });
+  expect(worker.posted.filter((m) => m.type === "frame")).toHaveLength(1);
+  worker.send({ type: "unmount", mount: 1 });
+});
+
+test("hidden mounts skip extraction and return with a full frame even without focus", async () => {
+  const worker = await start(false);
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  worker.mount(1, "s", { active: false, visible: false });
+  const channel = await server.opened("s");
+  const frames = () => worker.posted.flatMap((m) => m.type === "frame" ? [m.frame] : []);
+  const extracts = vi.spyOn(RenderState.prototype, "updatePacked");
+  try {
+    bootstrap(server, channel, session("s"));
+    worker.to(1, { type: "repaint" });
+    expect(extracts).not.toHaveBeenCalled();
+    worker.to(1, { type: "visibility", visible: true });
+    expect(frames()).toHaveLength(1);
+    expect(frames()[0]!.full).toBe(true);
+    worker.to(1, { type: "visibility", visible: false });
+    // The page discards this frame while hidden, releasing its slot.
+    worker.to(1, { type: "painted" });
+    server.pushRaw(encodeFrame(FrameType.Output, channel, output(0, "\r\nnew")));
+    worker.to(1, { type: "repaint" });
+    expect(extracts).toHaveBeenCalledTimes(1);
+    expect(frames()).toHaveLength(1);
+    worker.to(1, { type: "visibility", visible: true });
+    expect(frames()).toHaveLength(2);
+    expect(frames()[1]!.full).toBe(true);
+    const cells = frames()[1]!.lines[1]!.cells;
+    expect(Array.from({ length: cells.data.length / PACKED_STRIDE }, (_, x) => packedText(cells, x)).join("")).toBe("new");
+    worker.to(1, { type: "painted" });
+    worker.to(1, { type: "viewport", size: { cols: 10, rows: 3 }, profile: {}, active: false });
+    expect(frames()).toHaveLength(3);
+    expect(server.bodies(FrameType.Viewport)).toHaveLength(0);
+  } finally {
+    extracts.mockRestore();
+    worker.send({ type: "unmount", mount: 1 });
+  }
 });

@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 
-import { type Cell, FLAG, type Frame, NO_COLOR } from "../../src/engine/index.ts";
+import { type Cell, FLAG, type Frame, NO_COLOR, type PackedFrame } from "../../src/engine/index.ts";
 
 import { CanvasRenderer, type Context2D, type Metrics } from "../../src/renderer/index.ts";
 
@@ -146,4 +146,45 @@ test("selected cells are drawn inverted, and stay so when the cursor leaves thei
   ctx.ops = [];
   r.draw(frame([], { x: 0, y: 1, visible: true, blinking: false, style: "bar", color: NO_COLOR }));
   expect(ctx.ops).toContainEqual(["rect", "#ffffff", 0, 0, 10, 20]);
+});
+
+test("transferred rows preserve canvas operations and stay cached for cursor and scrollback redraws", () => {
+  const normal = new Recording();
+  const compact = new Recording();
+  const objectRenderer = new CanvasRenderer(normal, metrics, palette);
+  const packedRenderer = new CanvasRenderer(compact, metrics, palette);
+  const cursor = { x: 0, y: 1, visible: true, blinking: false, style: "block" as const, color: NO_COLOR };
+  const rows = [
+    { y: 0, selection: [0, 2] as [number, number], cells: [
+      cell("漢", { flags: FLAG.WIDE }), cell("", { flags: FLAG.SPACER }),
+      cell("e\u0301", { fg: 0xff0000, flags: FLAG.ITALIC, underline: 2 }),
+    ] },
+    { y: 1, cells: [cell("b", { bg: 0x0000ff, flags: FLAG.BOLD }), blank(), blank()] },
+  ];
+  const first = frame(rows, cursor, true);
+  const next = frame([{ y: 1, cells: [cell("c", { flags: FLAG.INVERSE | FLAG.FAINT }), blank(), blank()] }], { ...cursor, x: 2, y: 0 });
+  const scrolled = frame([], undefined, false, { total: 10, offset: 1, len: 2 });
+  const steps: [Frame, PackedFrame][] = [
+    [first, { ...first, lines: [
+      { y: 0, selection: [0, 2], cells: { data: new Int32Array([
+        0x6f22, -1, -1, FLAG.WIDE, 0, -1, -1, FLAG.SPACER,
+        -1, 0xff0000, -1, FLAG.ITALIC | (2 << 16),
+      ]), graphemes: ["e\u0301"] } },
+      { y: 1, cells: { data: new Int32Array([
+        98, -1, 0x0000ff, FLAG.BOLD, 0, -1, -1, 0, 0, -1, -1, 0,
+      ]), graphemes: [] } },
+    ] }],
+    [next, { ...next, lines: [{ y: 1, cells: { data: new Int32Array([
+      99, -1, -1, FLAG.INVERSE | FLAG.FAINT, 0, -1, -1, 0, 0, -1, -1, 0,
+    ]), graphemes: [] } }] }],
+    [scrolled, { ...scrolled, lines: [] }],
+  ];
+  for (const [objects, packed] of steps) {
+    objectRenderer.draw(objects);
+    const transferred = structuredClone(packed, { transfer: packed.lines.map((row) => row.cells.data.buffer) });
+    packedRenderer.draw(transferred);
+    expect(compact.ops).toEqual(normal.ops);
+    normal.ops = [];
+    compact.ops = [];
+  }
 });

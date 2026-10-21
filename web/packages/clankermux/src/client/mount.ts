@@ -1,6 +1,6 @@
 /** The page side of a terminal: canvas, keyboard, paste and resize, with
  * the engine in the client's worker. */
-import type { CellPoint } from "../engine/index.ts";
+import type { CellPoint, PackedFrame } from "../engine/index.ts";
 import type { Scheme, Size } from "../proto/index.ts";
 import { CanvasRenderer, type Metrics } from "../renderer/index.ts";
 
@@ -197,6 +197,26 @@ export function mountOn(
   /** Rows the view is scrolled back, as `onScroll` last reported;
    * undefined before the first frame. */
   let scrolled: number | undefined;
+  const visible = () => document.visibilityState === "visible";
+  let pendingFrame: PackedFrame | undefined;
+  let paintRequest = 0;
+  const paint = () => {
+    paintRequest = 0;
+    const frame = pendingFrame;
+    pendingFrame = undefined;
+    if (!frame || disposed) return;
+    if (visible()) {
+      fitCanvas(frame.cols, frame.rows);
+      if (fullNext && !frame.full) {
+        // The backing store was recreated; a partial frame cannot fill it.
+        send({ type: "repaint" });
+      } else {
+        fullNext = false;
+        renderer.draw(frame);
+      }
+    }
+    send({ type: "painted" });
+  };
   const receive = (message: ToPage) => {
     switch (message.type) {
       case "status":
@@ -205,23 +225,22 @@ export function mountOn(
       case "link":
         links.emit(message.link);
         break;
-      case "frame": {
-        if (message.frame.cursor) cursorAt = { x: message.frame.cursor.x, y: message.frame.cursor.y };
-        const { total, offset, len } = message.frame.scrollbar;
-        if (total - offset - len !== scrolled) {
-          scrolled = total - offset - len;
-          scrolls.emit(scrolled);
-        }
-        fitCanvas(message.frame.cols, message.frame.rows);
-        if (fullNext && !message.frame.full) {
-          // The backing store was recreated; a partial frame cannot fill it.
-          send({ type: "repaint" });
+      case "frame":
+        if (disposed) break;
+        if (!visible()) {
+          send({ type: "painted" });
         } else {
-          fullNext = false;
-          renderer.draw(message.frame);
+          const frame = message.frame;
+          if (frame.cursor) cursorAt = { x: frame.cursor.x, y: frame.cursor.y };
+          const { total, offset, len } = frame.scrollbar;
+          if (total - offset - len !== scrolled) {
+            scrolled = total - offset - len;
+            scrolls.emit(scrolled);
+          }
+          pendingFrame = frame;
+          paintRequest = requestAnimationFrame(paint);
         }
         break;
-      }
       case "clipboard":
         copier.write(message.text, "program");
         break;
@@ -484,14 +503,25 @@ export function mountOn(
   /** Whether the user is looking at this page: it is visible and its
    * window has the focus. Only then does the session get its size, so
    * of several clients the one in use sets it. */
-  const active = () => document.visibilityState === "visible" && document.hasFocus();
+  const active = () => visible() && document.hasFocus();
   const report = () => send({ type: "viewport", size: viewport(), profile: profile(), active: active() });
   const resizes = new ResizeObserver(report);
   resizes.observe(container);
   light.addEventListener("change", report, { signal });
   // Shown or focused: the session takes this page's size again; hidden or
   // blurred: the worker stops reporting.
-  document.addEventListener("visibilitychange", report, { signal });
+  document.addEventListener("visibilitychange", () => {
+    send({ type: "visibility", visible: visible() });
+    if (!visible() && pendingFrame) {
+      cancelAnimationFrame(paintRequest);
+      paintRequest = 0;
+      pendingFrame = undefined;
+      // Hidden documents may never get another animation callback. Release
+      // the frame after hiding the worker; showing requests a full refresh.
+      send({ type: "painted" });
+    }
+    report();
+  }, { signal });
   window.addEventListener("focus", report, { signal });
   window.addEventListener("blur", report, { signal });
   // A page pins its scheme (and its colours with it) with an attribute or
@@ -523,6 +553,7 @@ export function mountOn(
     viewport: viewport(),
     profile: profile(),
     active: active(),
+    visible: visible(),
     readOnly: options.readOnly ?? false,
     ackOnFocus: options.ackOnFocus ?? false,
   });
@@ -544,6 +575,8 @@ export function mountOn(
       if (disposed) return;
       host.send({ type: "unmount", mount: id });
       disposed = true;
+      cancelAnimationFrame(paintRequest);
+      pendingFrame = undefined;
       host.disposed();
       listening.abort();
       resizes.disconnect();

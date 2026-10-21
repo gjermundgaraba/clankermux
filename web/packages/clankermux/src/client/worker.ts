@@ -9,7 +9,7 @@ import {
   type CellPoint,
   ENGINE,
   Engine,
-  type Frame,
+  type PackedFrame,
   KeyEncoder,
   type KeyInput,
   RenderState,
@@ -88,6 +88,8 @@ export interface MountInit {
   viewport: Size;
   profile: Profile;
   active: boolean;
+  /** Whether the document is visible, independently of focus. */
+  visible: boolean;
   readOnly: boolean;
   ackOnFocus: boolean;
 }
@@ -125,6 +127,10 @@ export type ToWorker =
   | { type: "viewport"; mount: number; size: Size; profile: Profile; active: boolean }
   /** The terminal has the keyboard, and its window the focus, or not. */
   | { type: "focus"; mount: number; focused: boolean }
+  /** Visibility is independent of focus: visible, unfocused pages still paint. */
+  | { type: "visibility"; mount: number; visible: boolean }
+  /** The page painted its one outstanding frame, or discarded it while hidden. */
+  | { type: "painted"; mount: number }
   /** The page lost its drawing: send the whole screen again. */
   | { type: "repaint"; mount: number };
 
@@ -146,7 +152,7 @@ export type ToPage =
   | { type: "connection"; link: Link }
   | { type: "status"; mount: number; text: string }
   | { type: "link"; mount: number; link: Link }
-  | { type: "frame"; mount: number; frame: Frame }
+  | { type: "frame"; mount: number; frame: PackedFrame }
   | { type: "clipboard"; mount: number; text: string }
   /** The selection's text, or undefined once there is none; with `copy`,
    * the answer to the release of that number, so the text (if any) goes
@@ -155,7 +161,7 @@ export type ToPage =
 
 /** The worker's end of the page's messages: `self` in a dedicated worker. */
 export interface WorkerPort {
-  postMessage(message: ToPage): void;
+  postMessage(message: ToPage, options?: StructuredSerializeOptions): void;
   onmessage: ((e: MessageEvent<ToWorker>) => void) | null;
 }
 
@@ -240,7 +246,7 @@ function endedWith(err: unknown, retry: boolean): Link {
  * and event stream, the page's requests, and the mounted terminals.
  */
 class Hub {
-  constructor(readonly post: (message: ToPage) => void) {}
+  constructor(readonly post: WorkerPort["postMessage"]) {}
 
   engine!: Engine;
   keys!: KeyEncoder;
@@ -494,6 +500,7 @@ class Mount {
   private profile: Profile;
   /** The page is in use; only then are its size and profile reported. */
   private active: boolean;
+  private visible: boolean;
   private readonly readOnly: boolean;
   private readonly ackOnFocus: boolean;
   /** The terminal has the keyboard and its window the focus. */
@@ -513,6 +520,9 @@ class Mount {
   private writes: Promise<void> = Promise.resolve();
   private readonly clipboard = new Osc52Scanner();
   private paintTimer: ReturnType<typeof setTimeout> | undefined;
+  private paintPending = false;
+  private frameInFlight = false;
+  private fullNext = false;
   /** Re-attaches after a failure; reset by a screen. */
   private readonly backoff = new Backoff();
   private reopenTimer: ReturnType<typeof setTimeout> | undefined;
@@ -527,14 +537,15 @@ class Mount {
     this.viewport = init.viewport;
     this.profile = init.profile;
     this.active = init.active;
+    this.visible = init.visible;
     this.readOnly = init.readOnly;
     this.ackOnFocus = init.ackOnFocus;
     this.render = new RenderState(hub.engine);
     this.gesture = new SelectionGesture(hub.engine);
   }
 
-  private post(message: ToPage): void {
-    if (!this.disposed) this.hub.post(message);
+  private post(message: ToPage, options?: StructuredSerializeOptions): void {
+    if (!this.disposed) this.hub.post(message, options);
   }
 
   link(link: Link): void {
@@ -646,6 +657,8 @@ class Mount {
         break;
       }
       case "output":
+        // Selection state must reach the page even while painting is paused.
+        if (this.selected && !this.attachment?.term()?.selected) this.unselected();
         for (const write of this.clipboard.feed(action.bytes)) {
           // Only the clipboard selection; primary and secondary have no
           // browser equivalent.
@@ -653,7 +666,8 @@ class Mount {
             this.post({ type: "clipboard", mount: this.id, text: write.text });
           }
         }
-        this.paintTimer ??= setTimeout(() => this.paint(), PAINT_MS);
+        this.paintPending = true;
+        if (this.visible && !this.frameInFlight) this.paintTimer ??= setTimeout(() => this.paint(), PAINT_MS);
         break;
       case "resized":
         // Another client's size, while this page kept its focus (the user
@@ -716,14 +730,24 @@ class Mount {
   }
 
   repaint(): void {
-    const term = this.attachment?.term();
-    if (!term) return;
-    // Switching the render state to a fresh terminal makes the next
-    // update full; so does a resize. A full repaint of the same terminal
-    // comes from a clean render state.
-    this.render.free();
-    this.render = new RenderState(this.hub.engine);
+    this.fullNext = true;
     this.paint();
+  }
+
+  visibility(visible: boolean): void {
+    if (this.visible === visible) return;
+    this.visible = visible;
+    if (visible) this.repaint();
+    else if (this.paintTimer !== undefined) {
+      clearTimeout(this.paintTimer);
+      this.paintTimer = undefined;
+    }
+  }
+
+  painted(): void {
+    if (!this.frameInFlight) return;
+    this.frameInFlight = false;
+    if (this.paintPending) this.paint();
   }
 
   private paint(): void {
@@ -731,10 +755,21 @@ class Mount {
       clearTimeout(this.paintTimer);
       this.paintTimer = undefined;
     }
+    this.paintPending = true;
     const term = this.attachment?.term();
-    if (!term || this.disposed) return;
-    this.post({ type: "frame", mount: this.id, frame: this.render.update(term) });
+    if (!term || this.disposed || !this.visible || this.frameInFlight) return;
+    if (this.fullNext) {
+      this.render.free();
+      this.render = new RenderState(this.hub.engine);
+      this.fullNext = false;
+    }
+    const frame = this.render.updatePacked(term);
+    // Clean only the captured rows. While this frame is in flight, no
+    // extraction runs, so subsequent changes accumulate in the engine.
     this.render.clean();
+    this.paintPending = false;
+    this.frameInFlight = true;
+    this.post({ type: "frame", mount: this.id, frame }, { transfer: frame.lines.map((row) => row.cells.data.buffer) });
     // A switch to the alternate screen or a full reset took the selection.
     if (this.selected && !term.selected) this.unselected();
   }
@@ -1019,7 +1054,7 @@ function describe(exit: Exit): string {
 /** Serves a page's `connect` on `port`: the worker module the page starts
  * calls `runWorker(self)`. */
 export function runWorker(port: WorkerPort): void {
-  const hub = new Hub((message) => port.postMessage(message));
+  const hub = new Hub((message, options) => port.postMessage(message, options));
   port.onmessage = (e) => {
     const message = e.data;
     switch (message.type) {
@@ -1073,6 +1108,12 @@ export function runWorker(port: WorkerPort): void {
         break;
       case "focus":
         mount.focus(message.focused);
+        break;
+      case "visibility":
+        mount.visibility(message.visible);
+        break;
+      case "painted":
+        mount.painted();
         break;
       case "repaint":
         mount.repaint();
