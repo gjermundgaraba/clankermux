@@ -11,6 +11,7 @@ pub mod pty;
 mod read;
 mod records;
 mod registry;
+mod retained;
 pub mod session;
 pub mod sizing;
 mod stream;

@@ -146,17 +146,43 @@ def step (st : Sizing) (op : Op) : Sizing × Json :=
 
 end Size
 
+namespace Events
+
+open Clankermux.Events
+
+inductive Op where
+  /-- An event whose frame has `size` bytes, observed as `oldest` and
+  `latest`. -/
+  | event (size : Nat)
+  /-- `subscribe {after}`: `"ahead"` when `after` is above the latest,
+  `null` for a gap, else the replayed `size` and `seq` of each event. -/
+  | subscribe (after : Nat)
+  deriving FromJson
+
+def step (l : Limits) (log : List Nat) : Op → List Nat × Json
+  | .event size => let log := log ++ [size]; (log, toJson (oldest l log, latest log))
+  | .subscribe after =>
+    let seen := match replay l log after with
+      | .ahead => toJson "ahead"
+      | .gap => Json.null
+      | .events evs => toJson evs
+    (log, seen)
+
+end Events
+
 /-- A model and its operations. -/
 inductive Case where
   | attention (max : Nat) (ops : List Attention.Op)
   | stream (ring markers : Nat) (ops : List Stream.Op)
   | size (size : Size.Dims) (ops : List Size.Op)
+  | events (events bytes : Nat) (ops : List Events.Op)
   deriving FromJson
 
 def Case.run : Case → Json
   | .attention max ops => _root_.run Attention.empty (Attention.step max) ops
   | .stream ring markers ops => _root_.run ⟨⟨[], ring, markers⟩, ⟨0, 0⟩⟩ Stream.step ops
   | .size d ops => _root_.run (Size.new d) Size.step ops
+  | .events n bytes ops => _root_.run [] (Events.step ⟨n, bytes⟩) ops
 
 def answer (line : String) : String :=
   match Json.parse line >>= fromJson? with

@@ -1,6 +1,6 @@
 //! All sessions and the subscribers to their events.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
@@ -24,6 +24,7 @@ use crate::connection::{Writer, reply};
 use crate::park;
 use crate::pty;
 use crate::records::Records;
+use crate::retained::{Replay, Retained};
 use crate::session::{
     Body, Effects, InputQueue, Live, Parked, SNAPSHOT_RETRY, Session, Shared, blocking, check_size,
     default_color, now, snapshot_with_retry,
@@ -102,23 +103,10 @@ pub struct Registry {
     catalog: OnceLock<proto::catalog::Catalog>,
 }
 
-#[derive(Default)]
 struct State {
     sessions: BTreeMap<String, Shared>,
     subscribers: Vec<Writer>,
-    /// The `seq` of the latest event.
-    seq: u64,
-    /// The latest events as sent, oldest first, for `subscribe {after}`.
-    retained: VecDeque<(u64, Vec<u8>)>,
-    retained_bytes: usize,
-}
-
-impl State {
-    /// `oldest` and `latest` of the `subscribe` reply.
-    fn cursor(&self) -> (u64, u64) {
-        let oldest = self.retained.front().map_or(self.seq + 1, |(seq, _)| *seq);
-        (oldest, self.seq)
-    }
+    events: Retained,
 }
 
 impl Registry {
@@ -147,10 +135,18 @@ impl Registry {
                 err => io::Error::from(err),
             },
         )?;
+        let state = State {
+            sessions: BTreeMap::new(),
+            subscribers: Vec::new(),
+            events: Retained::new(
+                config.limits.events,
+                RETAINED_FRAMES * config.limits.max_frame,
+            ),
+        };
         let registry = Arc::new(Registry {
             config,
             incarnation: uuid::Uuid::new_v4().to_string(),
-            state: Mutex::default(),
+            state: Mutex::new(state),
             stopping: AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             attachments: TaskTracker::new(),
@@ -404,7 +400,7 @@ impl Registry {
         first: bool,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
-        let (oldest, latest) = state.cursor();
+        let (oldest, latest) = state.events.cursor();
         let (result, replay) = match (params.after, params.incarnation) {
             (None, None) => {
                 let page = self.page_of(&state, None);
@@ -417,26 +413,30 @@ impl Registry {
                 };
                 (Ok(subscribed), None)
             }
+            (Some(_), Some(_)) if !first => (
+                Err((ErrorCode::InvalidRequest, "already subscribed".into())),
+                None,
+            ),
             (Some(after), Some(incarnation)) => {
-                let same = incarnation == self.incarnation;
-                if !first {
-                    (
-                        Err((ErrorCode::InvalidRequest, "already subscribed".into())),
-                        None,
-                    )
-                } else if same && after > latest {
-                    let message = format!("after {after} is above the latest event, {latest}");
-                    (Err((ErrorCode::InvalidRequest, message)), None)
+                let replay = if incarnation == self.incarnation {
+                    state.events.replay(after)
                 } else {
-                    let gap = !same || after + 1 < oldest;
-                    let subscribed = Subscribed {
-                        sessions: None,
-                        next: None,
-                        oldest,
-                        latest,
-                        gap: Some(gap),
-                    };
-                    (Ok(subscribed), (!gap).then_some(after))
+                    Replay::Gap
+                };
+                let subscribed = |gap| Subscribed {
+                    sessions: None,
+                    next: None,
+                    oldest,
+                    latest,
+                    gap: Some(gap),
+                };
+                match replay {
+                    Replay::Ahead => {
+                        let message = format!("after {after} is above the latest event, {latest}");
+                        (Err((ErrorCode::InvalidRequest, message)), None)
+                    }
+                    Replay::Gap => (Ok(subscribed(true)), None),
+                    Replay::Events(events) => (Ok(subscribed(false)), Some(events)),
                 }
             }
             _ => {
@@ -449,9 +449,9 @@ impl Registry {
         if !ok || !first {
             return false;
         }
-        if let Some(after) = replay {
-            for (_, bytes) in state.retained.iter().filter(|(seq, _)| *seq > after) {
-                if !writer.send(bytes.clone()) {
+        if let Some(events) = replay {
+            for (_, frame) in events {
+                if !writer.send(frame.to_vec()) {
                     return false;
                 }
             }
@@ -500,21 +500,10 @@ impl Registry {
     /// within what a connection may queue.
     pub fn emit(&self, event: Event) {
         let mut state = self.state.lock().unwrap();
-        state.seq += 1;
-        let seq = state.seq;
-        let bytes = encode_json_frame(FrameType::Event, 0, &Numbered { seq, event });
-        state.subscribers.retain(|w| w.send(bytes.clone()));
-        state.retained_bytes += bytes.len();
-        state.retained.push_back((seq, bytes));
-        let limits = &self.config.limits;
-        while state.retained.len() as u64 > limits.events
-            || state.retained_bytes as u64 > RETAINED_FRAMES * limits.max_frame
-        {
-            let Some((_, dropped)) = state.retained.pop_front() else {
-                break;
-            };
-            state.retained_bytes -= dropped.len();
-        }
+        let seq = state.events.next_seq();
+        let frame = encode_json_frame(FrameType::Event, 0, &Numbered { seq, event });
+        state.subscribers.retain(|w| w.send(frame.clone()));
+        state.events.retain(frame);
     }
 
     pub fn emit_all(&self, events: Vec<Event>) {

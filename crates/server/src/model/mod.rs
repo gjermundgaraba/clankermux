@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::Value;
 
 mod attention;
+mod events;
 mod size;
 mod stream;
 
