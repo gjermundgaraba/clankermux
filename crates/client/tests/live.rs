@@ -7,7 +7,6 @@ use client::{Action, Attachment, Connection, Frame, connection::hello};
 use proto::*;
 use serde_json::json;
 use testkit::Server;
-use tokio::sync::mpsc;
 
 /// A test's whole wait for a condition.
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -40,7 +39,7 @@ fn text(a: &mut Attachment) -> String {
 /// Feeds frames until `done` holds, returning every action.
 async fn drive(
     a: &mut Attachment,
-    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    rx: &mut client::Receiver<Frame>,
     mut done: impl FnMut(&mut Attachment, &[Action]) -> bool,
 ) -> Vec<Action> {
     let mut all = Vec::new();
@@ -206,4 +205,72 @@ async fn bootstrap_stream_and_resume() {
         Err(client::Error::Server(e)) if e.code == ErrorCode::ProtocolError
     ));
     assert!(conn.events().recv().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unpolled_attachment_is_bounded_and_recovers_while_another_keeps_up() {
+    let server = start();
+    let conn = connect(&server).await;
+    let session: Session = conn
+        .call("create", json!({"argv": ["/bin/sleep", "60"]}))
+        .await
+        .unwrap();
+    let open = Open {
+        session: session.id.clone(),
+        read_only: true,
+        viewport: None,
+        profile: None,
+        resume: None,
+    };
+    let mut slow = conn.open(1, &open).unwrap();
+    let mut a = Attachment::new();
+    a.open_on(&conn.welcome);
+    drive(&mut a, &mut slow, |a, _| a.resume().is_some()).await;
+    let mut fast = conn.open(2, &open).unwrap();
+    while fast.recv().await.unwrap().header.frame_type != FrameType::SnapshotEnd {}
+    let shared = server.registry.get(&session.id).unwrap();
+    let chunk = vec![b'x'; 64 * 1024];
+    let mut received = 0;
+    for _ in 0..100 {
+        shared.lock().unwrap().output(&chunk);
+        let end = received + chunk.len();
+        while received < end {
+            let frame = tokio::time::timeout(DEADLINE, fast.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.header.frame_type, FrameType::Output);
+            let (offset, bytes) = parse_output(&frame.payload).unwrap();
+            assert_eq!(offset, received as u64);
+            assert!(bytes.iter().all(|&b| b == b'x'));
+            received += bytes.len();
+        }
+    }
+    assert!(conn.ended().is_none());
+    conn.request("inspect", json!({"session": session.id}))
+        .await
+        .unwrap();
+    let mut held = 0;
+    let mut lost = false;
+    while let Some(frame) = tokio::time::timeout(DEADLINE, slow.recv()).await.unwrap() {
+        for action in a.handle(frame).unwrap() {
+            match action {
+                Action::Output(bytes) => held += bytes.len(),
+                Action::Error(error) => {
+                    assert_eq!(error.code, ErrorCode::TooSlow);
+                    lost = true;
+                }
+                other => panic!("unexpected action: {other:?}"),
+            }
+        }
+    }
+    assert!(lost);
+    assert!(held <= 4 * 1024 * 1024, "queued {held} bytes");
+    assert!(a.ended() && a.resume().is_none());
+    let mut fresh = conn.open(3, &open).unwrap();
+    a.open_on(&conn.welcome);
+    drive(&mut a, &mut fresh, |a, _| a.resume().is_some()).await;
+    assert_eq!(a.resume().unwrap().offset, received as u64);
+    conn.send(FrameType::Close, 2, &[]).unwrap();
+    conn.send(FrameType::Close, 3, &[]).unwrap();
 }

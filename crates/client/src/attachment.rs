@@ -14,6 +14,13 @@ use crate::connection::{Error, Frame};
 /// Payloads and frame overhead held behind a bootstrap's first marker.
 const MAX_HELD_BYTES: usize = 4 * 1024 * 1024;
 
+pub(crate) fn keeps_attachment(code: proto::ErrorCode) -> bool {
+    matches!(
+        code,
+        proto::ErrorCode::ReadOnly | proto::ErrorCode::NotRunning | proto::ErrorCode::InputOverflow
+    )
+}
+
 /// What a client does in response to frames.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -262,12 +269,7 @@ impl<H: Handler + Default> Attachment<H> {
             }
             FrameType::Error => {
                 let error: ErrorMessage = frame.json()?;
-                if !matches!(
-                    error.code,
-                    proto::ErrorCode::ReadOnly
-                        | proto::ErrorCode::NotRunning
-                        | proto::ErrorCode::InputOverflow
-                ) {
+                if !keeps_attachment(error.code) {
                     self.end();
                 }
                 actions.push(Action::Error(error));
