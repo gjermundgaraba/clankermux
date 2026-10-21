@@ -14,6 +14,12 @@ check-rust:
 check-web: wasm fixtures
     cd web && pnpm install --frozen-lockfile && pnpm -r typecheck && pnpm -r test && pnpm -r build
 
+# The Lean proofs, then the server's code against the Lean models; lake
+# from elan's default place unless it is on PATH.
+lean:
+    cd lean && PATH="$PATH:$HOME/.elan/bin" lake build
+    PROPTEST_CASES=2000 CLANKERMUX_MODEL={{justfile_directory()}}/lean/.lake/build/bin/model cargo test -p server --lib model -- --ignored
+
 # Build ghostty-vt.wasm from the vendored tree.
 wasm:
     scripts/build-wasm.sh

@@ -9,12 +9,14 @@ A terminal multiplexer server with CLI and browser clients; the wire protocol is
 | [mise](https://mise.jdx.dev) | installs zig 0.16 and just from `mise.toml` (`mise install`) |
 | Rust | 1.98 |
 | pnpm | 12 (`web/package.json`), Node 24+ |
+| [elan](https://github.com/leanprover/elan) | for `just lean`; installs the Lean in `lean/lean-toolchain` |
 
 ## Commands
 
 | Command | Does |
 | --- | --- |
 | `just check` | fmt, bindings, PROTOCOL.md's generated tables, clippy, Rust and web tests (the web package in the installed Chrome among them; `CHROME` names another), web builds; required for every commit |
+| `just lean` | checks the proofs in `lean/` and runs the server's code against the Lean models; not part of `just check`, CI runs it on Linux |
 | `just protocol` | renders PROTOCOL.md's tables (between `generated` marks) from the protocol types in `crates/proto` |
 | `just release-build` | `target/release/clankermux` |
 | `just dev-serve` | release server: state and socket in `target/dev/`, `wss://127.0.0.1:7438/` with a self-signed certificate, origins `http://app.clankerspace-dev.localhost:10094` and `http://127.0.0.1:8787` |

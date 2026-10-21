@@ -24,3 +24,13 @@ jobs:
           node-version: 24
       - uses: Swatinem/rust-cache@v2
       - run: just check
+      # The Lean proofs and the server against the models; once is enough.
+      - if: matrix.os == 'ubuntu-latest'
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: elan-${{ hashFiles('lean/lean-toolchain') }}
+      - if: matrix.os == 'ubuntu-latest'
+        run: |
+          [ -x ~/.elan/bin/elan ] || curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          just lean

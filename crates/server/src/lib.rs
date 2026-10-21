@@ -4,6 +4,8 @@ mod attach;
 mod commands;
 mod connection;
 mod control;
+#[cfg(test)]
+mod model;
 pub mod park;
 pub mod pty;
 mod read;

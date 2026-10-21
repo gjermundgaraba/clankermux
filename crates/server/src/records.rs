@@ -22,7 +22,7 @@ pub struct Change {
 }
 
 /// A record's state as the protocol names it; `clear` sets no record.
-const fn state_name(state: ProgramStatusState) -> &'static str {
+pub(crate) const fn state_name(state: ProgramStatusState) -> &'static str {
     match state {
         ProgramStatusState::Idle => "idle",
         ProgramStatusState::Working => "working",

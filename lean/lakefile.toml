@@ -1,0 +1,11 @@
+name = "clankermux"
+defaultTargets = ["Clankermux", "model"]
+# A `sorry` is only a warning. Unused simp arguments are noise in proofs.
+leanOptions = { warningAsError = true, linter = { unusedSimpArgs = false } }
+
+[[lean_lib]]
+name = "Clankermux"
+
+[[lean_exe]]
+name = "model"
+root = "Main"
