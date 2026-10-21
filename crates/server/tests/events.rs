@@ -707,3 +707,40 @@ async fn a_removal_closes_its_attachments_as_removed() {
     .await;
     assert_eq!(reason, "removed");
 }
+
+#[tokio::test]
+async fn empty_effects_still_deliver_answers_and_announce_metadata_changes() {
+    use server::session::InputQueue;
+
+    let server = start(fast_limits());
+    let mut c = client(&server).await;
+    let session = c.create(json!({"argv": ["/bin/sleep", "60"]})).await;
+    let shared = server.registry.get(&session.id).unwrap();
+    let mut s = shared.lock().unwrap();
+    let (input, mut answers) = InputQueue::new(1024);
+    let original_input = std::mem::replace(&mut s.live_mut().unwrap().input, input);
+    s.take_events();
+    s.output(b"ordinary output");
+    assert!(s.take_events().is_empty());
+    s.flush_effects();
+    assert!(s.take_events().is_empty());
+    s.output(b"\x1b[5n");
+    assert_eq!(answers.try_recv().unwrap().0, b"\x1b[0n");
+    assert!(s.take_events().is_empty());
+    for (bytes, title, pwd) in [
+        (&b"\x1b]2;title\x07"[..], "title", ""),
+        (&b"\x1b]7;file:///tmp/work\x07"[..], "title", "/tmp/work"),
+        (&b"\x1bc"[..], "", ""),
+    ] {
+        s.output(bytes);
+        let events = s.take_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::SessionChanged { session }
+                if session.title == title && session.pwd == pwd)),
+            "{events:?}"
+        );
+    }
+    s.live_mut().unwrap().input = original_input;
+}

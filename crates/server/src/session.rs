@@ -655,6 +655,9 @@ impl Session {
         if !answers.is_empty() && live.input.push(answers).is_none() {
             tracing::warn!(session = self.id, "input queue full; query answers dropped");
         }
+        if notices.is_empty() && !changed {
+            return;
+        }
         let now = now();
         let id = self.id.clone();
         for (offset, notice) in notices {
