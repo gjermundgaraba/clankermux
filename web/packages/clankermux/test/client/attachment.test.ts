@@ -149,3 +149,27 @@ test("a gap discards and errors classify", () => {
   expect(a.closed()).toBe(true);
   expect(() => a.handle(json(FrameType.Welcome, {}))).toThrow(/on an attachment/);
 });
+
+test("held bootstrap overflow ends without a resume and allows a fresh open", () => {
+  const bytes = snapshotOf("before");
+  const ready = readyEnd(bytes)!;
+  const a = new Attachment(engine);
+  a.openOn(welcome("inc"));
+  a.handle(attached(100, 0, bytes));
+  a.handle(frame(FrameType.Snapshot, bytes.subarray(0, ready)));
+  a.handle(json(FrameType.Resized, { seq: 1, offset: 100, cols: 20, rows: 5 }));
+  const chunk = "x".repeat(64 * 1024);
+  for (let i = 0; i < 63; i++) expect(a.handle(outputFrame(100 + i * chunk.length, chunk))).toEqual([]);
+  expect(() => a.handle(outputFrame(100 + 63 * chunk.length, chunk))).toThrow(expect.objectContaining({ kind: "desync" }));
+  expect(a.ended()).toBe(true);
+  expect(a.closed()).toBe(false);
+  expect(a.resume()).toBeUndefined();
+  expect(a.term()!.cols).toBe(10);
+  expect(a.term()!.formatPlain().trimEnd()).toBe("before");
+  a.openOn(welcome("inc"));
+  a.handle(attached(200, 1, bytes));
+  a.handle(frame(FrameType.Snapshot, bytes));
+  a.handle(frame(FrameType.SnapshotEnd, new Uint8Array()));
+  expect(a.resume()!.offset).toBe(200);
+  a.free();
+});

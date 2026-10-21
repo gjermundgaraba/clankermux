@@ -212,6 +212,8 @@ struct Cursor {
 struct PendingSnapshot {
     bytes: Vec<u8>,
     sent: usize,
+    /// Live bytes sent since history last got a turn.
+    live_bytes: usize,
     /// The bootstrap followed a gap; another gap before it completes is
     /// `too_slow`.
     after_gap: bool,
@@ -359,6 +361,14 @@ impl Task {
                     ending = self.close.recv() => return ending,
                     _ = self.writer.drained() => {}
                 }
+                continue;
+            }
+            if self
+                .snapshot
+                .as_ref()
+                .is_some_and(|p| p.live_bytes >= PULL_BUDGET)
+            {
+                self.send_snapshot_chunk();
                 continue;
             }
             match self.pull() {
@@ -531,6 +541,7 @@ impl Task {
         self.snapshot = Some(PendingSnapshot {
             bytes,
             sent: ready,
+            live_bytes: 0,
             after_gap: gap_from.is_some(),
         });
         Ok(())
@@ -543,9 +554,10 @@ impl Task {
             return false;
         };
         let total = pending.bytes.len();
-        let end = total.min(pending.sent + self.max_frame);
+        let end = total.min(pending.sent + self.max_frame.min(PULL_BUDGET));
         let chunk = pending.bytes[pending.sent..end].to_vec();
         pending.sent = end;
+        pending.live_bytes = 0;
         let last = end == total;
         if last {
             self.snapshot = None;
@@ -645,6 +657,9 @@ impl Task {
             }
             if budget < PULL_BUDGET {
                 self.last_output = Some(Instant::now());
+            }
+            if let Some(pending) = &mut self.snapshot {
+                pending.live_bytes += PULL_BUDGET - budget;
             }
             self.done = s.status() != Status::Running && self.cursor.marker == stream.latest_seq();
         }
