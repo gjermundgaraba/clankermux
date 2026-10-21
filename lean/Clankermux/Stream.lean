@@ -93,10 +93,11 @@ def servedRetained (s : Stream) (c : Cursor) : List Event :=
   (s.log.filter (retained s)).filter (after c)
 
 /-- Whether the server can serve a cursor: its offset lies within the
-retained stream, and every marker above its marker is retained. Else a
-slow attachment gets `GAP` and a resume a snapshot. -/
+retained stream, its marker is at most the latest, and every marker
+above it is retained. Else a slow attachment gets `GAP` and a resume a
+snapshot. -/
 def retains (s : Stream) (c : Cursor) : Bool :=
-  start s ≤ c.offset && c.offset ≤ size s.log &&
+  start s ≤ c.offset && c.offset ≤ size s.log && c.marker ≤ latest s.log &&
     (markers s.log).all fun m => !(c.marker < m.1) || (retainedMarkers s).contains m
 
 /-- The latest marker at or before an offset, as a cursor there reflects
@@ -185,7 +186,7 @@ theorem servedRetained_eq (s : Stream) (c : Cursor) (h : retains s c) :
     servedRetained s c = served s.log c := by
   unfold retains at h
   simp only [Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true] at h
-  obtain ⟨⟨hstart, -⟩, hm⟩ := h
+  obtain ⟨⟨⟨hstart, -⟩, -⟩, hm⟩ := h
   simp only [servedRetained, served, List.filter_filter]
   apply List.filter_congr
   intro e he
@@ -202,12 +203,13 @@ theorem servedRetained_eq (s : Stream) (c : Cursor) (h : retains s c) :
 
 /-- When it does not, something the cursor needs is gone. -/
 theorem not_retains (s : Stream) (c : Cursor) (hw : Wf s.log) (hc : c.offset ≤ size s.log)
-    (h : retains s c = false) : ∃ e ∈ served s.log c, retained s e = false := by
+    (hl : c.marker ≤ latest s.log) (h : retains s c = false) :
+    ∃ e ∈ served s.log c, retained s e = false := by
   unfold retains at h
   by_cases h1 : start s ≤ c.offset
   · have hall : (markers s.log).all
         (fun m => !decide (c.marker < m.1) || (retainedMarkers s).contains m) = false := by
-      simpa [h1, hc] using h
+      simpa [h1, hc, hl] using h
     obtain ⟨m, hm, hf⟩ := List.all_eq_false.mp hall
     obtain ⟨e, he, hfe⟩ := List.mem_filterMap.mp hm
     cases e with

@@ -118,12 +118,18 @@ async fn open_checks_in_order() {
     .await;
     assert_eq!(c.expect_error(4).await, ErrorCode::InvalidRequest);
 
+    // A marker above the latest is a cursor the stream cannot serve.
     c.open(
         5,
         json!({"session": session.id, "resume": {"incarnation": welcome_incarnation, "offset": 0, "marker": 99}}),
     )
     .await;
-    assert_eq!(c.expect_error(5).await, ErrorCode::InvalidRequest);
+    let attached = c.attached(5).await;
+    assert_eq!(attached.mode, AttachMode::Snapshot);
+    let boot = c.ready_after(5, attached).await;
+    c.bootstrap_rest(5, boot).await;
+    c.send(FrameType::Close, 5, b"").await;
+    assert_eq!(c.expect_closed(5).await, ClosedReason::Closed);
 
     let mut no_engine = Client::connect(&server).await;
     no_engine.hello_with(None).await;

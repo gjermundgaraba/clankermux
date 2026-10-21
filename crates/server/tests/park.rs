@@ -618,14 +618,6 @@ async fn loading_keeps_the_newest_complete_generation_only() {
         "the working record is dropped on load"
     );
 
-    // A resume marker above the parked one is invalid, as on a live session.
-    c.open(
-        1,
-        json!({"session": id, "viewport": {"cols": 80, "rows": 24},
-        "resume": {"incarnation": server.registry.incarnation, "offset": 7, "marker": 3}}),
-    )
-    .await;
-    assert_eq!(c.expect_error(1).await, ErrorCode::InvalidRequest);
     // The fixture's snapshot is not one: the attach fails and is gone.
     c.open(
         1,

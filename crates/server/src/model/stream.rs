@@ -13,7 +13,7 @@ enum Op {
     Marker,
     Serve,
     /// A resume `back` bytes before one past the end, with a marker
-    /// `below` under the next `seq`, at least 1.
+    /// `below` under the next `seq`.
     Resume {
         back: u64,
         below: u64,
@@ -32,7 +32,7 @@ fn op() -> impl Strategy<Value = Op> {
         4 => prop::collection::vec(any::<u8>(), 1..6).prop_map(Op::Bytes),
         2 => Just(Op::Marker),
         3 => Just(Op::Serve),
-        1 => (0u64..16, 1u64..6).prop_map(|(back, below)| Op::Resume { back, below }),
+        1 => (0u64..16, 0u64..5).prop_map(|(back, below)| Op::Resume { back, below }),
         1 => (0u64..16).prop_map(|back| Op::SeqAt { back }),
         1 => (0u64..16, 0usize..6).prop_map(|(back, max)| Op::Read { back, max }),
     ]

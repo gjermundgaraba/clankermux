@@ -71,25 +71,23 @@ async fn events_are_numbered_and_replayed_after_a_cursor() {
         .await;
     assert_eq!(d.numbered().await.seq, 5);
 
-    // A cursor above the latest, half a cursor, and a second subscription
-    // with one are refused; a second plain one replies with a page.
-    let mut e = client(&server).await;
+    // Half a cursor is a gap; a second subscription with a cursor or
+    // half of one is refused, a second plain one replies with a page.
+    for params in [json!({"after": 1}), json!({"incarnation": incarnation})] {
+        let mut e = client(&server).await;
+        let half: Subscribed = from(e.ok("subscribe", params.clone()).await);
+        assert_eq!((half.sessions, half.gap), (None, Some(true)), "{params}");
+    }
     for params in [
-        json!({"after": 99, "incarnation": incarnation}),
-        json!({"after": 1}),
+        json!({"after": 1, "incarnation": incarnation}),
         json!({"incarnation": incarnation}),
     ] {
         assert_eq!(
-            e.err("subscribe", params.clone()).await,
+            d.err("subscribe", params.clone()).await,
             ErrorCode::InvalidRequest,
             "{params}"
         );
     }
-    assert_eq!(
-        d.err("subscribe", json!({"after": 1, "incarnation": incarnation}))
-            .await,
-        ErrorCode::InvalidRequest
-    );
     let again: Subscribed = from(d.ok("subscribe", json!({})).await);
     assert_eq!(
         (again.latest, again.sessions.map(|s| s.len())),
@@ -102,7 +100,7 @@ async fn events_are_numbered_and_replayed_after_a_cursor() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cursor_before_the_retained_events_or_from_another_server_is_a_gap() {
+async fn a_cursor_outside_the_retained_events_or_from_another_server_is_a_gap() {
     let server = start(Limits {
         events: 3,
         ..fast_limits()
@@ -133,6 +131,15 @@ async fn a_cursor_before_the_retained_events_or_from_another_server_is_a_gap() {
             .await,
     );
     assert_eq!(reply.gap, Some(true));
+    let mut a = client(&server).await;
+    let reply: Subscribed = from(
+        a.ok(
+            "subscribe",
+            json!({"after": 99, "incarnation": incarnation}),
+        )
+        .await,
+    );
+    assert_eq!(reply.gap, Some(true), "above the latest");
 
     c.ok("label", json!({"session": session.id, "label": "6"}))
         .await;
@@ -140,6 +147,7 @@ async fn a_cursor_before_the_retained_events_or_from_another_server_is_a_gap() {
     // connection serves on.
     assert_eq!(b.numbered().await.seq, 7);
     assert_eq!(o.numbered().await.seq, 7);
+    assert_eq!(a.numbered().await.seq, 7);
     for seq in 4..=7 {
         assert_eq!(r.numbered().await.seq, seq);
     }

@@ -308,20 +308,19 @@ processed and answered.
   of the latest event (0 before the first). With `{}` as `params` the
   reply also holds the first page of current sessions, as `sessions` and
   `next?` of a Page, and events are sent only for changes after the
-  moment of subscription; later pages come from `list`. With `after` and
-  `incarnation`, required together, the reply holds `gap` instead, and
-  the retained events with `seq` above `after` follow it, in order,
-  before any later event. `after` is the `seq` of the last event the
-  client applied, or `latest` of a reply; `incarnation` the `WELCOME`'s
-  it was counted in. `gap` is true when `incarnation` is not the
-  server's (`seq` counts from 1 again on every start) or when events
-  after `after` are no longer retained (`after + 1 < oldest`); then no
-  event is replayed, later ones follow as usual, and the client pages
-  `list` again for the current state. An `after` above
-  `latest` with the server's `incarnation` is `invalid_request`. A
+  moment of subscription; later pages come from `list`. With `after` or
+  `incarnation` the reply holds `gap` instead, and the retained events
+  with `seq` above `after` follow it, in order, before any later event.
+  `after` is the `seq` of the last event the client applied, or `latest`
+  of a reply; `incarnation` the `WELCOME`'s it was counted in. `gap` is
+  true when one of the two is missing, when `incarnation` is not the
+  server's (`seq` counts from 1 again on every start), when `after` is
+  above `latest`, or when events after `after` are no longer retained
+  (`after + 1 < oldest`); then no event is replayed, later ones follow
+  as usual, and the client pages `list` again for the current state. A
   connection subscribes once: a later `subscribe` with `{}` returns
   Subscribed with the first page and changes nothing, one with `after`
-  is `invalid_request`.
+  or `incarnation` is `invalid_request`.
 - `describe` answers the catalog of the protocol this server speaks:
   each method with its class, the JSON Schemas (2020-12) of its `params`
   and `result`, the codes its `ERROR` can carry and examples, then the
@@ -693,11 +692,10 @@ before the session check.
 <!-- end generated -->
 
 `resume` is chosen when `OPEN.resume.incarnation` equals the server's
-incarnation, `OPEN.resume.offset` lies within the retained stream, and
-every marker with `seq` above `OPEN.resume.marker` is retained. Otherwise
-`snapshot`. Under the server's incarnation, a `marker` above the session's
-latest `seq` fails with `invalid_request`; a cursor from another
-incarnation is not compared.
+incarnation, `OPEN.resume.offset` lies within the retained stream,
+`OPEN.resume.marker` is at most the session's latest `seq`, and every
+marker with `seq` above it is retained. Otherwise `snapshot`; a cursor
+from another incarnation is not compared.
 
 ### Bootstrap, mode `snapshot`
 
@@ -1040,7 +1038,7 @@ an attachment channel it ends the attachment, except `read_only`,
 | -------------------- | ------- |
 | `protocol_error`     | A connection error under Framing; the connection closes. |
 | `version_mismatch`   | `HELLO.version` is not 1; the connection closes. |
-| `invalid_request`    | Malformed payload, a field the protocol does not define, unknown method, a resume marker above the session's latest, a `subscribe` `after` above the latest event, `read` with `scrollback` and a scope other than `screen`, or `tail` from past the stream's end or with `max_bytes` 0. |
+| `invalid_request`    | Malformed payload, a field the protocol does not define, unknown method, `read` with `scrollback` and a scope other than `screen`, or `tail` from past the stream's end or with `max_bytes` 0. |
 | `limit_exceeded`     | `label`, `text` or `attachments` exceeded, or a snapshot failed. |
 | `no_such_session`    | No session has the id. |
 | `no_such_attachment` | `detach` named no open attachment of the session. |

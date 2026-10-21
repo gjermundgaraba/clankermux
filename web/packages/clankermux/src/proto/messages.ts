@@ -256,10 +256,9 @@ export type ErrorCode =
   /** `HELLO.version` is not 1; the connection closes. */
   | "version_mismatch"
   /**
-   * Malformed payload, a field the protocol does not define, unknown method, a
-   * resume marker above the session's latest, a `subscribe` `after` above the
-   * latest event, `read` with `scrollback` and a scope other than `screen`, or
-   * `tail` from past the stream's end or with `max_bytes` 0.
+   * Malformed payload, a field the protocol does not define, unknown method,
+   * `read` with `scrollback` and a scope other than `screen`, or `tail` from
+   * past the stream's end or with `max_bytes` 0.
    */
   | "invalid_request"
   /** `label`, `text` or `attachments` exceeded, or a snapshot failed. */
@@ -742,8 +741,8 @@ export interface StreamCursor {
 }
 
 /**
- * `subscribe`: `after` and `incarnation` together replay the events after
- * `after`; neither is the first page.
+ * `subscribe`: `after` and `incarnation` replay the events after `after`;
+ * neither is the first page, one alone a gap.
  */
 export interface SubscribeParams {
   /** The `seq` of the last event the client applied. */
@@ -752,19 +751,22 @@ export interface SubscribeParams {
   incarnation?: string;
 }
 
-/** The `subscribe` reply: the first page without `after`, `gap` with it. */
+/**
+ * The `subscribe` reply: the first page with neither `after` nor `incarnation`,
+ * `gap` with either.
+ */
 export interface Subscribed {
-  /** Without `after`: the first page of sessions. */
+  /** With neither: the first page of sessions. */
   sessions?: Session[];
-  /** Without `after`: as in Page. */
+  /** With neither: as in Page. */
   next?: string;
   /** The `seq` of the oldest event retained, `latest + 1` when none is. */
   oldest: number;
   /** The `seq` of the latest event, 0 before the first. */
   latest: number;
   /**
-   * With `after`: the events after it are not all retained, or `incarnation` is
-   * not the server's; none is replayed.
+   * With either: one is missing, `incarnation` is not the server's, or the
+   * events after `after` are not all retained; none is replayed.
    */
   gap?: boolean;
 }

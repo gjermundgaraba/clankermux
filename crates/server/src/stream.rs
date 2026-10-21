@@ -141,11 +141,13 @@ impl Stream {
         self.markers.iter().filter(move |m| m.seq > after)
     }
 
-    /// Whether the stream can serve `cursor`: its offset is retained, and
-    /// so is every marker above its marker.
+    /// Whether the stream can serve `cursor`: its offset is retained, its
+    /// marker is at most the latest, and every marker above it is
+    /// retained.
     pub fn retains(&self, cursor: Cursor) -> bool {
         self.start <= cursor.offset
             && cursor.offset <= self.offset()
+            && cursor.marker <= self.latest_seq
             && self.markers_retained_after(cursor.marker)
     }
 

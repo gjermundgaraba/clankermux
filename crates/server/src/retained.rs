@@ -13,16 +13,6 @@ pub struct Retained {
     max_bytes: u64,
 }
 
-/// A `subscribe {after}` in the server's incarnation.
-pub enum Replay<'a> {
-    /// `after` is above the latest event.
-    Ahead,
-    /// Events after `after` are no longer retained.
-    Gap,
-    /// The retained events above `after`, in order.
-    Events(Vec<(u64, &'a [u8])>),
-}
-
 impl Retained {
     /// Retains at most `max_events` events and `max_bytes` bytes of them.
     pub fn new(max_events: u64, max_bytes: u64) -> Self {
@@ -60,21 +50,20 @@ impl Retained {
         (oldest, self.seq)
     }
 
-    /// What `subscribe {after}` replays in this incarnation.
-    pub fn replay(&self, after: u64) -> Replay<'_> {
+    /// What `subscribe {after}` replays in this incarnation: the retained
+    /// events above `after`, in order, or `None`, a gap, when `after` is
+    /// above the latest or events after it are no longer retained.
+    pub fn replay(&self, after: u64) -> Option<Vec<(u64, &[u8])>> {
         let (oldest, latest) = self.cursor();
-        if after > latest {
-            Replay::Ahead
-        } else if after + 1 < oldest {
-            Replay::Gap
-        } else {
-            Replay::Events(
-                self.events
-                    .iter()
-                    .filter(|(seq, _)| *seq > after)
-                    .map(|(seq, frame)| (*seq, frame.as_slice()))
-                    .collect(),
-            )
+        if after > latest || after + 1 < oldest {
+            return None;
         }
+        Some(
+            self.events
+                .iter()
+                .filter(|(seq, _)| *seq > after)
+                .map(|(seq, frame)| (*seq, frame.as_slice()))
+                .collect(),
+        )
     }
 }

@@ -24,7 +24,7 @@ use crate::connection::{Writer, reply};
 use crate::park;
 use crate::pty;
 use crate::records::Records;
-use crate::retained::{Replay, Retained};
+use crate::retained::Retained;
 use crate::session::{
     Body, Effects, InputQueue, Live, Parked, SNAPSHOT_RETRY, Session, Shared, blocking, check_size,
     default_color, now, snapshot_with_retry,
@@ -413,35 +413,23 @@ impl Registry {
                 };
                 (Ok(subscribed), None)
             }
-            (Some(_), Some(_)) if !first => (
+            _ if !first => (
                 Err((ErrorCode::InvalidRequest, "already subscribed".into())),
                 None,
             ),
-            (Some(after), Some(incarnation)) => {
-                let replay = if incarnation == self.incarnation {
-                    state.events.replay(after)
-                } else {
-                    Replay::Gap
+            (after, incarnation) => {
+                let replay = match (after, incarnation) {
+                    (Some(after), Some(i)) if i == self.incarnation => state.events.replay(after),
+                    _ => None,
                 };
-                let subscribed = |gap| Subscribed {
+                let subscribed = Subscribed {
                     sessions: None,
                     next: None,
                     oldest,
                     latest,
-                    gap: Some(gap),
+                    gap: Some(replay.is_none()),
                 };
-                match replay {
-                    Replay::Ahead => {
-                        let message = format!("after {after} is above the latest event, {latest}");
-                        (Err((ErrorCode::InvalidRequest, message)), None)
-                    }
-                    Replay::Gap => (Ok(subscribed(true)), None),
-                    Replay::Events(events) => (Ok(subscribed(false)), Some(events)),
-                }
-            }
-            _ => {
-                let message = "after and incarnation go together".into();
-                (Err((ErrorCode::InvalidRequest, message)), None)
+                (Ok(subscribed), replay)
             }
         };
         let ok = result.is_ok();

@@ -5,7 +5,7 @@
 use proptest::prelude::*;
 use serde_json::{Value, json};
 
-use crate::retained::{Replay, Retained};
+use crate::retained::Retained;
 
 #[derive(Debug, Clone)]
 enum Op {
@@ -36,15 +36,11 @@ fn run(max_events: u64, max_bytes: u64, ops: &[Op]) -> (Value, Vec<Value>) {
             Op::Subscribe(back) => {
                 let (_, latest) = retained.cursor();
                 let after = (latest + 1).saturating_sub(back);
-                let replayed = match retained.replay(after) {
-                    Replay::Ahead => json!("ahead"),
-                    Replay::Gap => Value::Null,
-                    Replay::Events(events) => {
-                        let events = events.into_iter().map(|(seq, frame)| (frame.len(), seq));
-                        json!(events.collect::<Vec<_>>())
-                    }
-                };
-                (json!({"subscribe": {"after": after}}), replayed)
+                let replayed = retained.replay(after).map(|events| {
+                    let events = events.into_iter().map(|(seq, frame)| (frame.len(), seq));
+                    events.collect::<Vec<_>>()
+                });
+                (json!({"subscribe": {"after": after}}), json!(replayed))
             }
         };
         case.push(sent);

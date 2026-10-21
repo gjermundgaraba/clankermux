@@ -316,8 +316,7 @@ impl Task {
 
     async fn serve(&mut self, resume: Option<Resume>) -> End {
         match self.resume_cursor(resume) {
-            Err(end) => return end,
-            Ok(Some(cursor)) => {
+            Some(cursor) => {
                 let session = self.session.lock().unwrap().to_proto(false);
                 self.cursor = cursor;
                 self.send_json(
@@ -333,7 +332,7 @@ impl Task {
                     },
                 );
             }
-            Ok(None) => {
+            None => {
                 if let Err(end) = self.bootstrap(None).await {
                     return end;
                 }
@@ -403,33 +402,18 @@ impl Task {
     }
 
     /// The cursor to resume from, when `resume` qualifies.
-    fn resume_cursor(&self, resume: Option<Resume>) -> Result<Option<Cursor>, End> {
-        let Some(resume) = resume.filter(|r| r.incarnation == self.registry.incarnation) else {
-            return Ok(None);
-        };
+    fn resume_cursor(&self, resume: Option<Resume>) -> Option<Cursor> {
+        let resume = resume.filter(|r| r.incarnation == self.registry.incarnation)?;
         let s = self.session.lock().unwrap();
-        let above_latest = || {
-            Err(Some(Ending::Error(
-                ErrorCode::InvalidRequest,
-                "resume marker above the latest".into(),
-            )))
-        };
         // A parked session has no stream to resume on.
-        let live = match &s.body {
-            Body::Live(live) => live,
-            Body::Parked(parked) if resume.marker > parked.marker => {
-                return above_latest();
-            }
-            Body::Parked(_) => return Ok(None),
+        let Body::Live(live) = &s.body else {
+            return None;
         };
-        if resume.marker > live.stream.latest_seq() {
-            return above_latest();
-        }
         let cursor = Cursor {
             offset: resume.offset,
             marker: resume.marker,
         };
-        Ok(live.stream.retains(cursor).then_some(cursor))
+        live.stream.retains(cursor).then_some(cursor)
     }
 
     /// Takes a snapshot, retrying while the continuation limit is exceeded,

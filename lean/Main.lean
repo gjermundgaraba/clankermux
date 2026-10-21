@@ -154,19 +154,14 @@ inductive Op where
   /-- An event whose frame has `size` bytes, observed as `oldest` and
   `latest`. -/
   | event (size : Nat)
-  /-- `subscribe {after}`: `"ahead"` when `after` is above the latest,
-  `null` for a gap, else the replayed `size` and `seq` of each event. -/
+  /-- `subscribe {after}`: `null` for a gap, else the replayed `size`
+  and `seq` of each event. -/
   | subscribe (after : Nat)
   deriving FromJson
 
 def step (l : Limits) (log : List Nat) : Op → List Nat × Json
   | .event size => let log := log ++ [size]; (log, toJson (oldest l log, latest log))
-  | .subscribe after =>
-    let seen := match replay l log after with
-      | .ahead => toJson "ahead"
-      | .gap => Json.null
-      | .events evs => toJson evs
-    (log, seen)
+  | .subscribe after => (log, toJson (replay l log after))
 
 end Events
 

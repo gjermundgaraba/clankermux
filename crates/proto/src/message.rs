@@ -77,10 +77,8 @@ pub enum ErrorCode {
     /// `HELLO.version` is not 1; the connection closes.
     VersionMismatch,
     /// Malformed payload, a field the protocol does not define, unknown
-    /// method, a resume marker above the session's latest, a `subscribe`
-    /// `after` above the latest event, `read` with `scrollback` and a
-    /// scope other than `screen`, or `tail` from past the stream's end or
-    /// with `max_bytes` 0.
+    /// method, `read` with `scrollback` and a scope other than `screen`,
+    /// or `tail` from past the stream's end or with `max_bytes` 0.
     InvalidRequest,
     /// `label`, `text` or `attachments` exceeded, or a snapshot failed.
     LimitExceeded,
@@ -393,8 +391,8 @@ pub struct ListParams {
     pub after: Option<String>,
 }
 
-/// `subscribe`: `after` and `incarnation` together replay the events
-/// after `after`; neither is the first page.
+/// `subscribe`: `after` and `incarnation` replay the events after
+/// `after`; neither is the first page, one alone a gap.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubscribeParams {
@@ -406,21 +404,23 @@ pub struct SubscribeParams {
     pub incarnation: Option<String>,
 }
 
-/// The `subscribe` reply: the first page without `after`, `gap` with it.
+/// The `subscribe` reply: the first page with neither `after` nor
+/// `incarnation`, `gap` with either.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Subscribed {
-    /// Without `after`: the first page of sessions.
+    /// With neither: the first page of sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sessions: Option<Vec<Session>>,
-    /// Without `after`: as in Page.
+    /// With neither: as in Page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
     /// The `seq` of the oldest event retained, `latest + 1` when none is.
     pub oldest: u64,
     /// The `seq` of the latest event, 0 before the first.
     pub latest: u64,
-    /// With `after`: the events after it are not all retained, or
-    /// `incarnation` is not the server's; none is replayed.
+    /// With either: one is missing, `incarnation` is not the server's,
+    /// or the events after `after` are not all retained; none is
+    /// replayed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gap: Option<bool>,
 }
