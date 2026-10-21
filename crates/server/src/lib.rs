@@ -12,6 +12,7 @@ mod read;
 mod records;
 mod registry;
 pub mod session;
+pub mod sizing;
 mod stream;
 pub mod tailscale;
 pub mod tls;

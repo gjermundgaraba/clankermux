@@ -115,15 +115,48 @@ def step (a : Attached) : Op → Attached × Json
 
 end Stream
 
+namespace Size
+
+open Clankermux.Size
+
+deriving instance ToJson, FromJson for Policy
+deriving instance ToJson for Sizing
+
+inductive Op where
+  /-- An `OPEN`, with the viewport of a writable one. -/
+  | «open» (id : Nat) (viewport : Option Dims)
+  /-- A `VIEWPORT` recorded. -/
+  | viewport (id : Nat) (size : Dims)
+  /-- A report from attachment `id` applied, open or not. -/
+  | apply (id : Nat) (size : Dims)
+  | close (id : Nat)
+  | resize (size : Dims)
+  | policy (policy : Policy)
+  deriving FromJson
+
+def step (st : Sizing) (op : Op) : Sizing × Json :=
+  let st := match op with
+    | .open id viewport => openAttachment st id viewport
+    | .viewport id d => record st id d
+    | .apply id d => apply st (.attachment id) d
+    | .close id => close st id
+    | .resize d => resize st d
+    | .policy p => setPolicy st p
+  (st, toJson st)
+
+end Size
+
 /-- A model and its operations. -/
 inductive Case where
   | attention (max : Nat) (ops : List Attention.Op)
   | stream (ring markers : Nat) (ops : List Stream.Op)
+  | size (size : Size.Dims) (ops : List Size.Op)
   deriving FromJson
 
 def Case.run : Case → Json
   | .attention max ops => _root_.run Attention.empty (Attention.step max) ops
   | .stream ring markers ops => _root_.run ⟨⟨[], ring, markers⟩, ⟨0, 0⟩⟩ Stream.step ops
+  | .size d ops => _root_.run (Size.new d) Size.step ops
 
 def answer (line : String) : String :=
   match Json.parse line >>= fromJson? with

@@ -25,6 +25,7 @@ use crate::commands::Commands;
 use crate::park::ParkFile;
 use crate::records::Records;
 use crate::registry::{Fail, Registry};
+use crate::sizing::{Sizing, Source};
 use crate::stream::{MarkerKind, Stream};
 
 pub type Shared = Arc<Mutex<Session>>;
@@ -274,8 +275,6 @@ pub struct Attachment {
     pub id: u64,
     pub client: Peer,
     pub read_only: bool,
-    /// Its latest viewport report.
-    pub viewport: Option<Cells>,
     pub since: String,
     pub last_input: Option<String>,
     /// Tells the attachment to send `CLOSED` and end. Weak, so that the
@@ -287,24 +286,16 @@ pub struct Attachment {
 }
 
 impl Attachment {
-    fn to_proto(&self) -> AttachmentInfo {
+    fn to_proto(&self, viewport: Option<Cells>) -> AttachmentInfo {
         AttachmentInfo {
             channel: self.id,
             client: self.client.clone(),
             read_only: self.read_only,
-            viewport: self.viewport,
+            viewport,
             since: self.since.clone(),
             last_input: self.last_input.clone(),
         }
     }
-}
-
-/// Where a viewport report comes from.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    Attachment(u64),
-    /// `resize`, applied under every policy.
-    Resize,
 }
 
 /// A coalesced report waiting for the timer.
@@ -405,9 +396,7 @@ pub struct Session {
     pub commands_limit: usize,
     /// In the order they opened.
     pub attached: Vec<Attachment>,
-    pub size_policy: SizePolicy,
-    /// Under `latest`, the attachment whose report is current.
-    pub size_owner: Option<u64>,
+    pub sizing: Sizing,
     pub records: Records,
     pub commands: Commands,
     /// Events raised under the lock, emitted by whoever releases it.
@@ -458,8 +447,7 @@ impl Session {
             records_limit: limits.records as usize,
             commands_limit: limits.commands as usize,
             attached: Vec::new(),
-            size_policy: SizePolicy::Latest,
-            size_owner: None,
+            sizing: Sizing::new(SizePolicy::Latest),
             records: Records::default(),
             commands: Commands::default(),
             events: Vec::new(),
@@ -570,13 +558,17 @@ impl Session {
             exit: self.exit.clone(),
             offset,
             marker,
-            attachments: self.attached.iter().map(Attachment::to_proto).collect(),
+            attachments: self
+                .attached
+                .iter()
+                .map(|a| a.to_proto(self.sizing.viewport(a.id)))
+                .collect(),
             command: self.commands.current(),
             program_status: with_records.then(|| self.records.resolved()),
             attention: self.records.attention(),
             size: SizeInfo {
-                policy: self.size_policy,
-                owner: self.size_owner,
+                policy: self.sizing.policy(),
+                owner: self.sizing.owner(),
             },
         }
     }
@@ -825,34 +817,17 @@ impl Session {
     /// Records a writable attachment's viewport report; true when its
     /// recorded viewport changed.
     pub fn record_viewport(&mut self, id: u64, size: &Size) -> bool {
-        let cells = Some(Cells {
+        let cells = Cells {
             cols: size.cols,
             rows: size.rows,
-        });
-        match self.attached.iter_mut().find(|a| a.id == id) {
-            Some(a) if a.viewport != cells => {
-                a.viewport = cells;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// The smallest columns and rows among the recorded viewports.
-    fn smallest(&self) -> Option<(u16, u16)> {
-        let mut viewports = self.attached.iter().filter_map(|a| a.viewport);
-        let first = viewports.next()?;
-        Some(viewports.fold((first.cols, first.rows), |(cols, rows), v| {
-            (cols.min(v.cols), rows.min(v.rows))
-        }))
+        };
+        self.sizing.record(id, cells)
     }
 
     /// Applies a viewport report at once, discarding any pending coalesced
-    /// report, with the size the policy gives: the report's under
-    /// `latest` and for `resize`, the smallest recorded under `smallest`,
-    /// the current one under `fixed`. Returns whether what `Session`
-    /// shows changed: the size, the owner, or a recorded viewport a
-    /// discarded report changed.
+    /// report, with the size [`Sizing::apply`] gives. Returns whether what
+    /// `Session` shows changed: the size, the owner, or a recorded
+    /// viewport a discarded report changed.
     pub fn apply_report(&mut self, report: Viewport, from: Source) -> bool {
         let Body::Live(live) = &mut self.body else {
             return false;
@@ -875,24 +850,12 @@ impl Session {
             self.set_profile(profile);
         }
         let current = self.size();
-        let owner = self.size_owner;
-        let (cols, rows) = match (from, self.size_policy) {
-            (Source::Resize, _) => {
-                self.size_owner = None;
-                (cols, rows)
-            }
-            (Source::Attachment(id), SizePolicy::Latest) => {
-                // A coalesced report may outlive its attachment.
-                self.size_owner = self.attached.iter().any(|a| a.id == id).then_some(id);
-                (cols, rows)
-            }
-            (Source::Attachment(_), SizePolicy::Smallest) => {
-                self.smallest().unwrap_or((current.cols, current.rows))
-            }
-            (Source::Attachment(_), SizePolicy::Fixed) => (current.cols, current.rows),
-        };
+        let owner = self.sizing.owner();
+        let (cols, rows) = self
+            .sizing
+            .apply(from, (cols, rows), (current.cols, current.rows));
         let resized = self.resize_to(cols, rows, cell_width, cell_height);
-        recorded || resized || owner != self.size_owner
+        recorded || resized || owner != self.sizing.owner()
     }
 
     /// Sets the terminal and PTY size and the cell size the session
@@ -942,30 +905,30 @@ impl Session {
     /// for the next report. No owner remains. Returns whether what
     /// `Session` shows changed.
     pub fn set_policy(&mut self, policy: SizePolicy) -> bool {
-        let before = (self.size_policy, self.size_owner);
-        self.size_policy = policy;
-        self.size_owner = None;
-        let resized = match (policy, self.smallest()) {
-            (SizePolicy::Smallest, Some((cols, rows))) => self.resize_to(cols, rows, None, None),
-            _ => false,
-        };
-        let changed = resized || before != (self.size_policy, self.size_owner);
+        let before = (self.sizing.policy(), self.sizing.owner());
+        let resized = self
+            .sizing
+            .set_policy(policy)
+            .is_some_and(|(cols, rows)| self.resize_to(cols, rows, None, None));
+        let changed = resized || before != (self.sizing.policy(), self.sizing.owner());
         if changed {
             self.touch();
         }
         changed
     }
 
+    /// Puts an attachment on the list, with no viewport yet.
+    pub fn add_attachment(&mut self, attachment: Attachment) {
+        self.sizing.open(attachment.id);
+        self.attached.push(attachment);
+    }
+
     /// Takes attachment `id` off the list: under `latest` it no longer
     /// owns the size; under `smallest` the size follows those left.
     pub fn remove_attachment(&mut self, id: u64) {
         self.attached.retain(|a| a.id != id);
-        if self.size_owner == Some(id) {
-            self.size_owner = None;
-        }
-        if self.size_policy == SizePolicy::Smallest
+        if let Some((cols, rows)) = self.sizing.close(id)
             && self.running().is_ok()
-            && let Some((cols, rows)) = self.smallest()
         {
             self.resize_to(cols, rows, None, None);
         }
@@ -1087,7 +1050,7 @@ impl Session {
                 // Computed again from the records at load.
                 attention: None,
                 size: SizeInfo {
-                    policy: self.size_policy,
+                    policy: self.sizing.policy(),
                     owner: None,
                 },
                 ..self.to_proto(false)

@@ -17,7 +17,8 @@ use crate::connection::{Writer, reply};
 use crate::pty;
 use crate::read;
 use crate::registry::{Fail, Registry, internal};
-use crate::session::{self, Shared, Source};
+use crate::session::{self, Shared};
+use crate::sizing::Source;
 use crate::wait::{self, Facts, Waiter};
 
 /// A connection's requests that answer later and can be cancelled (a

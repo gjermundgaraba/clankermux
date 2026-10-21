@@ -28,6 +28,7 @@ use crate::session::{
     Body, Effects, InputQueue, Live, Parked, SNAPSHOT_RETRY, Session, Shared, blocking, check_size,
     default_color, now, snapshot_with_retry,
 };
+use crate::sizing::Sizing;
 use crate::stream::Stream;
 
 pub type Fail = (ErrorCode, String);
@@ -236,7 +237,7 @@ impl Registry {
             created_at: info.created_at,
             exited_at: info.exited_at,
             exit: info.exit,
-            size_policy: info.size.policy,
+            sizing: Sizing::new(info.size.policy),
             records,
             commands: Commands::load(file.commands),
             ..Session::blank(&self.config.limits, body)

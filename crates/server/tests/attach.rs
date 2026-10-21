@@ -626,7 +626,7 @@ async fn bootstrap_history_gets_a_turn_under_continuous_live_output() {
                 },
                 profile: None,
             },
-            server::session::Source::Resize,
+            server::sizing::Source::Resize,
         );
         s.output(&vec![b'x'; 3 * 1024 * 1024]);
     }

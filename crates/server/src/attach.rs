@@ -16,9 +16,10 @@ use tokio::time::Instant;
 use crate::connection::{Writer, error_frame};
 use crate::registry::{Fail, Registry};
 use crate::session::{
-    Attachment, Body, SNAPSHOT_RETRY, Session, Shared, Source, now, printable, snapshot_with_retry,
+    Attachment, Body, SNAPSHOT_RETRY, Session, Shared, now, printable, snapshot_with_retry,
     truncate,
 };
+use crate::sizing::Source;
 use crate::stream::{Cursor, MarkerKind, Served};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -123,14 +124,13 @@ pub fn open(
         if s.attached.len() as u64 >= limits.attachments {
             return Err((ErrorCode::LimitExceeded, "too many attachments".into()));
         }
-        s.attached.push(Attachment {
+        s.add_attachment(Attachment {
             id,
             client: Peer {
                 name: client_text(&client.name),
                 version: client_text(&client.version),
             },
             read_only: open.read_only,
-            viewport: None,
             since: now(),
             last_input: None,
             close: close_tx.downgrade(),
