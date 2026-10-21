@@ -11,6 +11,16 @@ use proto::{
 
 use crate::connection::{Error, Frame};
 
+/// Payloads and frame overhead held behind a bootstrap's first marker.
+const MAX_HELD_BYTES: usize = 4 * 1024 * 1024;
+
+pub(crate) fn keeps_attachment(code: proto::ErrorCode) -> bool {
+    matches!(
+        code,
+        proto::ErrorCode::ReadOnly | proto::ErrorCode::NotRunning | proto::ErrorCode::InputOverflow
+    )
+}
+
 /// What a client does in response to frames.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -49,6 +59,7 @@ enum State<H: Handler> {
         /// Stream frames held back after a `RESIZED` or `EXITED` until
         /// `SNAPSHOT_END`.
         held: Vec<Frame>,
+        held_bytes: usize,
     },
     Streaming(Terminal<H>),
     /// After the final marker, `CLOSED` or a fatal error. The terminal,
@@ -164,6 +175,7 @@ impl<H: Handler + Default> Attachment<H> {
                         self.state = State::Bootstrapping {
                             decoder,
                             held: Vec::new(),
+                            held_bytes: 0,
                         };
                     }
                     AttachMode::Resume => {
@@ -199,8 +211,9 @@ impl<H: Handler + Default> Attachment<H> {
                 if !matches!(self.state, State::Bootstrapping { .. }) {
                     return Err(Error::Protocol("SNAPSHOT_END outside a bootstrap".into()));
                 }
-                let State::Bootstrapping { mut decoder, held } =
-                    std::mem::replace(&mut self.state, State::Opening)
+                let State::Bootstrapping {
+                    mut decoder, held, ..
+                } = std::mem::replace(&mut self.state, State::Opening)
                 else {
                     unreachable!()
                 };
@@ -220,9 +233,19 @@ impl<H: Handler + Default> Attachment<H> {
                 }
             }
             FrameType::Output | FrameType::Resized | FrameType::Exited => {
-                if let State::Bootstrapping { held, .. } = &mut self.state
+                if let State::Bootstrapping {
+                    held, held_bytes, ..
+                } = &mut self.state
                     && (!held.is_empty() || kind != FrameType::Output)
                 {
+                    let bytes = frame.payload.len() + size_of::<Frame>();
+                    if bytes > MAX_HELD_BYTES - *held_bytes {
+                        self.end();
+                        return Err(Error::Desync(
+                            "bootstrap stream buffer full; fresh OPEN required".into(),
+                        ));
+                    }
+                    *held_bytes += bytes;
                     held.push(frame);
                     return Ok(());
                 }
@@ -246,12 +269,7 @@ impl<H: Handler + Default> Attachment<H> {
             }
             FrameType::Error => {
                 let error: ErrorMessage = frame.json()?;
-                if !matches!(
-                    error.code,
-                    proto::ErrorCode::ReadOnly
-                        | proto::ErrorCode::NotRunning
-                        | proto::ErrorCode::InputOverflow
-                ) {
+                if !keeps_attachment(error.code) {
                     self.end();
                 }
                 actions.push(Action::Error(error));
@@ -413,6 +431,48 @@ mod tests {
         let mut source = Terminal::new(10, 3).unwrap();
         source.vt_write(lines);
         snapshot::encode(&source).unwrap()
+    }
+
+    #[test]
+    fn held_bootstrap_overflow_ends_without_a_resume_and_allows_fresh_open() {
+        let bytes = snapshot_of(b"before");
+        let ready = snapshot::ready_end(&bytes).unwrap();
+        let mut a: Attachment = Attachment::new();
+        a.open_on(&welcome("inc"));
+        a.handle(attached(100, 0, &bytes)).unwrap();
+        a.handle(frame(FrameType::Snapshot, bytes[..ready].to_vec()))
+            .unwrap();
+        a.handle(json(
+            FrameType::Resized,
+            &Resized {
+                seq: 1,
+                offset: 100,
+                cols: 20,
+                rows: 5,
+            },
+        ))
+        .unwrap();
+        let chunk = vec![b'x'; 64 * 1024];
+        for i in 0..64 {
+            let result = a.handle(frame(
+                FrameType::Output,
+                proto::encode_output(100 + i * chunk.len() as u64, &chunk),
+            ));
+            if i < 63 {
+                assert!(result.unwrap().is_empty());
+            } else {
+                assert!(matches!(result, Err(Error::Desync(_))));
+            }
+        }
+        assert!(a.ended());
+        assert!(a.resume().is_none());
+        assert_eq!(a.term().unwrap().cols(), 10);
+        assert_eq!(text(a.term().unwrap()), "before");
+        a.open_on(&welcome("inc"));
+        a.handle(attached(200, 1, &bytes)).unwrap();
+        a.handle(frame(FrameType::Snapshot, bytes)).unwrap();
+        a.handle(frame(FrameType::SnapshotEnd, vec![])).unwrap();
+        assert_eq!(a.resume().unwrap().offset, 200);
     }
 
     #[test]

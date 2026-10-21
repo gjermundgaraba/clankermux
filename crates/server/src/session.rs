@@ -1,5 +1,6 @@
 //! One session: the child, its PTY, the engine and the stream.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
@@ -339,25 +340,24 @@ pub struct Live {
 }
 
 impl Live {
+    fn text_from(&self, row: u32) -> Result<String, ghostty_vt::Error> {
+        formatter::format(
+            &self.term,
+            formatter::Options {
+                unwrap: true,
+                trim: true,
+                region: formatter::Region::FromRow(row),
+                ..Default::default()
+            },
+        )
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
     /// History and screen as text, one logical line each, and how many
     /// of the leading lines are history.
     pub fn text(&self) -> Result<(String, usize), ghostty_vt::Error> {
-        let text = |region| {
-            formatter::format(
-                &self.term,
-                formatter::Options {
-                    unwrap: true,
-                    trim: true,
-                    region,
-                    ..Default::default()
-                },
-            )
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        };
-        let all = text(formatter::Region::FromRow(0))?;
-        let screen = text(formatter::Region::FromRow(
-            self.term.scrollback_rows() as u32
-        ))?;
+        let all = self.text_from(0)?;
+        let screen = self.text_from(self.term.scrollback_rows() as u32)?;
         let history_lines = all.lines().count() - screen.lines().count();
         Ok((all, history_lines))
     }
@@ -654,6 +654,9 @@ impl Session {
         let mut changed = std::mem::take(&mut effects.changed);
         if !answers.is_empty() && live.input.push(answers).is_none() {
             tracing::warn!(session = self.id, "input queue full; query answers dropped");
+        }
+        if notices.is_empty() && !changed {
+            return;
         }
         let now = now();
         let id = self.id.clone();
@@ -1043,8 +1046,24 @@ impl Session {
     /// parked.
     pub fn read_text(&self, scrollback: usize) -> Result<String, ghostty_vt::Error> {
         let (text, history_lines) = match &self.body {
-            Body::Live(live) => blocking(|| live.text())?,
-            Body::Parked(parked) => (parked.screen.clone(), parked.history_lines),
+            Body::Live(live) => blocking(|| {
+                // When the entire screen is blank, trimming also removes
+                // trailing empty history lines. Keep counting from that
+                // trimmed history for a request that includes scrollback.
+                if scrollback > 0
+                    && scrollback != usize::MAX
+                    && live.text_from(live.term.history_start(0)?)?.is_empty()
+                {
+                    return live.text().map(|(text, lines)| (Cow::Owned(text), lines));
+                }
+                let start = if scrollback == usize::MAX {
+                    0
+                } else {
+                    live.term.history_start(scrollback)?
+                };
+                live.text_from(start).map(|text| (Cow::Owned(text), 0))
+            })?,
+            Body::Parked(parked) => (Cow::Borrowed(parked.screen.as_str()), parked.history_lines),
         };
         let skip = history_lines.saturating_sub(scrollback);
         Ok(text.lines().skip(skip).collect::<Vec<_>>().join("\n"))

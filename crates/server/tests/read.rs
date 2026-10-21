@@ -521,3 +521,67 @@ async fn scrollback_counts_a_line_across_the_screen_top_as_the_screen() {
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
 }
+
+#[tokio::test]
+async fn text_regions_keep_wrapped_lines_trailing_blanks_and_alternate_screen() {
+    use server::session::{Body, Effects, Parked};
+
+    let server = start(fast_limits());
+    let mut c = client(&server).await;
+    let session = c.create(json!({"argv": ["/bin/sleep", "60"]})).await;
+    let shared = server.registry.get(&session.id).unwrap();
+    let cases: &[(&[u8], [&str; 3])] = &[
+        (b"", ["", "", ""]),
+        (
+            b"first\r\naaaaaaaaaabbbbbbbbbbcc\r\nx",
+            [
+                "aaaaaaaaaabbbbbbbbbbcc\nx",
+                "first\naaaaaaaaaabbbbbbbbbbcc\nx",
+                "first\naaaaaaaaaabbbbbbbbbbcc\nx",
+            ],
+        ),
+        (
+            b"first\r\nsecond\r\n\r\n\r\n\r\n",
+            ["", "second", "first\nsecond"],
+        ),
+        (
+            b"first\r\nsecond\r\nthird\r\nx\r\n",
+            ["third\nx", "second\nthird\nx", "first\nsecond\nthird\nx"],
+        ),
+        (
+            b"first\r\nsecond\r\nthird\r\nx\r\n\x1b[?1049h\x1b[Halt\r\n",
+            ["alt", "alt", "alt"],
+        ),
+    ];
+    for (input, expected) in cases {
+        let (live_text, parked_text) = {
+            let mut s = shared.lock().unwrap();
+            let mut term = ghostty_vt::Terminal::with_handler(10, 3, Effects::default()).unwrap();
+            term.vt_write(input);
+            s.live_mut().unwrap().term = term;
+            let scrollback = [0, 1, usize::MAX];
+            let live_text = scrollback.map(|n| s.read_text(n).unwrap());
+            let (screen, history_lines) = s.live().unwrap().text().unwrap();
+            let live = std::mem::replace(
+                &mut s.body,
+                Body::Parked(Parked {
+                    engine: ghostty_vt::ENGINE.into(),
+                    cols: 10,
+                    rows: 3,
+                    title: String::new(),
+                    pwd: String::new(),
+                    offset: 0,
+                    marker: 0,
+                    screen,
+                    history_lines,
+                    snapshot_path: Default::default(),
+                }),
+            );
+            let parked_text = scrollback.map(|n| s.read_text(n).unwrap());
+            s.body = live;
+            (live_text, parked_text)
+        };
+        assert_eq!(live_text, *expected, "live: {input:?}");
+        assert_eq!(parked_text, *expected, "parked: {input:?}");
+    }
+}

@@ -35,7 +35,7 @@ export type Action =
 type State =
   | { kind: "opening" }
   /** `held`: stream frames after a `RESIZED` or `EXITED`, until `SNAPSHOT_END`. */
-  | { kind: "bootstrapping"; decoder: Decoder; held: Frame[] }
+  | { kind: "bootstrapping"; decoder: Decoder; held: Frame[]; heldBytes: number }
   | { kind: "streaming"; term: Terminal }
   /** After the final marker, `CLOSED` or a fatal error. The terminal stays
    * for display only; `closed` says the server ended the attachment, so no
@@ -43,6 +43,9 @@ type State =
   | { kind: "ended"; term: Terminal | undefined; closed: boolean };
 
 const KEEPS_ATTACHMENT = new Set<ErrorMessage["code"]>(["read_only", "not_running", "input_overflow"]);
+
+/** Payload bytes plus a per-frame charge to bound tiny held frames too. */
+const MAX_HELD_BYTES = 4 * 1024 * 1024;
 
 /**
  * The attachment state machine: frames in, actions out. It keeps the
@@ -137,7 +140,7 @@ export class Attachment {
             decoder.free();
             throw err;
           }
-          this.state = { kind: "bootstrapping", decoder, held: [] };
+          this.state = { kind: "bootstrapping", decoder, held: [], heldBytes: 0 };
         } else if (this.state.kind !== "streaming") {
           throw ClientError.protocol("resume without a terminal");
         }
@@ -176,6 +179,12 @@ export class Attachment {
       case FrameType.Resized:
       case FrameType.Exited:
         if (this.state.kind === "bootstrapping" && (this.state.held.length > 0 || type !== FrameType.Output)) {
+          const bytes = frame.payload.byteLength + 64;
+          if (bytes > MAX_HELD_BYTES - this.state.heldBytes) {
+            this.end(false);
+            throw ClientError.desync("bootstrap stream buffer full; fresh OPEN required");
+          }
+          this.state.heldBytes += bytes;
           this.state.held.push(frame);
           return;
         }

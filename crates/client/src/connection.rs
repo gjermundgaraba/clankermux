@@ -16,7 +16,14 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{oneshot, watch};
+
+pub use crate::queue::Receiver;
+use crate::queue::{self, SendError, Sender, WeakSender};
+
+const ATTACHMENT_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+const EVENT_QUEUE_BYTES: usize = 1024 * 1024;
+const OUTGOING_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum Error {
@@ -72,17 +79,26 @@ impl Frame {
     }
 }
 
-#[derive(Default)]
+enum Channel {
+    Open(Sender<Frame>),
+    /// Discard the old stream until the server acknowledges its end.
+    Closing,
+}
+
 struct Routes {
     pending: HashMap<i64, oneshot::Sender<Result<Value, ErrorMessage>>>,
-    channels: HashMap<u32, mpsc::UnboundedSender<Frame>>,
-    events: Option<mpsc::UnboundedSender<Numbered>>,
-    /// Set once the reader ended.
+    channels: HashMap<u32, Channel>,
+    events: Option<Sender<Numbered>>,
+    stop: watch::Sender<bool>,
+    /// Set before receivers close, including local queue overflow.
     closed: Option<Ended>,
 }
 
 /// Why a connection ended.
+#[derive(Debug)]
 enum Ended {
+    /// A local queue overflowed; stream state must not be resumed.
+    Desync(String),
     /// The server sent an `ERROR` without id.
     Server(ErrorMessage),
     /// The server broke the protocol.
@@ -96,6 +112,7 @@ enum Ended {
 impl From<&Ended> for Error {
     fn from(ended: &Ended) -> Self {
         match ended {
+            Ended::Desync(reason) => Error::Desync(reason.clone()),
             Ended::Server(error) => Error::Server(error.clone()),
             Ended::Protocol(reason) => Error::Protocol(reason.clone()),
             Ended::Io(kind, reason) => Error::Io(io::Error::new(*kind, reason.clone())),
@@ -108,7 +125,7 @@ impl From<&Ended> for Error {
 pub struct Reply(oneshot::Receiver<Result<Value, ErrorMessage>>);
 
 pub struct Connection {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: Sender<Vec<u8>>,
     pub welcome: Welcome,
     next_id: AtomicI64,
     routes: Arc<Mutex<Routes>>,
@@ -141,18 +158,10 @@ impl Connection {
         hello: Hello,
     ) -> Result<Self, Error> {
         let (mut reader, mut writer) = tokio::io::split(stream);
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        // A flush per frame: a message carrier (the WebSocket adapter)
-        // sends nothing before one.
-        tokio::spawn(async move {
-            while let Some(bytes) = rx.recv().await {
-                if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
-                    break;
-                }
-            }
-            let _ = writer.shutdown().await;
-        });
-        let _ = tx.send(encode_json_frame(FrameType::Hello, 0, &hello));
+        writer
+            .write_all(&encode_json_frame(FrameType::Hello, 0, &hello))
+            .await?;
+        writer.flush().await?;
         let mut decoder = FrameDecoder::default();
         let mut buf = vec![0u8; 64 * 1024];
         let welcome = loop {
@@ -172,9 +181,25 @@ impl Connection {
                 n => decoder.push(&buf[..n]),
             }
         };
-        let routes = Arc::new(Mutex::new(Routes::default()));
+        let (tx, rx) = queue::channel(OUTGOING_QUEUE_BYTES);
+        let (stop, stopped) = watch::channel(false);
+        let routes = Arc::new(Mutex::new(Routes {
+            pending: HashMap::new(),
+            channels: HashMap::new(),
+            events: None,
+            closed: None,
+            stop,
+        }));
         let max_frame = welcome.limits.max_frame;
-        tokio::spawn(read_loop(reader, decoder, max_frame, routes.clone()));
+        tokio::spawn(write_loop(writer, rx, routes.clone(), stopped.clone()));
+        tokio::spawn(read_loop(
+            reader,
+            decoder,
+            max_frame,
+            routes.clone(),
+            tx.downgrade(),
+            stopped,
+        ));
         Ok(Connection {
             tx,
             welcome,
@@ -184,9 +209,23 @@ impl Connection {
     }
 
     pub fn send(&self, frame_type: FrameType, channel: u32, payload: &[u8]) -> Result<(), Error> {
-        self.tx
-            .send(encode_frame(frame_type, channel, payload))
-            .map_err(|_| self.ended().unwrap_or(Error::Closed))
+        if let Some(error) = self.ended() {
+            return Err(error);
+        }
+        match self.tx.send(
+            encode_frame(frame_type, channel, payload),
+            proto::HEADER_LEN + payload.len(),
+        ) {
+            Ok(()) => Ok(()),
+            Err(SendError::Full) => {
+                end_routes(
+                    &self.routes,
+                    Ended::Desync("outgoing queue full; reconnect with fresh OPENs".into()),
+                );
+                Err(self.ended().expect("just ended"))
+            }
+            Err(SendError::Closed) => Err(self.ended().unwrap_or(Error::Closed)),
+        }
     }
 
     pub fn send_json<T: Serialize>(
@@ -254,15 +293,20 @@ impl Connection {
     }
 
     /// Opens `channel` and returns the frames the server sends on it. The
-    /// receiver ends when the connection does.
-    pub fn open(&self, channel: u32, open: &Open) -> Result<mpsc::UnboundedReceiver<Frame>, Error> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    /// receiver ends after the attachment or connection ends. A local
+    /// overflow delivers `ERROR too_slow`; use a fresh OPEN on a new channel
+    /// or connection. The old channel stays reserved until its server end.
+    pub fn open(&self, channel: u32, open: &Open) -> Result<Receiver<Frame>, Error> {
+        let (tx, rx) = queue::channel(ATTACHMENT_QUEUE_BYTES);
         {
             let mut routes = self.routes.lock().unwrap();
             if let Some(closed) = &routes.closed {
                 return Err(closed.into());
             }
-            routes.channels.insert(channel, tx);
+            if routes.channels.contains_key(&channel) {
+                return Err(Error::Protocol("attachment channel is still open".into()));
+            }
+            routes.channels.insert(channel, Channel::Open(tx));
         }
         self.send_json(FrameType::Open, channel, open)?;
         Ok(rx)
@@ -270,8 +314,8 @@ impl Connection {
 
     /// The sink for `EVENT` frames; `subscribe` must be requested too.
     /// The receiver ends when the connection does.
-    pub fn events(&self) -> mpsc::UnboundedReceiver<Numbered> {
-        let (tx, rx) = mpsc::unbounded_channel();
+    pub fn events(&self) -> Receiver<Numbered> {
+        let (tx, rx) = queue::channel(EVENT_QUEUE_BYTES);
         let mut routes = self.routes.lock().unwrap();
         if routes.closed.is_none() {
             routes.events = Some(tx);
@@ -291,12 +335,17 @@ async fn read_loop<R: AsyncRead + Unpin>(
     mut decoder: FrameDecoder,
     max_frame: u64,
     routes: Arc<Mutex<Routes>>,
+    outgoing: WeakSender<Vec<u8>>,
+    mut stopped: watch::Receiver<bool>,
 ) {
     let mut buf = vec![0u8; 64 * 1024];
     let reason = loop {
+        if *stopped.borrow() {
+            return;
+        }
         match decoder.next_frame(max_frame) {
             Ok(Some((header, payload))) => {
-                if let Err(reason) = route(&routes, Frame { header, payload }) {
+                if let Err(reason) = route(&routes, &outgoing, Frame { header, payload }) {
                     break reason;
                 }
                 continue;
@@ -304,28 +353,129 @@ async fn read_loop<R: AsyncRead + Unpin>(
             Ok(None) => {}
             Err(err) => break Ended::Protocol(err.to_string()),
         }
-        match reader.read(&mut buf).await {
+        let read = tokio::select! {
+            biased;
+            _ = stopped.changed() => return,
+            read = reader.read(&mut buf) => read,
+        };
+        match read {
             Ok(0) => break Ended::Eof,
             Ok(n) => decoder.push(&buf[..n]),
             Err(err) => break Ended::Io(err.kind(), err.to_string()),
         }
     };
+    end_routes(&routes, reason);
+}
+
+async fn write_loop<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    mut rx: Receiver<Vec<u8>>,
+    routes: Arc<Mutex<Routes>>,
+    mut stopped: watch::Receiver<bool>,
+) {
+    let reason = loop {
+        let next = tokio::select! {
+            biased;
+            _ = stopped.changed() => return,
+            next = rx.rx.recv() => next,
+        };
+        let Some(bytes) = next else {
+            break Ended::Eof;
+        };
+        // Keep the byte permit until the carrier has flushed this frame.
+        let result = tokio::select! {
+            biased;
+            _ = stopped.changed() => return,
+            result = async {
+                writer.write_all(&bytes.value).await?;
+                writer.flush().await
+            } => result,
+        };
+        if let Err(err) = result {
+            break Ended::Io(err.kind(), err.to_string());
+        }
+    };
+    end_routes(&routes, reason);
+    let _ = writer.shutdown().await;
+}
+
+fn loss_frame(channel: u32, message: &str) -> Frame {
+    let payload = serde_json::to_vec(&ErrorMessage {
+        id: None,
+        code: proto::ErrorCode::TooSlow,
+        message: message.into(),
+    })
+    .expect("serializable");
+    Frame {
+        header: Header {
+            frame_type: FrameType::Error,
+            channel,
+            length: payload.len() as u32,
+        },
+        payload,
+    }
+}
+
+fn end_routes(routes: &Mutex<Routes>, reason: Ended) {
     let mut routes = routes.lock().unwrap();
+    if routes.closed.is_some() {
+        return;
+    }
+    for (channel, state) in routes.channels.drain() {
+        if let (Channel::Open(tx), Ended::Desync(message)) = (state, &reason) {
+            tx.end(loss_frame(channel, message));
+        }
+    }
     routes.closed = Some(reason);
     routes.pending.clear();
-    routes.channels.clear();
     routes.events = None;
+    routes.stop.send_replace(true);
 }
 
 /// Delivers one frame; an error ends the connection.
-fn route(routes: &Mutex<Routes>, frame: Frame) -> Result<(), Ended> {
+fn route(
+    routes: &Mutex<Routes>,
+    outgoing: &WeakSender<Vec<u8>>,
+    frame: Frame,
+) -> Result<(), Ended> {
     let lost = |e: Error| Ended::Protocol(e.to_string());
     let mut routes = routes.lock().unwrap();
     let channel = frame.header.channel;
+    if routes.closed.is_some() {
+        return Ok(());
+    }
     if channel != 0 {
-        if let Some(tx) = routes.channels.get(&channel)
-            && tx.send(frame).is_err()
-        {
+        let Some(state) = routes.channels.get(&channel) else {
+            return Ok(());
+        };
+        let terminal = frame.header.frame_type == FrameType::Closed
+            || (frame.header.frame_type == FrameType::Error
+                && !crate::attachment::keeps_attachment(
+                    frame.json::<ErrorMessage>().map_err(lost)?.code,
+                ));
+        if let Channel::Open(tx) = state {
+            let bytes = proto::HEADER_LEN + frame.payload.len();
+            if let Err(error) = tx.send(frame, bytes) {
+                if let Some(Channel::Open(tx)) = routes.channels.insert(channel, Channel::Closing)
+                    && error == SendError::Full
+                {
+                    tx.end(loss_frame(
+                        channel,
+                        "attachment queue full; fresh OPEN required",
+                    ));
+                }
+                if !terminal {
+                    let close = encode_frame(FrameType::Close, channel, &[]);
+                    outgoing.send(close, proto::HEADER_LEN).map_err(|_| {
+                        Ended::Desync(
+                            "cannot queue CLOSE after local loss; reconnect with fresh OPENs"
+                                .into(),
+                        )
+                    })?;
+                }
+            }
+        }
+        if terminal {
             routes.channels.remove(&channel);
         }
         return Ok(());
@@ -352,10 +502,16 @@ fn route(routes: &Mutex<Routes>, frame: Frame) -> Result<(), Ended> {
         }
         FrameType::Event => {
             let event: Numbered = frame.json().map_err(lost)?;
-            if let Some(tx) = &routes.events
-                && tx.send(event).is_err()
-            {
-                routes.events = None;
+            if let Some(tx) = &routes.events {
+                match tx.send(event, proto::HEADER_LEN + frame.payload.len()) {
+                    Ok(()) => {}
+                    Err(SendError::Closed) => routes.events = None,
+                    Err(SendError::Full) => {
+                        return Err(Ended::Desync(
+                            "event queue full; reconnect and resubscribe, with fresh OPENs".into(),
+                        ));
+                    }
+                }
             }
         }
         other => return Err(Ended::Protocol(format!("{other:?} on channel 0"))),
@@ -445,5 +601,247 @@ impl fmt::Display for Endpoint {
             Endpoint::Tcp(addr) => write!(f, "{addr}"),
             Endpoint::Ssh(destination) => write!(f, "ssh {destination}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn routes() -> Mutex<Routes> {
+        let (stop, _) = watch::channel(false);
+        Mutex::new(Routes {
+            pending: HashMap::new(),
+            channels: HashMap::new(),
+            events: None,
+            closed: None,
+            stop,
+        })
+    }
+
+    fn frame(kind: FrameType, channel: u32, payload: Vec<u8>) -> Frame {
+        Frame {
+            header: Header {
+                frame_type: kind,
+                channel,
+                length: payload.len() as u32,
+            },
+            payload,
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_overflow_signals_loss_without_blocking_other_routes() {
+        let routes = routes();
+        let (outgoing, mut writes) = queue::channel(1024);
+        let out = outgoing.downgrade();
+        let charge = size_of::<queue::Queued<Frame>>() + proto::HEADER_LEN + 9;
+        let (slow, mut slow_rx) = queue::channel(charge);
+        let (fast, mut fast_rx) = queue::channel(1024);
+        let (reply, mut reply_rx) = oneshot::channel();
+        {
+            let mut r = routes.lock().unwrap();
+            r.channels.insert(1, Channel::Open(slow));
+            r.channels.insert(2, Channel::Open(fast));
+            r.pending.insert(7, reply);
+        }
+        for offset in 0..3 {
+            route(
+                &routes,
+                &out,
+                frame(FrameType::Output, 1, proto::encode_output(offset, b"x")),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            slow_rx.recv().await.unwrap().header.frame_type,
+            FrameType::Output
+        );
+        let loss = slow_rx
+            .recv()
+            .await
+            .unwrap()
+            .json::<ErrorMessage>()
+            .unwrap();
+        assert_eq!(loss.code, proto::ErrorCode::TooSlow);
+        assert!(slow_rx.recv().await.is_none());
+        let close = writes.try_recv().unwrap();
+        assert_eq!(
+            proto::parse_frame(&close, 1024).unwrap().0.frame_type,
+            FrameType::Close
+        );
+        assert!(writes.is_empty(), "only one CLOSE for the lost stream");
+        assert!(matches!(
+            routes.lock().unwrap().channels.get(&1),
+            Some(Channel::Closing)
+        ));
+
+        route(
+            &routes,
+            &out,
+            frame(FrameType::Output, 2, proto::encode_output(0, b"y")),
+        )
+        .unwrap();
+        route(
+            &routes,
+            &out,
+            frame(
+                FrameType::Reply,
+                0,
+                br#"{"id":7,"result":{"ok":true}}"#.to_vec(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            proto::parse_output(&fast_rx.recv().await.unwrap().payload)
+                .unwrap()
+                .1,
+            b"y"
+        );
+        assert_eq!(
+            reply_rx.try_recv().unwrap().unwrap(),
+            serde_json::json!({"ok": true})
+        );
+        assert!(routes.lock().unwrap().closed.is_none());
+        route(
+            &routes,
+            &out,
+            frame(FrameType::Closed, 1, br#"{"reason":"closed"}"#.to_vec()),
+        )
+        .unwrap();
+        assert!(!routes.lock().unwrap().channels.contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn event_overflow_ends_with_loss_and_invalidates_attachment_cursors() {
+        let routes = routes();
+        let (outgoing, _) = queue::channel(1024);
+        let event = Numbered {
+            seq: 1,
+            event: proto::Event::Bell { id: "s".into() },
+        };
+        let payload = serde_json::to_vec(&event).unwrap();
+        let (events, mut events_rx) = queue::channel(
+            size_of::<queue::Queued<Numbered>>() + proto::HEADER_LEN + payload.len(),
+        );
+        let (frames, mut frames_rx) = queue::channel(1024);
+        {
+            let mut r = routes.lock().unwrap();
+            r.events = Some(events);
+            r.channels.insert(1, Channel::Open(frames));
+        }
+        route(
+            &routes,
+            &outgoing.downgrade(),
+            frame(FrameType::Event, 0, payload.clone()),
+        )
+        .unwrap();
+        let reason = route(
+            &routes,
+            &outgoing.downgrade(),
+            frame(FrameType::Event, 0, payload),
+        )
+        .unwrap_err();
+        assert!(matches!(reason, Ended::Desync(_)));
+        end_routes(&routes, reason);
+        assert_eq!(events_rx.recv().await.unwrap().seq, 1);
+        assert!(events_rx.recv().await.is_none());
+        assert!(matches!(
+            routes.lock().unwrap().closed,
+            Some(Ended::Desync(_))
+        ));
+        assert_eq!(
+            frames_rx
+                .recv()
+                .await
+                .unwrap()
+                .json::<ErrorMessage>()
+                .unwrap()
+                .code,
+            proto::ErrorCode::TooSlow
+        );
+        assert!(frames_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn outgoing_overflow_cancels_a_blocked_writer_and_pending_replies() {
+        let (socket, mut peer) = tokio::io::duplex(64);
+        let handshake = tokio::spawn(async move {
+            let mut decoder = FrameDecoder::default();
+            let mut buf = [0; 64];
+            loop {
+                let n = peer.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                decoder.push(&buf[..n]);
+                if let Some((header, _)) = decoder.next_frame(1024).unwrap() {
+                    assert_eq!(header.frame_type, FrameType::Hello);
+                    break;
+                }
+            }
+            let welcome = Welcome {
+                version: proto::VERSION,
+                server: proto::Peer {
+                    name: "test".into(),
+                    version: "0".into(),
+                },
+                engine: ghostty_vt::ENGINE.into(),
+                incarnation: "test".into(),
+                capabilities: vec![],
+                limits: Limits::default(),
+            };
+            peer.write_all(&encode_json_frame(FrameType::Welcome, 0, &welcome))
+                .await
+                .unwrap();
+            peer
+        });
+        let conn = Connection::handshake(socket, hello("test", Some(ghostty_vt::ENGINE)))
+            .await
+            .unwrap();
+        let mut peer = handshake.await.unwrap();
+        let mut frames = conn
+            .open(
+                1,
+                &Open {
+                    session: "s".into(),
+                    read_only: false,
+                    viewport: None,
+                    profile: None,
+                    resume: None,
+                },
+            )
+            .unwrap();
+        let chunk = vec![b'x'; 64 * 1024];
+        conn.send(FrameType::Input, 1, &chunk).unwrap();
+        tokio::task::yield_now().await;
+        let (_, reply) = conn.begin("list", serde_json::json!({})).unwrap();
+        let mut sent = 1;
+        loop {
+            match conn.send(FrameType::Input, 1, &chunk) {
+                Ok(()) => sent += 1,
+                Err(Error::Desync(_)) => break,
+                other => panic!("unexpected send result: {other:?}"),
+            }
+            assert!(sent <= OUTGOING_QUEUE_BYTES / chunk.len());
+        }
+        assert!(matches!(conn.ended(), Some(Error::Desync(_))));
+        assert!(matches!(conn.finish(reply).await, Err(Error::Desync(_))));
+        assert_eq!(
+            frames
+                .recv()
+                .await
+                .unwrap()
+                .json::<ErrorMessage>()
+                .unwrap()
+                .code,
+            proto::ErrorCode::TooSlow
+        );
+        assert!(frames.recv().await.is_none());
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), peer.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(received.len() <= 64, "the blocked writer was cancelled");
     }
 }

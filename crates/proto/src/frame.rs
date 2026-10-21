@@ -212,6 +212,21 @@ pub fn encode_output(offset: u64, bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// A complete OUTPUT frame from two adjacent slices of the stream.
+pub fn encode_output_frame(channel: u32, offset: u64, first: &[u8], second: &[u8]) -> Vec<u8> {
+    let length = OUTPUT_OFFSET_LEN + first.len() + second.len();
+    let mut out = Vec::with_capacity(HEADER_LEN + length);
+    out.extend_from_slice(&encode_header(
+        FrameType::Output,
+        channel,
+        u32::try_from(length).expect("frame payload longer than u32"),
+    ));
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(first);
+    out.extend_from_slice(second);
+    out
+}
+
 pub fn parse_output(payload: &[u8]) -> Option<(u64, &[u8])> {
     let (head, bytes) = payload.split_at_checked(OUTPUT_OFFSET_LEN)?;
     Some((u64::from_le_bytes(head.try_into().unwrap()), bytes))

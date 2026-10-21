@@ -593,3 +593,87 @@ async fn queries_are_answered_from_the_latest_profile_and_cell_size() {
         .await;
     c.output_until(1, b"\x1b[?997;1n").await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bootstrap_history_gets_a_turn_under_continuous_live_output() {
+    let server = start(fast_limits());
+    let mut c = client(&server).await;
+    let session = c
+        .create(json!({"argv": ["/bin/sleep", "60"], "cols": 80, "rows": 24}))
+        .await;
+    let shared = server.registry.get(&session.id).unwrap();
+    {
+        let mut s = shared.lock().unwrap();
+        s.output(
+            &[b"1234567890".repeat(8), b"\r\n".to_vec()]
+                .concat()
+                .repeat(14000),
+        );
+    }
+    c.open(1, json!({"session": session.id})).await;
+    let attached = c.attached(1).await;
+    let declared = attached.snapshot_bytes.unwrap() as usize;
+    assert!(declared > 1024 * 1024);
+    {
+        let mut s = shared.lock().unwrap();
+        s.apply_report(
+            Viewport {
+                size: Size {
+                    cols: 81,
+                    rows: 25,
+                    cell_width: None,
+                    cell_height: None,
+                },
+                profile: None,
+            },
+            server::session::Source::Resize,
+        );
+        s.output(&vec![b'x'; 3 * 1024 * 1024]);
+    }
+    let mut bytes = Vec::new();
+    let mut output = 0;
+    let mut resized = false;
+    loop {
+        let (header, payload) = c.recv_on(1).await;
+        match header.frame_type {
+            FrameType::Snapshot => bytes.extend_from_slice(&payload),
+            FrameType::SnapshotReady => {}
+            FrameType::Resized => {
+                let marker: Resized = serde_json::from_slice(&payload).unwrap();
+                assert_eq!(
+                    (marker.seq, marker.offset),
+                    (attached.marker + 1, attached.offset)
+                );
+                assert_eq!(output, 0);
+                resized = true;
+            }
+            FrameType::Output => {
+                assert!(resized);
+                let (offset, data) = parse_output(&payload).unwrap();
+                assert_eq!(offset, attached.offset + output as u64);
+                output += data.len();
+                shared.lock().unwrap().output(data);
+                assert!(
+                    output <= declared + 64 * 1024,
+                    "history starved after {output} live bytes"
+                );
+            }
+            FrameType::SnapshotEnd => break,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(resized && output > 0);
+    assert_eq!(bytes.len(), declared);
+    let restored = snapshot::decode(&bytes).unwrap();
+    assert_eq!(
+        (restored.cols(), restored.rows()),
+        (80, 24),
+        "snapshot precedes the resize"
+    );
+    c.send(FrameType::Close, 1, b"").await;
+    loop {
+        if c.recv_on(1).await.0.frame_type == FrameType::Closed {
+            break;
+        }
+    }
+}

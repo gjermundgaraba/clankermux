@@ -199,6 +199,7 @@ impl<H: Handler> Decoder<H> {
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
+        self.compact();
         self.source_mut().data.extend_from_slice(bytes);
     }
 
@@ -225,7 +226,6 @@ impl<H: Handler> Decoder<H> {
         let mut raw = ptr::null_mut();
         // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_ready(self.raw, &mut raw) };
-        self.compact();
         check(result)?;
         // SAFETY: on success raw is a caller-owned terminal.
         Ok(unsafe { self.adopt(raw) })
@@ -237,7 +237,6 @@ impl<H: Handler> Decoder<H> {
         self.intact()?;
         // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_next(self.raw) };
-        self.compact();
         if result == sys::GHOSTTY_NO_VALUE {
             self.finished = true;
             return Ok(false);
@@ -296,4 +295,52 @@ pub fn decode(bytes: &[u8]) -> Result<Terminal> {
     decoder.push(bytes);
     decoder.decode()?;
     Ok(decoder.into_terminal().expect("decoded"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pages_stay_in_place_until_the_next_received_chunk() {
+        let mut term = Terminal::new(80, 24).unwrap();
+        term.set_scrollback_max_bytes(10 * 1024 * 1024).unwrap();
+        term.vt_write(&b"a line of history\r\n".repeat(5000));
+        let bytes = encode(&term).unwrap();
+        let split = bytes.len() - 5;
+        let mut decoder = Decoder::new().unwrap();
+        decoder.push(&bytes[..split]);
+        assert!(decoder.ready_available());
+        decoder.ready().unwrap();
+        assert_eq!(decoder.source().data.len(), split);
+        let mut pages = 0;
+        while decoder.step_available() {
+            let pos = decoder.source().pos;
+            assert!(decoder.next_page().unwrap());
+            assert!(decoder.source().pos > pos);
+            assert_eq!(decoder.source().data.len(), split);
+            pages += 1;
+        }
+        assert!(pages > 1);
+        assert!(!decoder.finished());
+        let tail = decoder.source().data[decoder.source().pos..].to_vec();
+        decoder.push(&bytes[split..]);
+        assert_eq!(decoder.source().pos, 0);
+        assert_eq!(&decoder.source().data[..tail.len()], tail);
+        assert!(decoder.step_available());
+        assert!(!decoder.next_page().unwrap());
+        assert!(decoder.finished());
+        assert_eq!(decoder.buffered(), 0);
+        let restored = decoder.into_terminal().unwrap();
+        assert_eq!(restored.scrollback_rows(), term.scrollback_rows());
+        let options = crate::formatter::Options {
+            unwrap: true,
+            trim: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::formatter::format(&restored, options).unwrap(),
+            crate::formatter::format(&term, options).unwrap()
+        );
+    }
 }

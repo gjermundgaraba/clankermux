@@ -14,7 +14,6 @@ use proto::{Closed, ClosedReason, Exit, FrameType, Open, Size, Viewport};
 use rustix::termios::{self, OptionalActions, Termios};
 use tokio::io::AsyncReadExt;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 pub struct Options {
@@ -370,7 +369,7 @@ fn reconnect(endpoint: Endpoint) -> Connecting {
 enum Link {
     Up {
         conn: Box<Connection>,
-        frames: mpsc::UnboundedReceiver<Frame>,
+        frames: client::Receiver<Frame>,
     },
     Down(Connecting),
 }
@@ -399,7 +398,7 @@ impl Link {
     }
 }
 
-fn open(shell: &mut Shell, conn: &Connection) -> Result<mpsc::UnboundedReceiver<Frame>, Error> {
+fn open(shell: &mut Shell, conn: &Connection) -> Result<client::Receiver<Frame>, Error> {
     shell.attachment.open_on(&conn.welcome);
     conn.open(
         CHANNEL,
