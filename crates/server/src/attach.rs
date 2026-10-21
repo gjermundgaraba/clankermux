@@ -19,7 +19,7 @@ use crate::session::{
     Attachment, Body, SNAPSHOT_RETRY, Session, Shared, Source, now, printable, snapshot_with_retry,
     truncate,
 };
-use crate::stream::MarkerKind;
+use crate::stream::{Cursor, MarkerKind, Served};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -200,12 +200,6 @@ pub fn open(
 /// so that the attachments list stays small within `inspect`.
 fn client_text(text: &str) -> String {
     truncate(printable(text), CLIENT_TEXT)
-}
-
-#[derive(Clone, Copy)]
-struct Cursor {
-    offset: u64,
-    marker: u64,
 }
 
 /// Snapshot bytes not yet sent.
@@ -431,13 +425,11 @@ impl Task {
         if resume.marker > live.stream.latest_seq() {
             return above_latest();
         }
-        let retained = live.stream.retained_start() <= resume.offset
-            && resume.offset <= live.stream.offset()
-            && live.stream.markers_retained_after(resume.marker);
-        Ok(retained.then_some(Cursor {
+        let cursor = Cursor {
             offset: resume.offset,
             marker: resume.marker,
-        }))
+        };
+        Ok(live.stream.retains(cursor).then_some(cursor))
     }
 
     /// Takes a snapshot, retrying while the continuation limit is exceeded,
@@ -591,26 +583,22 @@ impl Task {
                 return Pull::Idle;
             };
             let stream = &live.stream;
-            if stream.retained_start() > self.cursor.offset
-                || !stream.markers_retained_after(self.cursor.marker)
-            {
+            if !stream.retains(self.cursor) {
                 return Pull::Gap;
             }
-            let end = stream.offset();
-            let chunk = self.max_frame - OUTPUT_OFFSET_LEN;
-            let mut markers = stream.markers_after(self.cursor.marker).peekable();
             if let Some(until) = coalesce_until(
                 self.last_output,
                 Instant::now(),
-                (end - self.cursor.offset) as usize,
-                markers.peek().is_some(),
+                (stream.offset() - self.cursor.offset) as usize,
+                stream.markers_after(self.cursor.marker).next().is_some(),
             ) {
                 return Pull::Wait(until);
             }
-            let mut budget = PULL_BUDGET;
-            loop {
-                while let Some(m) = markers.next_if(|m| m.offset <= self.cursor.offset) {
-                    let frame = match &m.kind {
+            let chunk = self.max_frame - OUTPUT_OFFSET_LEN;
+            let mut bytes = 0;
+            for served in stream.serve(&mut self.cursor, chunk, PULL_BUDGET) {
+                frames.push(match served {
+                    Served::Marker(m) => match &m.kind {
                         MarkerKind::Resized { cols, rows } => encode_json_frame(
                             FrameType::Resized,
                             self.channel,
@@ -630,36 +618,18 @@ impl Task {
                                 exit: exit.clone(),
                             },
                         ),
-                    };
-                    frames.push(frame);
-                    self.cursor.marker = m.seq;
-                }
-                if self.cursor.offset >= end || budget == 0 {
-                    break;
-                }
-                let limit = markers
-                    .peek()
-                    .map_or(end, |m| m.offset)
-                    .min(end)
-                    .min(self.cursor.offset + chunk.min(budget) as u64);
-                let (first, second) = stream
-                    .read_slices(self.cursor.offset, (limit - self.cursor.offset) as usize)
-                    .expect("offset within the retained stream");
-                let len = first.len() + second.len();
-                budget -= len;
-                frames.push(encode_output_frame(
-                    self.channel,
-                    self.cursor.offset,
-                    first,
-                    second,
-                ));
-                self.cursor.offset += len as u64;
+                    },
+                    Served::Output(offset, first, second) => {
+                        bytes += first.len() + second.len();
+                        encode_output_frame(self.channel, offset, first, second)
+                    }
+                });
             }
-            if budget < PULL_BUDGET {
+            if bytes > 0 {
                 self.last_output = Some(Instant::now());
             }
             if let Some(pending) = &mut self.snapshot {
-                pending.live_bytes += PULL_BUDGET - budget;
+                pending.live_bytes += bytes;
             }
             self.done = s.status() != Status::Running && self.cursor.marker == stream.latest_seq();
         }

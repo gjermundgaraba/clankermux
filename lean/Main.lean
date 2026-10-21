@@ -68,13 +68,62 @@ def step (max : Nat) (rs : Records) (op : Op) : Records × Json :=
 
 end Attention
 
+namespace Stream
+
+open Clankermux.Stream
+
+deriving instance ToJson for Event
+
+structure Attached where
+  s : Clankermux.Stream.Stream
+  cursor : Cursor
+
+inductive Op where
+  | bytes (values : List Nat)
+  | marker
+  /-- Serves the attachment everything: the stream, or `null` for a
+  gap; then a new bootstrap. -/
+  | serve
+  /-- `true` for a resume, `false` for a snapshot. -/
+  | resume (offset marker : Nat)
+  /-- `seqAt`, `null` outside the retained stream. -/
+  | seqAt (offset : Nat)
+  /-- `read`, `null` outside the retained stream. -/
+  | read (offset max : Nat)
+  deriving FromJson
+
+/-- Whether an offset lies within the retained stream. -/
+def within (s : Clankermux.Stream.Stream) (o : Nat) : Bool := start s ≤ o && o ≤ size s.log
+
+def step (a : Attached) : Op → Attached × Json
+  | .bytes values =>
+    ({ a with s.log := values.foldl (fun log v => push log (.byte v)) a.s.log }, Json.null)
+  | .marker => ({ a with s.log := push a.s.log .marker }, Json.null)
+  | .serve =>
+    let seen := if retains a.s a.cursor then some (served a.s.log a.cursor) else none
+    ({ a with cursor := next a.s.log }, toJson seen)
+  | .resume offset marker =>
+    let c : Cursor := ⟨offset, marker⟩
+    let resumes := retains a.s c
+    ({ a with cursor := if resumes then c else next a.s.log }, toJson resumes)
+  | .seqAt o => (a, toJson (if within a.s o then some (seqAt a.s o) else none))
+  | .read o max =>
+    let values := a.s.log.filterMap fun
+      | .byte o' v => if o ≤ o' && o' < o + max then some v else none
+      | .marker .. => none
+    (a, toJson (if within a.s o then some values else none))
+
+end Stream
+
 /-- A model and its operations. -/
 inductive Case where
   | attention (max : Nat) (ops : List Attention.Op)
+  | stream (ring markers : Nat) (ops : List Stream.Op)
   deriving FromJson
 
 def Case.run : Case → Json
   | .attention max ops => _root_.run Attention.empty (Attention.step max) ops
+  | .stream ring markers ops => _root_.run ⟨⟨[], ring, markers⟩, ⟨0, 0⟩⟩ Stream.step ops
 
 def answer (line : String) : String :=
   match Json.parse line >>= fromJson? with

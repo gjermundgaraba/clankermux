@@ -836,7 +836,8 @@ export interface Waited {
   reason: WaitReason;
   /**
    * Just past the match; after the output holding the prompt; at the end of the
-   * stream; else the cursor when it ended.
+   * stream; else the cursor when it ended. Past a match or a prompt, `marker`
+   * is 0 when a later marker is no longer retained.
    */
   at: StreamCursor;
   /** `exited`: the session's `exit`. */

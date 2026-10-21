@@ -16,11 +16,29 @@ pub struct Marker {
     pub kind: MarkerKind,
 }
 
+/// A place in the stream: the next byte to receive and the latest marker
+/// already reflected.
+#[derive(Clone, Copy)]
+pub struct Cursor {
+    pub offset: u64,
+    pub marker: u64,
+}
+
+/// What a cursor is served.
+pub enum Served<'a> {
+    Marker(&'a Marker),
+    /// Bytes as the ring's (possibly wrapped) slices, and the offset of the
+    /// first.
+    Output(u64, &'a [u8], &'a [u8]),
+}
+
 pub struct Stream {
     ring: VecDeque<u8>,
     /// Offset of the first retained byte.
     start: u64,
     markers: VecDeque<Marker>,
+    /// The offset of the latest marker dropped for `max_markers`.
+    dropped: Option<u64>,
     latest_seq: u64,
     max_ring: usize,
     max_markers: usize,
@@ -32,6 +50,7 @@ impl Stream {
             ring: VecDeque::new(),
             start: 0,
             markers: VecDeque::new(),
+            dropped: None,
             latest_seq: 0,
             max_ring,
             max_markers,
@@ -70,7 +89,7 @@ impl Stream {
             kind,
         });
         if self.markers.len() > self.max_markers {
-            self.markers.pop_front();
+            self.dropped = self.markers.pop_front().map(|m| m.offset);
         }
     }
 
@@ -95,9 +114,14 @@ impl Stream {
         ))
     }
 
-    /// The latest marker `seq` at or before `offset`, as a cursor at
-    /// `offset` reflects it.
+    /// For an offset within the ring, the latest marker `seq` at or before
+    /// `offset`, as a cursor at `offset` reflects it; 0 when a marker after
+    /// `offset` was dropped for `max_markers`, and which came before it is
+    /// unknown.
     pub fn seq_at(&self, offset: u64) -> u64 {
+        if self.dropped.is_some_and(|d| d > offset) {
+            return 0;
+        }
         let later = self.markers.iter().filter(|m| m.offset > offset).count();
         self.latest_seq - later as u64
     }
@@ -116,11 +140,61 @@ impl Stream {
     pub fn markers_after(&self, after: u64) -> impl Iterator<Item = &Marker> {
         self.markers.iter().filter(move |m| m.seq > after)
     }
+
+    /// Whether the stream can serve `cursor`: its offset is retained, and
+    /// so is every marker above its marker.
+    pub fn retains(&self, cursor: Cursor) -> bool {
+        self.start <= cursor.offset
+            && cursor.offset <= self.offset()
+            && self.markers_retained_after(cursor.marker)
+    }
+
+    /// The stream from `cursor`, which it retains: each marker before any
+    /// byte at or past its offset, the bytes in pieces of at most `chunk`
+    /// and up to `budget` in all. `cursor` advances past what is returned.
+    pub fn serve(&self, cursor: &mut Cursor, chunk: usize, mut budget: usize) -> Vec<Served<'_>> {
+        debug_assert!(self.retains(*cursor));
+        let end = self.offset();
+        let mut served = Vec::new();
+        let mut markers = self.markers_after(cursor.marker).peekable();
+        loop {
+            while let Some(m) = markers.next_if(|m| m.offset <= cursor.offset) {
+                served.push(Served::Marker(m));
+                cursor.marker = m.seq;
+            }
+            if cursor.offset >= end || budget == 0 {
+                break;
+            }
+            let limit = markers
+                .peek()
+                .map_or(end, |m| m.offset)
+                .min(end)
+                .min(cursor.offset + chunk.min(budget) as u64);
+            let (first, second) = self
+                .read_slices(cursor.offset, (limit - cursor.offset) as usize)
+                .expect("offset within the retained stream");
+            let len = first.len() + second.len();
+            budget -= len;
+            served.push(Served::Output(cursor.offset, first, second));
+            cursor.offset += len as u64;
+        }
+        served
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seq_at_is_0_past_a_marker_dropped_for_the_count() {
+        let mut s = Stream::new(3, 1);
+        s.append(b"a");
+        s.add_marker(MarkerKind::Resized { cols: 1, rows: 1 });
+        s.add_marker(MarkerKind::Resized { cols: 2, rows: 1 });
+        assert_eq!(s.seq_at(0), 0, "marker 1, after offset 0, is gone");
+        assert_eq!(s.seq_at(1), 2);
+    }
 
     #[test]
     fn ring_drops_oldest_bytes_and_markers() {

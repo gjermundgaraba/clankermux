@@ -669,7 +669,8 @@ pub enum WaitReason {
 pub struct Waited {
     pub reason: WaitReason,
     /// Just past the match; after the output holding the prompt; at the
-    /// end of the stream; else the cursor when it ended.
+    /// end of the stream; else the cursor when it ended. Past a match or a
+    /// prompt, `marker` is 0 when a later marker is no longer retained.
     pub at: StreamCursor,
     /// `exited`: the session's `exit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

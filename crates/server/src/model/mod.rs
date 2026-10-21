@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::Value;
 
 mod attention;
+mod stream;
 
 struct Model {
     /// Ends when the tests close its stdin.

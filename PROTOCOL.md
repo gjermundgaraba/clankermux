@@ -361,7 +361,7 @@ Waited
 | Field    | Type                                                                  | Meaning |
 | -------- | --------------------------------------------------------------------- | ------- |
 | `reason` | `exited` \| `matched` \| `status` \| `prompt` \| `quiet` \| `timeout` | |
-| `at`     | {offset, marker}                                                      | Just past the match; after the output holding the prompt; at the end of the stream; else the cursor when it ended. |
+| `at`     | {offset, marker}                                                      | Just past the match; after the output holding the prompt; at the end of the stream; else the cursor when it ended. Past a match or a prompt, `marker` is 0 when a later marker is no longer retained. |
 | `exit`   | ({code} \| {signal})?                                                 | `exited`: the session's `exit`. |
 | `match`  | {text, offset}?                                                       | `matched`: the plain text that matched and the stream offset of its first byte. |
 | `record` | StatusRecord?                                                         | `status`: the record, as `inspect` shows it. |
@@ -632,7 +632,11 @@ Every client of a session receives the same bytes. No byte is filtered or
 rewritten per client. A cursor is `{offset, marker}`: the next byte to
 receive and the latest marker already reflected. A stream served from a
 cursor sends the bytes from `offset` and the markers with `seq` greater
-than `marker`, each marker before any byte at or past its offset.
+than `marker`, each marker before any byte at or past its offset. A
+cursor the server places within the stream, as `Waited.at`, reflects
+the markers at or before its offset; when a marker after the offset is
+no longer retained, which those are is unknown, and `marker` is 0, so a
+resume from it gets a snapshot.
 
 The stream ends when the PTY master has reached end of file and the child
 is reaped. The server reads the PTY to end of file before appending

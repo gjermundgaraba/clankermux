@@ -412,7 +412,7 @@ impl Waiter {
     }
 }
 
-/// The cursor at `offset`: the latest marker at or before it.
+/// The cursor at `offset`, its marker as `Stream::seq_at` gives it.
 fn at(s: &Session, offset: u64) -> StreamCursor {
     match &s.body {
         Body::Live(live) => StreamCursor {
