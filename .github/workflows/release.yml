@@ -1,7 +1,10 @@
 name: release
+# On v* tags: builds the Linux binaries and attaches them to the tag's GitHub release.
 on:
   push:
     tags: ["v*"]
+permissions:
+  contents: write
 jobs:
   build:
     strategy:
@@ -18,45 +21,15 @@ jobs:
         with:
           toolchain: "1.98"
       - uses: jdx/mise-action@v2
-      # The tag names the version the binary and the web packages carry.
-      - name: version
-        run: |
-          version=${GITHUB_REF_NAME#v}
-          release=$(scripts/version.sh)
-          if [ "$version" != "$release" ]; then
-            echo "tag $GITHUB_REF_NAME does not match version $release" >&2
-            exit 1
-          fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
       - run: cargo build --release --locked -p clankermux --target ${{ matrix.target }}
-      - name: package
-        run: |
-          name=clankermux-$VERSION-${{ matrix.target }}
-          mkdir out
-          cp target/${{ matrix.target }}/release/clankermux "out/$name"
-          strip "out/$name"
-          (cd out && sha256sum "$name" > "$name.sha256")
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.target }}
-          path: out/*
-  release:
-    needs: build
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: out
-          merge-multiple: true
-      - name: release
+      - name: upload
         env:
           GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
         run: |
-          cd out
-          cat ./*.sha256 > SHA256SUMS
-          rm ./*.sha256
-          sha256sum -c SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "$GITHUB_REF_NAME" ./*
+          asset=clankermux-${GITHUB_REF_NAME#v}-$TARGET
+          cp "target/$TARGET/release/clankermux" "$asset"
+          strip "$asset"
+          # Both jobs try to create the release; the second one finds it there.
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" || true
+          gh release upload "$GITHUB_REF_NAME" "$asset" --clobber

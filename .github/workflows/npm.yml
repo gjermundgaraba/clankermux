@@ -1,28 +1,18 @@
 name: npm
-# On v* tags, as release.yml: packs @gjermundgaraba/clankermux with
-# scripts/pack-web.sh, which checks the tarball, and publishes that tarball
-# with npm trusted publishing (this repository and this file are its trusted
-# publisher on npmjs.com), so no npm token is stored. The repository is
-# private, so npm attaches no provenance. npm registers a trusted publisher
-# only on a package that exists, so the first version is published by hand
-# (README.md, "Release"); until then this skips. A version npm already has
-# is skipped too, so a rerun finishes a release.
+# Release: bump the version, commit, tag v<version> and push the tag. Publishes every package whose
+# version npm doesn't have yet, through npm trusted publishing. A new package's first version is
+# published by hand (`pnpm publish`), then `npm trust github <package> --repo <repo> --file npm.yml`.
 on:
   push:
     tags: ["v*"]
 permissions:
   contents: read
+  id-token: write
 jobs:
   publish:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.98"
       - uses: jdx/mise-action@v2
       - uses: pnpm/action-setup@v4
         with:
@@ -30,27 +20,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
-      - name: version
+      - run: just wasm
+      - working-directory: web
         run: |
-          version=${GITHUB_REF_NAME#v}
-          release=$(scripts/version.sh)
-          if [ "$version" != "$release" ]; then
-            echo "tag $GITHUB_REF_NAME does not match version $release" >&2
-            exit 1
-          fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
-      - run: just pack-web
-      # Outside the checkout, so no project manifest applies to npm.
-      - name: publish
-        working-directory: ${{ runner.temp }}
-        run: |
-          name=@gjermundgaraba/clankermux
-          if ! out=$(npm view "$name" name 2>&1); then
-            grep -q E404 <<< "$out" || { echo "$out" >&2; exit 1; }
-            echo "::notice::$name is not on npm yet; its first version is published by hand"
-          elif npm view "$name@$VERSION" version >/dev/null 2>&1; then
-            echo "$name@$VERSION is published already"
-          else
-            npm publish "$GITHUB_WORKSPACE/web/dist-packages/gjermundgaraba-clankermux-$VERSION.tgz" --access public
-          fi
+          pnpm install --frozen-lockfile
+          pnpm -r build
+          pnpm -r publish --no-git-checks

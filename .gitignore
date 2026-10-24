@@ -8,5 +8,4 @@ web/packages/clankermux/test/engine/fixtures
 web/apps/client/dist
 proptest-regressions/
 *.proptest-regressions
-web/dist-packages
 web/packages/clankermux/dist

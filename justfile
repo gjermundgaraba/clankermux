@@ -34,10 +34,6 @@ protocol:
 pin sha:
     scripts/pin.sh {{sha}}
 
-# Build and pack the npm package into web/dist-packages.
-pack-web: wasm
-    scripts/pack-web.sh
-
 # The release binary, as a tagged release builds it.
 release-build:
     cargo build --release -p clankermux

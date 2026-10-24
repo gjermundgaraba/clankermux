@@ -18,7 +18,6 @@ A terminal multiplexer server with CLI and browser clients; the wire protocol is
 | `just protocol` | renders PROTOCOL.md's tables (between `generated` marks) from the protocol types in `crates/proto` |
 | `just release-build` | `target/release/clankermux` |
 | `just dev-serve` | release server: state and socket in `target/dev/`, `wss://127.0.0.1:7438/` with a self-signed certificate, origins `http://app.clankerspace-dev.localhost:10094` and `http://127.0.0.1:8787` |
-| `just pack-web` | `web/dist-packages/gjermundgaraba-clankermux-<version>.tgz`, checked, and `COMMIT` |
 | `cd web/apps/client && pnpm build && pnpm serve` | demo page on `http://127.0.0.1:8787/?ws=wss://127.0.0.1:7438/`; after `just check`, which installs `web/` and builds the wasm |
 | `target/release/clankermux --socket target/dev/sock create` | a session on the dev server |
 
@@ -66,19 +65,7 @@ A server that dies without a signal (SIGKILL, a machine powered off) starts agai
 
 ## Release
 
-1. Bump `version` in `crates/clankermux/Cargo.toml` and `web/packages/clankermux/package.json` (`scripts/version.sh` checks they agree), push `main` and wait for `check.yml`.
-2. `git tag v<version> && git push origin v<version>`: `release.yml` attaches `clankermux-<version>-{x86_64,aarch64}-unknown-linux-gnu` and `SHA256SUMS` to a GitHub release; `npm.yml` runs `just pack-web` and publishes the tarball as `@gjermundgaraba/clankermux@<version>` through npm trusted publishing, skipping a version npm already has.
-
-npm registers a trusted publisher only on a package that exists, so the first version is published by hand, logged in to npm as the owner of the `@gjermundgaraba` scope, at the tagged commit with a clean tree:
-
-```sh
-just pack-web                    # COMMIT names the tag's commit, without -dirty
-npm publish web/dist-packages/gjermundgaraba-clankermux-0.1.0.tgz --access public --dry-run
-npm publish web/dist-packages/gjermundgaraba-clankermux-0.1.0.tgz --access public
-npm trust github @gjermundgaraba/clankermux --repo gjermundgaraba/clankermux --file npm.yml --allow-publish
-```
-
-The last line, or the package's settings on npmjs.com, names this repository and `npm.yml` as its trusted publisher.
+Bump `version` in `crates/clankermux/Cargo.toml` and/or `web/packages/clankermux/package.json`, commit, tag `v<version>` and push the tag. `release.yml` attaches `clankermux-<version>-{x86_64,aarch64}-unknown-linux-gnu` to the tag's GitHub release, named after the tag. `npm.yml` publishes `@gjermundgaraba/clankermux` through npm trusted publishing if npm doesn't have its version yet.
 
 ### Versions
 
