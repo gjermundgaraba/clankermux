@@ -20,7 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.98"
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v5
       - run: cargo build --release --locked -p clankermux --target ${{ matrix.target }}
       - name: upload
         env:
