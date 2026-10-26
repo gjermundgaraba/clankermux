@@ -7,5 +7,5 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-bindgen = "0.72"
+bindgen = "0.73"
 proto = { workspace = true }
