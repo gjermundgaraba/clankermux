@@ -4,9 +4,11 @@ use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::time::Duration;
 
+use base64::Engine as _;
 use client::{Connection, connection::hello};
 use proto::*;
 use serde_json::json;
+use tokio::io::AsyncWriteExt as _;
 use tokio::io::unix::AsyncFd;
 use tokio::process::Child;
 
@@ -31,6 +33,13 @@ async fn run_status(args: &[&str], env: &[(&str, &str)]) -> (i32, String, String
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// `run_status` against the server on `socket`, outside any session.
+async fn run_on(socket: &str, args: &[&str]) -> (i32, String, String) {
+    let mut all = vec!["--socket", socket];
+    all.extend_from_slice(args);
+    run_status(&all, &[]).await
 }
 
 /// Runs the binary as `run_status` does and returns its stdout; the
@@ -78,15 +87,15 @@ struct Term {
 impl Term {
     /// Runs `clankermux attach` with `args` in a `cols` by `rows` PTY.
     fn attach(server: &Server, cols: u16, rows: u16, args: &[&str]) -> Term {
-        let mut argv = vec![
+        let mut command = vec![
             env!("CARGO_BIN_EXE_clankermux").to_string(),
             "--socket".to_string(),
             server.socket.to_str().unwrap().to_string(),
             "attach".to_string(),
         ];
-        argv.extend(args.iter().map(|s| s.to_string()));
+        command.extend(args.iter().map(ToString::to_string));
         let (pty, child) =
-            server::pty::spawn(&argv, server.dir.path(), &BTreeMap::new(), cols, rows).unwrap();
+            server::pty::spawn(&command, server.dir.path(), &BTreeMap::new(), cols, rows).unwrap();
         // SAFETY: the master is an owned, non-blocking fd registered once.
         let master = unsafe { AsyncFd::register(pty.master) }.unwrap();
         Term {
@@ -117,13 +126,13 @@ impl Term {
             match guard
                 .try_io(|fd| rustix::io::read(fd.get_ref(), &mut buf).map_err(std::io::Error::from))
             {
-                Ok(Ok(0)) | Ok(Err(_)) => panic!(
+                Ok(Ok(0) | Err(_)) => panic!(
                     "the terminal closed before {:?}: {:?}",
                     String::from_utf8_lossy(needle),
                     String::from_utf8_lossy(&self.seen)
                 ),
                 Ok(Ok(n)) => self.seen.extend_from_slice(&buf[..n]),
-                Err(_would_block) => continue,
+                Err(_would_block) => {}
             }
         }
     }
@@ -374,12 +383,13 @@ async fn the_relay_ends_when_the_server_side_does() {
 }
 
 #[tokio::test]
-async fn websocket_flags_need_the_websocket() {
+async fn websocket_flags_are_checked_before_serving() {
     // Isolated, so that a regression of the check cannot start a server on
     // the user's own socket and state directory.
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("sock");
     for args in [
+        ["--ws", "nowhere"],
         ["--origin", "http://page.test"],
         ["--tls-cert", "c"],
         ["--tls-key", "k"],
@@ -748,12 +758,11 @@ async fn the_guide_is_printed_without_a_server() {
     }
 }
 
+/// However fast the child exits.
 #[tokio::test(flavor = "multi_thread")]
-async fn waits_exit_with_the_child_status_a_timeout_or_an_interrupt() {
+async fn create_wait_exits_with_the_child_code() {
     let server = start();
-    let conn = connect(&server).await;
     let socket = server.socket.to_str().unwrap();
-    // create --wait: the child's code, however fast it exits.
     let (code, out, err) = run_status(
         &[
             "--socket", socket, "create", "--wait", "--", "/bin/sh", "-c", "exit 5",
@@ -763,8 +772,13 @@ async fn waits_exit_with_the_child_status_a_timeout_or_an_interrupt() {
     .await;
     assert_eq!(code, 5, "{err}");
     assert_eq!(out, "exited 5\n");
+}
 
-    // A signal: 128 + its number.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_exits_128_plus_the_signal_that_ended_the_child() {
+    let server = start();
+    let conn = connect(&server).await;
+    let socket = server.socket.to_str().unwrap();
     let session = create(&conn, json!({"argv": ["/bin/cat"], "on_exit": "keep"})).await;
     let waiting = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
         .args(["--socket", socket, "wait", &session.id, "--wait-exit"])
@@ -778,8 +792,13 @@ async fn waits_exit_with_the_child_status_a_timeout_or_an_interrupt() {
     let (output, ()) = tokio::join!(waiting, killer);
     let output = output.unwrap();
     assert_eq!(output.status.code(), Some(128 + 9), "{output:?}");
+}
 
-    // A timeout: 124. Text and keys with a match.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_times_out_with_124_and_send_waits_for_a_match() {
+    let server = start();
+    let conn = connect(&server).await;
+    let socket = server.socket.to_str().unwrap();
     let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
     let (code, out, _) = run_status(
         &[
@@ -831,7 +850,15 @@ async fn waits_exit_with_the_child_status_a_timeout_or_an_interrupt() {
     assert_eq!(code, 0, "{err}");
     let sent: Sent = serde_json::from_str(&out).unwrap();
     assert_eq!(sent.wait.unwrap().reason, WaitReason::Matched);
-    // Usage: nothing to wait for; a timeout alone.
+}
+
+/// Nothing to wait for, or a timeout alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn waits_for_nothing_are_usage_errors() {
+    let server = start();
+    let conn = connect(&server).await;
+    let socket = server.socket.to_str().unwrap();
+    let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
     let (code, _, _) = run_status(&["--socket", socket, "wait", &session.id], &[]).await;
     assert_eq!(code, 2);
     let (code, _, _) = run_status(
@@ -848,8 +875,14 @@ async fn waits_exit_with_the_child_status_a_timeout_or_an_interrupt() {
     )
     .await;
     assert_eq!(code, 2);
+}
 
-    // Ctrl-C cancels the wait: 130.
+#[tokio::test(flavor = "multi_thread")]
+async fn ctrl_c_cancels_a_wait_with_130() {
+    let server = start();
+    let conn = connect(&server).await;
+    let socket = server.socket.to_str().unwrap();
+    let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
     let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
         .args(["--socket", socket, "wait", &session.id, "--exit"])
         .stderr(std::process::Stdio::piped())
@@ -858,7 +891,7 @@ async fn waits_exit_with_the_child_status_a_timeout_or_an_interrupt() {
     // Long enough for the binary to start and listen for Ctrl-C on a
     // loaded machine; before that, SIGINT would kill it outright.
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    let pid = rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap();
+    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id().unwrap()).unwrap()).unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
     let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
         .await
@@ -874,7 +907,6 @@ async fn ack_marks_records_seen_and_list_shows_attention() {
     let conn = connect(&server).await;
     let socket = server.socket.to_str().unwrap();
     let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
-    use base64::Engine as _;
     let data = base64::engine::general_purpose::STANDARD
         .encode("\x1b]7501;state=done:id=a\x1b\\\x1b]7501;state=error:id=b\x1b\\\n");
     conn.request("send", json!({"session": session.id, "data": data}))
@@ -1135,20 +1167,15 @@ async fn detach_and_resize_policy_from_the_command_line() {
     assert!(err.contains("no_such_attachment"), "{err}");
 }
 
-/// `api`: the server's catalog, one method of it, and requests as they
-/// are, failing with the CLI's exit codes.
+/// `api list` and `api describe`: the server's catalog and one method of
+/// it.
 #[tokio::test(flavor = "multi_thread")]
-async fn api_lists_describes_and_calls_as_the_server_answers() {
+async fn api_lists_and_describes_the_catalog() {
     let server = start();
     let socket = server.socket.to_str().unwrap();
-    let api = |args: &'static [&'static str]| {
-        let mut all = vec!["--socket", socket];
-        all.extend_from_slice(args);
-        async move { run_status(&all, &[]).await }
-    };
     let catalog = proto::catalog::catalog(&server.registry.config.version);
 
-    let (code, listed, err) = api(&["api", "list"]).await;
+    let (code, listed, err) = run_on(socket, &["api", "list"]).await;
     assert_eq!(code, 0, "{err}");
     for method in &catalog.methods {
         assert!(
@@ -1159,38 +1186,46 @@ async fn api_lists_describes_and_calls_as_the_server_answers() {
             method.name
         );
     }
-    let (_, listed, _) = api(&["--json", "api", "list"]).await;
+    let (_, listed, _) = run_on(socket, &["--json", "api", "list"]).await;
     let listed: Vec<serde_json::Value> = serde_json::from_str(&listed).unwrap();
     let names: Vec<&str> = listed.iter().map(|m| m["name"].as_str().unwrap()).collect();
     let expected: Vec<&str> = catalog.methods.iter().map(|m| m.name.as_str()).collect();
     assert_eq!(names, expected);
     assert_eq!(listed[0]["class"], "mutation");
 
-    let (code, shown, _) = api(&["api", "describe", "send"]).await;
+    let (code, shown, _) = run_on(socket, &["api", "describe", "send"]).await;
     assert_eq!(code, 0);
     assert_eq!(
         shown,
         proto::render::method(&catalog.describe("send").unwrap())
     );
-    let (_, shown, _) = api(&["--json", "api", "describe", "send"]).await;
+    let (_, shown, _) = run_on(socket, &["--json", "api", "describe", "send"]).await;
     let one: proto::catalog::Description = serde_json::from_str(&shown).unwrap();
     assert_eq!(one, catalog.describe("send").unwrap());
-    let (code, _, err) = api(&["api", "describe", "no_such_method"]).await;
+    let (code, _, err) = run_on(socket, &["api", "describe", "no_such_method"]).await;
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("invalid_request"), "{err}");
+}
 
-    // A call prints the result as the server sent it.
-    let (code, created, err) = api(&[
-        "api",
-        "call",
-        "create",
-        r#"{"argv": ["/bin/cat"], "label": "raw"}"#,
-    ])
+/// `api call` prints the result as the server sent it.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_calls_print_the_result_as_sent() {
+    let server = start();
+    let socket = server.socket.to_str().unwrap();
+    let (code, created, err) = run_on(
+        socket,
+        &[
+            "api",
+            "call",
+            "create",
+            r#"{"argv": ["/bin/cat"], "label": "raw"}"#,
+        ],
+    )
     .await;
     assert_eq!(code, 0, "{err}");
     let created: Session = serde_json::from_str(&created).unwrap();
     assert_eq!(created.label, "raw");
-    let (code, page, _) = api(&["api", "call", "list"]).await;
+    let (code, page, _) = run_on(socket, &["api", "call", "list"]).await;
     assert_eq!(code, 0);
     let page: Page = serde_json::from_str(&page).unwrap();
     assert_eq!(page.sessions.len(), 1);
@@ -1222,7 +1257,6 @@ async fn api_lists_describes_and_calls_as_the_server_answers() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    use tokio::io::AsyncWriteExt as _;
     let mut stdin = piped.stdin.take().unwrap();
     stdin
         .write_all(format!(r#"{{"session": "{}"}}"#, created.id).as_bytes())
@@ -1233,16 +1267,26 @@ async fn api_lists_describes_and_calls_as_the_server_answers() {
     assert!(output.status.success());
     let inspected: Session = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(inspected.id, created.id);
+}
 
-    // Failures: a target the server does not know, a refused request, a
-    // method it does not know, params that are not JSON.
-    let (code, out, err) = api(&["api", "call", "inspect", r#"{"session": "nope"}"#]).await;
+/// `api call` fails with the CLI's exit codes: a target the server does
+/// not know, a refused request, a method it does not know, params that
+/// are not JSON.
+#[tokio::test(flavor = "multi_thread")]
+async fn api_failures_exit_with_the_cli_codes() {
+    let server = start();
+    let socket = server.socket.to_str().unwrap();
+    let (code, out, err) = run_on(
+        socket,
+        &["api", "call", "inspect", r#"{"session": "nope"}"#],
+    )
+    .await;
     assert_eq!((code, out.as_str()), (3, ""), "{err}");
     assert!(err.contains("no_such_session"), "{err}");
-    let (code, _, err) = api(&["api", "call", "list", r#"{"extra": 1}"#]).await;
+    let (code, _, err) = run_on(socket, &["api", "call", "list", r#"{"extra": 1}"#]).await;
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("invalid_request"), "{err}");
-    let (code, _, err) = api(&["api", "call", "no_such_method", "{}"]).await;
+    let (code, _, err) = run_on(socket, &["api", "call", "no_such_method", "{}"]).await;
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("unknown method no_such_method"), "{err}");
     let dead = tempfile::tempdir().unwrap();

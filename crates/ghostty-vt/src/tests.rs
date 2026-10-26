@@ -31,7 +31,7 @@ fn formats_a_tail_of_rows() {
     }
     // Three rows of history, then the screen: line4, line5, line6 and a
     // blank cursor row.
-    assert_eq!(term.scrollback_rows(), 4);
+    assert_eq!(term.scrollback_rows().unwrap(), 4);
     let trimmed = |region| {
         String::from_utf8(
             formatter::format(
@@ -98,7 +98,10 @@ fn snapshot_round_trip() {
     let restored = snapshot::decode(&bytes).unwrap();
     assert_eq!(plain(&restored), plain(&term));
     assert_eq!(restored.title(), "title");
-    assert_eq!(restored.scrollback_rows(), term.scrollback_rows());
+    assert_eq!(
+        restored.scrollback_rows().unwrap(),
+        term.scrollback_rows().unwrap()
+    );
 }
 
 /// Decodes `bytes` by steps, pushing `chunk` bytes at a time, and returns
@@ -145,8 +148,8 @@ fn incremental_decode_at_arbitrary_splits() {
         assert!(pages >= 1, "chunk {chunk}");
         assert_eq!(restored.title(), "between", "chunk {chunk}");
         assert_eq!(
-            restored.scrollback_rows(),
-            term.scrollback_rows(),
+            restored.scrollback_rows().unwrap(),
+            term.scrollback_rows().unwrap(),
             "chunk {chunk}"
         );
         assert_eq!(plain(&restored), plain(&term), "chunk {chunk}");
@@ -372,7 +375,7 @@ fn the_engine_id_names_the_linked_build() {
         assert_eq!(
             ghostty_vt_sys::ghostty_build_info(
                 ghostty_vt_sys::GHOSTTY_BUILD_INFO_VERSION_STRING,
-                &mut version as *mut _ as *mut std::ffi::c_void,
+                (&raw mut version).cast::<std::ffi::c_void>(),
             ),
             ghostty_vt_sys::GHOSTTY_SUCCESS
         );
@@ -476,11 +479,8 @@ mod keys {
             b"\x1b[200~a\nb\x1b[201~"
         );
         let injected = encode_paste(b"x\x1b[201~y", true).unwrap();
-        assert_eq!(
-            injected.iter().filter(|&&b| b == 0x1b).count(),
-            2,
-            "{injected:?}"
-        );
+        // The injected ESC becomes a space.
+        assert_eq!(injected, b"\x1b[200~x [201~y\x1b[201~");
     }
 }
 
@@ -504,7 +504,7 @@ fn html_rows_and_the_alternate_screen() {
          inline;color: var(--vt-palette-1);\">red</div> &lt;b&gt;&amp;\nabcdefghijklm</div>"
     );
     // The first row scrolled off; the second wrapped once.
-    assert_eq!(term.scrollback_rows(), 1);
+    assert_eq!(term.scrollback_rows().unwrap(), 1);
     let continues: Vec<bool> = (0..4).map(|y| term.row_continues(y).unwrap()).collect();
     assert_eq!(continues, [false, false, true, false]);
     assert_eq!(term.history_start(0).unwrap(), 1);
@@ -513,7 +513,7 @@ fn html_rows_and_the_alternate_screen() {
     // A line across the top of the screen counts as the screen's.
     let mut term = Terminal::new(10, 3).unwrap();
     term.vt_write(b"first\r\naaaaaaaaaabbbbbbbbbbcc\r\nx");
-    assert_eq!(term.scrollback_rows(), 2);
+    assert_eq!(term.scrollback_rows().unwrap(), 2);
     assert!(term.row_continues(2).unwrap());
     assert_eq!(term.history_start(0).unwrap(), 1);
     assert_eq!(term.history_start(1).unwrap(), 0);
@@ -521,7 +521,11 @@ fn html_rows_and_the_alternate_screen() {
     assert!(!term.alternate_screen());
     term.vt_write(b"\x1b[?1049hALT");
     assert!(term.alternate_screen());
-    assert_eq!(term.scrollback_rows(), 0, "the alternate screen has none");
+    assert_eq!(
+        term.scrollback_rows().unwrap(),
+        0,
+        "the alternate screen has none"
+    );
     term.vt_write(b"\x1b[?1049l");
     assert!(!term.alternate_screen());
 }

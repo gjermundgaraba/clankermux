@@ -103,7 +103,11 @@ fn format_rows(
         return Ok((text, false));
     }
     // The first row from which the rest fits; past the last, nothing does.
-    let end = term.scrollback_rows() as u32 + u32::from(term.rows());
+    let end = term
+        .scrollback_rows()
+        .map_err(internal)?
+        .checked_add(term.rows().into())
+        .ok_or_else(|| internal(ghostty_vt::Error::LimitExceeded))?;
     let (mut low, mut high) = (from + 1, end);
     while low < high {
         let mid = low + (high - low) / 2;
@@ -130,7 +134,9 @@ fn from_terminal(
     let from = match scope {
         ReadScope::Screen => term.history_start(scrollback).map_err(internal)?,
         ReadScope::History => 0,
-        ReadScope::Alternate if term.alternate_screen() => term.scrollback_rows() as u32,
+        ReadScope::Alternate if term.alternate_screen() => {
+            term.scrollback_rows().map_err(internal)?
+        }
         ReadScope::Alternate => {
             return Err(unavailable("the session is not on the alternate screen"));
         }
@@ -153,10 +159,7 @@ fn last_command_bytes(s: &Session) -> Result<(Vec<u8>, bool), Fail> {
     };
     let end = command.end.unwrap_or_else(|| live.stream.offset());
     let start = output.max(live.stream.retained_start());
-    let bytes = live
-        .stream
-        .read(start, end.saturating_sub(start) as usize)
-        .unwrap_or_default();
+    let bytes = live.stream.read(start, end).unwrap_or_default();
     Ok((bytes, start > output))
 }
 
@@ -175,7 +178,7 @@ fn replay(
     format_rows(&term, format, 0, budget)
 }
 
-pub fn read(registry: &Registry, p: ReadParams) -> Result<proto::Read, Fail> {
+pub fn read(registry: &Registry, p: &ReadParams) -> Result<proto::Read, Fail> {
     let format = p.format.unwrap_or_default();
     let scope = p.scope.unwrap_or_default();
     if p.scrollback.is_some() && scope != ReadScope::Screen {
@@ -189,7 +192,7 @@ pub fn read(registry: &Registry, p: ReadParams) -> Result<proto::Read, Fail> {
         _ => p.scrollback.unwrap_or(0) as usize,
     };
     let limits = &registry.config.limits;
-    let budget = (limits.max_frame as usize).saturating_sub(REPLY_MARGIN);
+    let budget = proto::cap(limits.max_frame).saturating_sub(REPLY_MARGIN);
     let session = registry.get(&p.session)?;
     let s = session.lock().unwrap();
     let info = s.to_proto(false);
@@ -211,7 +214,7 @@ pub fn read(registry: &Registry, p: ReadParams) -> Result<proto::Read, Fail> {
         let reply = reply((String::new(), false));
         drop(s);
         let (text, cut) =
-            blocking(|| replay(&bytes, size, format, limits.scrollback as usize, budget))?;
+            blocking(|| replay(&bytes, size, format, proto::cap(limits.scrollback), budget))?;
         return Ok(proto::Read {
             text,
             truncated: cut || gone,
@@ -258,7 +261,7 @@ pub fn read(registry: &Registry, p: ReadParams) -> Result<proto::Read, Fail> {
     }
 }
 
-pub fn tail(registry: &Registry, p: TailParams) -> Result<proto::Tail, Fail> {
+pub fn tail(registry: &Registry, p: &TailParams) -> Result<proto::Tail, Fail> {
     let max = p.max_bytes.unwrap_or(TAIL_MAX_BYTES);
     if max == 0 {
         return Err((
@@ -266,7 +269,7 @@ pub fn tail(registry: &Registry, p: TailParams) -> Result<proto::Tail, Fail> {
             "max_bytes must be at least 1".into(),
         ));
     }
-    let budget = (registry.config.limits.max_frame as usize).saturating_sub(REPLY_MARGIN);
+    let budget = proto::cap(registry.config.limits.max_frame).saturating_sub(REPLY_MARGIN);
     let session = registry.get(&p.session)?;
     let s = session.lock().unwrap();
     let past = || {
@@ -297,18 +300,12 @@ pub fn tail(registry: &Registry, p: TailParams) -> Result<proto::Tail, Fail> {
     let start = p.after.max(stream.retained_start());
     let previous = start
         .checked_sub(1)
-        .and_then(|at| stream.read(at, 1))
+        .and_then(|at| stream.read(at, at + 1))
         .and_then(|b| b.first().copied());
     let bytes = stream.bytes_from(start);
     let mut filter = Filter::new(previous, start > p.after);
-    let (consumed, unfinished) = blocking(|| {
-        filter.run(
-            bytes,
-            usize::try_from(max).unwrap_or(usize::MAX),
-            budget,
-            s.exited_at.is_some(),
-        )
-    });
+    let (consumed, unfinished) =
+        blocking(|| filter.run(bytes, proto::cap(max), budget, s.exited_at.is_some()));
     let next = start + consumed as u64;
     Ok(proto::Tail {
         text: filter.out,
@@ -452,13 +449,14 @@ impl Filter {
                 0x1b => self.state = State::StringEsc,
                 _ => {}
             },
-            State::StringEsc => match byte {
-                b'\\' => self.state = State::Ground,
-                _ => {
+            State::StringEsc => {
+                if byte == b'\\' {
+                    self.state = State::Ground;
+                } else {
                     self.state = State::Esc;
                     self.byte(byte);
                 }
-            },
+            }
         }
     }
 
@@ -577,7 +575,7 @@ mod tests {
         // A string longer than `max` at the start is skipped whole.
         assert_eq!(
             filter(b"\x1b]52;c;aGVsbG8=\x07x", 2, false),
-            ("".into(), 16, false)
+            (String::new(), 16, false)
         );
         // The JSON budget: a quote takes two bytes.
         let mut f = Filter::new(None, false);

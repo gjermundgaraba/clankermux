@@ -2,7 +2,7 @@
 
 mod attach;
 
-use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -78,38 +78,7 @@ enum Command {
     /// Run the server.
     Serve(Carriers),
     /// Start a session; `argv` after `--`, the login shell by default.
-    Create {
-        #[arg(long)]
-        label: Option<String>,
-        #[arg(long)]
-        cwd: Option<String>,
-        #[arg(long)]
-        cols: Option<u16>,
-        #[arg(long)]
-        rows: Option<u16>,
-        /// Keep the session listed after it exits.
-        #[arg(long)]
-        keep: bool,
-        /// Environment entries, `NAME=value`.
-        #[arg(short = 'e', long = "env")]
-        env: Vec<String>,
-        /// Attach once created.
-        #[arg(long, conflicts_with = "wait")]
-        attach: bool,
-        /// Wait for it to exit, from its first byte, and exit with its
-        /// status.
-        #[arg(long)]
-        wait: bool,
-        /// With `--wait`: give up after DUR (`500ms`, `10s`, `2m`).
-        #[arg(long, value_name = "DUR", value_parser = parse_duration, requires = "wait")]
-        timeout: Option<std::time::Duration>,
-        /// Prefix key for `--attach` (`C-x`); followed by `d` it detaches,
-        /// twice it is sent.
-        #[arg(long, default_value = DETACH_KEY)]
-        detach_key: String,
-        #[arg(last = true)]
-        argv: Vec<String>,
-    },
+    Create(CreateArgs),
     /// List sessions.
     List,
     /// Show one session with its program status.
@@ -125,8 +94,8 @@ enum Command {
         read_only: bool,
         /// Prefix key (`C-x`); followed by `d` it detaches, twice it is
         /// sent.
-        #[arg(long, default_value = DETACH_KEY)]
-        detach_key: String,
+        #[arg(long, default_value = DETACH_KEY, value_parser = parse_detach_key)]
+        detach_key: u8,
     },
     /// Hang up the session's process group.
     End {
@@ -202,27 +171,7 @@ enum Command {
     },
     /// Send text as typed, named keys, or stdin's bytes; optionally wait
     /// for what follows.
-    Send {
-        /// The session, `$CLANKERMUX_SESSION` when left out, then the text.
-        #[arg(value_name = "[SESSION] TEXT", num_args = 0..=2)]
-        args: Vec<String>,
-        /// Press Enter after the text.
-        #[arg(long, conflicts_with_all = ["bytes", "keys"])]
-        enter: bool,
-        /// Send the text (or stdin's bytes) as a paste: bracketed when the
-        /// program asked for it, control bytes made harmless.
-        #[arg(long, conflicts_with = "keys")]
-        paste: bool,
-        /// Keys by name, encoded as the program expects them: `enter`,
-        /// `tab`, `esc`, `up`, `f5`, `ctrl+c`, `shift+tab`, `alt+x`, `a`.
-        #[arg(long, value_name = "KEY", num_args = 1.., conflicts_with = "bytes")]
-        keys: Vec<String>,
-        /// Send stdin's bytes as they are.
-        #[arg(long)]
-        bytes: bool,
-        #[command(flatten)]
-        wait: WaitArgs,
-    },
+    Send(SendArgs),
     /// Wait for the session to exit, print a match, show a status or a
     /// prompt, or fall quiet.
     Wait {
@@ -306,7 +255,7 @@ struct WaitArgs {
     quiet: Option<u64>,
     /// Give up after DUR (`500ms`, `10s`, `2m`, or seconds) and exit 124.
     #[arg(long, value_name = "DUR", value_parser = parse_duration)]
-    timeout: Option<std::time::Duration>,
+    timeout: Option<u64>,
 }
 
 impl WaitArgs {
@@ -334,14 +283,11 @@ impl WaitArgs {
         }
         Ok(Some(until))
     }
-
-    fn timeout_ms(&self) -> Option<u64> {
-        self.timeout.map(|t| t.as_millis() as u64)
-    }
 }
 
-/// `500ms`, `10s`, `2m`, `1h`, or a number of seconds.
-fn parse_duration(spec: &str) -> Result<std::time::Duration, String> {
+/// `500ms`, `10s`, `2m`, `1h`, or a number of seconds, in milliseconds.
+fn parse_duration(spec: &str) -> Result<u64, String> {
+    let invalid = || "not a duration: 500ms, 10s, 2m, 1h".to_string();
     let (number, unit) = match spec.find(|c: char| !c.is_ascii_digit() && c != '.') {
         Some(at) => spec.split_at(at),
         None => (spec, "s"),
@@ -351,14 +297,14 @@ fn parse_duration(spec: &str) -> Result<std::time::Duration, String> {
         "s" => 1.0,
         "m" => 60.0,
         "h" => 3600.0,
-        _ => return Err(format!("{spec:?} is not a duration: 500ms, 10s, 2m, 1h")),
+        _ => return Err(invalid()),
     };
     number
         .parse::<f64>()
         .ok()
-        .filter(|n| n.is_finite() && *n >= 0.0)
-        .map(|n| std::time::Duration::from_secs_f64(n * scale))
-        .ok_or_else(|| format!("{spec:?} is not a duration: 500ms, 10s, 2m, 1h"))
+        .and_then(|n| std::time::Duration::try_from_secs_f64(n * scale).ok())
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .ok_or_else(invalid)
 }
 
 #[derive(Subcommand)]
@@ -410,27 +356,25 @@ impl From<std::io::Error> for Fail {
     }
 }
 
-fn parse_detach_key(spec: &str) -> Result<u8, Fail> {
-    attach::parse_key(spec).ok_or_else(|| {
-        Fail::Usage(format!(
-            "unusable detach key {spec:?}: use C-<letter> or C-<@ [ \\ ] ^ _ ?>"
-        ))
-    })
+fn parse_detach_key(spec: &str) -> Result<u8, String> {
+    attach::parse_key(spec).ok_or_else(|| "use C-<letter> or C-<@ [ \\ ] ^ _ ?>".into())
 }
 
-fn parse_env(entries: &[String]) -> Result<BTreeMap<String, String>, Fail> {
-    entries
-        .iter()
-        .map(|entry| {
-            entry
-                .split_once('=')
-                .filter(|(name, _)| !name.is_empty())
-                .map(|(name, value)| (name.to_string(), value.to_string()))
-                .ok_or_else(|| {
-                    Fail::Usage(format!("environment entry {entry:?} is not NAME=value"))
-                })
-        })
-        .collect()
+/// An environment entry, `NAME=value`.
+fn parse_env(entry: &str) -> Result<(String, String), String> {
+    entry
+        .split_once('=')
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .ok_or_else(|| "not NAME=value".into())
+}
+
+/// A key name `--keys` can encode.
+fn parse_key_name(name: &str) -> Result<String, String> {
+    match ghostty_vt::keys::KeyPress::parse(name) {
+        Some(_) => Ok(name.to_string()),
+        None => Err("not a key name".into()),
+    }
 }
 
 /// A wire name (`last_command`) as its protocol value; serde's error
@@ -521,12 +465,13 @@ async fn resolve(conn: &Connection, here: bool, needle: Option<String>) -> Resul
     };
     let mut message = format!("{what} {needle:?}");
     for s in candidates {
-        message.push_str(&format!(
+        let _ = write!(
+            message,
             "\n  {}  {}  {}",
             short_id(&s.id),
             s.label,
             s.status
-        ));
+        );
     }
     Err(Fail::Target(message))
 }
@@ -560,7 +505,7 @@ fn parse_size(spec: &str) -> Result<Sides, Fail> {
     };
     match (side(cols)?, side(rows)?) {
         (None, None) => Err(bad()),
-        size => Ok(size),
+        sides => Ok(sides),
     }
 }
 
@@ -624,9 +569,11 @@ fn session_line(s: &Session) {
 /// Binds the carriers `serve` was asked for and runs them with the Unix
 /// socket until a signal; then parks every running session.
 async fn serve(socket: PathBuf, carriers: Carriers) -> Result<(), Fail> {
+    use tokio::signal::unix::{SignalKind, signal};
+
     let Carriers {
         tcp,
-        ws,
+        ws: ws_bind,
         origin,
         tls_cert,
         tls_key,
@@ -636,18 +583,6 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<(), Fail> {
         .iter()
         .map(|o| server::ws::origin(o).map_err(Fail::Usage))
         .collect::<Result<Vec<_>, _>>()?;
-    let ws_bind = ws
-        .as_deref()
-        .map(|bind| match bind.parse::<u16>() {
-            Ok(port) => Ok(WsBind::Port(port)),
-            Err(_) => match bind.parse::<SocketAddr>() {
-                Ok(addr) if addr.ip().is_loopback() => Ok(WsBind::Loopback(addr)),
-                _ => Err(Fail::Usage(format!(
-                    "--ws takes a port on the tailnet address or a loopback address, not {bind:?}"
-                ))),
-            },
-        })
-        .transpose()?;
     let tls_files = match (tls_cert, tls_key) {
         (Some(cert), Some(key)) => Some(server::tls::Source::Files { cert, key }),
         _ => None,
@@ -675,46 +610,14 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<(), Fail> {
     } else {
         None
     };
-    let tailnet_addr = |port: u16| {
-        let (_, status) = tailnet.as_ref().expect("needed, so requested");
-        let ip = status
-            .this
-            .tailscale_ips
-            .iter()
-            .find(|ip| ip.is_ipv4())
-            .or(status.this.tailscale_ips.first())
-            .ok_or_else(|| Error::Io(std::io::Error::other("this node has no tailnet address")))?;
-        Ok::<SocketAddr, Error>(SocketAddr::new(*ip, port))
-    };
     let mut tcp_listener = None;
     if let Some(port) = tcp {
-        tcp_listener = Some(tokio::net::TcpListener::bind(tailnet_addr(port)?).await?);
+        tcp_listener =
+            Some(tokio::net::TcpListener::bind(tailnet_addr(tailnet.as_ref(), port)?).await?);
     }
     let mut ws_listener = None;
     if let Some(bind) = ws_bind {
-        let addr = match bind {
-            WsBind::Port(port) => tailnet_addr(port)?,
-            WsBind::Loopback(addr) => addr,
-        };
-        let source = match tls_files {
-            Some(files) => files,
-            None => {
-                let (api, status) = tailnet.as_ref().expect("needed, so requested");
-                let domain = status.cert_domains.first().cloned().ok_or_else(|| {
-                    Error::Io(std::io::Error::other(
-                        "this node has no certificate domain; pass --tls-cert and --tls-key",
-                    ))
-                })?;
-                server::tls::Source::Tailscale {
-                    api: api.clone(),
-                    domain,
-                }
-            }
-        };
-        let tls = server::tls::Tls::start(source).await?;
-        tokio::spawn(tls.clone().renew_forever());
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        ws_listener = Some((listener, tls));
+        ws_listener = Some(bind_ws(bind, tls_files, tailnet.as_ref()).await?);
     }
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -734,7 +637,6 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<(), Fail> {
             origins,
         ));
     }
-    use tokio::signal::unix::{SignalKind, signal};
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
     let result = tokio::select! {
@@ -749,6 +651,110 @@ async fn serve(socket: PathBuf, carriers: Carriers) -> Result<(), Fail> {
     Ok(result?)
 }
 
+/// `port` on this node's tailnet address, IPv4 first.
+fn tailnet_addr(
+    tailnet: Option<&(server::tailscale::LocalApi, server::tailscale::Status)>,
+    port: u16,
+) -> Result<SocketAddr, Error> {
+    let (_, status) = tailnet.expect("needed, so requested");
+    let ip = status
+        .this
+        .tailscale_ips
+        .iter()
+        .find(|ip| ip.is_ipv4())
+        .or(status.this.tailscale_ips.first())
+        .ok_or_else(|| Error::Io(std::io::Error::other("this node has no tailnet address")))?;
+    Ok(SocketAddr::new(*ip, port))
+}
+
+/// The WebSocket listener on `bind`, with TLS from `tls_files` or else
+/// the node's Tailscale certificate, renewed for as long as it serves.
+async fn bind_ws(
+    bind: WsBind,
+    tls_files: Option<server::tls::Source>,
+    tailnet: Option<&(server::tailscale::LocalApi, server::tailscale::Status)>,
+) -> Result<(tokio::net::TcpListener, std::sync::Arc<server::tls::Tls>), Error> {
+    let addr = match bind {
+        WsBind::Port(port) => tailnet_addr(tailnet, port)?,
+        WsBind::Loopback(addr) => addr,
+    };
+    let source = if let Some(files) = tls_files {
+        files
+    } else {
+        let (api, status) = tailnet.expect("needed, so requested");
+        let domain = status.cert_domains.first().cloned().ok_or_else(|| {
+            Error::Io(std::io::Error::other(
+                "this node has no certificate domain; pass --tls-cert and --tls-key",
+            ))
+        })?;
+        server::tls::Source::Tailscale {
+            api: api.clone(),
+            domain,
+        }
+    };
+    let tls = server::tls::Tls::start(source).await?;
+    tokio::spawn(tls.clone().renew_forever());
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    Ok((listener, tls))
+}
+
+#[derive(Args)]
+struct CreateArgs {
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long)]
+    cwd: Option<String>,
+    #[arg(long)]
+    cols: Option<u16>,
+    #[arg(long)]
+    rows: Option<u16>,
+    /// Keep the session listed after it exits.
+    #[arg(long)]
+    keep: bool,
+    /// Environment entries, `NAME=value`.
+    #[arg(short = 'e', long = "env", value_parser = parse_env)]
+    env: Vec<(String, String)>,
+    /// Attach once created.
+    #[arg(long, conflicts_with = "wait")]
+    attach: bool,
+    /// Wait for it to exit, from its first byte, and exit with its
+    /// status.
+    #[arg(long)]
+    wait: bool,
+    /// With `--wait`: give up after DUR (`500ms`, `10s`, `2m`).
+    #[arg(long, value_name = "DUR", value_parser = parse_duration, requires = "wait")]
+    timeout: Option<u64>,
+    /// Prefix key for `--attach` (`C-x`); followed by `d` it detaches,
+    /// twice it is sent.
+    #[arg(long, default_value = DETACH_KEY, value_parser = parse_detach_key)]
+    detach_key: u8,
+    #[arg(last = true)]
+    argv: Vec<String>,
+}
+
+#[derive(Args)]
+struct SendArgs {
+    /// The session, `$CLANKERMUX_SESSION` when left out, then the text.
+    #[arg(value_name = "[SESSION] TEXT", num_args = 0..=2)]
+    args: Vec<String>,
+    /// Press Enter after the text.
+    #[arg(long, conflicts_with_all = ["bytes", "keys"])]
+    enter: bool,
+    /// Send the text (or stdin's bytes) as a paste: bracketed when the
+    /// program asked for it, control bytes made harmless.
+    #[arg(long, conflicts_with = "keys")]
+    paste: bool,
+    /// Keys by name, encoded as the program expects them: `enter`,
+    /// `tab`, `esc`, `up`, `f5`, `ctrl+c`, `shift+tab`, `alt+x`, `a`.
+    #[arg(long, value_name = "KEY", num_args = 1.., conflicts_with = "bytes", value_parser = parse_key_name)]
+    keys: Vec<String>,
+    /// Send stdin's bytes as they are.
+    #[arg(long)]
+    bytes: bool,
+    #[command(flatten)]
+    wait: WaitArgs,
+}
+
 #[derive(Args)]
 struct Carriers {
     /// Also listen on the tailnet address, plaintext.
@@ -756,8 +762,14 @@ struct Carriers {
     tcp: Option<u16>,
     /// Also serve TLS WebSocket: `PORT` on the tailnet address, or
     /// `127.0.0.1:PORT` / `[::1]:PORT`.
-    #[arg(long, value_name = "BIND", num_args = 0..=1, default_missing_value = "7438")]
-    ws: Option<String>,
+    #[arg(
+        long,
+        value_name = "BIND",
+        num_args = 0..=1,
+        default_missing_value = "7438",
+        value_parser = parse_ws_bind
+    )]
+    ws: Option<WsBind>,
     /// A page origin allowed on the WebSocket (repeatable); none
     /// refuses every page.
     #[arg(long, value_name = "ORIGIN", requires = "ws")]
@@ -804,9 +816,20 @@ fn parse_park_timing(spec: &str) -> Result<server::ParkTiming, String> {
 }
 
 /// What `--ws` names: a port on the tailnet address, or a loopback address.
+#[derive(Clone)]
 enum WsBind {
     Port(u16),
     Loopback(SocketAddr),
+}
+
+fn parse_ws_bind(bind: &str) -> Result<WsBind, String> {
+    if let Ok(port) = bind.parse::<u16>() {
+        return Ok(WsBind::Port(port));
+    }
+    match bind.parse::<SocketAddr>() {
+        Ok(addr) if addr.ip().is_loopback() => Ok(WsBind::Loopback(addr)),
+        _ => Err("not a port on the tailnet address or a loopback address".into()),
+    }
 }
 
 /// `--stdio`: bytes both ways between stdio and the socket. The relay ends
@@ -869,9 +892,9 @@ async fn send_chunks(
     let limits = &conn.welcome.limits;
     // A paste's brackets add 12 bytes.
     let bracket = if paste { 12 } else { 0 };
-    let budget = (limits.control_body as usize)
+    let budget = proto::cap(limits.control_body)
         .saturating_sub(1024)
-        .min((limits.input_queue as usize).saturating_sub(bracket))
+        .min(proto::cap(limits.input_queue).saturating_sub(bracket))
         .max(1);
     let mut requests = Vec::new();
     for chunk in chunks {
@@ -949,7 +972,7 @@ fn wait_status(waited: &Waited) -> i32 {
         (WaitReason::Exited, Some(proto::Exit::Code { code })) => *code,
         (WaitReason::Exited, Some(proto::Exit::Signal { signal })) => {
             128 + server::pty::signal_by_name(signal)
-                .map(|s| s.as_raw())
+                .map(rustix::process::Signal::as_raw)
                 .or_else(|| signal.parse().ok())
                 .unwrap_or(0)
         }
@@ -1034,36 +1057,21 @@ fn detach_args(args: Vec<String>) -> Result<(Option<String>, u64), Fail> {
 /// one whatever the server's state.
 fn check_args(command: &Command) -> Result<(), Fail> {
     match command {
-        Command::Create {
-            env, detach_key, ..
-        } => {
-            parse_detach_key(detach_key)?;
-            parse_env(env)?;
-        }
-        Command::Attach { detach_key, .. } => {
-            parse_detach_key(detach_key)?;
-        }
         Command::Resize { args, policy } => {
             resize_args(args.clone(), *policy)?;
         }
         Command::Detach { args, .. } => {
             detach_args(args.clone())?;
         }
-        Command::Send {
+        Command::Send(SendArgs {
             args,
             enter,
             keys,
             bytes,
             wait,
             ..
-        } => {
+        }) => {
             wait.until()?;
-            if let Some(key) = keys
-                .iter()
-                .find(|k| ghostty_vt::keys::KeyPress::parse(k).is_none())
-            {
-                return Err(Fail::Usage(format!("unknown key {key:?}")));
-            }
             let payload = !keys.is_empty() || *bytes;
             if payload && args.len() > 1 {
                 return Err(Fail::Usage("--keys and --bytes take no TEXT".into()));
@@ -1296,74 +1304,26 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
         }
         other => other.into(),
     })?;
+    dispatch(conn, endpoint, here, json, command).await
+}
+
+/// Runs a client `command` over `conn`; `here` when `$CLANKERMUX_SESSION`
+/// may name the session.
+async fn dispatch(
+    conn: Connection,
+    endpoint: Endpoint,
+    here: bool,
+    json: bool,
+    command: Command,
+) -> Result<i32, Fail> {
     match command {
         Command::Serve(_) | Command::Skill { .. } => unreachable!(),
         Command::Api { command } => return api(&conn, command, json).await,
-        Command::Create {
-            label,
-            cwd,
-            cols,
-            rows,
-            keep,
-            env,
-            attach,
-            wait,
-            timeout,
-            detach_key,
-            argv,
-        } => {
-            let detach_key = parse_detach_key(&detach_key)?;
-            let params = CreateParams {
-                label,
-                argv: (!argv.is_empty()).then_some(argv),
-                cwd,
-                env: Some(parse_env(&env)?),
-                cols,
-                rows,
-                on_exit: keep.then_some(OnExit::Keep),
-            };
-            let created: Session = conn.call("create", params).await?;
-            if attach {
-                let code = attach::run(
-                    attach::Options {
-                        endpoint,
-                        session: created.id,
-                        read_only: false,
-                        detach_key,
-                    },
-                    conn,
-                )
-                .await?;
-                return Ok(code);
-            }
-            if wait {
-                // From the first byte, so an exit before this request
-                // still counts.
-                let (reply, waited) = wait_request(
-                    &conn,
-                    WaitParams {
-                        session: created.id.clone(),
-                        until: Until {
-                            exited: Some(true),
-                            ..Default::default()
-                        },
-                        after: Some(CursorParams {
-                            offset: 0,
-                            marker: 0,
-                        }),
-                        timeout_ms: timeout.map(|t| t.as_millis() as u64),
-                    },
-                )
-                .await?;
-                let both = serde_json::json!({"session": created, "wait": reply});
-                return Ok(report_wait(json, &both, &waited));
-            }
-            print(json, &created, |s| emit(&format!("{}\n", s.id)));
-        }
+        Command::Create(args) => return create(conn, endpoint, json, args).await,
         Command::List => {
             let sessions = all_sessions(&conn).await?;
             print(json, &sessions, |sessions| {
-                sessions.iter().for_each(session_line)
+                sessions.iter().for_each(session_line);
             });
         }
         Command::Inspect { session } => {
@@ -1376,7 +1336,6 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             read_only,
             detach_key,
         } => {
-            let detach_key = parse_detach_key(&detach_key)?;
             let session = resolve(&conn, here, session).await?;
             let code = attach::run(
                 attach::Options {
@@ -1412,34 +1371,8 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             let updated: Session = conn.call("label", LabelParams { session, label }).await?;
             print(json, &updated, |_| {});
         }
-        Command::Resize { args, policy } => {
-            let (session, size) = resize_args(args, policy)?;
-            let session = resolve(&conn, here, session).await?;
-            let (cols, rows) = size.unwrap_or_default();
-            conn.request(
-                "resize",
-                ResizeParams {
-                    session,
-                    cols,
-                    rows,
-                    policy,
-                },
-            )
-            .await?;
-        }
-        Command::Detach { args, reason } => {
-            let (session, channel) = detach_args(args)?;
-            let session = resolve(&conn, here, session).await?;
-            conn.request(
-                "detach",
-                DetachParams {
-                    session,
-                    channel,
-                    reason,
-                },
-            )
-            .await?;
-        }
+        Command::Resize { args, policy } => resize(&conn, here, args, policy).await?,
+        Command::Detach { args, reason } => detach(&conn, here, args, reason).await?,
         Command::Read {
             session,
             scrollback,
@@ -1468,137 +1401,268 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
             let session = resolve(&conn, here, session).await?;
             tail(&conn, session, after, follow, json).await?;
         }
-        Command::Send {
-            args,
-            enter,
-            paste,
-            keys,
-            bytes,
-            wait,
-        } => {
-            let until = wait.until()?;
-            let payload = !keys.is_empty() || bytes;
-            let (session, rest) = target_and(args, if payload { 0 } else { 1 });
-            // `send build --enter` means the session `build`, not the text.
-            if let (None, [text]) = (&session, rest.as_slice())
-                && names_session(&conn, text).await?
-            {
-                return Err(Fail::Usage(format!(
-                    "{text:?} names a session: give SESSION and TEXT, or --keys enter"
-                )));
-            }
-            let mut chunks = match rest.into_iter().next() {
-                _ if bytes => {
-                    let mut data = Vec::new();
-                    std::io::stdin().read_to_end(&mut data)?;
-                    vec![Chunk::Data(data)]
-                }
-                _ if !keys.is_empty() => vec![Chunk::Keys(keys)],
-                Some(text) => vec![Chunk::Text(text)],
-                // `--enter` alone: check_args refused a send of nothing.
-                None => Vec::new(),
-            };
-            if enter {
-                // Enter after a paste, not inside it.
-                match chunks.last_mut() {
-                    Some(Chunk::Text(text)) if !paste => text.push('\r'),
-                    _ => chunks.push(Chunk::Keys(vec!["enter".into()])),
-                }
-            }
-            let session = resolve(&conn, here, session).await?;
-            let wait = until.map(|until| SendWait {
-                until,
-                timeout_ms: wait.timeout_ms(),
-            });
-            if let Some((id, reply)) = send_chunks(&conn, &session, chunks, paste, wait).await? {
-                let reply = finish_wait(&conn, id, reply).await?;
-                let sent: Sent = serde_json::from_value(reply.clone())
-                    .map_err(|e| Error::Protocol(format!("send reply: {e}")))?;
-                let waited = sent
-                    .wait
-                    .ok_or_else(|| Error::Protocol("send reply without its wait".into()))?;
-                return Ok(report_wait(json, &reply, &waited));
-            }
-        }
+        Command::Send(args) => return send(&conn, here, json, args).await,
         Command::Wait { session, wait } => {
-            let until = wait
-                .until()?
-                .expect("check_args refused a wait for nothing");
-            let session = resolve(&conn, here, session).await?;
-            let (reply, waited) = wait_request(
-                &conn,
-                WaitParams {
-                    session,
-                    until,
-                    after: None,
-                    timeout_ms: wait.timeout_ms(),
-                },
-            )
-            .await?;
-            return Ok(report_wait(json, &reply, &waited));
+            return wait_for(&conn, here, json, session, &wait).await;
         }
-        Command::Ack { args } => {
-            let mut args = args.into_iter();
-            let session = resolve(&conn, here, args.next()).await?;
-            let ids: Vec<String> = args.collect();
-            let acked: Acked = conn
-                .call(
-                    "ack",
-                    AckParams {
-                        session,
-                        record_ids: (!ids.is_empty()).then_some(ids),
-                    },
-                )
-                .await?;
-            print(json, &acked, |_| {});
-        }
-        Command::Events { after, incarnation } => {
-            let mut events = conn.events();
-            let params = SubscribeParams {
-                after,
-                incarnation: after
-                    .map(|_| incarnation.unwrap_or_else(|| conn.welcome.incarnation.clone())),
-            };
-            let subscribed: Subscribed = conn.call("subscribe", params).await?;
-            // What a later `--after` needs, off the event stream.
-            eprintln!(
-                "clankermux: incarnation {}, latest event {}",
-                conn.welcome.incarnation, subscribed.latest
-            );
-            let sessions = match subscribed.sessions {
-                Some(sessions) => {
-                    let page = Page {
-                        sessions,
-                        next: subscribed.next,
-                    };
-                    Some(following_pages(&conn, page).await?)
-                }
-                None if subscribed.gap == Some(true) => {
-                    eprintln!(
-                        "clankermux: events after {} are gone; the sessions follow",
-                        after.unwrap_or_default()
-                    );
-                    Some(all_sessions(&conn).await?)
-                }
-                None => None,
-            };
-            if let Some(sessions) = sessions {
-                print(json, &sessions, |sessions| {
-                    sessions.iter().for_each(session_line)
-                });
-            }
-            loop {
-                tokio::select! {
-                    event = events.recv() => match event {
-                        Some(event) => emit(&format!("{}\n", serde_json::to_string(&event).unwrap())),
-                        None => return Err(conn.ended().unwrap_or(Error::Closed).into()),
-                    },
-                    _ = tokio::signal::ctrl_c() => break,
-                }
-            }
-        }
+        Command::Ack { args } => ack(&conn, here, json, args).await?,
+        Command::Events { after, incarnation } => events(&conn, after, incarnation, json).await?,
     }
     Ok(0)
+}
+
+/// `resize` from its `[SESSION] [SIZE]` arguments.
+async fn resize(
+    conn: &Connection,
+    here: bool,
+    args: Vec<String>,
+    policy: Option<SizePolicy>,
+) -> Result<(), Fail> {
+    let (session, size) = resize_args(args, policy)?;
+    let session = resolve(conn, here, session).await?;
+    let (cols, rows) = size.unwrap_or_default();
+    let params = ResizeParams {
+        session,
+        cols,
+        rows,
+        policy,
+    };
+    conn.request("resize", params).await?;
+    Ok(())
+}
+
+/// `detach` from its `[SESSION] CHANNEL` arguments.
+async fn detach(
+    conn: &Connection,
+    here: bool,
+    args: Vec<String>,
+    reason: Option<String>,
+) -> Result<(), Fail> {
+    let (session, channel) = detach_args(args)?;
+    let session = resolve(conn, here, session).await?;
+    let params = DetachParams {
+        session,
+        channel,
+        reason,
+    };
+    conn.request("detach", params).await?;
+    Ok(())
+}
+
+/// `ack` from its `[SESSION [ID...]]` arguments.
+async fn ack(conn: &Connection, here: bool, json: bool, args: Vec<String>) -> Result<(), Fail> {
+    let mut args = args.into_iter();
+    let session = resolve(conn, here, args.next()).await?;
+    let ids: Vec<String> = args.collect();
+    let params = AckParams {
+        session,
+        record_ids: (!ids.is_empty()).then_some(ids),
+    };
+    let acked: Acked = conn.call("ack", params).await?;
+    print(json, &acked, |_| {});
+    Ok(())
+}
+
+/// `create`, then `--attach` or `--wait` if asked.
+async fn create(
+    conn: Connection,
+    endpoint: Endpoint,
+    json: bool,
+    args: CreateArgs,
+) -> Result<i32, Fail> {
+    let CreateArgs {
+        label,
+        cwd,
+        cols,
+        rows,
+        keep,
+        env,
+        attach,
+        wait,
+        timeout,
+        detach_key,
+        argv,
+    } = args;
+    let params = CreateParams {
+        label,
+        argv: (!argv.is_empty()).then_some(argv),
+        cwd,
+        env: Some(env.into_iter().collect()),
+        cols,
+        rows,
+        on_exit: keep.then_some(OnExit::Keep),
+    };
+    let created: Session = conn.call("create", params).await?;
+    if attach {
+        let code = attach::run(
+            attach::Options {
+                endpoint,
+                session: created.id,
+                read_only: false,
+                detach_key,
+            },
+            conn,
+        )
+        .await?;
+        return Ok(code);
+    }
+    if wait {
+        // From the first byte, so an exit before this request
+        // still counts.
+        let (reply, waited) = wait_request(
+            &conn,
+            WaitParams {
+                session: created.id.clone(),
+                until: Until {
+                    exited: Some(true),
+                    ..Default::default()
+                },
+                after: Some(CursorParams {
+                    offset: 0,
+                    marker: 0,
+                }),
+                timeout_ms: timeout,
+            },
+        )
+        .await?;
+        let both = serde_json::json!({"session": created, "wait": reply});
+        return Ok(report_wait(json, &both, &waited));
+    }
+    print(json, &created, |s| emit(&format!("{}\n", s.id)));
+    Ok(0)
+}
+
+/// `send`, and with a wait the exit status it reports.
+async fn send(conn: &Connection, here: bool, json: bool, args: SendArgs) -> Result<i32, Fail> {
+    let SendArgs {
+        args,
+        enter,
+        paste,
+        keys,
+        bytes,
+        wait,
+    } = args;
+    let until = wait.until()?;
+    let payload = !keys.is_empty() || bytes;
+    let (session, rest) = target_and(args, usize::from(!payload));
+    // `send build --enter` means the session `build`, not the text.
+    if let (None, [text]) = (&session, rest.as_slice())
+        && names_session(conn, text).await?
+    {
+        return Err(Fail::Usage(format!(
+            "{text:?} names a session: give SESSION and TEXT, or --keys enter"
+        )));
+    }
+    let mut chunks = match rest.into_iter().next() {
+        _ if bytes => {
+            let mut data = Vec::new();
+            std::io::stdin().read_to_end(&mut data)?;
+            vec![Chunk::Data(data)]
+        }
+        _ if !keys.is_empty() => vec![Chunk::Keys(keys)],
+        Some(text) => vec![Chunk::Text(text)],
+        // `--enter` alone: check_args refused a send of nothing.
+        None => Vec::new(),
+    };
+    if enter {
+        // Enter after a paste, not inside it.
+        match chunks.last_mut() {
+            Some(Chunk::Text(text)) if !paste => text.push('\r'),
+            _ => chunks.push(Chunk::Keys(vec!["enter".into()])),
+        }
+    }
+    let session = resolve(conn, here, session).await?;
+    let wait = until.map(|until| SendWait {
+        until,
+        timeout_ms: wait.timeout,
+    });
+    if let Some((id, reply)) = send_chunks(conn, &session, chunks, paste, wait).await? {
+        let reply = finish_wait(conn, id, reply).await?;
+        let sent: Sent = serde_json::from_value(reply.clone())
+            .map_err(|e| Error::Protocol(format!("send reply: {e}")))?;
+        let waited = sent
+            .wait
+            .ok_or_else(|| Error::Protocol("send reply without its wait".into()))?;
+        return Ok(report_wait(json, &reply, &waited));
+    }
+    Ok(0)
+}
+
+/// `wait`, and the exit status it reports.
+async fn wait_for(
+    conn: &Connection,
+    here: bool,
+    json: bool,
+    session: Option<String>,
+    wait: &WaitArgs,
+) -> Result<i32, Fail> {
+    let until = wait
+        .until()?
+        .expect("check_args refused a wait for nothing");
+    let session = resolve(conn, here, session).await?;
+    let (reply, waited) = wait_request(
+        conn,
+        WaitParams {
+            session,
+            until,
+            after: None,
+            timeout_ms: wait.timeout,
+        },
+    )
+    .await?;
+    Ok(report_wait(json, &reply, &waited))
+}
+
+/// `events`: the sessions, then the events until interrupted.
+async fn events(
+    conn: &Connection,
+    after: Option<u64>,
+    incarnation: Option<String>,
+    json: bool,
+) -> Result<(), Fail> {
+    let mut events = conn.events();
+    let params = SubscribeParams {
+        after,
+        incarnation: after.map(|_| incarnation.unwrap_or_else(|| conn.welcome.incarnation.clone())),
+    };
+    let subscribed: Subscribed = conn.call("subscribe", params).await?;
+    // What a later `--after` needs, off the event stream.
+    eprintln!(
+        "clankermux: incarnation {}, latest event {}",
+        conn.welcome.incarnation, subscribed.latest
+    );
+    let sessions = match subscribed.sessions {
+        Some(sessions) => {
+            let page = Page {
+                sessions,
+                next: subscribed.next,
+            };
+            Some(following_pages(conn, page).await?)
+        }
+        None if subscribed.gap == Some(true) => {
+            eprintln!(
+                "clankermux: events after {} are gone; the sessions follow",
+                after.unwrap_or_default()
+            );
+            Some(all_sessions(conn).await?)
+        }
+        None => None,
+    };
+    if let Some(sessions) = sessions {
+        print(json, &sessions, |sessions| {
+            sessions.iter().for_each(session_line);
+        });
+    }
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => emit(&format!("{}\n", serde_json::to_string(&event).unwrap())),
+                None => return Err(conn.ended().unwrap_or(Error::Closed).into()),
+            },
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]

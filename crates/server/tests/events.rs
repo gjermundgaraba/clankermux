@@ -24,80 +24,83 @@ fn report(id: &str, body: &str) -> Value {
 async fn events_are_numbered_and_replayed_after_a_cursor() {
     let server = start(fast_limits());
     let incarnation = server.registry.incarnation.clone();
-    let mut a = client(&server).await;
-    let first: Subscribed = from(a.ok("subscribe", json!({})).await);
+    let mut watcher = client(&server).await;
+    let first: Subscribed = from(watcher.ok("subscribe", json!({})).await);
     assert_eq!(first.sessions, Some(vec![]));
     assert_eq!((first.oldest, first.latest, first.gap), (1, 0, None));
 
-    let mut c = client(&server).await;
-    let session = c.create(json!({"argv": ["/bin/cat"]})).await;
+    let mut ctl = client(&server).await;
+    let session = ctl.create(json!({"argv": ["/bin/cat"]})).await;
     for label in ["one", "two"] {
-        c.ok("label", json!({"session": session.id, "label": label}))
+        ctl.ok("label", json!({"session": session.id, "label": label}))
             .await;
     }
     let mut seen = Vec::new();
     for _ in 0..3 {
-        seen.push(a.numbered().await);
+        seen.push(watcher.numbered().await);
     }
     assert_eq!(seen.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2, 3]);
     assert!(matches!(seen[0].event, Event::SessionCreated { .. }));
 
     // After the first event: the other two again, then the live ones.
-    let mut b = client(&server).await;
+    let mut resumed = client(&server).await;
     let replay: Subscribed = from(
-        b.ok("subscribe", json!({"after": 1, "incarnation": incarnation}))
+        resumed
+            .ok("subscribe", json!({"after": 1, "incarnation": incarnation}))
             .await,
     );
     assert_eq!(
         (replay.sessions, replay.oldest, replay.latest, replay.gap),
         (None, 1, 3, Some(false))
     );
-    assert_eq!(b.numbered().await, seen[1]);
-    assert_eq!(b.numbered().await, seen[2]);
-    c.ok("label", json!({"session": session.id, "label": "three"}))
+    assert_eq!(resumed.numbered().await, seen[1]);
+    assert_eq!(resumed.numbered().await, seen[2]);
+    ctl.ok("label", json!({"session": session.id, "label": "three"}))
         .await;
-    let live = a.numbered().await;
+    let live = watcher.numbered().await;
     assert_eq!(live.seq, 4);
-    assert_eq!(b.numbered().await, live);
+    assert_eq!(resumed.numbered().await, live);
 
     // At the latest: nothing to replay.
-    let mut d = client(&server).await;
+    let mut caught_up = client(&server).await;
     let replay: Subscribed = from(
-        d.ok("subscribe", json!({"after": 4, "incarnation": incarnation}))
+        caught_up
+            .ok("subscribe", json!({"after": 4, "incarnation": incarnation}))
             .await,
     );
     assert_eq!(replay.gap, Some(false));
-    c.ok("label", json!({"session": session.id, "label": "four"}))
+    ctl.ok("label", json!({"session": session.id, "label": "four"}))
         .await;
-    assert_eq!(d.numbered().await.seq, 5);
+    assert_eq!(caught_up.numbered().await.seq, 5);
 
     // A cursor above the latest, half a cursor, and a second subscription
     // with one are refused; a second plain one replies with a page.
-    let mut e = client(&server).await;
+    let mut refused = client(&server).await;
     for params in [
         json!({"after": 99, "incarnation": incarnation}),
         json!({"after": 1}),
         json!({"incarnation": incarnation}),
     ] {
         assert_eq!(
-            e.err("subscribe", params.clone()).await,
+            refused.err("subscribe", params.clone()).await,
             ErrorCode::InvalidRequest,
             "{params}"
         );
     }
     assert_eq!(
-        d.err("subscribe", json!({"after": 1, "incarnation": incarnation}))
+        caught_up
+            .err("subscribe", json!({"after": 1, "incarnation": incarnation}))
             .await,
         ErrorCode::InvalidRequest
     );
-    let again: Subscribed = from(d.ok("subscribe", json!({})).await);
+    let again: Subscribed = from(caught_up.ok("subscribe", json!({})).await);
     assert_eq!(
         (again.latest, again.sessions.map(|s| s.len())),
         (5, Some(1))
     );
-    c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
+    ctl.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
-    let exited = d.numbered().await;
+    let exited = caught_up.numbered().await;
     assert_eq!(exited.seq, 6, "each event once");
 }
 
@@ -387,8 +390,8 @@ async fn attention_changed(c: &mut Client) -> Option<(String, String)> {
     .await
 }
 
-fn attention(state: &str, record: &str) -> Option<(String, String)> {
-    Some((state.into(), record.into()))
+fn attention(state: &str, record: &str) -> (String, String) {
+    (state.into(), record.into())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -409,12 +412,18 @@ async fn ack_marks_done_and_error_seen_and_attention_follows() {
         (record.state.as_str(), record.seen, reason),
         ("working", None, StatusReason::Report)
     );
-    assert_eq!(attention_changed(&mut c).await, attention("working", ""));
+    assert_eq!(
+        attention_changed(&mut c).await,
+        Some(attention("working", ""))
+    );
 
     c.ok("send", report(&id, "state=done:id=a")).await;
     let (record, _) = status_event(&mut c).await;
     assert_eq!(record.unwrap().seen, Some(false));
-    assert_eq!(attention_changed(&mut c).await, attention("done", "a"));
+    assert_eq!(
+        attention_changed(&mut c).await,
+        Some(attention("done", "a"))
+    );
 
     c.ok(
         "send",
@@ -422,7 +431,10 @@ async fn ack_marks_done_and_error_seen_and_attention_follows() {
     )
     .await;
     assert!(status_event(&mut c).await.0.is_ok());
-    assert_eq!(attention_changed(&mut c).await, attention("blocked", "b"));
+    assert_eq!(
+        attention_changed(&mut c).await,
+        Some(attention("blocked", "b"))
+    );
     let listed = c.list().await.sessions.remove(0).attention.unwrap();
     assert_eq!(
         (
@@ -438,9 +450,12 @@ async fn ack_marks_done_and_error_seen_and_attention_follows() {
     let (removed, reason) = status_event(&mut c).await;
     assert_eq!(
         (removed, reason),
-        (Err(vec!["".into(), "b".into()]), StatusReason::Prompt)
+        (Err(vec![String::new(), "b".into()]), StatusReason::Prompt)
     );
-    assert_eq!(attention_changed(&mut c).await, attention("done", "a"));
+    assert_eq!(
+        attention_changed(&mut c).await,
+        Some(attention("done", "a"))
+    );
 
     let acked: Acked = from(
         c.ok("ack", json!({"session": id, "record_ids": ["a", "nope"]}))
@@ -463,7 +478,10 @@ async fn ack_marks_done_and_error_seen_and_attention_follows() {
     c.ok("send", report(&id, "state=error:id=a")).await;
     let (record, _) = status_event(&mut c).await;
     assert_eq!(record.unwrap().seen, Some(false));
-    assert_eq!(attention_changed(&mut c).await, attention("error", "a"));
+    assert_eq!(
+        attention_changed(&mut c).await,
+        Some(attention("error", "a"))
+    );
     c.ok("send", report(&id, "state=clear:id=a")).await;
     let (removed, reason) = status_event(&mut c).await;
     assert_eq!(
@@ -471,8 +489,20 @@ async fn ack_marks_done_and_error_seen_and_attention_follows() {
         (Err(vec!["a".into()]), StatusReason::Clear)
     );
     assert_eq!(attention_changed(&mut c).await, None);
+}
 
-    // Beyond `records` the least recently updated goes.
+/// Beyond `records` the least recently updated goes; an exit drops the
+/// working record.
+#[tokio::test(flavor = "multi_thread")]
+async fn records_beyond_the_limit_evict_the_least_recently_updated() {
+    let server = start(Limits {
+        records: 3,
+        ..fast_limits()
+    });
+    let mut c = client(&server).await;
+    c.ok("subscribe", json!({})).await;
+    let session = c.create(json!({"argv": ["/bin/cat"]})).await;
+    let id = session.id.clone();
     for record in ["x", "y", "z", "w"] {
         c.ok("send", report(&id, &format!("state=idle:id={record}")))
             .await;
@@ -487,7 +517,10 @@ async fn ack_marks_done_and_error_seen_and_attention_follows() {
     assert_eq!((removed, reason), (vec!["x".into()], StatusReason::Evicted));
 
     c.ok("send", report(&id, "state=working:id=v")).await;
-    assert_eq!(attention_changed(&mut c).await, attention("working", "v"));
+    assert_eq!(
+        attention_changed(&mut c).await,
+        Some(attention("working", "v"))
+    );
     c.ok("signal", json!({"session": id, "signal": "KILL"}))
         .await;
     let (removed, reason) = status_event(&mut c).await;
@@ -721,12 +754,12 @@ async fn empty_effects_still_deliver_answers_and_announce_metadata_changes() {
     let original_input = std::mem::replace(&mut s.live_mut().unwrap().input, input);
     s.take_events();
     s.output(b"ordinary output");
-    assert!(s.take_events().is_empty());
+    assert_eq!(s.take_events(), []);
     s.flush_effects();
-    assert!(s.take_events().is_empty());
+    assert_eq!(s.take_events(), []);
     s.output(b"\x1b[5n");
     assert_eq!(answers.try_recv().unwrap().0, b"\x1b[0n");
-    assert!(s.take_events().is_empty());
+    assert_eq!(s.take_events(), []);
     for (bytes, title, pwd) in [
         (&b"\x1b]2;title\x07"[..], "title", ""),
         (&b"\x1b]7;file:///tmp/work\x07"[..], "title", "/tmp/work"),

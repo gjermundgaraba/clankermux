@@ -144,10 +144,10 @@ fn passwd_entry() -> Option<(String, String)> {
     let rc = unsafe {
         libc::getpwuid_r(
             libc::getuid(),
-            &mut pw,
+            &raw mut pw,
             buf.as_mut_ptr().cast(),
             buf.len(),
-            &mut found,
+            &raw mut found,
         )
     };
     if rc != 0 || found.is_null() || pw.pw_shell.is_null() || pw.pw_dir.is_null() {
@@ -167,9 +167,7 @@ pub fn default_config() -> Config {
         shell
     };
     let home = if home.is_empty() {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/"))
+        std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
     } else {
         PathBuf::from(home)
     };

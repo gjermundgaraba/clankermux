@@ -180,7 +180,7 @@ pub fn announced(session: &proto::Session) -> Announced {
 /// Relative luminance per WCAG, 0 for black and 1 for white.
 pub fn luminance(c: Rgb) -> f64 {
     fn lin(v: u8) -> f64 {
-        let s = v as f64 / 255.0;
+        let s = f64::from(v) / 255.0;
         if s <= 0.04045 {
             s / 12.92
         } else {
@@ -357,7 +357,7 @@ impl Live {
     /// of the leading lines are history.
     pub fn text(&self) -> Result<(String, usize), ghostty_vt::Error> {
         let all = self.text_from(0)?;
-        let screen = self.text_from(self.term.scrollback_rows() as u32)?;
+        let screen = self.text_from(self.term.scrollback_rows()?)?;
         let history_lines = all.lines().count() - screen.lines().count();
         Ok((all, history_lines))
     }
@@ -454,9 +454,9 @@ impl Session {
             exited_at: None,
             exit: None,
             wake: Arc::new(Notify::new()),
-            text_limit: limits.text as usize,
-            records_limit: limits.records as usize,
-            commands_limit: limits.commands as usize,
+            text_limit: proto::cap(limits.text),
+            records_limit: proto::cap(limits.records),
+            commands_limit: proto::cap(limits.commands),
             attached: Vec::new(),
             size_policy: SizePolicy::Latest,
             size_owner: None,
@@ -464,9 +464,9 @@ impl Session {
             commands: Commands::default(),
             events: Vec::new(),
             removed: false,
-            announced: Default::default(),
+            announced: Announced::default(),
             last_bell: None,
-            park_lock: Default::default(),
+            park_lock: Arc::default(),
             unparked: None,
             parked_at: None,
             park_due: Arc::new(Notify::new()),
@@ -584,12 +584,11 @@ impl Session {
     /// Records a change for the activity park.
     pub fn touch(&mut self) {
         let now = Instant::now();
-        match &mut self.unparked {
-            Some((_, last)) => *last = now,
-            None => {
-                self.unparked = Some((now, now));
-                self.park_due.notify_one();
-            }
+        if let Some((_, last)) = &mut self.unparked {
+            *last = now;
+        } else {
+            self.unparked = Some((now, now));
+            self.park_due.notify_one();
         }
     }
 
@@ -663,44 +662,12 @@ impl Session {
         for (offset, notice) in notices {
             let event = match notice {
                 Notice::Report(report) => {
-                    let change = self.records.apply(report, self.records_limit, &now);
-                    let reason = if change.set.is_some() {
-                        StatusReason::Evicted
-                    } else {
-                        StatusReason::Clear
-                    };
-                    if let Some(record) = change.set {
-                        self.events.push(Event::ProgramStatusChanged {
-                            id: id.clone(),
-                            record,
-                            reason: StatusReason::Report,
-                        });
-                    }
-                    if !change.removed.is_empty() {
-                        self.events.push(Event::ProgramStatusRemoved {
-                            id: id.clone(),
-                            record_ids: change.removed,
-                            reason,
-                        });
-                    }
+                    self.apply_status_report(report, &now);
                     changed = true;
                     continue;
                 }
                 Notice::PromptStart(prompt) => {
-                    let mark = SemanticPrompt {
-                        kind: SemanticPromptKind::PromptStart,
-                        prompt,
-                    };
-                    changed |= self.mark(mark, None, offset);
-                    if let Body::Live(live) = &mut self.body {
-                        let start = live.stream.retained_start();
-                        live.prompts.retain(|&o| o >= start);
-                        if live.prompts.len() >= PROMPTS {
-                            live.prompts.pop_front();
-                        }
-                        live.prompts.push_back(offset);
-                    }
-                    changed |= self.drop_transient_records(StatusReason::Prompt);
+                    changed |= self.prompt_started(prompt, offset);
                     continue;
                 }
                 Notice::CommandStarted => {
@@ -759,6 +726,51 @@ impl Session {
         if changed {
             self.announce();
         }
+    }
+
+    /// Applies a program status report, with its events.
+    fn apply_status_report(&mut self, report: ProgramStatus, now: &str) {
+        let change = self.records.apply(report, self.records_limit, now);
+        let reason = if change.set.is_some() {
+            StatusReason::Evicted
+        } else {
+            StatusReason::Clear
+        };
+        if let Some(record) = change.set {
+            self.events.push(Event::ProgramStatusChanged {
+                id: self.id.clone(),
+                record,
+                reason: StatusReason::Report,
+            });
+        }
+        if !change.removed.is_empty() {
+            self.events.push(Event::ProgramStatusRemoved {
+                id: self.id.clone(),
+                record_ids: change.removed,
+                reason,
+            });
+        }
+    }
+
+    /// Marks a prompt's start at `offset`, remembers it among the recent
+    /// prompts, and drops the transient records; whether that changed
+    /// what the session announces.
+    fn prompt_started(&mut self, prompt: PromptKind, offset: u64) -> bool {
+        let mark = SemanticPrompt {
+            kind: SemanticPromptKind::PromptStart,
+            prompt,
+        };
+        let mut changed = self.mark(mark, None, offset);
+        if let Body::Live(live) = &mut self.body {
+            let start = live.stream.retained_start();
+            live.prompts.retain(|&o| o >= start);
+            if live.prompts.len() >= PROMPTS {
+                live.prompts.pop_front();
+            }
+            live.prompts.push_back(offset);
+        }
+        changed |= self.drop_transient_records(StatusReason::Prompt);
+        changed
     }
 
     /// Queues `session_changed` when the title, pwd, attention or
@@ -872,7 +884,7 @@ impl Session {
             profile,
         } = report;
         if let Some(profile) = profile {
-            self.set_profile(profile);
+            self.set_profile(&profile);
         }
         let current = self.size();
         let owner = self.size_owner;
@@ -974,7 +986,7 @@ impl Session {
     /// Makes `profile` the session's: default colours for OSC 10, 11 and
     /// 12 (falling back to [`default_color`]), the scheme for CSI ? 996
     /// n, and a mode 2031 report when the scheme answer changed.
-    pub fn set_profile(&mut self, profile: Profile) {
+    pub fn set_profile(&mut self, profile: &Profile) {
         let id = self.id.clone();
         let Body::Live(live) = &mut self.body else {
             return;
@@ -1092,7 +1104,7 @@ impl Session {
                 },
                 ..self.to_proto(false)
             },
-            history_lines: history_lines as u64,
+            history_lines,
             commands: self.commands.all(),
         };
         Ok((file, all))
@@ -1192,15 +1204,12 @@ pub fn pwd_path(value: &str) -> String {
                 .and_then(|hex| u8::from_str_radix(hex, 16).ok()),
             _ => None,
         };
-        match decoded {
-            Some(byte) => {
-                out.push(byte);
-                i += 3;
-            }
-            None => {
-                out.push(bytes[i]);
-                i += 1;
-            }
+        if let Some(byte) = decoded {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
         }
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -1258,8 +1267,8 @@ pub async fn snapshot_with_retry<T>(
             Ok(value) => return Ok(Some(value)),
             Err(ghostty_vt::Error::LimitExceeded) if tokio::time::Instant::now() < deadline => {
                 tokio::select! {
-                    _ = notified => {}
-                    _ = tokio::time::sleep_until(deadline) => {}
+                    () = notified => {}
+                    () = tokio::time::sleep_until(deadline) => {}
                 }
             }
             Err(err) => return Err(err),

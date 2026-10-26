@@ -48,11 +48,7 @@ impl Commands {
             .back_mut()
             .filter(|c| c.end.is_none() && c.output.is_none());
         match (mark.kind, open) {
-            (SemanticPromptKind::PromptStart, _) if mark.prompt != PromptKind::Primary => {
-                return false;
-            }
-            (SemanticPromptKind::PromptStart, Some(_)) => return false,
-            (SemanticPromptKind::PromptStart, None) => {
+            (SemanticPromptKind::PromptStart, None) if mark.prompt == PromptKind::Primary => {
                 if self.list.back().is_some_and(|c| c.output.is_none()) {
                     self.list.pop_back();
                 }
@@ -64,7 +60,7 @@ impl Commands {
                         exit: None,
                     },
                     max,
-                )
+                );
             }
             (SemanticPromptKind::OutputStart, Some(command)) => command.output = Some(offset),
             (SemanticPromptKind::OutputStart, None) => self.push(
@@ -85,7 +81,7 @@ impl Commands {
                     None => return false,
                 }
             }
-            (SemanticPromptKind::InputStart, _) => return false,
+            (SemanticPromptKind::PromptStart | SemanticPromptKind::InputStart, _) => return false,
         }
         true
     }

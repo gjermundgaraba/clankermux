@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -14,7 +15,7 @@ use proto::{
 };
 use rustix::process::Signal;
 use tokio::io::unix::AsyncFd;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -25,8 +26,8 @@ use crate::park;
 use crate::pty;
 use crate::records::Records;
 use crate::session::{
-    Body, Effects, InputQueue, Live, Parked, SNAPSHOT_RETRY, Session, Shared, blocking, check_size,
-    default_color, now, snapshot_with_retry,
+    Body, Effects, InputQueue, InputUnit, Live, Parked, SNAPSHOT_RETRY, Session, Shared, blocking,
+    check_size, default_color, now, snapshot_with_retry,
 };
 use crate::stream::Stream;
 
@@ -172,7 +173,7 @@ impl Registry {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {}
-                    _ = shutdown.cancelled() => return,
+                    () = shutdown.cancelled() => return,
                 }
                 let Some(registry) = timer.upgrade() else {
                     return;
@@ -224,7 +225,7 @@ impl Registry {
             offset: info.offset,
             marker: info.marker,
             screen,
-            history_lines: file.history_lines as usize,
+            history_lines: file.history_lines,
             snapshot_path,
         });
         let mut session = Session {
@@ -300,7 +301,9 @@ impl Registry {
             Ok(Some(Ok((bytes, file, screen)))) => {
                 let generation = {
                     let mut s = session.lock().unwrap();
-                    s.last_generation = (at.as_millisecond() as u64).max(s.last_generation + 1);
+                    s.last_generation = u64::try_from(at.as_millisecond())
+                        .unwrap_or(0)
+                        .max(s.last_generation + 1);
                     s.last_generation
                 };
                 // Four fsyncs and a rename: off the async workers.
@@ -464,8 +467,8 @@ impl Registry {
     /// to up to six bytes a character); `next` names the last one when
     /// more follow.
     fn page_of(&self, state: &State, after: Option<&str>) -> Page {
-        let page = self.config.limits.page as usize;
-        let budget = (self.config.limits.max_frame as usize).saturating_sub(PAGE_MARGIN);
+        let page = proto::cap(self.config.limits.page);
+        let budget = proto::cap(self.config.limits.max_frame).saturating_sub(PAGE_MARGIN);
         let mut sessions = Vec::new();
         let mut bytes = 0;
         let mut more = false;
@@ -537,31 +540,14 @@ impl Registry {
         }
         let limits = &self.config.limits;
         let label = params.label.unwrap_or_default();
-        if label.len() > limits.label as usize {
+        if label.len() > proto::cap(limits.label) {
             return Err((ErrorCode::LimitExceeded, "label too long".into()));
         }
         let argv = params.argv.unwrap_or_else(|| self.config.shell.clone());
         let cwd = params
             .cwd
             .unwrap_or_else(|| self.config.home.to_string_lossy().into_owned());
-        if cwd.len() > limits.text as usize
-            || argv.iter().map(|a| a.len()).sum::<usize>() > limits.text as usize
-        {
-            return Err((ErrorCode::LimitExceeded, "cwd or argv too long".into()));
-        }
-        if argv.is_empty()
-            || argv.iter().chain([&cwd]).any(|s| s.contains('\0'))
-            || params
-                .env
-                .iter()
-                .flatten()
-                .any(|(k, v)| k.contains('\0') || v.contains('\0'))
-        {
-            return Err((
-                ErrorCode::InvalidRequest,
-                "argv must not be empty, and argv, cwd and env must not hold NUL".into(),
-            ));
-        }
+        check_command(&argv, &cwd, params.env.as_ref(), limits)?;
         let cols = params.cols.unwrap_or(80);
         let rows = params.rows.unwrap_or(24);
         check_size(&proto::Size {
@@ -581,29 +567,8 @@ impl Registry {
         );
 
         // Everything that can fail is tried before the child exists.
-        let mut term =
-            ghostty_vt::Terminal::with_handler(cols, rows, Effects::default()).map_err(internal)?;
-        term.set_xtversion(&format!("clankermux {}", self.config.version));
-        term.set_terminfo_name("xterm-ghostty").map_err(internal)?;
-        for kind in [
-            ghostty_vt::ColorKind::Foreground,
-            ghostty_vt::ColorKind::Background,
-            ghostty_vt::ColorKind::Cursor,
-        ] {
-            term.set_color(kind, Some(default_color(kind)))
-                .map_err(internal)?;
-        }
-        term.set_scrollback_max_bytes(limits.scrollback as usize)
-            .map_err(internal)?;
-        term.set_continuation_max_bytes(limits.continuation as usize)
-            .map_err(internal)?;
-        term.handler_mut().size = ghostty_vt::SizeReport {
-            cols,
-            rows,
-            cell_width: 0,
-            cell_height: 0,
-        };
-        let (pty, mut child) = pty::spawn(&argv, std::path::Path::new(&cwd), &env, cols, rows)
+        let term = new_terminal(cols, rows, limits, &self.config.version).map_err(internal)?;
+        let (pty, child) = pty::spawn(&argv, std::path::Path::new(&cwd), &env, cols, rows)
             .map_err(|e| match e.kind() {
                 io::ErrorKind::NotFound
                 | io::ErrorKind::PermissionDenied
@@ -617,20 +582,20 @@ impl Registry {
         // SAFETY: the master is an owned, non-blocking fd registered once.
         // A failure drops the child, which tokio reaps when it exits.
         let master = Arc::new(unsafe { AsyncFd::register(pty.master) }.map_err(internal)?);
-        let (input, input_rx) = InputQueue::new(limits.input_queue as usize);
+        let (input, input_rx) = InputQueue::new(proto::cap(limits.input_queue));
         let created = Instant::now();
         let body = Body::Live(Box::new(Live {
             pid: Some(pid),
             pgid: pid,
             term,
-            stream: Stream::new(limits.ring as usize, limits.markers as usize),
+            stream: Stream::new(proto::cap(limits.ring), proto::cap(limits.markers)),
             master: master.clone(),
             slave_path: pty.slave_path,
             input,
             pty_eof: false,
             pending: None,
             timer_running: false,
-            prompts: Default::default(),
+            prompts: VecDeque::new(),
             last_output: created,
         }));
         let session = Session {
@@ -663,84 +628,9 @@ impl Registry {
             due,
             self.shutdown.clone(),
         ));
-
-        let registry = self.clone();
-        let reader_session = shared.clone();
-        let reader_master = master.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let Ok(mut guard) = reader_master.readable().await else {
-                    break;
-                };
-                match guard.try_io(|fd| {
-                    rustix::io::read(fd.get_ref(), &mut buf).map_err(std::io::Error::from)
-                }) {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => {
-                        let events = {
-                            let mut session = reader_session.lock().unwrap();
-                            session.output(&buf[..n]);
-                            session.take_events()
-                        };
-                        registry.emit_all(events);
-                    }
-                    // EIO is how Linux reports the slave side closing.
-                    Ok(Err(_)) => break,
-                    Err(_would_block) => continue,
-                }
-            }
-            let ended = {
-                let mut session = reader_session.lock().unwrap();
-                if let Some(live) = session.live_mut() {
-                    live.pty_eof = true;
-                }
-                session.maybe_end().map(|_| session.to_proto(false))
-            };
-            registry.ended(&reader_session, ended);
-        });
-
-        let registry = self.clone();
-        let wait_session = shared.clone();
-        tokio::spawn(async move {
-            let status = child.wait().await;
-            let ended = {
-                let mut session = wait_session.lock().unwrap();
-                if let Some(live) = session.live_mut() {
-                    live.pid = None;
-                }
-                session.exit = Some(match status {
-                    Ok(status) => exit_of(status),
-                    Err(_) => Exit::Code { code: -1 },
-                });
-                session.maybe_end().map(|_| session.to_proto(false))
-            };
-            registry.ended(&wait_session, ended);
-        });
-
-        tokio::spawn(async move {
-            let mut rx = input_rx;
-            while let Some((bytes, permit, done)) = rx.recv().await {
-                let mut written = 0;
-                while written < bytes.len() {
-                    let Ok(mut guard) = master.writable().await else {
-                        return;
-                    };
-                    match guard.try_io(|fd| {
-                        rustix::io::write(fd.get_ref(), &bytes[written..])
-                            .map_err(std::io::Error::from)
-                    }) {
-                        Ok(Ok(n)) => written += n,
-                        // The waiter sees a dropped `done` as a failed write.
-                        Ok(Err(_)) => return,
-                        Err(_would_block) => continue,
-                    }
-                }
-                drop(permit);
-                let _ = done.send(());
-            }
-        });
-
+        tokio::spawn(read_pty(self.clone(), shared.clone(), master.clone()));
+        tokio::spawn(wait_child(self.clone(), shared, child));
+        tokio::spawn(write_input(master, input_rx));
         Ok(snapshot)
     }
 
@@ -873,6 +763,139 @@ impl Registry {
     }
 }
 
+/// Refuses a command over the text limit, without a program, or with a
+/// NUL the OS cannot pass.
+fn check_command(
+    argv: &[String],
+    cwd: &str,
+    env: Option<&BTreeMap<String, String>>,
+    limits: &Limits,
+) -> Result<(), Fail> {
+    if cwd.len() > proto::cap(limits.text)
+        || argv.iter().map(String::len).sum::<usize>() > proto::cap(limits.text)
+    {
+        return Err((ErrorCode::LimitExceeded, "cwd or argv too long".into()));
+    }
+    if argv.is_empty()
+        || argv
+            .iter()
+            .map(String::as_str)
+            .chain([cwd])
+            .any(|s| s.contains('\0'))
+        || env
+            .into_iter()
+            .flatten()
+            .any(|(k, v)| k.contains('\0') || v.contains('\0'))
+    {
+        return Err((
+            ErrorCode::InvalidRequest,
+            "argv must not be empty, and argv, cwd and env must not hold NUL".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A session's terminal, `cols` by `rows`, as its program starts.
+fn new_terminal(
+    cols: u16,
+    rows: u16,
+    limits: &Limits,
+    version: &str,
+) -> ghostty_vt::Result<ghostty_vt::Terminal<Effects>> {
+    let mut term = ghostty_vt::Terminal::with_handler(cols, rows, Effects::default())?;
+    term.set_xtversion(&format!("clankermux {version}"));
+    term.set_terminfo_name("xterm-ghostty")?;
+    for kind in [
+        ghostty_vt::ColorKind::Foreground,
+        ghostty_vt::ColorKind::Background,
+        ghostty_vt::ColorKind::Cursor,
+    ] {
+        term.set_color(kind, Some(default_color(kind)))?;
+    }
+    term.set_scrollback_max_bytes(proto::cap(limits.scrollback))?;
+    term.set_continuation_max_bytes(proto::cap(limits.continuation))?;
+    term.handler_mut().size = ghostty_vt::SizeReport {
+        cols,
+        rows,
+        cell_width: 0,
+        cell_height: 0,
+    };
+    Ok(term)
+}
+
+/// Feeds the PTY's output to `session` until the slave side closes.
+async fn read_pty(registry: Arc<Registry>, session: Shared, master: Arc<AsyncFd<OwnedFd>>) {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let Ok(mut guard) = master.readable().await else {
+            break;
+        };
+        match guard
+            .try_io(|fd| rustix::io::read(fd.get_ref(), &mut buf).map_err(std::io::Error::from))
+        {
+            // EOF, or EIO: how Linux reports the slave side closing.
+            Ok(Ok(0) | Err(_)) => break,
+            Ok(Ok(n)) => {
+                let events = {
+                    let mut s = session.lock().unwrap();
+                    s.output(&buf[..n]);
+                    s.take_events()
+                };
+                registry.emit_all(events);
+            }
+            Err(_would_block) => {}
+        }
+    }
+    let ended = {
+        let mut s = session.lock().unwrap();
+        if let Some(live) = s.live_mut() {
+            live.pty_eof = true;
+        }
+        s.maybe_end().map(|_| s.to_proto(false))
+    };
+    registry.ended(&session, ended);
+}
+
+/// Records the child's exit on `session`.
+async fn wait_child(registry: Arc<Registry>, session: Shared, mut child: tokio::process::Child) {
+    let status = child.wait().await;
+    let ended = {
+        let mut s = session.lock().unwrap();
+        if let Some(live) = s.live_mut() {
+            live.pid = None;
+        }
+        s.exit = Some(match status {
+            Ok(status) => exit_of(status),
+            Err(_) => Exit::Code { code: -1 },
+        });
+        s.maybe_end().map(|_| s.to_proto(false))
+    };
+    registry.ended(&session, ended);
+}
+
+/// Writes each queued input whole to the PTY, then releases its permit
+/// and answers its `done`, until the queue or a write fails.
+async fn write_input(master: Arc<AsyncFd<OwnedFd>>, mut rx: mpsc::UnboundedReceiver<InputUnit>) {
+    while let Some((bytes, permit, done)) = rx.recv().await {
+        let mut written = 0;
+        while written < bytes.len() {
+            let Ok(mut guard) = master.writable().await else {
+                return;
+            };
+            match guard.try_io(|fd| {
+                rustix::io::write(fd.get_ref(), &bytes[written..]).map_err(std::io::Error::from)
+            }) {
+                Ok(Ok(n)) => written += n,
+                // The waiter sees a dropped `done` as a failed write.
+                Ok(Err(_)) => return,
+                Err(_would_block) => {}
+            }
+        }
+        drop(permit);
+        let _ = done.send(());
+    }
+}
+
 /// A running session's activity park: once its changes have been quiet
 /// for `park.quiet`, or `park.busy` after the first of them, whichever
 /// comes first, and not within `park.gap` of the last park, so that
@@ -910,14 +933,14 @@ async fn park_when_due(
             }
             drop((registry, shared));
             tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => {}
-                _ = shutdown.cancelled() => return,
+                () = tokio::time::sleep_until(deadline) => {}
+                () = shutdown.cancelled() => return,
             }
         }
         // The session's end notifies too, so that this task ends with it.
         tokio::select! {
-            _ = due.notified() => {}
-            _ = shutdown.cancelled() => return,
+            () = due.notified() => {}
+            () = shutdown.cancelled() => return,
         }
     }
 }

@@ -18,6 +18,21 @@ fn with_extra(mut value: Value, path: &[&str]) -> Value {
     value
 }
 
+/// The refused requests took no effect: the session runs on unlabelled
+/// at its first size.
+async fn assert_untouched(c: &mut Client, id: &str) {
+    let after = c.inspect(id).await;
+    assert_eq!(
+        (
+            after.status,
+            after.label.as_str(),
+            after.cols,
+            after.size.policy
+        ),
+        (Status::Running, "", 80, SizePolicy::Latest)
+    );
+}
+
 #[tokio::test]
 async fn an_unknown_field_in_hello_closes_the_connection() {
     let server = start(fast_limits());
@@ -84,7 +99,21 @@ async fn an_unknown_field_in_a_request_is_invalid() {
             "{method}"
         );
     }
-    // The objects inside them, and `wait` and `cancel`.
+    assert_eq!(
+        c.err("subscribe", json!({"after": id})).await,
+        ErrorCode::InvalidRequest,
+        "subscribe takes no after"
+    );
+    assert_untouched(&mut c, id).await;
+}
+
+/// The objects inside params, and `wait` and `cancel`.
+#[tokio::test]
+async fn an_unknown_field_inside_params_is_invalid() {
+    let server = start(fast_limits());
+    let mut c = client(&server).await;
+    let s = c.create(json!({"argv": ["/bin/cat"]})).await;
+    let id = s.id.as_str();
     let until = json!({"output": {"text": "x"}, "status": {"states": ["done"]}});
     let nested = [
         ("wait", json!({"session": id, "until": until}), &[][..]),
@@ -127,22 +156,7 @@ async fn an_unknown_field_in_a_request_is_invalid() {
             "{method} {path:?}"
         );
     }
-    assert_eq!(
-        c.err("subscribe", json!({"after": id})).await,
-        ErrorCode::InvalidRequest,
-        "subscribe takes no after"
-    );
-    // Nothing above took effect: the session runs on unlabelled.
-    let after = c.inspect(id).await;
-    assert_eq!(
-        (
-            after.status,
-            after.label.as_str(),
-            after.cols,
-            after.size.policy
-        ),
-        (Status::Running, "", 80, SizePolicy::Latest)
-    );
+    assert_untouched(&mut c, id).await;
 }
 
 #[tokio::test]

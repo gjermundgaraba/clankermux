@@ -16,7 +16,7 @@ fn frame_type() -> impl Strategy<Value = FrameType> {
 fn payload_len() -> impl Strategy<Value = usize> {
     prop_oneof![
         4 => 0..300usize,
-        1 => (MAX_FRAME as usize - 2)..=(MAX_FRAME as usize),
+        1 => (cap(MAX_FRAME) - 2)..=cap(MAX_FRAME),
     ]
 }
 
@@ -142,7 +142,7 @@ proptest! {
     fn headers_fail_as_specified(
         frame_type in frame_type(),
         channel in any::<u32>(),
-        length in prop_oneof![0..=(MAX_FRAME as u32), any::<u32>()],
+        length in prop_oneof![0..=u32::try_from(MAX_FRAME).unwrap(), any::<u32>()],
         bad_type in any::<u8>(),
     ) {
         let header = encode_header(frame_type, channel, length);

@@ -79,7 +79,7 @@ unsafe extern "C" fn read_source(
     // SAFETY: userdata is the Source owned by the Decoder, and buffer has
     // room for capacity bytes.
     unsafe {
-        let source = &mut *(userdata as *mut Source);
+        let source = &mut *userdata.cast::<Source>();
         let n = capacity.min(source.data.len() - source.pos);
         ptr::copy_nonoverlapping(source.data.as_ptr().add(source.pos), buffer, n);
         source.pos += n;
@@ -126,13 +126,13 @@ impl<H: Handler> Decoder<H> {
         }));
         let reader = sys::GhosttyReader {
             read: Some(read_source),
-            userdata: source as *mut c_void,
+            userdata: source.cast::<c_void>(),
         };
         let mut raw = ptr::null_mut();
         // SAFETY: the source outlives the decoder; Drop frees the decoder
         // first.
         if let Err(err) =
-            check(unsafe { sys::ghostty_snapshot_decoder_new(ptr::null(), &mut raw, reader) })
+            check(unsafe { sys::ghostty_snapshot_decoder_new(ptr::null(), &raw mut raw, reader) })
         {
             // SAFETY: source came from Box::into_raw above and was not
             // handed to a decoder.
@@ -193,7 +193,7 @@ impl<H: Handler> Decoder<H> {
             sys::ghostty_snapshot_decoder_set(
                 self.raw,
                 sys::GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES,
-                &max as *const usize as *const c_void,
+                (&raw const max).cast::<c_void>(),
             )
         })
     }
@@ -225,7 +225,7 @@ impl<H: Handler> Decoder<H> {
     pub fn ready(&mut self) -> Result<&mut Terminal<H>> {
         let mut raw = ptr::null_mut();
         // SAFETY: raw is a live decoder.
-        let result = unsafe { sys::ghostty_snapshot_decoder_ready(self.raw, &mut raw) };
+        let result = unsafe { sys::ghostty_snapshot_decoder_ready(self.raw, &raw mut raw) };
         check(result)?;
         // SAFETY: on success raw is a caller-owned terminal.
         Ok(unsafe { self.adopt(raw) })
@@ -250,7 +250,7 @@ impl<H: Handler> Decoder<H> {
     fn decode(&mut self) -> Result<&mut Terminal<H>> {
         let mut raw = ptr::null_mut();
         // SAFETY: raw is a live decoder.
-        let result = unsafe { sys::ghostty_snapshot_decoder_decode(self.raw, &mut raw) };
+        let result = unsafe { sys::ghostty_snapshot_decoder_decode(self.raw, &raw mut raw) };
         self.compact();
         check(result)?;
         self.finished = true;
@@ -332,7 +332,10 @@ mod tests {
         assert!(decoder.finished());
         assert_eq!(decoder.buffered(), 0);
         let restored = decoder.into_terminal().unwrap();
-        assert_eq!(restored.scrollback_rows(), term.scrollback_rows());
+        assert_eq!(
+            restored.scrollback_rows().unwrap(),
+            term.scrollback_rows().unwrap()
+        );
         let options = crate::formatter::Options {
             unwrap: true,
             trim: true,

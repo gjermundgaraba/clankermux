@@ -65,7 +65,7 @@ impl Client {
             decoder: FrameDecoder::default(),
             max_frame: Limits::default().max_frame,
             next_id: 1,
-            events: Default::default(),
+            events: std::collections::VecDeque::new(),
         }
     }
 
@@ -322,20 +322,20 @@ impl Client {
     }
 
     /// Polls `inspect` until the session reports `count` attachments.
-    pub async fn wait_attachments(&mut self, id: &str, count: u32) {
-        inspect_until(self, id, |s| s.attachments.len() as u32 == count).await;
+    pub async fn wait_attachments(&mut self, id: &str, count: usize) {
+        inspect_until(self, id, |s| s.attachments.len() == count).await;
     }
 }
 
 /// The bootstrap of a `snapshot` attachment: ATTACHED, snapshot frames
-/// and SNAPSHOT_READY / SNAPSHOT_END markers.
+/// and `SNAPSHOT_READY` / `SNAPSHOT_END` markers.
 pub struct Bootstrap {
     pub attached: Attached,
     /// Snapshot bytes through the READY record.
     pub ready: Vec<u8>,
     /// The remaining snapshot bytes.
     pub rest: Vec<u8>,
-    /// Stream frames interleaved after SNAPSHOT_READY.
+    /// Stream frames interleaved after `SNAPSHOT_READY`.
     pub stream: Vec<(Header, Vec<u8>)>,
 }
 

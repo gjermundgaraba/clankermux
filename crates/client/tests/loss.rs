@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const SESSIONS: usize = 8;
+const CUTS: usize = 6;
 
 /// A TCP proxy that delays every chunk, drops every connection on
 /// `cut`, and refuses new ones while `paused`.
@@ -127,7 +128,7 @@ async fn start(limits: Limits) -> Server {
 /// The screen as the client's engine shows it, trimmed, history excluded.
 fn screen(a: &mut Attachment) -> String {
     let term = a.term().unwrap();
-    let from = term.scrollback_rows() as u32;
+    let from = term.scrollback_rows().unwrap();
     let out = ghostty_vt::formatter::format(
         term,
         ghostty_vt::formatter::Options {
@@ -188,15 +189,12 @@ async fn follow(
             tokio::time::Instant::now() < deadline,
             "{session}: {seen:?}"
         );
-        let conn = match endpoint
+        let Ok(conn) = endpoint
             .connect(hello("loss", Some(ghostty_vt::ENGINE)))
             .await
-        {
-            Ok(conn) => conn,
-            Err(_) => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
+        else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
         };
         a.open_on(&conn.welcome);
         let resume = a.resume();
@@ -302,7 +300,6 @@ async fn clients_converge_through_delay_and_cuts() {
         })
         .collect();
     // Cuts while the output flows, then a calm end.
-    const CUTS: usize = 6;
     for _ in 0..CUTS {
         tokio::time::sleep(Duration::from_millis(400)).await;
         proxy.cut();

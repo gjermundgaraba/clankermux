@@ -106,7 +106,7 @@ impl<H: Handler + Default> Attachment<H> {
     pub fn open_on(&mut self, welcome: &Welcome) {
         self.next = Some((
             welcome.incarnation.clone(),
-            welcome.limits.continuation as usize,
+            proto::cap(welcome.limits.continuation),
         ));
     }
 
@@ -155,36 +155,7 @@ impl<H: Handler + Default> Attachment<H> {
     fn step(&mut self, frame: Frame, actions: &mut Vec<Action>) -> Result<(), Error> {
         let kind = frame.header.frame_type;
         match kind {
-            FrameType::Attached => {
-                let attached: Attached = frame.json()?;
-                if let Some((incarnation, continuation)) = self.next.take() {
-                    self.incarnation = incarnation;
-                    self.continuation = continuation;
-                }
-                self.cursor = Cursor {
-                    offset: attached.offset,
-                    marker: attached.marker,
-                };
-                self.session = Some(attached.session);
-                match attached.mode {
-                    AttachMode::Snapshot => {
-                        let mut decoder = Decoder::with_handler(H::default()).map_err(engine)?;
-                        decoder
-                            .set_max_continuation_bytes(self.continuation)
-                            .map_err(engine)?;
-                        self.state = State::Bootstrapping {
-                            decoder,
-                            held: Vec::new(),
-                            held_bytes: 0,
-                        };
-                    }
-                    AttachMode::Resume => {
-                        let State::Streaming(_) = self.state else {
-                            return Err(Error::Protocol("resume without a terminal".into()));
-                        };
-                    }
-                }
-            }
+            FrameType::Attached => self.attached(frame.json()?)?,
             FrameType::Snapshot => {
                 let State::Bootstrapping { decoder, .. } = &mut self.state else {
                     return Err(Error::Protocol("SNAPSHOT outside a bootstrap".into()));
@@ -207,31 +178,7 @@ impl<H: Handler + Default> Attachment<H> {
                     return Err(Error::Protocol("SNAPSHOT_READY before READY".into()));
                 }
             }
-            FrameType::SnapshotEnd => {
-                if !matches!(self.state, State::Bootstrapping { .. }) {
-                    return Err(Error::Protocol("SNAPSHOT_END outside a bootstrap".into()));
-                }
-                let State::Bootstrapping {
-                    mut decoder, held, ..
-                } = std::mem::replace(&mut self.state, State::Opening)
-                else {
-                    unreachable!()
-                };
-                if decoder.terminal().is_none() {
-                    return Err(Error::Protocol("SNAPSHOT_END before READY".into()));
-                }
-                while decoder.step_available() && decoder.next_page().map_err(engine)? {}
-                if !decoder.finished() {
-                    return Err(Error::Protocol("SNAPSHOT_END before FINISH".into()));
-                }
-                let term = decoder
-                    .into_terminal()
-                    .ok_or_else(|| Error::Protocol("the decoder's terminal was replaced".into()))?;
-                self.state = State::Streaming(term);
-                for frame in held {
-                    self.step(frame, actions)?;
-                }
-            }
+            FrameType::SnapshotEnd => self.snapshot_end(actions)?,
             FrameType::Output | FrameType::Resized | FrameType::Exited => {
                 if let State::Bootstrapping {
                     held, held_bytes, ..
@@ -255,7 +202,7 @@ impl<H: Handler + Default> Attachment<H> {
                 ) {
                     return Err(Error::Protocol(format!("{kind:?} outside the stream")));
                 }
-                self.stream(frame, actions)?;
+                self.stream(&frame, actions)?;
             }
             FrameType::Gap => {
                 let gap: Gap = frame.json()?;
@@ -279,8 +226,69 @@ impl<H: Handler + Default> Attachment<H> {
         Ok(())
     }
 
+    /// `ATTACHED`: the cursor, and a bootstrap for a snapshot.
+    fn attached(&mut self, attached: Attached) -> Result<(), Error> {
+        if let Some((incarnation, continuation)) = self.next.take() {
+            self.incarnation = incarnation;
+            self.continuation = continuation;
+        }
+        self.cursor = Cursor {
+            offset: attached.offset,
+            marker: attached.marker,
+        };
+        self.session = Some(attached.session);
+        match attached.mode {
+            AttachMode::Snapshot => {
+                let mut decoder = Decoder::with_handler(H::default()).map_err(engine)?;
+                decoder
+                    .set_max_continuation_bytes(self.continuation)
+                    .map_err(engine)?;
+                self.state = State::Bootstrapping {
+                    decoder,
+                    held: Vec::new(),
+                    held_bytes: 0,
+                };
+            }
+            AttachMode::Resume => {
+                let State::Streaming(_) = self.state else {
+                    return Err(Error::Protocol("resume without a terminal".into()));
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// `SNAPSHOT_END`: the decoded terminal streams on, starting with the
+    /// frames held during the bootstrap.
+    fn snapshot_end(&mut self, actions: &mut Vec<Action>) -> Result<(), Error> {
+        if !matches!(self.state, State::Bootstrapping { .. }) {
+            return Err(Error::Protocol("SNAPSHOT_END outside a bootstrap".into()));
+        }
+        let State::Bootstrapping {
+            mut decoder, held, ..
+        } = std::mem::replace(&mut self.state, State::Opening)
+        else {
+            unreachable!()
+        };
+        if decoder.terminal().is_none() {
+            return Err(Error::Protocol("SNAPSHOT_END before READY".into()));
+        }
+        while decoder.step_available() && decoder.next_page().map_err(engine)? {}
+        if !decoder.finished() {
+            return Err(Error::Protocol("SNAPSHOT_END before FINISH".into()));
+        }
+        let term = decoder
+            .into_terminal()
+            .ok_or_else(|| Error::Protocol("the decoder's terminal was replaced".into()))?;
+        self.state = State::Streaming(term);
+        for frame in held {
+            self.step(frame, actions)?;
+        }
+        Ok(())
+    }
+
     /// A stream frame at the cursor.
-    fn stream(&mut self, frame: Frame, actions: &mut Vec<Action>) -> Result<(), Error> {
+    fn stream(&mut self, frame: &Frame, actions: &mut Vec<Action>) -> Result<(), Error> {
         let cursor = self.cursor;
         match frame.header.frame_type {
             FrameType::Output => {
@@ -343,17 +351,10 @@ fn engine(err: ghostty_vt::Error) -> Error {
 mod tests {
     use super::*;
     use ghostty_vt::snapshot;
-    use proto::{Header, Limits, Status};
+    use proto::{Limits, Status};
 
     fn frame(frame_type: FrameType, payload: Vec<u8>) -> Frame {
-        Frame {
-            header: Header {
-                frame_type,
-                channel: 1,
-                length: payload.len() as u32,
-            },
-            payload,
-        }
+        Frame::new(frame_type, 1, payload)
     }
 
     fn json(frame_type: FrameType, body: &impl serde::Serialize) -> Frame {
@@ -396,7 +397,7 @@ mod tests {
             command: None,
             program_status: None,
             attention: None,
-            size: Default::default(),
+            size: proto::SizeInfo::default(),
         }
     }
 
@@ -459,7 +460,7 @@ mod tests {
                 proto::encode_output(100 + i * chunk.len() as u64, &chunk),
             ));
             if i < 63 {
-                assert!(result.unwrap().is_empty());
+                assert_eq!(result.unwrap(), []);
             } else {
                 assert!(matches!(result, Err(Error::Desync(_))));
             }

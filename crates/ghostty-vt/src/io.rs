@@ -8,7 +8,7 @@ unsafe extern "C" fn write_to_vec(userdata: *mut c_void, data: *const u8, len: u
     // SAFETY: userdata is the `*mut Vec<u8>` passed by the caller that owns
     // the writer, and data points at len readable bytes for this call.
     unsafe {
-        let out = &mut *(userdata as *mut Vec<u8>);
+        let out = &mut *userdata.cast::<Vec<u8>>();
         out.extend_from_slice(bytes(data, len));
     }
     true
@@ -30,7 +30,7 @@ pub(crate) unsafe fn bytes<'a>(data: *const u8, len: usize) -> &'a [u8] {
 pub(crate) fn writer(out: &mut Vec<u8>) -> sys::GhosttyWriter {
     sys::GhosttyWriter {
         write: Some(write_to_vec),
-        userdata: out as *mut Vec<u8> as *mut c_void,
+        userdata: std::ptr::from_mut(out).cast(),
     }
 }
 

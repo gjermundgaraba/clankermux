@@ -49,7 +49,7 @@ struct Claim {
 /// Answers the pending request `claim` with `outcome`, unless a `cancel`
 /// (or the connection's end) took it first; a later request that reused
 /// the id after a cancel is not this one.
-fn finish(pending: &Pending, writer: &Writer, claim: Claim, outcome: Result<Value, Fail>) {
+fn finish(pending: &Pending, writer: &Writer, claim: &Claim, outcome: Result<Value, Fail>) {
     let mut pending = pending.lock().unwrap();
     if pending
         .by_id
@@ -79,7 +79,7 @@ fn spawn_wait(
             _ = stop => return,
             outcome = wait::run(&session, waiter, timeout) => outcome,
         };
-        finish(&pending, &writer, claim, outcome.map(answer));
+        finish(&pending, &writer, &claim, outcome.map(answer));
     });
 }
 
@@ -245,7 +245,7 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
             if written.await.is_err() {
                 let fail = internal("the PTY refused the bytes");
                 match claim {
-                    Some((claim, _)) => finish(&pending, &writer, claim, Err(fail)),
+                    Some((claim, _)) => finish(&pending, &writer, &claim, Err(fail)),
                     None => reply(&writer, id, Err(fail)),
                 }
                 return;
@@ -302,133 +302,27 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
             let out = session.lock().unwrap().to_proto(true);
             Ok(json!(out))
         }
-        "end" | "signal" => {
-            let (id, signal) = if request.method == "end" {
-                (params::<proto::SessionParams>(p)?.session, Signal::HUP)
-            } else {
-                let p: proto::SignalParams = params(p)?;
-                let signal = pty::signal_by_name(&p.signal).ok_or((
-                    ErrorCode::InvalidRequest,
-                    format!("unknown signal {}", p.signal),
-                ))?;
-                (p.session, signal)
-            };
-            let session = registry.get(&id)?;
-            let (pgid, slave) = {
-                let s = session.lock().unwrap();
-                let live = s.running()?;
-                (live.pgid, live.slave_path.clone())
-            };
-            if pty::signal(pgid, &slave, signal) {
-                Ok(json!({}))
-            } else {
-                Err((ErrorCode::SignalFailed, "no process to signal".into()))
-            }
+        "end" => {
+            let p: proto::SessionParams = params(p)?;
+            send_signal(registry, &p.session, Signal::HUP)
+        }
+        "signal" => {
+            let p: proto::SignalParams = params(p)?;
+            let signal = pty::signal_by_name(&p.signal).ok_or((
+                ErrorCode::InvalidRequest,
+                format!("unknown signal {}", p.signal),
+            ))?;
+            send_signal(registry, &p.session, signal)
         }
         "remove" => {
             let p: proto::SessionParams = params(p)?;
             registry.remove(&p.session)?;
             Ok(json!({}))
         }
-        "ack" => {
-            let p: proto::AckParams = params(p)?;
-            let session = registry.get(&p.session)?;
-            let (record_ids, events) = {
-                let mut s = session.lock().unwrap();
-                let record_ids = s.ack(p.record_ids.as_deref());
-                (record_ids, s.take_events())
-            };
-            registry.emit_all(events);
-            if !record_ids.is_empty() {
-                registry.records_changed(&session);
-            }
-            Ok(json!(proto::Acked { record_ids }))
-        }
-        "label" => {
-            let p: proto::LabelParams = params(p)?;
-            if p.label.len() > registry.config.limits.label as usize {
-                return Err((ErrorCode::LimitExceeded, "label too long".into()));
-            }
-            let session = registry.get(&p.session)?;
-            let out = {
-                let mut s = session.lock().unwrap();
-                s.label = p.label;
-                s.touch();
-                s.to_proto(false)
-            };
-            registry.emit(Event::SessionChanged {
-                session: out.clone(),
-            });
-            Ok(json!(out))
-        }
-        "resize" => {
-            let p: proto::ResizeParams = params(p)?;
-            if p.cols.is_none() && p.rows.is_none() && p.policy.is_none() {
-                return Err((
-                    ErrorCode::InvalidRequest,
-                    "cols, rows or policy is needed".into(),
-                ));
-            }
-            if p.cols == Some(0) || p.rows == Some(0) {
-                return Err((
-                    ErrorCode::InvalidRequest,
-                    "cols and rows must be at least 1".into(),
-                ));
-            }
-            let session = registry.get(&p.session)?;
-            let mut s = session.lock().unwrap();
-            s.running()?;
-            // The policy first, so that a size given with `smallest`
-            // holds until the next report.
-            let mut changed = p.policy.is_some_and(|policy| s.set_policy(policy));
-            if p.cols.is_some() || p.rows.is_some() {
-                let current = s.size();
-                let report = Viewport {
-                    size: Size {
-                        cols: p.cols.unwrap_or(current.cols),
-                        rows: p.rows.unwrap_or(current.rows),
-                        cell_width: None,
-                        cell_height: None,
-                    },
-                    profile: None,
-                };
-                changed |= s.apply_report(report, Source::Resize);
-            }
-            let changed = changed.then(|| s.to_proto(false));
-            let events = s.take_events();
-            drop(s);
-            registry.emit_session(events, changed);
-            Ok(json!({}))
-        }
-        "detach" => {
-            let p: proto::DetachParams = params(p)?;
-            if p.reason
-                .as_ref()
-                .is_some_and(|r| r.len() > registry.config.limits.text as usize)
-            {
-                return Err((ErrorCode::LimitExceeded, "reason too long".into()));
-            }
-            let session = registry.get(&p.session)?;
-            let s = session.lock().unwrap();
-            let attachment = s
-                .attached
-                .iter()
-                .find(|a| a.id == p.channel)
-                .ok_or_else(|| {
-                    (
-                        ErrorCode::NoSuchAttachment,
-                        format!("no attachment {} on session {}", p.channel, p.session),
-                    )
-                })?;
-            // A connection that dropped the attachment is ending it already.
-            if let Some(close) = attachment.close.upgrade() {
-                let _ = close.send(Ending::Closed(Closed {
-                    reason: ClosedReason::Detached,
-                    message: p.reason.as_deref().map(session::printable),
-                }));
-            }
-            Ok(json!({}))
-        }
+        "ack" => ack(registry, &params(p)?),
+        "label" => label(registry, params(p)?),
+        "resize" => resize(registry, &params(p)?),
+        "detach" => detach(registry, &params(p)?),
         "describe" => {
             let p: proto::catalog::DescribeParams = params(p)?;
             let catalog = registry.catalog();
@@ -440,8 +334,122 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
                     .ok_or((ErrorCode::InvalidRequest, format!("no method {name}"))),
             }
         }
-        "read" => Ok(json!(read::read(registry, params(p)?)?)),
-        "tail" => Ok(json!(read::tail(registry, params(p)?)?)),
+        "read" => Ok(json!(read::read(registry, &params(p)?)?)),
+        "tail" => Ok(json!(read::tail(registry, &params(p)?)?)),
         other => Err((ErrorCode::InvalidRequest, format!("unknown method {other}"))),
     }
+}
+
+/// Sends `signal` to the session's process group, as `end` and `signal`.
+fn send_signal(registry: &Registry, id: &str, signal: Signal) -> Result<Value, Fail> {
+    let session = registry.get(id)?;
+    let (pgid, slave) = {
+        let s = session.lock().unwrap();
+        let live = s.running()?;
+        (live.pgid, live.slave_path.clone())
+    };
+    if pty::signal(pgid, &slave, signal) {
+        Ok(json!({}))
+    } else {
+        Err((ErrorCode::SignalFailed, "no process to signal".into()))
+    }
+}
+
+fn ack(registry: &Arc<Registry>, p: &proto::AckParams) -> Result<Value, Fail> {
+    let session = registry.get(&p.session)?;
+    let (record_ids, events) = {
+        let mut s = session.lock().unwrap();
+        let record_ids = s.ack(p.record_ids.as_deref());
+        (record_ids, s.take_events())
+    };
+    registry.emit_all(events);
+    if !record_ids.is_empty() {
+        registry.records_changed(&session);
+    }
+    Ok(json!(proto::Acked { record_ids }))
+}
+
+fn label(registry: &Registry, p: proto::LabelParams) -> Result<Value, Fail> {
+    if p.label.len() > proto::cap(registry.config.limits.label) {
+        return Err((ErrorCode::LimitExceeded, "label too long".into()));
+    }
+    let session = registry.get(&p.session)?;
+    let out = {
+        let mut s = session.lock().unwrap();
+        s.label = p.label;
+        s.touch();
+        s.to_proto(false)
+    };
+    registry.emit(Event::SessionChanged {
+        session: out.clone(),
+    });
+    Ok(json!(out))
+}
+
+fn resize(registry: &Registry, p: &proto::ResizeParams) -> Result<Value, Fail> {
+    if p.cols.is_none() && p.rows.is_none() && p.policy.is_none() {
+        return Err((
+            ErrorCode::InvalidRequest,
+            "cols, rows or policy is needed".into(),
+        ));
+    }
+    if p.cols == Some(0) || p.rows == Some(0) {
+        return Err((
+            ErrorCode::InvalidRequest,
+            "cols and rows must be at least 1".into(),
+        ));
+    }
+    let session = registry.get(&p.session)?;
+    let mut s = session.lock().unwrap();
+    s.running()?;
+    // The policy first, so that a size given with `smallest`
+    // holds until the next report.
+    let mut changed = p.policy.is_some_and(|policy| s.set_policy(policy));
+    if p.cols.is_some() || p.rows.is_some() {
+        let current = s.size();
+        let report = Viewport {
+            size: Size {
+                cols: p.cols.unwrap_or(current.cols),
+                rows: p.rows.unwrap_or(current.rows),
+                cell_width: None,
+                cell_height: None,
+            },
+            profile: None,
+        };
+        changed |= s.apply_report(report, Source::Resize);
+    }
+    let changed = changed.then(|| s.to_proto(false));
+    let events = s.take_events();
+    drop(s);
+    registry.emit_session(events, changed);
+    Ok(json!({}))
+}
+
+fn detach(registry: &Registry, p: &proto::DetachParams) -> Result<Value, Fail> {
+    if p.reason
+        .as_ref()
+        .is_some_and(|r| r.len() > proto::cap(registry.config.limits.text))
+    {
+        return Err((ErrorCode::LimitExceeded, "reason too long".into()));
+    }
+    let session = registry.get(&p.session)?;
+    let s = session.lock().unwrap();
+    let attachment = s
+        .attached
+        .iter()
+        .find(|a| a.id == p.channel)
+        .ok_or_else(|| {
+            (
+                ErrorCode::NoSuchAttachment,
+                format!("no attachment {} on session {}", p.channel, p.session),
+            )
+        })?;
+    // A connection that dropped the attachment is ending it already.
+    if let Some(close) = attachment.close.upgrade() {
+        let _ = close.send(Ending::Closed(Closed {
+            reason: ClosedReason::Detached,
+            message: p.reason.as_deref().map(session::printable),
+        }));
+    }
+    Ok(json!({}))
 }

@@ -182,8 +182,7 @@ impl Plain {
         self.vt = match self.vt {
             Vt::Ground => match b {
                 ESC => Vt::Escape,
-                b'\n' | b'\t' => return true,
-                0x20..=0x7e | 0x80..=0xff => return true,
+                b'\n' | b'\t' | 0x20..=0x7e | 0x80..=0xff => return true,
                 _ => Vt::Ground,
             },
             Vt::Escape => match b {
@@ -209,13 +208,14 @@ impl Plain {
                 ESC => Vt::TextEscape,
                 _ => Vt::Text,
             },
-            Vt::TextEscape => match b {
-                b'\\' => Vt::Ground,
-                _ => {
+            Vt::TextEscape => {
+                if b == b'\\' {
+                    Vt::Ground
+                } else {
                     self.vt = Vt::Escape;
                     return self.step(b);
                 }
-            },
+            }
         };
         false
     }
@@ -308,7 +308,7 @@ impl Waiter {
             return None;
         };
         self.scanned = self.scanned.max(live.stream.retained_start());
-        let chunk = live.stream.read(self.scanned, usize::MAX)?;
+        let chunk = live.stream.read(self.scanned, u64::MAX)?;
         let at = self.scanned;
         self.scanned += chunk.len() as u64;
         Some((at, chunk))
@@ -441,7 +441,7 @@ pub async fn run(
         let next = {
             let s = session.lock().unwrap();
             match waiter.check(&s, found)? {
-                Check::Fired(waited) => return Ok(*waited),
+                Check::Fired(fired) => return Ok(*fired),
                 Check::Pending(_) if deadline.is_some_and(|d| Instant::now() >= d) => {
                     return Ok(Waited {
                         reason: WaitReason::Timeout,
@@ -457,8 +457,8 @@ pub async fn run(
         match next {
             Some(next) => {
                 tokio::select! {
-                    _ = notified => {}
-                    _ = tokio::time::sleep_until(next) => {}
+                    () = notified => {}
+                    () = tokio::time::sleep_until(next) => {}
                 }
             }
             None => notified.await,

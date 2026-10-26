@@ -161,7 +161,7 @@ pub fn color_scheme_report(scheme: ColorScheme) -> Vec<u8> {
             scheme.raw(),
             buf.as_mut_ptr().cast(),
             buf.len(),
-            &mut written,
+            &raw mut written,
         )
     };
     debug_assert_eq!(check(result), Ok::<(), Error>(()));
@@ -184,9 +184,7 @@ impl Term {
     fn get<T: Default>(&self, key: sys::GhosttyTerminalData) -> Result<T> {
         let mut out = T::default();
         // SAFETY: T matches the documented output type of key at each call site.
-        check(unsafe {
-            sys::ghostty_terminal_get(self.0, key, &mut out as *mut T as *mut c_void)
-        })?;
+        check(unsafe { sys::ghostty_terminal_get(self.0, key, (&raw mut out).cast::<c_void>()) })?;
         Ok(out)
     }
 
@@ -221,9 +219,11 @@ impl Term {
         unsafe { string(&s) }
     }
 
-    pub fn scrollback_rows(&self) -> usize {
-        self.get(sys::GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS)
-            .unwrap_or(0)
+    /// The rows above the screen; `LimitExceeded` when there are more
+    /// than a `u32` row can address.
+    pub fn scrollback_rows(&self) -> Result<u32> {
+        let rows: usize = self.get(sys::GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS)?;
+        u32::try_from(rows).map_err(|_| Error::LimitExceeded)
     }
 
     /// Whether the alternate screen is the active one.
@@ -250,12 +250,12 @@ impl Term {
         // SAFETY: the terminal is live, the reference is used before any
         // change, and the output type of WRAP_CONTINUATION is bool.
         unsafe {
-            check(sys::ghostty_terminal_grid_ref(self.0, point, &mut grid))?;
-            check(sys::ghostty_grid_ref_row(&grid, &mut row))?;
+            check(sys::ghostty_terminal_grid_ref(self.0, point, &raw mut grid))?;
+            check(sys::ghostty_grid_ref_row(&raw const grid, &raw mut row))?;
             check(sys::ghostty_row_get(
                 row,
                 sys::GHOSTTY_ROW_DATA_WRAP_CONTINUATION,
-                &mut out as *mut bool as *mut c_void,
+                (&raw mut out).cast::<c_void>(),
             ))?;
         }
         Ok(out)
@@ -265,7 +265,7 @@ impl Term {
     /// `lines` logical lines of history: soft-wrapped rows count as one,
     /// and a line the top of the screen continues is the screen's.
     pub fn history_start(&self, lines: usize) -> Result<u32> {
-        let mut row = self.scrollback_rows() as u32;
+        let mut row = self.scrollback_rows()?;
         while row > 0 && self.row_continues(row)? {
             row -= 1;
         }
@@ -287,7 +287,7 @@ impl Term {
             sys::ghostty_terminal_get(
                 self.0,
                 sys::GHOSTTY_TERMINAL_DATA_MODE,
-                &mut config as *mut sys::GhosttyTerminalModeConfig as *mut c_void,
+                (&raw mut config).cast::<c_void>(),
             )
         })?;
         Ok(config.value)
@@ -345,7 +345,7 @@ impl<H: Handler> Terminal<H> {
     pub fn with_handler(cols: u16, rows: u16, handler: H) -> Result<Self> {
         let mut raw = ptr::null_mut();
         // SAFETY: a null allocator selects the default allocator.
-        check(unsafe { sys::ghostty_terminal_new(ptr::null(), &mut raw, cols, rows) })?;
+        check(unsafe { sys::ghostty_terminal_new(ptr::null(), &raw mut raw, cols, rows) })?;
         // SAFETY: raw is a fresh caller-owned terminal.
         Ok(unsafe { Terminal::install(raw, handler) })
     }
@@ -397,7 +397,11 @@ impl<H: Handler> Terminal<H> {
         // pointer has the type its option documents; callback options take
         // the function pointer itself as the value.
         unsafe {
-            sys::ghostty_terminal_set(raw, sys::GHOSTTY_TERMINAL_OPT_USERDATA, slot as *mut c_void);
+            sys::ghostty_terminal_set(
+                raw,
+                sys::GHOSTTY_TERMINAL_OPT_USERDATA,
+                slot.cast::<c_void>(),
+            );
             for (option, f) in callbacks {
                 let result = sys::ghostty_terminal_set(raw, option, f);
                 debug_assert_eq!(check(result), Ok::<(), Error>(()));
@@ -451,7 +455,7 @@ impl<H: Handler> Terminal<H> {
         // The option copies the string during the call.
         self.set(
             sys::GHOSTTY_TERMINAL_OPT_TERMINFO_NAME,
-            &value as *const sys::GhosttyString as *const c_void,
+            (&raw const value).cast::<c_void>(),
         )
     }
 
@@ -490,33 +494,36 @@ impl<H: Handler> Terminal<H> {
             g: c.g,
             b: c.b,
         });
-        let value = raw.as_ref().map_or(ptr::null(), |c| {
-            c as *const sys::GhosttyColorRgb as *const c_void
-        });
+        let value = raw
+            .as_ref()
+            .map_or(ptr::null(), |c| ptr::from_ref(c).cast());
         self.set(option, value)
     }
 
     pub fn set_scrollback_max_bytes(&mut self, bytes: usize) -> Result<()> {
         self.set(
             sys::GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES,
-            &bytes as *const usize as *const c_void,
+            (&raw const bytes).cast::<c_void>(),
         )
     }
 
     pub fn set_continuation_max_bytes(&mut self, bytes: usize) -> Result<()> {
         self.set(
             sys::GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES,
-            &bytes as *const usize as *const c_void,
+            (&raw const bytes).cast::<c_void>(),
         )
     }
 }
 
 mod cb {
-    use super::*;
+    use super::{
+        Handler, ProgramStatus, ProgramStatusKind, ProgramStatusState, ProgressState, PromptKind,
+        SemanticPrompt, SemanticPromptKind, Slot, c_void, string, sys,
+    };
 
     unsafe fn slot<'a, H: Handler>(userdata: *mut c_void) -> &'a mut Slot<H> {
         // SAFETY: userdata is the Slot<H> installed by Terminal::install.
-        unsafe { &mut *(userdata as *mut Slot<H>) }
+        unsafe { &mut *userdata.cast::<Slot<H>>() }
     }
 
     pub(super) unsafe extern "C" fn write_pty<H: Handler>(

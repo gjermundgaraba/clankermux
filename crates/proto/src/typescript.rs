@@ -2,6 +2,8 @@
 //! definition with its doc comments, and `Methods`, each method's params
 //! and result.
 
+use std::fmt::Write as _;
+
 use serde_json::Value;
 
 use crate::catalog::Catalog;
@@ -11,30 +13,28 @@ use crate::render::{ref_name, required};
 pub fn module(catalog: &Catalog) -> String {
     let mut out =
         String::from("// Generated from the catalog by `cargo xtask protocol`; do not edit.\n\n");
-    out.push_str(&format!("export const VERSION = {};\n\n", catalog.protocol));
+    let _ = write!(out, "export const VERSION = {};\n\n", catalog.protocol);
     out.push_str("/** Each method's params and result. */\nexport interface Methods {\n");
     for m in &catalog.methods {
         out.push_str(&doc(&m.summary, "  "));
-        out.push_str(&format!(
-            "  {}: {{ params: {}; result: {} }};\n",
+        let _ = writeln!(
+            out,
+            "  {}: {{ params: {}; result: {} }};",
             m.name,
             ty(&m.params, "  "),
             ty(&m.result, "  ")
-        ));
+        );
     }
     out.push_str("}\n\nexport type Method = keyof Methods;\n");
     for (name, schema) in &catalog.defs {
         out.push('\n');
         out.push_str(&doc(description(schema), ""));
         if is_interface(schema) {
-            out.push_str(&format!(
-                "export interface {name} {}\n",
-                fields(schema, "", true)
-            ));
+            let _ = writeln!(out, "export interface {name} {}", fields(schema, "", true));
         } else {
             let ty = ty(schema, "");
             let sep = if ty.starts_with('\n') { "" } else { " " };
-            out.push_str(&format!("export type {name} ={sep}{ty};\n"));
+            let _ = writeln!(out, "export type {name} ={sep}{ty};");
         }
     }
     out
@@ -67,12 +67,12 @@ fn doc(text: &str, indent: &str) -> String {
     let mut out = format!("{indent}/**\n");
     for (i, paragraph) in text.split("\n\n").enumerate() {
         if i > 0 {
-            out.push_str(&format!("{indent} *\n"));
+            let _ = writeln!(out, "{indent} *");
         }
         let mut line = String::new();
         for word in paragraph.split_whitespace() {
             if !line.is_empty() && indent.len() + 3 + line.len() + 1 + word.len() > 80 {
-                out.push_str(&format!("{indent} * {line}\n"));
+                let _ = writeln!(out, "{indent} * {line}");
                 line.clear();
             }
             if !line.is_empty() {
@@ -80,9 +80,9 @@ fn doc(text: &str, indent: &str) -> String {
             }
             line.push_str(word);
         }
-        out.push_str(&format!("{indent} * {line}\n"));
+        let _ = writeln!(out, "{indent} * {line}");
     }
-    out.push_str(&format!("{indent} */\n"));
+    let _ = writeln!(out, "{indent} */");
     out
 }
 
@@ -113,9 +113,9 @@ fn fields(schema: &Value, indent: &str, block: bool) -> String {
     let mut out = String::from("{\n");
     for entry in &properties {
         out.push_str(&doc(description(entry.1), &inner));
-        out.push_str(&format!("{inner}{};\n", field(entry)));
+        let _ = writeln!(out, "{inner}{};", field(entry));
     }
-    out.push_str(&format!("{indent}}}"));
+    let _ = write!(out, "{indent}}}");
     out
 }
 
@@ -184,7 +184,7 @@ fn union(branches: &[Value], indent: &str) -> String {
     for branch in branches {
         out.push('\n');
         out.push_str(&doc(description(branch), &inner));
-        out.push_str(&format!("{inner}| {}", ty(branch, &inner)));
+        let _ = write!(out, "{inner}| {}", ty(branch, &inner));
     }
     out
 }

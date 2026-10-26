@@ -45,12 +45,12 @@ pub fn spawn(
     )?;
     set_size(&master, cols, rows)?;
 
-    let (program, args) = argv
+    let (program, arguments) = argv
         .split_first()
         .ok_or_else(|| io::Error::other("empty argv"))?;
     let mut command = Command::new(OsStr::new(program));
     command
-        .args(args)
+        .args(arguments)
         .current_dir(cwd)
         .envs(env)
         .stdin(Stdio::from(slave.try_clone()?))
@@ -98,13 +98,16 @@ pub fn set_size(master: &impl AsFd, cols: u16, rows: u16) -> io::Result<()> {
 /// holds the slave open. Returns false when no process was signalled.
 pub fn signal(pgid: u32, slave_path: &str, signal: Signal) -> bool {
     let kill = |pid: u32, group: bool| {
-        Pid::from_raw(pid as i32).is_some_and(|pid| {
-            if group {
-                rustix::process::kill_process_group(pid, signal).is_ok()
-            } else {
-                rustix::process::kill_process(pid, signal).is_ok()
-            }
-        })
+        i32::try_from(pid)
+            .ok()
+            .and_then(Pid::from_raw)
+            .is_some_and(|pid| {
+                if group {
+                    rustix::process::kill_process_group(pid, signal).is_ok()
+                } else {
+                    rustix::process::kill_process(pid, signal).is_ok()
+                }
+            })
     };
     if kill(pgid, true) {
         return true;

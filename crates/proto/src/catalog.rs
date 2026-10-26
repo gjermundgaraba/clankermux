@@ -9,7 +9,12 @@ use schemars::{JsonSchema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::*;
+use crate::{
+    AckParams, Acked, CancelParams, Cancelled, CreateParams, DetachParams, Empty, ErrorCode,
+    ErrorMessage, FrameType, LabelParams, ListParams, Numbered, Page, Read, ReadParams,
+    ResizeParams, SendParams, Sent, Session, SessionParams, SignalParams, SubscribeParams,
+    Subscribed, Tail, TailParams, VERSION, WaitParams, Waited,
+};
 
 /// The shared message vectors; the examples come from them.
 pub(crate) const VECTORS: &str = include_str!("../vectors/messages.json");
@@ -336,6 +341,54 @@ fn vector(vectors: &Map<String, Value>, name: &str) -> Value {
         .clone()
 }
 
+fn frame_info(t: FrameType, de: &mut SchemaGenerator, ser: &mut SchemaGenerator) -> FrameInfo {
+    FrameInfo {
+        name: frame_name(t),
+        frame_type: t as u8,
+        direction: if t.is_server() {
+            Direction::Server
+        } else {
+            Direction::Client
+        },
+        channel: match t {
+            FrameType::Error => "0 or n",
+            t if t.is_control() => "0",
+            _ => "n",
+        }
+        .into(),
+        payload: match t {
+            t if t.is_json() => Payload::Json,
+            FrameType::Close | FrameType::SnapshotReady | FrameType::SnapshotEnd => Payload::Empty,
+            _ => Payload::Raw,
+        },
+        summary: frame_summary(t).into(),
+        schema: frame_schema(t, de, ser).map(schemars::Schema::to_value),
+    }
+}
+
+/// An event from its branch of `Event`, with the vectors named after it
+/// (`event/NAME` or `event/NAME-...`) as examples.
+fn event_info(branch: &Value, vectors: &Map<String, Value>) -> EventInfo {
+    let name = branch["properties"]["event"]["const"]
+        .as_str()
+        .expect("an event name")
+        .to_string();
+    let prefix = format!("event/{name}");
+    EventInfo {
+        summary: description(branch),
+        schema: branch.clone(),
+        examples: vectors
+            .iter()
+            .filter(|(key, _)| {
+                key.strip_prefix(&prefix)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+            })
+            .map(|(_, v)| v.clone())
+            .collect(),
+        name,
+    }
+}
+
 /// The catalog of this crate's protocol, for a server of release
 /// `version`.
 pub fn catalog(version: &str) -> Catalog {
@@ -371,30 +424,7 @@ pub fn catalog(version: &str) -> Catalog {
 
     let frames = FrameType::ALL
         .iter()
-        .map(|&t| FrameInfo {
-            name: frame_name(t),
-            frame_type: t as u8,
-            direction: if t.is_server() {
-                Direction::Server
-            } else {
-                Direction::Client
-            },
-            channel: match t {
-                FrameType::Error => "0 or n",
-                t if t.is_control() => "0",
-                _ => "n",
-            }
-            .into(),
-            payload: match t {
-                t if t.is_json() => Payload::Json,
-                FrameType::Close | FrameType::SnapshotReady | FrameType::SnapshotEnd => {
-                    Payload::Empty
-                }
-                _ => Payload::Raw,
-            },
-            summary: frame_summary(t).into(),
-            schema: frame_schema(t, &mut de, &mut ser).map(|s| s.to_value()),
-        })
+        .map(|&t| frame_info(t, &mut de, &mut ser))
         .collect();
 
     ser.subschema_for::<ErrorCode>();
@@ -417,26 +447,7 @@ pub fn catalog(version: &str) -> Catalog {
     }
 
     let events = variants(&defs["Event"])
-        .map(|branch| {
-            let name = branch["properties"]["event"]["const"]
-                .as_str()
-                .expect("an event name")
-                .to_string();
-            let prefix = format!("event/{name}");
-            EventInfo {
-                summary: description(branch),
-                schema: branch.clone(),
-                examples: vectors
-                    .iter()
-                    .filter(|(key, _)| {
-                        key.strip_prefix(&prefix)
-                            .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
-                    })
-                    .map(|(_, v)| v.clone())
-                    .collect(),
-                name,
-            }
-        })
+        .map(|branch| event_info(branch, &vectors))
         .collect();
     let errors = variants(&defs["ErrorCode"])
         .map(|branch| ErrorInfo {

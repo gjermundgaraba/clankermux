@@ -48,7 +48,7 @@ async fn snapshot_bootstrap_then_stream_then_close() {
     assert_eq!(c.expect_closed(1).await, ClosedReason::Closed);
     // The attachment is gone and the channel free once CLOSED is read.
     let inspected = c.inspect(&session.id).await;
-    assert!(inspected.attachments.is_empty());
+    assert_eq!(inspected.attachments, []);
     c.open(1, json!({"session": session.id})).await;
     let boot = c.bootstrap(1).await;
     assert_eq!(boot.attached.offset, offset + bytes.len() as u64);
@@ -360,7 +360,7 @@ async fn exit_ends_the_stream_and_removal_closes() {
         boot.attached.marker, 1,
         "the snapshot reflects the exit; no EXITED frame"
     );
-    assert!(boot.stream.is_empty());
+    assert_eq!(boot.stream, []);
     // From another connection: the reply and the CLOSED are unordered.
     events.ok("remove", json!({"session": kept.id})).await;
     assert_eq!(
@@ -402,7 +402,7 @@ async fn gap_when_the_client_falls_behind() {
     let go = json!({"session": session.id, "data": b64("go\n")});
     c.open(1, json!({"session": session.id})).await;
     let boot = c.bootstrap(1).await;
-    assert!(boot.stream.is_empty());
+    assert_eq!(boot.stream, []);
     // Read nothing until the session has produced everything and exited.
     events.ok("send", go.clone()).await;
     wait_text(&mut events, &session.id, "FIRST-DONE").await;
@@ -612,7 +612,7 @@ async fn bootstrap_history_gets_a_turn_under_continuous_live_output() {
     }
     c.open(1, json!({"session": session.id})).await;
     let attached = c.attached(1).await;
-    let declared = attached.snapshot_bytes.unwrap() as usize;
+    let declared = usize::try_from(attached.snapshot_bytes.unwrap()).unwrap();
     assert!(declared > 1024 * 1024);
     {
         let mut s = shared.lock().unwrap();

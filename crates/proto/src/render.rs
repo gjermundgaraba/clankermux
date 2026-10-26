@@ -3,6 +3,7 @@
 //! one method as `api describe` prints it.
 
 use std::collections::{BTreeSet, VecDeque};
+use std::fmt::Write as _;
 
 use serde_json::{Map, Value};
 
@@ -154,10 +155,7 @@ pub fn method(description: &Description) -> String {
     let params = resolve(&m.params, defs);
     out.push_str(&about(params));
     out.push_str(&fields_table(params, defs));
-    out.push_str(&format!(
-        "\n## Result: {}\n\n",
-        code(&shape(&m.result, defs))
-    ));
+    let _ = write!(out, "\n## Result: {}\n\n", code(&shape(&m.result, defs)));
     let result = resolve(&m.result, defs);
     if result.get("properties").is_some() {
         out.push_str(&about(result));
@@ -179,21 +177,22 @@ pub fn method(description: &Description) -> String {
             continue;
         }
         if schema.get("properties").is_some() {
-            out.push_str(&format!("## {name}\n\n"));
+            let _ = write!(out, "## {name}\n\n");
             out.push_str(&about(schema));
             out.push_str(&fields_table(schema, defs));
             out.push('\n');
         }
         refs(schema, &mut queue);
     }
-    out.push_str(&format!("## Errors\n\n{}\n", codes(&m.errors)));
+    let _ = writeln!(out, "## Errors\n\n{}", codes(&m.errors));
     for example in &m.examples {
-        out.push_str(&format!(
-            "\n## Example\n\n```json\n{{\"method\": {:?}, \"params\": {}}}\n{{\"result\": {}}}\n```\n",
+        let _ = writeln!(
+            out,
+            "\n## Example\n\n```json\n{{\"method\": {:?}, \"params\": {}}}\n{{\"result\": {}}}\n```",
             m.name,
             serde_json::to_string(&example.params).expect("json"),
             serde_json::to_string(&example.result).expect("json"),
-        ));
+        );
     }
     out
 }
@@ -371,7 +370,7 @@ fn table(head: &[&str], rows: impl Iterator<Item = Vec<String>>) -> String {
                 .collect()
         })
         .collect();
-    rows.insert(0, head.iter().map(|h| h.to_string()).collect());
+    rows.insert(0, head.iter().map(ToString::to_string).collect());
     let last = head.len() - 1;
     let widths: Vec<usize> = (0..head.len())
         .map(|i| match i {

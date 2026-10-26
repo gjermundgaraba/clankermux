@@ -36,6 +36,22 @@ fn text(a: &mut Attachment) -> String {
     String::from_utf8(out).unwrap()
 }
 
+/// Polls `read` until the session's screen holds `needle`.
+async fn wait_screen(conn: &Connection, session: &str, needle: &str) {
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let read: Read = conn
+            .call("read", json!({"session": session}))
+            .await
+            .unwrap();
+        if read.text.contains(needle) {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{:?}", read.text);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Feeds frames until `done` holds, returning every action.
 async fn drive(
     a: &mut Attachment,
@@ -73,18 +89,7 @@ async fn bootstrap_stream_and_resume() {
         .unwrap();
     // The echo is on the screen before the attach, so it comes with the
     // snapshot rather than as OUTPUT.
-    let deadline = tokio::time::Instant::now() + DEADLINE;
-    loop {
-        let read: Read = conn
-            .call("read", json!({"session": session.id}))
-            .await
-            .unwrap();
-        if read.text.contains("one\none") {
-            break;
-        }
-        assert!(tokio::time::Instant::now() < deadline, "{:?}", read.text);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_screen(&conn, &session.id, "one\none").await;
 
     let open = Open {
         session: session.id.clone(),
@@ -176,7 +181,14 @@ async fn bootstrap_stream_and_resume() {
         }
     }
     assert_eq!(a.resume(), None);
+}
 
+#[tokio::test(flavor = "multi_thread")]
+async fn server_errors_are_typed_and_a_protocol_error_ends_the_connection() {
+    let server = start();
+    let conn = connect(&server).await;
+    let mut events = conn.events();
+    conn.request("subscribe", json!({})).await.unwrap();
     // Server errors arrive typed; the connection reports its end.
     let err = conn.request("inspect", json!({"session": "nope"})).await;
     assert!(matches!(err, Err(client::Error::Server(e)) if e.code == ErrorCode::NoSuchSession));
@@ -201,7 +213,16 @@ async fn bootstrap_stream_and_resume() {
         Err(client::Error::Server(e)) if e.code == ErrorCode::ProtocolError
     ));
     assert!(matches!(
-        conn.open(2, &open),
+        conn.open(
+            2,
+            &Open {
+                session: "nope".into(),
+                read_only: false,
+                viewport: None,
+                profile: None,
+                resume: None,
+            }
+        ),
         Err(client::Error::Server(e)) if e.code == ErrorCode::ProtocolError
     ));
     assert!(conn.events().recv().await.is_none());

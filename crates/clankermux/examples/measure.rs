@@ -3,13 +3,17 @@
 //! session, and a park. Prints a Markdown report.
 //!
 //!     cargo run --release -p clankermux --example measure
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "byte counts as f64 for MiB, far below 2^53"
+)]
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use client::connection::hello;
 use client::{Connection, Endpoint};
-use proto::*;
+use proto::{Attached, FrameType, Limits, Open, Read, Resume, Session, Size, parse_output};
 use serde_json::json;
 use testkit::connect_ws;
 use tokio_rustls::TlsConnector;
@@ -111,7 +115,7 @@ fn open(session: &str, resume: Option<Resume>) -> Open {
     }
 }
 
-/// OPEN to SNAPSHOT_END, and the snapshot's size.
+/// OPEN to `SNAPSHOT_END`, and the snapshot's size.
 async fn bootstrap(conn: &Connection, session: &str) -> (Duration, u64) {
     let started = Instant::now();
     let mut rx = conn.open(1, &open(session, None)).unwrap();
@@ -218,21 +222,19 @@ fn cpu_secs() -> f64 {
 }
 
 fn dir_size(path: &Path) -> u64 {
-    std::fs::read_dir(path)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|e| {
-                    let path = e.path();
-                    if path.is_dir() {
-                        dir_size(&path)
-                    } else {
-                        e.metadata().map(|m| m.len()).unwrap_or(0)
-                    }
-                })
-                .sum()
-        })
-        .unwrap_or(0)
+    std::fs::read_dir(path).map_or(0, |entries| {
+        entries
+            .flatten()
+            .map(|e| {
+                let path = e.path();
+                if path.is_dir() {
+                    dir_size(&path)
+                } else {
+                    e.metadata().map_or(0, |m| m.len())
+                }
+            })
+            .sum()
+    })
 }
 
 /// macOS only; empty elsewhere.
@@ -303,7 +305,7 @@ async fn main() {
             .unwrap()
             .body
         {
-            server::session::Body::Live(live) => live.term.scrollback_rows(),
+            server::session::Body::Live(live) => live.term.scrollback_rows().unwrap(),
             server::session::Body::Parked(_) => 0,
         };
         println!(

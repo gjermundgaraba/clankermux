@@ -20,6 +20,10 @@ pub enum Format {
 /// Formatting options. `Default` is plain text of the whole screen with
 /// nothing extra. The extras apply to VT output only.
 #[derive(Debug, Clone, Copy, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "mirrors GhosttyFormatterTerminalOptions"
+)]
 pub struct Options {
     pub format: Format,
     /// Join soft-wrapped rows into one line.
@@ -116,7 +120,12 @@ pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
     let mut formatter = ptr::null_mut();
     // SAFETY: term outlives the formatter, which is freed before returning.
     check(unsafe {
-        sys::ghostty_formatter_terminal_new(ptr::null(), &mut formatter, term.raw(), raw_options)
+        sys::ghostty_formatter_terminal_new(
+            ptr::null(),
+            &raw mut formatter,
+            term.raw(),
+            raw_options,
+        )
     })?;
     let mut out = Vec::new();
     // SAFETY: the writer borrows `out` only for the duration of this call.
@@ -140,7 +149,7 @@ fn point(term: &Term, tag: sys::GhosttyPointTag, x: u16, y: u32) -> Result<sys::
         ..Default::default()
     };
     // SAFETY: term is live and out is a sized GhosttyGridRef.
-    check(unsafe { sys::ghostty_terminal_grid_ref(term.raw(), point, &mut out) })?;
+    check(unsafe { sys::ghostty_terminal_grid_ref(term.raw(), point, &raw mut out) })?;
     Ok(out)
 }
 

@@ -32,7 +32,7 @@ async fn max_frame_bounds_every_frame() {
     // The server may close on the header before the payload is written.
     let _ = c
         .stream
-        .write_all(&encode_frame(FrameType::Request, 0, &[b' '; MAX + 1]))
+        .write_all(&encode_frame(FrameType::Request, 0, &vec![b' '; MAX + 1]))
         .await;
     let (header, body) = c.recv_json().await;
     assert_eq!(header.channel, 0);
@@ -72,7 +72,7 @@ async fn scrollback_bounds_the_history() {
         .create(json!({"rows": 4, "argv": ["/bin/sh", "-c", "seq 1 2000 | sed 's/^/line-/'; echo END; exec cat"]}))
         .await;
     wait_text(&mut c, &session.id, "END").await;
-    let read = c.read(&session.id, 100000).await;
+    let read = c.read(&session.id, 100_000).await;
     let lines = read.text.lines().count();
     assert!(lines < 2000, "{lines} lines retained");
     assert!(
@@ -256,15 +256,15 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
     };
     let session = |records: bool| Session {
         id: "a8098c1a-f86e-11da-bd1a-00112444be1e".into(),
-        label: worst_text(limits.label as usize),
+        label: worst_text(proto::cap(limits.label)),
         status: Status::Running,
-        argv: vec![worst_text(limits.text as usize)],
-        cwd: worst_text(limits.text as usize),
+        argv: vec![worst_text(proto::cap(limits.text))],
+        cwd: worst_text(proto::cap(limits.text)),
         pid: Some(u32::MAX),
         cols: u16::MAX,
         rows: u16::MAX,
-        title: worst_text(limits.text as usize),
-        pwd: worst_text(limits.text as usize),
+        title: worst_text(proto::cap(limits.text)),
+        pwd: worst_text(proto::cap(limits.text)),
         on_exit: OnExit::Remove,
         created_at: "2026-10-18T16:00:00.123456789Z".into(),
         exited_at: Some("2026-10-18T16:00:00.123456789Z".into()),
@@ -273,14 +273,14 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
         }),
         offset: u64::MAX,
         marker: u64::MAX,
-        attachments: vec![attachment.clone(); limits.attachments as usize],
+        attachments: vec![attachment.clone(); proto::cap(limits.attachments)],
         command: Some(Command {
             start: u64::MAX,
             output: Some(u64::MAX),
             end: Some(u64::MAX),
             exit: Some(i32::MIN),
         }),
-        program_status: records.then(|| vec![record.clone(); limits.records as usize]),
+        program_status: records.then(|| vec![record.clone(); proto::cap(limits.records)]),
         attention: Some(attention.clone()),
         size: SizeInfo {
             policy: SizePolicy::Smallest,
@@ -326,7 +326,10 @@ async fn read_replies_stay_under_max_frame() {
     // The harness decodes with the server's max_frame; a larger frame
     // fails the test there.
     let reply = c
-        .ok("read", json!({"session": session.id, "scrollback": 100000}))
+        .ok(
+            "read",
+            json!({"session": session.id, "scrollback": 100_000}),
+        )
         .await;
     let read: Read = serde_json::from_value(reply.clone()).unwrap();
     assert!(read.text.ends_with("END\n"), "the newest lines stay");
@@ -347,7 +350,7 @@ async fn a_page_is_cut_to_max_frame() {
     let mut c = client(&server).await;
     // Sessions whose label and argv escape to six bytes a character: about
     // 14 KiB each, so a page of 100 would be over max_frame.
-    let label = "\u{1}".repeat(Limits::default().label as usize);
+    let label = "\u{1}".repeat(proto::cap(Limits::default().label));
     let arg = "\u{1}".repeat(2000);
     let mut ids = std::collections::BTreeSet::new();
     for _ in 0..100 {

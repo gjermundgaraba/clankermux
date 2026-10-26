@@ -73,6 +73,18 @@ pub struct Frame {
 }
 
 impl Frame {
+    pub fn new(frame_type: FrameType, channel: u32, payload: Vec<u8>) -> Frame {
+        let length = u32::try_from(payload.len()).expect("frame payload longer than u32");
+        Frame {
+            header: Header {
+                frame_type,
+                channel,
+                length,
+            },
+            payload,
+        }
+    }
+
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, Error> {
         serde_json::from_slice(&self.payload)
             .map_err(|e| Error::Protocol(format!("{:?} payload: {e}", self.header.frame_type)))
@@ -406,14 +418,7 @@ fn loss_frame(channel: u32, message: &str) -> Frame {
         message: message.into(),
     })
     .expect("serializable");
-    Frame {
-        header: Header {
-            frame_type: FrameType::Error,
-            channel,
-            length: payload.len() as u32,
-        },
-        payload,
-    }
+    Frame::new(FrameType::Error, channel, payload)
 }
 
 fn end_routes(routes: &Mutex<Routes>, reason: Ended) {
@@ -579,7 +584,7 @@ impl Endpoint {
                         let said = tokio::time::timeout(std::time::Duration::from_secs(2), drain)
                             .await
                             .ok()
-                            .and_then(|r| r.ok())
+                            .and_then(Result::ok)
                             .unwrap_or_default();
                         match said.trim() {
                             "" => Err(error),
@@ -620,17 +625,6 @@ mod tests {
         })
     }
 
-    fn frame(kind: FrameType, channel: u32, payload: Vec<u8>) -> Frame {
-        Frame {
-            header: Header {
-                frame_type: kind,
-                channel,
-                length: payload.len() as u32,
-            },
-            payload,
-        }
-    }
-
     #[tokio::test]
     async fn attachment_overflow_signals_loss_without_blocking_other_routes() {
         let routes = routes();
@@ -650,7 +644,7 @@ mod tests {
             route(
                 &routes,
                 &out,
-                frame(FrameType::Output, 1, proto::encode_output(offset, b"x")),
+                Frame::new(FrameType::Output, 1, proto::encode_output(offset, b"x")),
             )
             .unwrap();
         }
@@ -680,13 +674,13 @@ mod tests {
         route(
             &routes,
             &out,
-            frame(FrameType::Output, 2, proto::encode_output(0, b"y")),
+            Frame::new(FrameType::Output, 2, proto::encode_output(0, b"y")),
         )
         .unwrap();
         route(
             &routes,
             &out,
-            frame(
+            Frame::new(
                 FrameType::Reply,
                 0,
                 br#"{"id":7,"result":{"ok":true}}"#.to_vec(),
@@ -707,7 +701,7 @@ mod tests {
         route(
             &routes,
             &out,
-            frame(FrameType::Closed, 1, br#"{"reason":"closed"}"#.to_vec()),
+            Frame::new(FrameType::Closed, 1, br#"{"reason":"closed"}"#.to_vec()),
         )
         .unwrap();
         assert!(!routes.lock().unwrap().channels.contains_key(&1));
@@ -734,13 +728,13 @@ mod tests {
         route(
             &routes,
             &outgoing.downgrade(),
-            frame(FrameType::Event, 0, payload.clone()),
+            Frame::new(FrameType::Event, 0, payload.clone()),
         )
         .unwrap();
         let reason = route(
             &routes,
             &outgoing.downgrade(),
-            frame(FrameType::Event, 0, payload),
+            Frame::new(FrameType::Event, 0, payload),
         )
         .unwrap_err();
         assert!(matches!(reason, Ended::Desync(_)));

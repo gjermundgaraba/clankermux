@@ -110,8 +110,8 @@ async fn next(raw: &mut ClientWs) -> (Header, Vec<u8>) {
     (header, payload.to_vec())
 }
 
-fn json(frame_type: FrameType, body: serde_json::Value) -> Message {
-    Message::Binary(encode_frame(frame_type, 0, &serde_json::to_vec(&body).unwrap()).into())
+fn json(frame_type: FrameType, body: &serde_json::Value) -> Message {
+    Message::Binary(encode_frame(frame_type, 0, &serde_json::to_vec(body).unwrap()).into())
 }
 
 /// A raw connection past its handshake.
@@ -119,7 +119,7 @@ async fn greeted(ws: &Ws) -> ClientWs {
     let mut raw = ws.connect(Some("http://allowed")).await.unwrap();
     raw.send(json(
         FrameType::Hello,
-        json!({"version": 1, "client": {"name": "raw", "version": "0"}, "capabilities": [],
+        &json!({"version": 1, "client": {"name": "raw", "version": "0"}, "capabilities": [],
             "engine": ghostty_vt::ENGINE}),
     ))
     .await
@@ -138,7 +138,7 @@ async fn ends_with_protocol_error(raw: &mut ClientWs) -> String {
             .await
             .expect("the close in time");
         match message {
-            None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+            None | Some(Err(_) | Ok(Message::Close(_))) => break,
             Some(Ok(Message::Binary(bytes))) => {
                 let (header, payload) = parse_frame(&bytes, max_frame).unwrap();
                 // Whatever was still queued for channel 1 may arrive first.
@@ -165,7 +165,7 @@ async fn each_message_is_exactly_one_frame() {
     let mut raw = greeted(&ws).await;
     raw.send(json(
         FrameType::Request,
-        json!({"id": 1, "method": "create", "params": {"argv": ["/bin/cat"]}}),
+        &json!({"id": 1, "method": "create", "params": {"argv": ["/bin/cat"]}}),
     ))
     .await
     .unwrap();
@@ -245,7 +245,7 @@ async fn each_message_is_exactly_one_frame() {
 
     // A message over the ceiling, too.
     let mut raw = greeted(&ws).await;
-    let over = vec![0u8; Limits::default().max_frame as usize + HEADER_LEN + 1];
+    let over = vec![0u8; proto::cap(Limits::default().max_frame) + HEADER_LEN + 1];
     // The server refuses it from its header, before the bytes are all
     // written, so the send itself may fail.
     let _ = raw.send(Message::Binary(over.into())).await;

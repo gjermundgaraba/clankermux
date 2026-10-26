@@ -69,7 +69,7 @@ pub async fn serve_ws(
             };
             match tokio::time::timeout_at(accepted + hello_timeout, upgrade).await {
                 Ok(Ok(ws)) => {
-                    serve_connection(WsStream::new(ws, max_frame), registry, accepted).await
+                    serve_connection(WsStream::new(ws, max_frame), registry, accepted).await;
                 }
                 Ok(Err(error)) => tracing::debug!(%error, "WebSocket handshake failed"),
                 Err(_) => tracing::debug!("WebSocket handshake timed out"),

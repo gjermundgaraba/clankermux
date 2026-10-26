@@ -146,6 +146,42 @@ enum Outcome {
     Failed(String),
 }
 
+impl Outcome {
+    /// What to tell the user, and the exit status.
+    fn report(self) -> (String, i32) {
+        match self {
+            Outcome::Detached => ("detached".to_string(), 0),
+            Outcome::Exited(Exit::Code { code }) => (
+                format!("session exited with code {code}"),
+                i32::from(code != 0),
+            ),
+            Outcome::Exited(Exit::Signal { signal }) => {
+                (format!("session killed by SIG{signal}"), 1)
+            }
+            Outcome::Restored => (
+                "session restored from a previous server; no process".to_string(),
+                0,
+            ),
+            Outcome::Closed(Closed {
+                reason: ClosedReason::Removed,
+                ..
+            }) => ("session removed".to_string(), 0),
+            Outcome::Closed(Closed {
+                reason: ClosedReason::Detached,
+                message,
+            }) => (
+                match message {
+                    Some(message) => format!("detached by another client: {message}"),
+                    None => "detached by another client".to_string(),
+                },
+                0,
+            ),
+            Outcome::Closed(Closed { reason, .. }) => (format!("closed: {reason}"), 0),
+            Outcome::Failed(message) => (message, 1),
+        }
+    }
+}
+
 /// What a batch of keys asks for.
 enum Keys {
     Send(Vec<u8>),
@@ -485,8 +521,8 @@ pub async fn run(opts: Options, conn: Connection) -> Result<i32, Error> {
                     shell.keys(false)
                 }
             },
-            _ = tokio::time::sleep_until(keys_at) => shell.keys(true),
-            _ = tokio::time::sleep_until(repaint_at) => {
+            () = tokio::time::sleep_until(keys_at) => shell.keys(true),
+            () = tokio::time::sleep_until(repaint_at) => {
                 shell.paint();
                 continue;
             },
@@ -520,34 +556,7 @@ pub async fn run(opts: Options, conn: Connection) -> Result<i32, Error> {
     };
     write_out(&[RESET_MODES, SHOW_CURSOR].concat());
     drop(raw);
-    let (message, code) = match outcome {
-        Outcome::Detached => ("detached".to_string(), 0),
-        Outcome::Exited(Exit::Code { code }) => (
-            format!("session exited with code {code}"),
-            if code == 0 { 0 } else { 1 },
-        ),
-        Outcome::Exited(Exit::Signal { signal }) => (format!("session killed by SIG{signal}"), 1),
-        Outcome::Restored => (
-            "session restored from a previous server; no process".to_string(),
-            0,
-        ),
-        Outcome::Closed(Closed {
-            reason: ClosedReason::Removed,
-            ..
-        }) => ("session removed".to_string(), 0),
-        Outcome::Closed(Closed {
-            reason: ClosedReason::Detached,
-            message,
-        }) => (
-            match message {
-                Some(message) => format!("detached by another client: {message}"),
-                None => "detached by another client".to_string(),
-            },
-            0,
-        ),
-        Outcome::Closed(Closed { reason, .. }) => (format!("closed: {reason}"), 0),
-        Outcome::Failed(message) => (message, 1),
-    };
+    let (message, code) = outcome.report();
     eprintln!("\r\n[clankermux: {message}]");
     Ok(code)
 }
@@ -559,7 +568,7 @@ mod tests {
     fn shell(detach_key: u8) -> Shell {
         Shell::new(
             Options {
-                endpoint: Endpoint::Unix(Default::default()),
+                endpoint: Endpoint::Unix(std::path::PathBuf::new()),
                 session: String::new(),
                 read_only: false,
                 detach_key,

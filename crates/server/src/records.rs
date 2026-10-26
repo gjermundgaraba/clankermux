@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(r.all().len(), 2);
         // Replacing an existing record does not evict.
         let c = r.apply(report(ProgramStatusState::Done, "deploy", "tf"), 2, "t4");
-        assert!(c.removed.is_empty());
+        assert_eq!(c.removed, Vec::<String>::new());
         // The child takes its app from the nearest ancestor at inspect.
         let resolved = r.resolved();
         assert_eq!(
@@ -334,7 +334,7 @@ mod tests {
             c.removed,
             vec!["deploy".to_string(), "deploy/us".to_string()]
         );
-        assert!(r.all().is_empty());
+        assert_eq!(r.all(), []);
     }
 
     #[test]

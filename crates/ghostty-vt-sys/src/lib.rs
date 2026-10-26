@@ -1,5 +1,5 @@
 //! Raw bindings to the vendored libghostty-vt. Regenerate with `cargo xtask bindings`.
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
-#![allow(clippy::all)]
+#![allow(clippy::all, clippy::pedantic)]
 
 include!("bindings.rs");

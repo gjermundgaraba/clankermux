@@ -227,7 +227,7 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
     assert_eq!(restored.label, "work");
     assert_eq!(restored.title, "parked title");
     assert_eq!((restored.cols, restored.rows), (30, 6));
-    assert!(restored.attachments.is_empty());
+    assert_eq!(restored.attachments, []);
     assert!(restored.exit.is_none());
 
     let read = c.read(&session.id, 100).await;
@@ -268,7 +268,7 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
         "the parked size"
     );
     assert!(boot.text().contains("hello-park"), "{:?}", boot.text());
-    assert!(boot.stream.is_empty());
+    assert_eq!(boot.stream, []);
     c.send(FrameType::Close, 1, &[]).await;
     assert_eq!(c.expect_closed(1).await, ClosedReason::Closed);
     c.wait_attachments(&session.id, 0).await;
@@ -356,7 +356,7 @@ async fn a_stop_parks_an_exited_session_whose_final_park_is_waiting() {
         c.wait_exit(&session.id).await.exit,
         Some(Exit::Code { code: 4 })
     );
-    assert!(generations(&state, &session.id).is_empty());
+    assert_eq!(generations(&state, &session.id), Vec::<PathBuf>::new());
     drop(c);
     let registry = a.registry.clone();
     let stop = tokio::spawn(async move { registry.stop().await });
@@ -479,7 +479,7 @@ async fn the_lock_refuses_a_second_server() {
             version: "test".into(),
             state_dir: state.clone(),
             socket: dir.path().join("sock"),
-            park: Default::default(),
+            park: server::ParkTiming::default(),
         })
     };
     assert_eq!(
@@ -497,58 +497,21 @@ async fn loading_keeps_the_newest_complete_generation_only() {
     let state = dir.path().join("state");
     let id = "11111111-2222-3333-4444-555555555555";
     let session_dir = sessions_dir(&state).join(id);
-    let file = server::park::ParkFile {
-        protocol: server::park::PROTOCOL,
-        engine: ghostty_vt::ENGINE.into(),
-        parked_at: "2026-10-18T00:00:00Z".into(),
-        history_lines: 1,
-        commands: Vec::new(),
-        session: Session {
-            id: id.into(),
-            label: "old".into(),
-            status: Status::Running,
-            argv: vec!["/bin/sh".into()],
-            cwd: "/".into(),
-            pid: Some(1),
-            cols: 20,
-            rows: 5,
-            title: "t".into(),
-            pwd: "/tmp".into(),
-            on_exit: OnExit::Keep,
-            created_at: "2026-10-18T00:00:00Z".into(),
-            exited_at: None,
-            exit: None,
-            offset: 7,
-            marker: 2,
-            attachments: Vec::new(),
-            command: None,
-            program_status: Some(vec![
-                StatusRecord {
-                    id: "".into(),
-                    state: "working".into(),
-                    kind: None,
-                    app: None,
-                    title: None,
-                    msg: None,
-                    progress: None,
-                    updated_at: "x".into(),
-                    seen: None,
-                },
-                StatusRecord {
-                    id: "k".into(),
-                    state: "done".into(),
-                    kind: None,
-                    app: Some("a".into()),
-                    title: None,
-                    msg: None,
-                    progress: None,
-                    updated_at: "x".into(),
-                    seen: None,
-                },
-            ]),
-            attention: None,
-            size: Default::default(),
-        },
+    let mut file = park_file(id);
+    file.history_lines = 1;
+    file.session = Session {
+        label: "old".into(),
+        argv: vec!["/bin/sh".into()],
+        pid: Some(1),
+        title: "t".into(),
+        pwd: "/tmp".into(),
+        offset: 7,
+        marker: 2,
+        program_status: Some(vec![
+            record("", "working", None),
+            record("k", "done", Some("a")),
+        ]),
+        ..file.session
     };
     // As 0.3.0 wrote it: a count of attachments, no size.
     let mut old = serde_json::to_value(&file).unwrap();
@@ -572,26 +535,12 @@ async fn loading_keeps_the_newest_complete_generation_only() {
     write("50", &["session.json", "snapshot.ghostsnp", "screen.txt"]);
     // An unrelated session directory with nothing complete goes away.
     std::fs::create_dir_all(sessions_dir(&state).join("empty").join("1")).unwrap();
-    // A session parked by another engine.
-    let other_dir = sessions_dir(&state).join(OTHER).join("100");
-    std::fs::create_dir_all(&other_dir).unwrap();
-    let mut other = file.clone();
-    other.engine = "ghostty-vt@0.0.0+none".into();
-    other.history_lines = 0;
-    other.session.id = OTHER.into();
-    std::fs::write(
-        other_dir.join("session.json"),
-        serde_json::to_vec(&other).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(other_dir.join("snapshot.ghostsnp"), b"GHOSTSNP").unwrap();
-    std::fs::write(other_dir.join("screen.txt"), "elsewhere\n").unwrap();
 
     let server = start_with(fast_limits(), state.clone());
     let mut c = client(&server).await;
     let page = c.list().await;
-    assert_eq!(page.sessions.len(), 2);
-    let s = page.sessions.iter().find(|s| s.id == id).unwrap();
+    assert_eq!(page.sessions.len(), 1);
+    let s = &page.sessions[0];
     assert_eq!(
         (s.status, s.pid, s.attachments.len(), s.offset, s.marker),
         (Status::Restored, None, 0, 7, 2)
@@ -634,36 +583,19 @@ async fn loading_keeps_the_newest_complete_generation_only() {
     .await;
     assert_eq!(c.expect_error(1).await, ErrorCode::Internal);
     c.wait_attachments(id, 0).await;
-
-    // After an engine change only `read` and `remove` work.
-    c.open(
-        1,
-        json!({"session": OTHER, "viewport": {"cols": 80, "rows": 24}}),
-    )
-    .await;
-    assert_eq!(c.expect_error(1).await, ErrorCode::EngineMismatch);
-    assert_eq!(c.read(OTHER, 0).await.text, "elsewhere\n");
-    c.ok("remove", json!({"session": OTHER})).await;
 }
 
 const OTHER: &str = "99999999-2222-3333-4444-555555555555";
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_park_naming_another_session_is_skipped() {
-    // A `remove` of the restored session would delete `sessions/<id>`
-    // for the id the file claims, so a file under the wrong directory is
-    // left alone and not restored.
-    let tmp = tempfile::tempdir().unwrap();
-    let state = tmp.path().to_path_buf();
-    let dir = sessions_dir(&state).join("mislabeled").join("1");
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = server::park::ParkFile {
+/// A running session's park, as written by this engine and protocol.
+fn park_file(id: &str) -> server::park::ParkFile {
+    server::park::ParkFile {
         protocol: server::park::PROTOCOL,
         engine: ghostty_vt::ENGINE.into(),
         parked_at: "2026-10-18T00:00:00Z".into(),
         history_lines: 0,
         session: Session {
-            id: OTHER.into(),
+            id: id.into(),
             label: String::new(),
             status: Status::Running,
             argv: vec!["cat".into()],
@@ -683,10 +615,66 @@ async fn a_park_naming_another_session_is_skipped() {
             command: None,
             program_status: None,
             attention: None,
-            size: Default::default(),
+            size: SizeInfo::default(),
         },
         commands: Vec::new(),
-    };
+    }
+}
+
+/// A record with nothing but its id, state and app.
+fn record(id: &str, state: &str, app: Option<&str>) -> StatusRecord {
+    StatusRecord {
+        id: id.into(),
+        state: state.into(),
+        kind: None,
+        app: app.map(Into::into),
+        title: None,
+        msg: None,
+        progress: None,
+        updated_at: "x".into(),
+        seen: None,
+    }
+}
+
+/// After an engine change only `read` and `remove` work.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_parked_by_another_engine_is_only_read_and_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let other_dir = sessions_dir(&state).join(OTHER).join("100");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let mut other = park_file(OTHER);
+    other.engine = "ghostty-vt@0.0.0+none".into();
+    std::fs::write(
+        other_dir.join("session.json"),
+        serde_json::to_vec(&other).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(other_dir.join("snapshot.ghostsnp"), b"GHOSTSNP").unwrap();
+    std::fs::write(other_dir.join("screen.txt"), "elsewhere\n").unwrap();
+
+    let server = start_with(fast_limits(), state.clone());
+    let mut c = client(&server).await;
+    c.open(
+        1,
+        json!({"session": OTHER, "viewport": {"cols": 80, "rows": 24}}),
+    )
+    .await;
+    assert_eq!(c.expect_error(1).await, ErrorCode::EngineMismatch);
+    assert_eq!(c.read(OTHER, 0).await.text, "elsewhere\n");
+    c.ok("remove", json!({"session": OTHER})).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_park_naming_another_session_is_skipped() {
+    // A `remove` of the restored session would delete `sessions/<id>`
+    // for the id the file claims, so a file under the wrong directory is
+    // left alone and not restored.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().to_path_buf();
+    let dir = sessions_dir(&state).join("mislabeled").join("1");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = park_file(OTHER);
     std::fs::write(dir.join("session.json"), serde_json::to_vec(&file).unwrap()).unwrap();
     std::fs::write(dir.join("snapshot.ghostsnp"), b"GHOSTSNP").unwrap();
     std::fs::write(dir.join("screen.txt"), "x\n").unwrap();
@@ -694,7 +682,7 @@ async fn a_park_naming_another_session_is_skipped() {
     let server = start_with(fast_limits(), state.clone());
     let mut c = client(&server).await;
     let page = c.list().await;
-    assert!(page.sessions.is_empty());
+    assert_eq!(page.sessions, []);
     assert!(dir.join("session.json").is_file(), "the directory is kept");
 }
 
@@ -715,7 +703,10 @@ async fn a_stopped_server_leaves_the_directory_to_its_successor() {
     // nothing new.
     assert!(c.recv().await.is_none(), "closed by the stop");
     assert_eq!(
-        a.registry.create(Default::default()).map(|s| s.id).err(),
+        a.registry
+            .create(CreateParams::default())
+            .map(|s| s.id)
+            .err(),
         Some((ErrorCode::Internal, "server stopping".into()))
     );
 

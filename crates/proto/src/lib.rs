@@ -9,7 +9,7 @@ pub mod render;
 pub mod typescript;
 
 pub use frame::*;
-pub use limits::Limits;
+pub use limits::{Limits, cap};
 pub use message::*;
 
 pub const VERSION: u32 = 1;

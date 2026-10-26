@@ -8,29 +8,13 @@ use ghostty_vt_sys as sys;
 use crate::error::{Error, Result, check};
 use crate::terminal::Term;
 
-/// Modifiers held with a key.
+/// Modifiers held with a key, as the engine's `GHOSTTY_MODS_*` bits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Mods {
-    shift: bool,
-    ctrl: bool,
-    alt: bool,
-    super_: bool,
-}
+struct Mods(sys::GhosttyMods);
 
 impl Mods {
-    fn raw(self) -> sys::GhosttyMods {
-        let mut mods = 0;
-        for (held, bit) in [
-            (self.shift, sys::GHOSTTY_MODS_SHIFT),
-            (self.ctrl, sys::GHOSTTY_MODS_CTRL),
-            (self.alt, sys::GHOSTTY_MODS_ALT),
-            (self.super_, sys::GHOSTTY_MODS_SUPER),
-        ] {
-            if held {
-                mods |= bit as sys::GhosttyMods;
-            }
-        }
-        mods
+    fn shift(self) -> bool {
+        self.0 & sys::GHOSTTY_MODS_SHIFT != 0
     }
 }
 
@@ -111,16 +95,17 @@ impl KeyPress {
         };
         let mut mods = Mods::default();
         for part in parts {
-            let held = match part.to_ascii_lowercase().as_str() {
-                "ctrl" => &mut mods.ctrl,
-                "shift" => &mut mods.shift,
-                "alt" => &mut mods.alt,
-                "super" => &mut mods.super_,
+            let bit = match part.to_ascii_lowercase().as_str() {
+                "ctrl" => sys::GHOSTTY_MODS_CTRL,
+                "shift" => sys::GHOSTTY_MODS_SHIFT,
+                "alt" => sys::GHOSTTY_MODS_ALT,
+                "super" => sys::GHOSTTY_MODS_SUPER,
                 _ => return None,
             };
-            if std::mem::replace(held, true) {
+            if mods.0 & bit != 0 {
                 return None;
             }
+            mods.0 |= bit;
         }
         let lower = key.to_ascii_lowercase();
         if let Some((_, code)) = NAMED.iter().find(|(n, _)| *n == lower) {
@@ -146,9 +131,11 @@ impl KeyPress {
         }
         if c.is_ascii_alphabetic() {
             let base = c.to_ascii_lowercase();
-            let code = sys::GHOSTTY_KEY_A + (base as u8 - b'a') as sys::GhosttyKey;
-            mods.shift |= c.is_ascii_uppercase();
-            let text = if mods.shift {
+            let code = sys::GHOSTTY_KEY_A + sys::GhosttyKey::from(base as u8 - b'a');
+            if c.is_ascii_uppercase() {
+                mods.0 |= sys::GHOSTTY_MODS_SHIFT;
+            }
+            let text = if mods.shift() {
                 base.to_ascii_uppercase()
             } else {
                 base
@@ -159,8 +146,10 @@ impl KeyPress {
             .iter()
             .find(|(plain, shifted, _)| *plain == c || *shifted == c)
         {
-            mods.shift |= c == shifted;
-            let text = if mods.shift { shifted } else { plain };
+            if c == shifted {
+                mods.0 |= sys::GHOSTTY_MODS_SHIFT;
+            }
+            let text = if mods.shift() { shifted } else { plain };
             return Some(Self::character(code, mods, text, plain));
         }
         // Any other character is text with no key of its own.
@@ -189,7 +178,7 @@ impl KeyPress {
             mods,
             text: text.to_string(),
             unshifted: Some(unshifted),
-            shift_consumed: mods.shift && text != unshifted,
+            shift_consumed: mods.shift() && text != unshifted,
         }
     }
 }
@@ -204,10 +193,11 @@ impl KeyEncoder {
     pub fn new() -> Result<Self> {
         let mut encoder = ptr::null_mut();
         // SAFETY: a null allocator selects the default allocator.
-        check(unsafe { sys::ghostty_key_encoder_new(ptr::null(), &mut encoder) })?;
+        check(unsafe { sys::ghostty_key_encoder_new(ptr::null(), &raw mut encoder) })?;
         let mut event = ptr::null_mut();
         // SAFETY: as above.
-        if let Err(err) = check(unsafe { sys::ghostty_key_event_new(ptr::null(), &mut event) }) {
+        if let Err(err) = check(unsafe { sys::ghostty_key_event_new(ptr::null(), &raw mut event) })
+        {
             // SAFETY: the encoder was just created and is freed once.
             unsafe { sys::ghostty_key_encoder_free(encoder) };
             return Err(err);
@@ -228,13 +218,13 @@ impl KeyEncoder {
             sys::ghostty_key_encoder_setopt(
                 self.encoder,
                 sys::GHOSTTY_KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT,
-                (&option_as_alt as *const sys::GhosttyOptionAsAlt).cast(),
+                (&raw const option_as_alt).cast(),
             );
             sys::ghostty_key_event_set_action(self.event, sys::GHOSTTY_KEY_ACTION_PRESS);
             sys::ghostty_key_event_set_key(self.event, key.key);
-            sys::ghostty_key_event_set_mods(self.event, key.mods.raw());
+            sys::ghostty_key_event_set_mods(self.event, key.mods.0);
             let consumed = if key.shift_consumed {
-                sys::GHOSTTY_MODS_SHIFT as sys::GhosttyMods
+                sys::GHOSTTY_MODS_SHIFT
             } else {
                 0
             };
@@ -261,7 +251,7 @@ impl KeyEncoder {
                     self.event,
                     buf.as_mut_ptr().cast(),
                     buf.len(),
-                    &mut written,
+                    &raw mut written,
                 )
             };
             match check(result) {
@@ -304,7 +294,7 @@ pub fn encode_paste(data: &[u8], bracketed: bool) -> Result<Vec<u8>> {
                 bracketed,
                 out.as_mut_ptr().cast(),
                 out.len(),
-                &mut written,
+                &raw mut written,
             )
         };
         match check(result) {

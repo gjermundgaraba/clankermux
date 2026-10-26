@@ -14,8 +14,8 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::tailscale::{Cert, LocalApi};
 
 /// Tailscaled renews a certificate valid for less than this.
-const MIN_VALIDITY: Duration = Duration::from_secs(7 * 24 * 3600);
-const RENEW_EVERY: Duration = Duration::from_secs(12 * 3600);
+const MIN_VALIDITY: Duration = Duration::from_hours(7 * 24);
+const RENEW_EVERY: Duration = Duration::from_hours(12);
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(3600);
 
 pub enum Source {

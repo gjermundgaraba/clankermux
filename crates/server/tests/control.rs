@@ -77,7 +77,7 @@ async fn handshake_and_protocol_errors() {
     assert!(c.recv().await.is_none());
 
     let mut c = client(&server).await;
-    let big = vec![b' '; Limits::default().control_body as usize + 1];
+    let big = vec![b' '; proto::cap(Limits::default().control_body) + 1];
     c.send(FrameType::Request, 0, &big).await;
     let (_, body) = c.recv_json().await;
     assert_eq!(body["code"], "protocol_error", "JSON above control_body");
@@ -103,7 +103,7 @@ async fn session_lifecycle() {
     let mut c = client(&server).await;
     let mut events = client(&server).await;
     let first: Page = serde_json::from_value(events.ok("subscribe", json!({})).await).unwrap();
-    assert!(first.sessions.is_empty());
+    assert_eq!(first.sessions, []);
 
     let session = c.create(json!({"label": "cat", "argv": ["/bin/cat"], "cols": 30, "rows": 10, "on_exit": "keep"})).await;
     assert_eq!(session.status, Status::Running);
@@ -138,60 +138,11 @@ async fn session_lifecycle() {
     assert!(
         matches!(events.event().await, Event::SessionChanged { session: s } if (s.cols, s.rows, s.marker) == (40, 12, 1))
     );
-    // A title (OSC 2) and a working directory (OSC 7) set by the program
-    // are announced, and so is their clearing by a full reset (RIS),
-    // which the engine reports separately. `cat` passes a line on once it
-    // is complete.
-    let data = b64("\x1b]2;titled\x07\n");
-    c.ok("send", json!({"session": session.id, "data": data}))
-        .await;
-    assert!(
-        matches!(events.event().await, Event::SessionChanged { session: s } if s.title == "titled")
-    );
-    let data = b64("\x1b]7;file://host/tmp/work\x07\n");
-    c.ok("send", json!({"session": session.id, "data": data}))
-        .await;
-    assert!(
-        matches!(events.event().await, Event::SessionChanged { session: s } if s.title == "titled" && s.pwd == "/tmp/work")
-    );
-    let data = b64("\x1bc\n");
-    c.ok("send", json!({"session": session.id, "data": data}))
-        .await;
-    // The reset removes any progress report too.
-    assert!(matches!(
-        events.event().await,
-        Event::Progress {
-            state: ProgressState::Remove,
-            progress: None,
-            ..
-        }
-    ));
-    assert!(
-        matches!(events.event().await, Event::SessionChanged { session: s } if s.title.is_empty() && s.pwd.is_empty())
-    );
     c.ok(
         "resize",
         json!({"session": session.id, "cols": 40, "rows": 12}),
     )
     .await;
-
-    let relabelled: Session = serde_json::from_value(
-        c.ok("label", json!({"session": session.id, "label": "new"}))
-            .await,
-    )
-    .unwrap();
-    assert_eq!(relabelled.label, "new");
-    assert!(
-        matches!(events.event().await, Event::SessionChanged { session: s } if s.label == "new")
-    );
-    assert_eq!(
-        c.err(
-            "label",
-            json!({"session": session.id, "label": "x".repeat(257)})
-        )
-        .await,
-        ErrorCode::LimitExceeded
-    );
 
     assert_eq!(
         c.err("remove", json!({"session": session.id})).await,
@@ -247,6 +198,74 @@ async fn session_lifecycle() {
     assert_eq!(
         c.err("inspect", json!({"session": session.id})).await,
         ErrorCode::NoSuchSession
+    );
+}
+
+#[tokio::test]
+async fn the_program_s_title_and_pwd_are_announced_until_a_reset() {
+    let server = start(fast_limits());
+    let mut c = client(&server).await;
+    let mut events = client(&server).await;
+    events.ok("subscribe", json!({})).await;
+    let session = c.create(json!({"argv": ["/bin/cat"]})).await;
+    assert!(matches!(events.event().await, Event::SessionCreated { .. }));
+    // A title (OSC 2) and a working directory (OSC 7) set by the program
+    // are announced, and so is their clearing by a full reset (RIS),
+    // which the engine reports separately. `cat` passes a line on once it
+    // is complete.
+    let data = b64("\x1b]2;titled\x07\n");
+    c.ok("send", json!({"session": session.id, "data": data}))
+        .await;
+    assert!(
+        matches!(events.event().await, Event::SessionChanged { session: s } if s.title == "titled")
+    );
+    let data = b64("\x1b]7;file://host/tmp/work\x07\n");
+    c.ok("send", json!({"session": session.id, "data": data}))
+        .await;
+    assert!(
+        matches!(events.event().await, Event::SessionChanged { session: s } if s.title == "titled" && s.pwd == "/tmp/work")
+    );
+    let data = b64("\x1bc\n");
+    c.ok("send", json!({"session": session.id, "data": data}))
+        .await;
+    // The reset removes any progress report too.
+    assert!(matches!(
+        events.event().await,
+        Event::Progress {
+            state: ProgressState::Remove,
+            progress: None,
+            ..
+        }
+    ));
+    assert!(
+        matches!(events.event().await, Event::SessionChanged { session: s } if s.title.is_empty() && s.pwd.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn a_label_change_is_announced_and_limited() {
+    let server = start(fast_limits());
+    let mut c = client(&server).await;
+    let mut events = client(&server).await;
+    events.ok("subscribe", json!({})).await;
+    let session = c.create(json!({"argv": ["/bin/cat"]})).await;
+    assert!(matches!(events.event().await, Event::SessionCreated { .. }));
+    let relabelled: Session = serde_json::from_value(
+        c.ok("label", json!({"session": session.id, "label": "new"}))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(relabelled.label, "new");
+    assert!(
+        matches!(events.event().await, Event::SessionChanged { session: s } if s.label == "new")
+    );
+    assert_eq!(
+        c.err(
+            "label",
+            json!({"session": session.id, "label": "x".repeat(257)})
+        )
+        .await,
+        ErrorCode::LimitExceeded
     );
 }
 
@@ -491,8 +510,8 @@ async fn write_replies_come_in_request_order() {
     wait_text(&mut c, &session.id, "up").await;
     for _ in 0..20 {
         let mut pipelined = Vec::new();
-        for id in 1..=4 {
-            let data = b64([b'0' + id as u8]);
+        for id in 1..=4u8 {
+            let data = b64([b'0' + id]);
             let request = json!({"id": id, "method": "send",
                 "params": {"session": session.id, "data": data}});
             pipelined.extend(encode_frame(
@@ -522,7 +541,7 @@ async fn subscribed_connections_close_on_errors_and_get_each_event_once() {
     let mut other = client(&server).await;
     let session = other.create(json!({"argv": ["/bin/sleep", "5"]})).await;
     assert!(matches!(c.event().await, Event::SessionCreated { session: s } if s.id == session.id));
-    let big = vec![b' '; Limits::default().control_body as usize + 1];
+    let big = vec![b' '; proto::cap(Limits::default().control_body) + 1];
     c.send(FrameType::Request, 0, &big).await;
     let (_, body) = c.recv_json().await;
     assert_eq!(body["code"], "protocol_error");
@@ -603,7 +622,7 @@ async fn read_screen_only_after_clear_and_bounded_replies() {
     let read = c.read(&session.id, 2).await;
     // Before the clear the screen held line997 to line1000 and the cursor row.
     assert_eq!(read.text, "line995\nline996\nonly\n");
-    let read = c.read(&session.id, 100000).await;
+    let read = c.read(&session.id, 100_000).await;
     assert!(read.text.len() <= TEXT_BUDGET);
     assert!(
         read.text.starts_with("line"),

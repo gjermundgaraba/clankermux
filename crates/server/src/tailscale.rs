@@ -220,7 +220,9 @@ async fn get<S: AsyncRead + AsyncWrite + Unpin>(
     let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
     if let Some(token) = token {
         let credentials = base64::engine::general_purpose::STANDARD.encode(format!(":{token}"));
-        request.push_str(&format!("Authorization: Basic {credentials}\r\n"));
+        request.push_str("Authorization: Basic ");
+        request.push_str(&credentials);
+        request.push_str("\r\n");
     }
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).await?;
@@ -261,9 +263,9 @@ fn parse(raw: &[u8]) -> io::Result<Response> {
     let body = if chunked {
         let mut out = Vec::new();
         loop {
-            let (skip, size) = match httparse::parse_chunk_size(body) {
-                Ok(httparse::Status::Complete(parsed)) => parsed,
-                _ => return Err(invalid("bad chunk size")),
+            let Ok(httparse::Status::Complete((skip, size))) = httparse::parse_chunk_size(body)
+            else {
+                return Err(invalid("bad chunk size"));
             };
             let size = usize::try_from(size).map_err(|_| invalid("bad chunk size"))?;
             body = &body[skip..];
@@ -347,7 +349,7 @@ mod tests {
             .unwrap()
         {
             Cert::RetryAfter(delay) => assert_eq!(delay, Duration::from_secs(7)),
-            other => panic!("{other:?}"),
+            other @ Cert::Pem(_) => panic!("{other:?}"),
         }
     }
 

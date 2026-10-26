@@ -74,20 +74,20 @@ impl Stream {
         }
     }
 
-    /// Up to `max` retained bytes from `offset`, or `None` when the
-    /// stream no longer retains `offset`.
-    pub fn read(&self, offset: u64, max: usize) -> Option<Vec<u8>> {
-        let (first, second) = self.read_slices(offset, max)?;
+    /// The retained bytes from `offset` up to `end` or the stream's end,
+    /// or `None` when the stream does not hold `offset`.
+    pub fn read(&self, offset: u64, end: u64) -> Option<Vec<u8>> {
+        let (first, second) = self.read_slices(offset, end)?;
         Some([first, second].concat())
     }
 
     /// A retained range as the ring's (possibly wrapped) borrowed slices.
-    pub fn read_slices(&self, offset: u64, max: usize) -> Option<(&[u8], &[u8])> {
-        let skip = usize::try_from(offset.checked_sub(self.start)?).ok()?;
-        if skip > self.ring.len() {
+    pub fn read_slices(&self, offset: u64, end: u64) -> Option<(&[u8], &[u8])> {
+        if offset < self.start || offset > self.offset() {
             return None;
         }
-        let end = skip.saturating_add(max).min(self.ring.len());
+        let skip = self.index(offset);
+        let end = self.index(end.clamp(offset, self.offset()));
         let (first, second) = self.ring.as_slices();
         Some((
             &first[skip.min(first.len())..end.min(first.len())],
@@ -105,7 +105,12 @@ impl Stream {
     /// The bytes from `offset` on, which is retained: from
     /// `retained_start` up to `offset()`.
     pub fn bytes_from(&self, offset: u64) -> impl Iterator<Item = u8> + '_ {
-        self.ring.range((offset - self.start) as usize..).copied()
+        self.ring.range(self.index(offset)..).copied()
+    }
+
+    /// The ring index of a retained `offset`.
+    fn index(&self, offset: u64) -> usize {
+        usize::try_from(offset - self.start).expect("offset within the ring")
     }
 
     /// Whether every marker with `seq` above `after` is still retained.
@@ -133,10 +138,11 @@ mod tests {
         assert_eq!(s.offset(), 7);
         assert_eq!(s.retained_start(), 3);
         assert_eq!(s.read(3, 100).unwrap(), b"defg");
-        assert_eq!(s.read(4, 2).unwrap(), b"ef");
-        assert!(s.read(2, 1).is_none());
-        assert!(s.read(8, 1).is_none());
-        assert_eq!(s.read(7, 1).unwrap(), b"");
+        assert_eq!(s.read(4, 6).unwrap(), b"ef");
+        assert_eq!(s.read(4, 0).unwrap(), b"", "an end before the offset");
+        assert!(s.read(2, 3).is_none());
+        assert!(s.read(8, 9).is_none());
+        assert_eq!(s.read(7, 8).unwrap(), b"");
         assert!(
             s.markers_retained_after(0),
             "marker at offset 3 is at the ring start"
@@ -151,20 +157,21 @@ mod tests {
         let mut s = Stream::new(8, 8);
         s.append(b"abcdefgh");
         s.append(b"ijklm");
-        let (first, second) = s.read_slices(5, 8).unwrap();
+        let (first, second) = s.read_slices(5, 13).unwrap();
         assert!(!first.is_empty() && !second.is_empty());
-        for offset in 5..=13 {
-            for max in [0, 1, 3, 8, usize::MAX] {
-                let (first, second) = s.read_slices(offset, max).unwrap();
-                let expected = &b"fghijklm"[(offset - 5) as usize..];
-                let expected = &expected[..max.min(expected.len())];
+        for offset in 5..=13_u64 {
+            for len in [0, 1, 3, 8, u64::MAX] {
+                let end = offset.saturating_add(len);
+                let (first, second) = s.read_slices(offset, end).unwrap();
+                let index = |at: u64| usize::try_from(at - 5).unwrap();
+                let expected = &b"fghijklm"[index(offset)..index(end.min(13))];
                 let frame = proto::encode_output_frame(1, offset, first, second);
                 let (_, payload) = proto::parse_frame(&frame, 1024).unwrap();
                 assert_eq!(proto::parse_output(payload), Some((offset, expected)));
             }
         }
-        assert!(s.read_slices(4, 1).is_none());
-        assert!(s.read_slices(14, 1).is_none());
+        assert!(s.read_slices(4, 5).is_none());
+        assert!(s.read_slices(14, 15).is_none());
     }
 
     #[test]
@@ -192,7 +199,7 @@ mod tests {
         assert_eq!(s.ring.capacity(), capacity);
         assert_eq!(s.retained_start(), 24);
         assert_eq!(s.offset(), (limit + 24) as u64);
-        assert_eq!(s.read(limit as u64, 24).unwrap(), [b'y'; 24]);
+        assert_eq!(s.read(limit as u64, s.offset()).unwrap(), [b'y'; 24]);
     }
 
     #[test]
@@ -206,7 +213,7 @@ mod tests {
             assert_eq!(s.offset(), 13);
             assert_eq!(s.retained_start(), 13 - limit as u64);
             assert_eq!(
-                s.read(s.retained_start(), 100).unwrap(),
+                s.read(s.retained_start(), s.offset()).unwrap(),
                 bytes[10 - limit..]
             );
             assert!(!s.markers_retained_after(0));

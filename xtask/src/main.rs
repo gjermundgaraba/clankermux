@@ -33,6 +33,7 @@ fn bindings(check: bool) -> ExitCode {
         .allowlist_var("GHOSTTY_.*")
         .derive_default(true)
         .prepend_enum_name(false)
+        .parse_callbacks(Box::new(ModsBits))
         .generate()
         .expect("bindgen")
         .to_string();
@@ -46,6 +47,21 @@ fn bindings(check: bool) -> ExitCode {
     }
     std::fs::write(&path, generated).expect("write bindings");
     ExitCode::SUCCESS
+}
+
+/// Types the `GHOSTTY_MODS_*` bits as `GhosttyMods`, which they combine
+/// into, rather than `u32`.
+#[derive(Debug)]
+struct ModsBits;
+
+impl bindgen::callbacks::ParseCallbacks for ModsBits {
+    fn int_macro(&self, name: &str, _value: i64) -> Option<bindgen::callbacks::IntKind> {
+        name.starts_with("GHOSTTY_MODS_")
+            .then_some(bindgen::callbacks::IntKind::Custom {
+                name: "GhosttyMods",
+                is_signed: false,
+            })
+    }
 }
 
 /// Renders PROTOCOL.md's generated regions and the web package's protocol

@@ -27,7 +27,7 @@ fn frame_type_vectors() {
     let types = vectors["types"].as_object().unwrap();
     assert_eq!(types.len(), FrameType::ALL.len());
     for (name, value) in types {
-        let value = value.as_u64().unwrap() as u8;
+        let value = u8::try_from(value.as_u64().unwrap()).unwrap();
         let frame_type = FrameType::from_u8(value).unwrap_or_else(|| panic!("{name}"));
         // The vectors name types in snake_case; the enum in CamelCase.
         let camel: String = name
@@ -55,48 +55,45 @@ fn frame_vectors() {
         let bytes = hex(v["hex"].as_str().unwrap());
         let mut decoder = FrameDecoder::default();
         decoder.push(&bytes);
-        match v.get("error") {
-            Some(expected) => {
-                let err = parse_frame(&bytes, max_frame).expect_err(name);
-                assert_eq!(error_kind(err), expected.as_str().unwrap(), "{name}");
-                // The stream decoder sees the same header errors, and waits
-                // for more bytes otherwise.
-                match decoder.next_frame(max_frame) {
-                    Err(stream_err) => assert_eq!(stream_err, err, "{name}"),
-                    Ok(_) => assert!(
-                        matches!(err, FrameError::Short | FrameError::LengthMismatch { .. }),
-                        "{name}"
-                    ),
-                }
-            }
-            None => {
-                let (header, payload) = parse_frame(&bytes, max_frame).expect(name);
-                assert_eq!(
-                    header.frame_type as u8,
-                    v["type"].as_u64().unwrap() as u8,
+        if let Some(expected) = v.get("error") {
+            let err = parse_frame(&bytes, max_frame).expect_err(name);
+            assert_eq!(error_kind(err), expected.as_str().unwrap(), "{name}");
+            // The stream decoder sees the same header errors, and waits
+            // for more bytes otherwise.
+            match decoder.next_frame(max_frame) {
+                Err(stream_err) => assert_eq!(stream_err, err, "{name}"),
+                Ok(_) => assert!(
+                    matches!(err, FrameError::Short | FrameError::LengthMismatch { .. }),
                     "{name}"
-                );
-                assert_eq!(
-                    header.channel,
-                    v["channel"].as_u64().unwrap() as u32,
-                    "{name}"
-                );
-                assert_eq!(payload, hex(v["payload"].as_str().unwrap()), "{name}");
-                assert_eq!(
-                    decoder.next_frame(max_frame).unwrap(),
-                    Some((header, payload.to_vec())),
-                    "{name}: stream"
-                );
-                assert_eq!(
-                    decoder.next_frame(max_frame).unwrap(),
-                    None,
-                    "{name}: trailing bytes"
-                );
-                let encoded = encode_frame(header.frame_type, header.channel, payload);
-                let mut expected = bytes.clone();
-                expected[1] = 0;
-                assert_eq!(encoded, expected, "{name}: re-encode with flags 0");
+                ),
             }
+        } else {
+            let (header, payload) = parse_frame(&bytes, max_frame).expect(name);
+            assert_eq!(
+                header.frame_type as u8,
+                u8::try_from(v["type"].as_u64().unwrap()).unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                header.channel,
+                u32::try_from(v["channel"].as_u64().unwrap()).unwrap(),
+                "{name}"
+            );
+            assert_eq!(payload, hex(v["payload"].as_str().unwrap()), "{name}");
+            assert_eq!(
+                decoder.next_frame(max_frame).unwrap(),
+                Some((header, payload.to_vec())),
+                "{name}: stream"
+            );
+            assert_eq!(
+                decoder.next_frame(max_frame).unwrap(),
+                None,
+                "{name}: trailing bytes"
+            );
+            let encoded = encode_frame(header.frame_type, header.channel, payload);
+            let mut expected = bytes.clone();
+            expected[1] = 0;
+            assert_eq!(encoded, expected, "{name}: re-encode with flags 0");
         }
     }
 }
@@ -106,7 +103,7 @@ fn stream_decoder_handles_pieces_and_boundaries() {
     let first = encode_frame(FrameType::Output, 7, &encode_output(42, b"abc"));
     let second = encode_frame(FrameType::Close, 7, b"");
     let third = encode_frame(FrameType::Input, 7, b"xyz");
-    let max_frame = u64::from(first.len() as u32 - HEADER_LEN as u32);
+    let max_frame = u64::try_from(first.len() - HEADER_LEN).unwrap();
 
     let mut decoder = FrameDecoder::default();
     for byte in &first[..first.len() - 1] {
@@ -248,17 +245,6 @@ fn client_payloads_refuse_unknown_fields_and_server_payloads_ignore_them() {
 /// Whether each object `schema` reaches, through its references,
 /// refuses undefined fields.
 fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &mut Vec<bool>) {
-    let mut names = Vec::new();
-    catalog::refs(schema, &mut names);
-    let mut seen = std::collections::BTreeSet::new();
-    let mut stack = vec![schema.clone()];
-    while let Some(name) = names.pop() {
-        if seen.insert(name.clone()) {
-            let def = defs[&name].clone();
-            catalog::refs(&def, &mut names);
-            stack.push(def);
-        }
-    }
     fn walk(schema: &Value, out: &mut Vec<bool>) {
         match schema {
             Value::Object(map) => {
@@ -271,7 +257,21 @@ fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &m
             _ => {}
         }
     }
-    stack.iter().for_each(|s| walk(s, out));
+
+    let mut names = Vec::new();
+    catalog::refs(schema, &mut names);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![schema.clone()];
+    while let Some(name) = names.pop() {
+        if seen.insert(name.clone()) {
+            let def = defs[&name].clone();
+            catalog::refs(&def, &mut names);
+            stack.push(def);
+        }
+    }
+    for s in &stack {
+        walk(s, out);
+    }
 }
 
 #[test]
@@ -372,15 +372,16 @@ fn a_frame_has_a_schema_exactly_when_its_payload_is_json() {
 }
 
 #[test]
-fn every_reference_resolves_and_nothing_is_null() {
+fn references_and_definitions_match_and_nothing_is_null() {
     let catalog = catalog::catalog("0");
     let json = serde_json::to_value(&catalog).unwrap();
-    let mut names = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
     catalog::refs(&json, &mut names);
-    assert!(!names.is_empty());
-    for name in names {
-        assert!(catalog.defs.contains_key(&name), "{name}");
-    }
+    let defs: std::collections::BTreeSet<_> = catalog.defs.keys().cloned().collect();
+    assert_eq!(
+        names, defs,
+        "every reference resolves, every definition is referenced"
+    );
     let text = serde_json::to_string(&json).unwrap();
     assert!(!text.contains(r#""null""#), "a schema allows null");
     // Well inside a reply.

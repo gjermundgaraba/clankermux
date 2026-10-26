@@ -35,11 +35,11 @@ const OUTPUT_COALESCE: Duration = Duration::from_millis(1);
 fn coalesce_until(
     last: Option<Instant>,
     now: Instant,
-    bytes: usize,
+    bytes: u64,
     marker: bool,
 ) -> Option<Instant> {
     let until = last? + OUTPUT_COALESCE;
-    (bytes > 0 && bytes < PULL_BUDGET && !marker && now < until).then_some(until)
+    (bytes > 0 && bytes < PULL_BUDGET as u64 && !marker && now < until).then_some(until)
 }
 
 /// How an attachment ends, as the session or the connection decides it.
@@ -111,7 +111,7 @@ pub fn open(
     channel: u32,
     client: &ClientPeer,
     open: Open,
-    session: Shared,
+    session: &Shared,
 ) -> Result<Handle, Fail> {
     let limits = &registry.config.limits;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -160,7 +160,7 @@ pub fn open(
                 }
                 None => {
                     if let Some(profile) = open.profile {
-                        s.set_profile(profile);
+                        s.set_profile(&profile);
                     }
                 }
             }
@@ -177,7 +177,7 @@ pub fn open(
         close: close_rx,
         finished,
         ended: ended.clone(),
-        max_frame: registry.config.limits.max_frame as usize,
+        max_frame: proto::cap(registry.config.limits.max_frame),
         cursor: Cursor {
             offset: 0,
             marker: 0,
@@ -189,7 +189,7 @@ pub fn open(
     Ok(Handle {
         id,
         read_only: open.read_only,
-        session: Arc::downgrade(&session),
+        session: Arc::downgrade(session),
         close: close_tx,
         ended,
         task: registry.attachments.spawn(task.run(open.resume)),
@@ -359,7 +359,7 @@ impl Task {
             if self.writer.over_high_water() {
                 tokio::select! {
                     ending = self.close.recv() => return ending,
-                    _ = self.writer.drained() => {}
+                    () = self.writer.drained() => {}
                 }
                 continue;
             }
@@ -380,8 +380,8 @@ impl Task {
                 Pull::Wait(until) => {
                     tokio::select! {
                         ending = self.close.recv() => return ending,
-                        _ = notified => {},
-                        _ = tokio::time::sleep_until(until) => {}
+                        () = notified => {},
+                        () = tokio::time::sleep_until(until) => {}
                     }
                 }
                 Pull::Gap => {
@@ -401,7 +401,7 @@ impl Task {
                     }
                     tokio::select! {
                         ending = self.close.recv() => return ending,
-                        _ = notified => {}
+                        () = notified => {}
                     }
                 }
             }
@@ -453,50 +453,47 @@ impl Task {
             let s = self.session.lock().unwrap();
             s.parked().map(|p| p.snapshot_path.clone())
         };
-        let (bytes, cursor, session) = match parked_path {
-            Some(path) => {
-                let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
-                    .await
-                    .map_err(|e| internal(e.to_string()))?
-                    .map_err(|e| internal(format!("park file unreadable: {e}")))?;
-                self.done = true;
-                let s = self.session.lock().unwrap();
-                let Some(parked) = s.parked() else {
-                    return Err(internal("session changed while reading its park".into()));
-                };
-                (
-                    bytes,
-                    Cursor {
-                        offset: parked.offset,
-                        marker: parked.marker,
-                    },
-                    s.to_proto(false),
-                )
-            }
-            None => {
-                let taken = tokio::select! {
-                    taken = snapshot_with_retry(&self.session, SNAPSHOT_RETRY, |s, live, bytes| {
-                        (
-                            bytes,
-                            Cursor {
-                                offset: live.stream.offset(),
-                                marker: live.stream.latest_seq(),
-                            },
-                            s.to_proto(false),
-                        )
-                    }) => taken,
-                    ending = self.close.recv() => return Err(ending),
-                };
-                match taken {
-                    Ok(Some(taken)) => taken,
-                    Ok(None) => return Err(internal("session is no longer live".into())),
-                    Err(err) => {
-                        let code = match err {
-                            ghostty_vt::Error::LimitExceeded => ErrorCode::LimitExceeded,
-                            _ => ErrorCode::Internal,
-                        };
-                        return Err(Some(Ending::Error(code, format!("snapshot failed: {err}"))));
-                    }
+        let (bytes, cursor, session) = if let Some(path) = parked_path {
+            let bytes = tokio::task::spawn_blocking(move || std::fs::read(path))
+                .await
+                .map_err(|e| internal(e.to_string()))?
+                .map_err(|e| internal(format!("park file unreadable: {e}")))?;
+            self.done = true;
+            let s = self.session.lock().unwrap();
+            let Some(parked) = s.parked() else {
+                return Err(internal("session changed while reading its park".into()));
+            };
+            (
+                bytes,
+                Cursor {
+                    offset: parked.offset,
+                    marker: parked.marker,
+                },
+                s.to_proto(false),
+            )
+        } else {
+            let taken = tokio::select! {
+                taken = snapshot_with_retry(&self.session, SNAPSHOT_RETRY, |s, live, bytes| {
+                    (
+                        bytes,
+                        Cursor {
+                            offset: live.stream.offset(),
+                            marker: live.stream.latest_seq(),
+                        },
+                        s.to_proto(false),
+                    )
+                }) => taken,
+                ending = self.close.recv() => return Err(ending),
+            };
+            match taken {
+                Ok(Some(taken)) => taken,
+                Ok(None) => return Err(internal("session is no longer live".into())),
+                Err(err) => {
+                    let code = match err {
+                        ghostty_vt::Error::LimitExceeded => ErrorCode::LimitExceeded,
+                        _ => ErrorCode::Internal,
+                    };
+                    return Err(Some(Ending::Error(code, format!("snapshot failed: {err}"))));
                 }
             }
         };
@@ -532,7 +529,7 @@ impl Task {
             if self.writer.over_high_water() {
                 tokio::select! {
                     ending = self.close.recv() => return Err(ending),
-                    _ = self.writer.drained() => {}
+                    () = self.writer.drained() => {}
                 }
             }
             self.send(FrameType::Snapshot, chunk);
@@ -602,7 +599,7 @@ impl Task {
             if let Some(until) = coalesce_until(
                 self.last_output,
                 Instant::now(),
-                (end - self.cursor.offset) as usize,
+                end - self.cursor.offset,
                 markers.peek().is_some(),
             ) {
                 return Pull::Wait(until);
@@ -643,7 +640,7 @@ impl Task {
                     .min(end)
                     .min(self.cursor.offset + chunk.min(budget) as u64);
                 let (first, second) = stream
-                    .read_slices(self.cursor.offset, (limit - self.cursor.offset) as usize)
+                    .read_slices(self.cursor.offset, limit)
                     .expect("offset within the retained stream");
                 let len = first.len() + second.len();
                 budget -= len;
@@ -689,7 +686,10 @@ mod tests {
             coalesce_until(Some(last), now, 1, false),
             Some(last + OUTPUT_COALESCE)
         );
-        assert_eq!(coalesce_until(Some(last), now, PULL_BUDGET, false), None);
+        assert_eq!(
+            coalesce_until(Some(last), now, PULL_BUDGET as u64, false),
+            None
+        );
         assert_eq!(coalesce_until(Some(last), now, 1, true), None);
         assert_eq!(coalesce_until(Some(last), now, 0, false), None);
     }

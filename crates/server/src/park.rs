@@ -20,7 +20,7 @@ pub struct ParkFile {
     pub session: proto::Session,
     /// How many leading lines of `screen.txt` are history, the rest being
     /// the screen; `read` takes `scrollback` from them.
-    pub history_lines: u64,
+    pub history_lines: usize,
     /// The last commands, oldest first.
     #[serde(default)]
     pub commands: Vec<proto::Command>,

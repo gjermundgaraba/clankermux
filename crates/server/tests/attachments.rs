@@ -40,8 +40,8 @@ fn size_of(s: &Session) -> (u16, u16) {
     (s.cols, s.rows)
 }
 
-fn viewport(cols: u16, rows: u16) -> Option<Cells> {
-    Some(Cells { cols, rows })
+fn viewport(cols: u16, rows: u16) -> Cells {
+    Cells { cols, rows }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -52,7 +52,7 @@ async fn the_list_follows_open_input_viewport_and_close() {
     let session = ctl
         .create(json!({"argv": ["/bin/cat"], "cols": 20, "rows": 5}))
         .await;
-    assert!(session.attachments.is_empty());
+    assert_eq!(session.attachments, []);
     assert_eq!(session.size, SizeInfo::default());
 
     let mut one = client_named(&server, "one\u{1}", &"9".repeat(40)).await;
@@ -70,9 +70,9 @@ async fn the_list_follows_open_input_viewport_and_close() {
         "the HELLO client, cut to 32 bytes, control characters replaced"
     );
     assert!(!first.read_only);
-    assert_eq!(first.viewport, viewport(30, 8));
+    assert_eq!(first.viewport, Some(viewport(30, 8)));
     assert!(first.last_input.is_none());
-    assert!(!first.since.is_empty());
+    first.since.parse::<jiff::Timestamp>().unwrap();
     assert_eq!(
         opened.size.owner,
         Some(first.channel),
@@ -126,7 +126,7 @@ async fn the_list_follows_open_input_viewport_and_close() {
     one.send_json(FrameType::Viewport, 1, &json!({"cols": 40, "rows": 10}))
         .await;
     let reported = changed_until(&mut ctl, &session.id, |s| {
-        s.attachments[0].viewport == viewport(40, 10)
+        s.attachments[0].viewport == Some(viewport(40, 10))
     })
     .await;
     assert_eq!(size_of(&reported), (40, 10));
@@ -182,7 +182,7 @@ async fn detach_closes_another_connections_attachment() {
         ctl.err(
             "detach",
             json!({"session": session.id, "channel": reopened,
-                   "reason": "x".repeat(fast_limits().text as usize + 1)})
+                   "reason": "x".repeat(proto::cap(fast_limits().text) + 1)})
         )
         .await,
         ErrorCode::LimitExceeded
@@ -270,7 +270,7 @@ async fn each_policy_with_two_attachments() {
     a.send_json(FrameType::Viewport, 1, &json!({"cols": 70, "rows": 25}))
         .await;
     let s = changed_until(&mut ctl, id, |s| {
-        s.attachments[0].viewport == viewport(70, 25)
+        s.attachments[0].viewport == Some(viewport(70, 25))
     })
     .await;
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -347,7 +347,7 @@ async fn the_policy_is_parked_and_restored() {
             owner: None
         }
     );
-    assert!(restored.attachments.is_empty());
+    assert_eq!(restored.attachments, []);
     assert_eq!(
         c.err("resize", json!({"session": session.id, "policy": "latest"}))
             .await,

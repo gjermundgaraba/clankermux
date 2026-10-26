@@ -8,3 +8,6 @@ publish.workspace = true
 
 [dependencies]
 ghostty-vt-sys = { workspace = true }
+
+[lints]
+workspace = true

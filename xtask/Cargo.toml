@@ -9,3 +9,6 @@ publish.workspace = true
 [dependencies]
 bindgen = "0.73"
 proto = { workspace = true }
+
+[lints]
+workspace = true

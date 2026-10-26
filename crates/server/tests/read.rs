@@ -75,7 +75,10 @@ async fn each_scope() {
         .create(json!({"argv": ["/bin/sh", "-c", "i=1; while [ $i -le 30 ]; do echo line$i; i=$((i+1)); done; exec sleep 5"], "cols": 20, "rows": 5}))
         .await;
     wait_text(&mut c, &session.id, "line30").await;
-    let all: String = (1..=30).map(|i| format!("line{i}\n")).collect();
+    let all = (1..=30)
+        .map(|i| format!("line{i}\n"))
+        .collect::<Vec<_>>()
+        .concat();
     let history = read_with(&mut c, json!({"session": session.id, "scope": "history"})).await;
     assert_eq!(history.text, all);
     let html = read_with(
@@ -412,7 +415,7 @@ async fn prompt_redraws_and_further_lines_start_no_command() {
     let mut c = client(&server).await;
     c.ok("subscribe", json!({})).await;
     // A prompt, its redraw, then a command that prints and ends.
-    let script = r#"printf '\033]133;A;redraw=last;cl=line\007\033]133;P;k=i\007line1\n\033]133;P;k=s\007$ \033]133;B\007'; printf '\033]133;A;redraw=last;cl=line\007\033]133;P;k=i\007line1\n\033]133;P;k=s\007$ \033]133;B\007'; printf 'ls\n\033]133;C\007out\n\033]133;D;0\007'; printf '\033]133;A\007$ '; exec cat"#;
+    let script = r"printf '\033]133;A;redraw=last;cl=line\007\033]133;P;k=i\007line1\n\033]133;P;k=s\007$ \033]133;B\007'; printf '\033]133;A;redraw=last;cl=line\007\033]133;P;k=i\007line1\n\033]133;P;k=s\007$ \033]133;B\007'; printf 'ls\n\033]133;C\007out\n\033]133;D;0\007'; printf '\033]133;A\007$ '; exec cat";
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", script], "cols": 20, "rows": 5}))
         .await;
@@ -445,7 +448,7 @@ async fn a_mark_whose_st_is_split_across_reads_ends_after_it() {
     let server = start(fast_limits());
     let mut c = client(&server).await;
     let script =
-        r#"printf '\033]133;C\033'; sleep 0.3; printf '\\output\n\033]133;D;0\007'; exec cat"#;
+        r"printf '\033]133;C\033'; sleep 0.3; printf '\\output\n\033]133;D;0\007'; exec cat";
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", script], "cols": 20, "rows": 5}))
         .await;
@@ -468,7 +471,7 @@ async fn a_mark_whose_st_is_split_across_reads_ends_after_it() {
 async fn tail_waits_for_unfinished_sequences_and_characters() {
     let server = start(fast_limits());
     let mut c = client(&server).await;
-    let script = r#"printf 'ab\nx\303'; sleep 0.5; printf '\251y\033]0;never ends'; exec sleep 5"#;
+    let script = r"printf 'ab\nx\303'; sleep 0.5; printf '\251y\033]0;never ends'; exec sleep 5";
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", script], "cols": 20, "rows": 5}))
         .await;
@@ -574,7 +577,7 @@ async fn text_regions_keep_wrapped_lines_trailing_blanks_and_alternate_screen() 
                     marker: 0,
                     screen,
                     history_lines,
-                    snapshot_path: Default::default(),
+                    snapshot_path: std::path::PathBuf::new(),
                 }),
             );
             let parked_text = scrollback.map(|n| s.read_text(n).unwrap());
