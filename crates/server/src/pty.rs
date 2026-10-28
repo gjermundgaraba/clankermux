@@ -193,6 +193,10 @@ mod holders {
         const PROC_ALL_PIDS: u32 = 1;
         const PROC_PIDFDVNODEPATHINFO: i32 = 2;
         #[repr(C)]
+        #[expect(
+            clippy::struct_field_names,
+            reason = "mirrors struct proc_fileinfo in <sys/proc_info.h>"
+        )]
         struct ProcFileInfo {
             fi_openflags: u32,
             fi_status: u32,
@@ -209,48 +213,49 @@ mod holders {
         let mut out = Vec::new();
         // SAFETY: proc_listpids with a null buffer returns the size needed.
         let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
-        if bytes <= 0 {
+        let Ok(capacity @ 1..) = usize::try_from(bytes) else {
             return out;
-        }
-        let mut pids = vec![0i32; bytes as usize / size_of::<i32>()];
+        };
+        let mut pids = vec![0i32; capacity / size_of::<i32>()];
         // SAFETY: the buffer holds `bytes` bytes of pids.
         let bytes =
             unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast(), bytes) };
-        pids.truncate(bytes.max(0) as usize / size_of::<i32>());
+        pids.truncate(usize::try_from(bytes).unwrap_or(0) / size_of::<i32>());
         for pid in pids.into_iter().filter(|p| *p > 0) {
             // SAFETY: PROC_PIDLISTFDS with a null buffer returns the size needed.
             let size = unsafe {
                 libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
             };
-            if size <= 0 {
+            let Ok(capacity @ 1..) = usize::try_from(size) else {
                 continue;
-            }
+            };
             let mut fds = vec![
                 libc::proc_fdinfo {
                     proc_fd: 0,
                     proc_fdtype: 0
                 };
-                size as usize / size_of::<libc::proc_fdinfo>()
+                capacity / size_of::<libc::proc_fdinfo>()
             ];
             // SAFETY: the buffer holds `size` bytes of proc_fdinfo.
             let size = unsafe {
                 libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), size)
             };
-            fds.truncate(size.max(0) as usize / size_of::<libc::proc_fdinfo>());
+            fds.truncate(usize::try_from(size).unwrap_or(0) / size_of::<libc::proc_fdinfo>());
             for fd in fds
                 .iter()
                 .filter(|fd| fd.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
             {
                 // SAFETY: the struct is plain data.
                 let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
-                let len = size_of::<VnodeFdInfoWithPath>() as i32;
+                let len = i32::try_from(size_of::<VnodeFdInfoWithPath>())
+                    .expect("vnode_fdinfowithpath fits an int");
                 // SAFETY: the out pointer is a VnodeFdInfoWithPath of `len` bytes.
                 let got = unsafe {
                     libc::proc_pidfdinfo(
                         pid,
                         fd.proc_fd,
                         PROC_PIDFDVNODEPATHINFO,
-                        (&mut info as *mut VnodeFdInfoWithPath).cast(),
+                        (&raw mut info).cast(),
                         len,
                     )
                 };
@@ -260,7 +265,7 @@ mod holders {
                 // SAFETY: vip_path is a NUL-terminated path.
                 let open_path = unsafe { CStr::from_ptr(info.pvip.vip_path.as_ptr().cast()) };
                 if open_path.to_bytes() == path.as_bytes() {
-                    out.push(pid as u32);
+                    out.push(pid.cast_unsigned());
                     break;
                 }
             }
