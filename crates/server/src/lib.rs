@@ -1,5 +1,3 @@
-//! The clankermux server.
-
 mod attach;
 mod commands;
 mod connection;
@@ -23,10 +21,9 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, UnixListener};
 use tokio::time::Instant;
 
-pub use registry::{Config, ParkTiming, Registry};
+pub use read::REPLY_MARGIN;
+pub use registry::{AbsolutePath, Config, ParkTiming, Registry};
 
-/// Binds the Unix socket: directories it creates are 0700, the socket
-/// 0600. Refuses to replace a socket another server is listening on.
 pub fn bind_unix(socket: &Path) -> io::Result<UnixListener> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     if let Some(dir) = socket.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -47,8 +44,6 @@ pub fn bind_unix(socket: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Serves connections from the server's own uid until the task is
-/// cancelled.
 pub async fn serve_unix(listener: UnixListener, registry: Arc<Registry>) -> io::Result<()> {
     let uid = rustix::process::getuid().as_raw();
     loop {
@@ -72,15 +67,11 @@ pub async fn serve_unix(listener: UnixListener, registry: Arc<Registry>) -> io::
     }
 }
 
-/// Transient accept errors (EMFILE, ECONNABORTED) must not stop the
-/// server: they are logged and the listener backs off briefly.
 async fn accept_failed(err: io::Error) {
     tracing::warn!(error = %err, "accept failed");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 }
 
-/// Serves `listener` until cancelled: `TCP_NODELAY` on every stream, then
-/// `handle` on a task of `connections` with the instant it was accepted.
 pub(crate) async fn serve_tcp_with<F, Fut>(
     listener: TcpListener,
     connections: tokio_util::task::TaskTracker,
@@ -103,9 +94,10 @@ where
     }
 }
 
-/// Serves `listener` until cancelled: plaintext frames. Trust is the
-/// caller's: the binary binds the tailnet address only.
-pub async fn serve_tcp(listener: TcpListener, registry: Arc<Registry>) -> io::Result<()> {
+pub async fn serve_tcp_unauthenticated(
+    listener: TcpListener,
+    registry: Arc<Registry>,
+) -> io::Result<()> {
     let connections = registry.connections.clone();
     serve_tcp_with(listener, connections, move |stream, accepted| {
         connection::serve_connection(stream, registry.clone(), accepted)
@@ -124,7 +116,6 @@ pub fn state_dir() -> PathBuf {
         .join("clankermux")
 }
 
-/// `$XDG_RUNTIME_DIR/clankermux/sock`, else `sock` in the state directory.
 pub fn socket_path() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         Some(dir) => PathBuf::from(dir).join("clankermux/sock"),
@@ -132,8 +123,6 @@ pub fn socket_path() -> PathBuf {
     }
 }
 
-/// The login shell and home directory of the server's user, from the
-/// password database.
 fn passwd_entry() -> Option<(String, String)> {
     use std::ffi::CStr;
     let mut buf = vec![0u8; 16 * 1024];
@@ -158,8 +147,7 @@ fn passwd_entry() -> Option<(String, String)> {
     Some((string(pw.pw_shell), string(pw.pw_dir)))
 }
 
-/// Defaults from the user's password entry, else the environment.
-pub fn default_config() -> Config {
+pub fn default_config(socket: AbsolutePath) -> Config {
     let (shell, home) = passwd_entry().unwrap_or_default();
     let shell = if shell.is_empty() {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
@@ -177,7 +165,7 @@ pub fn default_config() -> Config {
         home,
         version: env!("CARGO_PKG_VERSION").into(),
         state_dir: state_dir(),
-        socket: socket_path(),
+        socket,
         park: ParkTiming::default(),
     }
 }

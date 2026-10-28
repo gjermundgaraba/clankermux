@@ -1,10 +1,8 @@
-//! All sessions and the subscribers to their events.
-
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -24,50 +22,51 @@ use crate::commands::Commands;
 use crate::connection::{Writer, reply};
 use crate::park;
 use crate::pty;
-use crate::records::Records;
+use crate::records::{self, Records};
 use crate::session::{
-    Body, Effects, InputQueue, InputUnit, Live, Parked, SNAPSHOT_RETRY, Session, Shared, blocking,
-    check_size, default_color, now, snapshot_with_retry,
+    Body, Effects, InputQueue, InputUnit, Live, Parked, SNAPSHOT_RETRY, Session, Shared, Unparked,
+    blocking, check_size, default_color, now, snapshot_with_retry,
 };
 use crate::stream::Stream;
 
 pub type Fail = (ErrorCode, String);
 
-/// The retained events' bytes, in `max_frame`s: with a first page, a
-/// replay stays under a connection's ceiling (`connection::Writer`).
 const RETAINED_FRAMES: u64 = 2;
-/// JSON overhead allowed around a page's sessions within `max_frame`.
 const PAGE_MARGIN: usize = 4096;
-/// How long a stop waits for the attachments to end, and then for the
-/// connections to flush and close.
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
 pub struct Config {
     pub limits: Limits,
-    /// Default `argv`.
     pub shell: Vec<String>,
-    /// Default `cwd`.
     pub home: PathBuf,
     pub version: String,
-    /// Holds `lock` and `sessions/`.
     pub state_dir: PathBuf,
-    /// The Unix socket, absolute: every child gets it as
-    /// `CLANKERMUX_SOCKET`.
-    pub socket: PathBuf,
+    pub socket: AbsolutePath,
     pub park: ParkTiming,
 }
 
-/// When running sessions are parked, besides the last detach and a stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbsolutePath(PathBuf);
+
+impl AbsolutePath {
+    pub fn new(path: &Path) -> io::Result<Self> {
+        std::path::absolute(path).map(AbsolutePath)
+    }
+}
+
+impl std::ops::Deref for AbsolutePath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ParkTiming {
-    /// Every running session, this often.
     pub interval: Duration,
-    /// A session that changed, once it has been quiet this long...
     pub quiet: Duration,
-    /// ...but no sooner than this long after its last park began...
     pub gap: Duration,
-    /// ...and at the latest this long after its first change since its
-    /// last park, or `gap` after that park when later.
     pub busy: Duration,
 }
 
@@ -82,23 +81,22 @@ impl Default for ParkTiming {
     }
 }
 
+impl ParkTiming {
+    pub fn next_due(&self, changes: Unparked, parked_at: Option<Instant>) -> Instant {
+        let due = (changes.latest + self.quiet).min(changes.first + self.busy);
+        parked_at.map_or(due, |at| due.max(at + self.gap))
+    }
+}
+
 pub struct Registry {
     pub config: Config,
     pub incarnation: String,
     state: Mutex<State>,
-    /// Set by `stop`: nothing touches the state directory after it, and
-    /// no session is created.
     stopping: AtomicBool,
-    /// Cancelled by `stop` once every attachment has ended: connections
-    /// flush and close.
     pub(crate) shutdown: CancellationToken,
-    /// The attachment tasks, joined by `stop` before the connections go.
     pub(crate) attachments: TaskTracker,
-    /// The connection tasks, joined by `stop` before the lock is released.
     pub(crate) connections: TaskTracker,
-    /// The exclusive lock on the state directory, held until `stop`.
     lock: File,
-    /// What `describe` answers, built at its first request.
     catalog: OnceLock<proto::catalog::Catalog>,
 }
 
@@ -106,15 +104,12 @@ pub struct Registry {
 struct State {
     sessions: BTreeMap<String, Shared>,
     subscribers: Vec<Writer>,
-    /// The `seq` of the latest event.
     seq: u64,
-    /// The latest events as sent, oldest first, for `subscribe {after}`.
     retained: VecDeque<(u64, Vec<u8>)>,
     retained_bytes: usize,
 }
 
 impl State {
-    /// `oldest` and `latest` of the `subscribe` reply.
     fn cursor(&self) -> (u64, u64) {
         let oldest = self.retained.front().map_or(self.seq + 1, |(seq, _)| *seq);
         (oldest, self.seq)
@@ -122,9 +117,6 @@ impl State {
 }
 
 impl Registry {
-    /// Locks the state directory (another server holding it is an error),
-    /// loads the parked sessions and starts the park timer. Needs a tokio
-    /// runtime.
     pub fn new(config: Config) -> io::Result<Arc<Self>> {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         std::fs::DirBuilder::new()
@@ -161,9 +153,6 @@ impl Registry {
         for loaded in park::load(&registry.sessions_dir()) {
             registry.restore(loaded);
         }
-        // The timer does not keep the registry alive and ends with `stop`.
-        // Its first tick is one interval after the start; a new session
-        // parks sooner, as a change (`park_when_due`).
         let timer = Arc::downgrade(&registry);
         let shutdown = registry.shutdown.clone();
         let period = registry.config.park.interval;
@@ -207,7 +196,6 @@ impl Registry {
         self.config.state_dir.join("sessions")
     }
 
-    /// A session from its park file: `exited` if it was, `restored` else.
     fn restore(&self, loaded: park::Loaded) {
         let park::Loaded {
             file,
@@ -215,7 +203,8 @@ impl Registry {
             snapshot_path,
         } = loaded;
         let info = file.session;
-        let (records, dropped) = Records::load(info.program_status.unwrap_or_default());
+        let records::Loaded { records, dropped } =
+            Records::load(info.program_status.unwrap_or_default());
         let body = Body::Parked(Parked {
             engine: file.engine,
             cols: info.cols,
@@ -242,7 +231,6 @@ impl Registry {
             commands: Commands::load(file.commands),
             ..Session::blank(&self.config.limits, body)
         };
-        // What the clients of this incarnation are shown first.
         session.announced = crate::session::announced(&session.to_proto(false));
         self.state
             .lock()
@@ -258,15 +246,10 @@ impl Registry {
         }
     }
 
-    /// Parks a live session (the timer, a change, the last detach and
-    /// the end of a kept session): nothing once the server is stopping,
-    /// whose own parks come first.
     pub async fn park(self: &Arc<Self>, session: &Shared) {
         self.park_if(session, false).await;
     }
 
-    /// `park`, or with `changed` only when the session changed since
-    /// the last park began: a park it waited behind may have taken all.
     async fn park_if(self: &Arc<Self>, session: &Shared, changed: bool) {
         let park_lock = session.lock().unwrap().park_lock.clone();
         let _one_at_a_time = park_lock.lock().await;
@@ -275,15 +258,7 @@ impl Registry {
         }
     }
 
-    /// Writes a generation for a live session under its park lock,
-    /// retrying the snapshot while the continuation limit is exceeded. A
-    /// failure keeps the previous generation and is logged; the next
-    /// change, the last detach or the timer parks again. A removal or
-    /// an `on_exit: remove` end that overlaps the write takes the files
-    /// with it.
     async fn park_locked(self: &Arc<Self>, session: &Shared) {
-        // A change from here on is not certain to be in this park, so it
-        // counts towards the next.
         let id = {
             let mut s = session.lock().unwrap();
             s.unparked = None;
@@ -306,14 +281,11 @@ impl Registry {
                         .max(s.last_generation + 1);
                     s.last_generation
                 };
-                // Four fsyncs and a rename: off the async workers.
                 blocking(|| park::write(&self.sessions_dir(), &file, generation, &bytes, &screen))
                     .map_err(|e| e.to_string())
             }
             Ok(Some(Err(err))) | Err(err) => Err(err.to_string()),
         };
-        // A removal deletes the files on purpose; a write it broke is no
-        // failure.
         if session.lock().unwrap().gone() {
             park::remove(&self.sessions_dir(), &id);
         } else if let Err(error) = result {
@@ -321,19 +293,8 @@ impl Registry {
         }
     }
 
-    /// Graceful stop: parks every session that is live and not going
-    /// (running, or exited and kept) and deletes the files of those
-    /// going, closes every attachment with `stopping` and hangs up each
-    /// running session's process group, then closes the connections once
-    /// the attachments have queued their `CLOSED`, and releases the state
-    /// directory once the connections have flushed (the attachment and
-    /// connection waits bounded by `STOP_GRACE`).
     pub async fn stop(self: &Arc<Self>) {
         self.stopping.store(true, Ordering::Release);
-        // Taking a park lock joins a park in flight; a later one does
-        // nothing, so every session is parked here (a kept session that
-        // exited may still be waiting for its final park), all at once so
-        // the phase lasts one snapshot retry past any park in flight.
         let mut parks = tokio::task::JoinSet::new();
         for session in self.sessions() {
             let registry = self.clone();
@@ -354,7 +315,7 @@ impl Registry {
         while parks.join_next().await.is_some() {}
         for session in self.sessions() {
             let s = session.lock().unwrap();
-            s.close_attachments(ClosedReason::Stopping, false);
+            s.close_attachments(ClosedReason::Stopping);
             if let Ok(live) = s.running() {
                 pty::signal(live.pgid, &live.slave_path, Signal::HUP);
             }
@@ -364,15 +325,12 @@ impl Registry {
         self.shutdown.cancel();
         self.connections.close();
         let _ = tokio::time::timeout(STOP_GRACE, self.connections.wait()).await;
-        // Nothing of this registry touches the directory from here on, so
-        // the next server may take it.
         let _ = rustix::fs::flock(&self.lock, rustix::fs::FlockOperation::Unlock);
     }
 
-    /// The protocol's catalog, with this server's release.
     pub fn catalog(&self) -> &proto::catalog::Catalog {
         self.catalog
-            .get_or_init(|| proto::catalog::catalog(&self.config.version))
+            .get_or_init(|| proto::catalog::catalog(Some(&self.config.version)))
     }
 
     pub fn get(&self, id: &str) -> Result<Shared, Fail> {
@@ -385,19 +343,12 @@ impl Registry {
             .ok_or_else(|| (ErrorCode::NoSuchSession, format!("no session {id}")))
     }
 
-    /// Answers a `list` with a page under the state lock, so no event
-    /// raised after the page is queued before it.
     pub fn reply_page(&self, writer: &Writer, id: i64, after: Option<&str>) {
         let state = self.state.lock().unwrap();
         let page = self.page_of(&state, after);
         reply(writer, id, Ok(serde_json::json!(page)));
     }
 
-    /// Answers a `subscribe` under the state lock and, on the
-    /// connection's first (`first`), registers it for events: without
-    /// `after` the reply holds the first page, with it the retained events
-    /// after `after` follow the reply, unless there is a gap. Either way
-    /// every later event follows them. Returns whether it registered.
     pub fn subscribe(
         &self,
         writer: &Writer,
@@ -462,10 +413,6 @@ impl Registry {
         true
     }
 
-    /// Up to `limits.page` sessions after `after`, fewer when the page
-    /// would not fit `max_frame` as JSON (a session's text fields escape
-    /// to up to six bytes a character); `next` names the last one when
-    /// more follow.
     fn page_of(&self, state: &State, after: Option<&str>) -> Page {
         let page = proto::cap(self.config.limits.page);
         let budget = proto::cap(self.config.limits.max_frame).saturating_sub(PAGE_MARGIN);
@@ -488,18 +435,12 @@ impl Registry {
             }
             sessions.push(session);
         }
-        // `next` is the last session sent, per the protocol.
         let next = more
             .then(|| sessions.last().map(|s| s.id.clone()))
             .flatten();
         Page { sessions, next }
     }
 
-    /// Numbers `event`, retains it, and queues it for every subscriber
-    /// under the state lock, so it follows any page replied before it.
-    /// The retained events are at most `limits.events`, and at most
-    /// `RETAINED_FRAMES` frames' worth of bytes, so a replay stays well
-    /// within what a connection may queue.
     pub fn emit(&self, event: Event) {
         let mut state = self.state.lock().unwrap();
         state.seq += 1;
@@ -525,8 +466,6 @@ impl Registry {
         }
     }
 
-    /// Emits what a session raised under its lock, then `session_changed`
-    /// with `changed` when there is one.
     pub fn emit_session(&self, events: Vec<Event>, changed: Option<proto::Session>) {
         self.emit_all(events);
         if let Some(session) = changed {
@@ -556,7 +495,6 @@ impl Registry {
             cell_width: None,
             cell_height: None,
         })?;
-        // `TERM` is a default; the session's own id and socket are not.
         let id = uuid::Uuid::new_v4().to_string();
         let mut env = BTreeMap::from([("TERM".to_string(), "xterm-ghostty".to_string())]);
         env.extend(params.env.unwrap_or_default());
@@ -566,7 +504,6 @@ impl Registry {
             self.config.socket.to_string_lossy().into_owned(),
         );
 
-        // Everything that can fail is tried before the child exists.
         let term = new_terminal(cols, rows, limits, &self.config.version).map_err(internal)?;
         let (pty, child) = pty::spawn(&argv, std::path::Path::new(&cwd), &env, cols, rows)
             .map_err(|e| match e.kind() {
@@ -605,9 +542,7 @@ impl Registry {
             cwd,
             on_exit: params.on_exit.unwrap_or(OnExit::Remove),
             created_at: now(),
-            // Created is changed: parked within `quiet` even if the
-            // program never writes.
-            unparked: Some((created, created)),
+            unparked: Some(Unparked::at(created)),
             ..Session::blank(limits, body)
         };
         let id = session.id.clone();
@@ -634,9 +569,6 @@ impl Registry {
         Ok(snapshot)
     }
 
-    /// Emits `session_exited` when a stream ended, then schedules removal
-    /// or parks the session once for `on_exit: keep`. After `stop` the
-    /// directory is another server's: nothing is written or deleted.
     fn ended(self: &Arc<Self>, session: &Shared, ended: Option<proto::Session>) {
         let Some(snapshot) = ended else { return };
         let events = session.lock().unwrap().take_events();
@@ -648,8 +580,6 @@ impl Registry {
             return;
         }
         if remove {
-            // Its timer parks say `running`; a stop within the grace must
-            // not bring it back.
             park::remove(&self.sessions_dir(), &id);
             self.remove_after_grace(id);
         } else {
@@ -659,10 +589,6 @@ impl Registry {
         }
     }
 
-    /// `ack` changed a session's records: they reach its files with its
-    /// next park when it runs, with a park now when it ended and is
-    /// kept, and with a rewrite of `session.json` alone for a session
-    /// loaded from a park file.
     pub fn records_changed(self: &Arc<Self>, session: &Shared) {
         let mut s = session.lock().unwrap();
         if s.gone() || self.is_stopping() {
@@ -685,9 +611,6 @@ impl Registry {
         });
     }
 
-    /// Writes a parked session's records into its `session.json` under
-    /// its park lock, outside the session lock: the fsyncs hold up no
-    /// one. A removal that overlaps the write takes the files with it.
     async fn rewrite_records(self: &Arc<Self>, session: &Shared) {
         let park_lock = session.lock().unwrap().park_lock.clone();
         let _one_at_a_time = park_lock.lock().await;
@@ -717,8 +640,6 @@ impl Registry {
         });
     }
 
-    /// An explicit `remove`: finished attachments close at once; when
-    /// others are open the session stays until `remove_grace` has passed.
     pub fn remove(self: &Arc<Self>, id: &str) -> Result<(), Fail> {
         if self.is_stopping() {
             return Err((ErrorCode::Internal, "server stopping".into()));
@@ -731,10 +652,8 @@ impl Registry {
             }
             let all_finished = s.attachments_finished();
             if !all_finished {
-                // The files stay for the grace (a parked session serves
-                // its snapshot from them); a stop within it deletes them.
                 s.removed = true;
-                s.close_attachments(ClosedReason::Removed, true);
+                s.close_finished_attachments(ClosedReason::Removed);
             }
             all_finished
         };
@@ -746,7 +665,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Drops the session and its files, closing every attachment.
     fn remove_now(&self, id: &str) {
         let Some(session) = self.state.lock().unwrap().sessions.remove(id) else {
             return;
@@ -754,8 +672,7 @@ impl Registry {
         {
             let mut s = session.lock().unwrap();
             s.removed = true;
-            s.close_attachments(ClosedReason::Removed, false);
-            // Its waits end.
+            s.close_attachments(ClosedReason::Removed);
             s.wake.notify_waiters();
         }
         park::remove(&self.sessions_dir(), id);
@@ -763,8 +680,6 @@ impl Registry {
     }
 }
 
-/// Refuses a command over the text limit, without a program, or with a
-/// NUL the OS cannot pass.
 fn check_command(
     argv: &[String],
     cwd: &str,
@@ -795,7 +710,6 @@ fn check_command(
     Ok(())
 }
 
-/// A session's terminal, `cols` by `rows`, as its program starts.
 fn new_terminal(
     cols: u16,
     rows: u16,
@@ -817,13 +731,12 @@ fn new_terminal(
     term.handler_mut().size = ghostty_vt::SizeReport {
         cols,
         rows,
-        cell_width: 0,
-        cell_height: 0,
+        cell_width: None,
+        cell_height: None,
     };
     Ok(term)
 }
 
-/// Feeds the PTY's output to `session` until the slave side closes.
 async fn read_pty(registry: Arc<Registry>, session: Shared, master: Arc<AsyncFd<OwnedFd>>) {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -856,7 +769,6 @@ async fn read_pty(registry: Arc<Registry>, session: Shared, master: Arc<AsyncFd<
     registry.ended(&session, ended);
 }
 
-/// Records the child's exit on `session`.
 async fn wait_child(registry: Arc<Registry>, session: Shared, mut child: tokio::process::Child) {
     let status = child.wait().await;
     let ended = {
@@ -873,10 +785,13 @@ async fn wait_child(registry: Arc<Registry>, session: Shared, mut child: tokio::
     registry.ended(&session, ended);
 }
 
-/// Writes each queued input whole to the PTY, then releases its permit
-/// and answers its `done`, until the queue or a write fails.
 async fn write_input(master: Arc<AsyncFd<OwnedFd>>, mut rx: mpsc::UnboundedReceiver<InputUnit>) {
-    while let Some((bytes, permit, done)) = rx.recv().await {
+    while let Some(InputUnit {
+        bytes,
+        permit,
+        done,
+    }) = rx.recv().await
+    {
         let mut written = 0;
         while written < bytes.len() {
             let Ok(mut guard) = master.writable().await else {
@@ -886,7 +801,6 @@ async fn write_input(master: Arc<AsyncFd<OwnedFd>>, mut rx: mpsc::UnboundedRecei
                 rustix::io::write(fd.get_ref(), &bytes[written..]).map_err(std::io::Error::from)
             }) {
                 Ok(Ok(n)) => written += n,
-                // The waiter sees a dropped `done` as a failed write.
                 Ok(Err(_)) => return,
                 Err(_would_block) => {}
             }
@@ -896,11 +810,6 @@ async fn write_input(master: Arc<AsyncFd<OwnedFd>>, mut rx: mpsc::UnboundedRecei
     }
 }
 
-/// A running session's activity park: once its changes have been quiet
-/// for `park.quiet`, or `park.busy` after the first of them, whichever
-/// comes first, and not within `park.gap` of the last park, so that
-/// output in bursts just over `quiet` apart parks once per `gap`. Woken by `due` at the first change after a park; ends
-/// with the session's stream, the session or the server.
 async fn park_when_due(
     registry: Weak<Registry>,
     session: Weak<Mutex<Session>>,
@@ -917,13 +826,8 @@ async fn park_when_due(
                 if s.status() != Status::Running {
                     return;
                 }
-                let timing = registry.config.park;
                 match s.unparked {
-                    Some((first, last)) => {
-                        let due = (last + timing.quiet).min(first + timing.busy);
-                        s.parked_at.map_or(due, |at| due.max(at + timing.gap))
-                    }
-                    // Parked meanwhile, by the timer or a detach.
+                    Some(changes) => registry.config.park.next_due(changes, s.parked_at),
                     None => break,
                 }
             };
@@ -937,7 +841,6 @@ async fn park_when_due(
                 () = shutdown.cancelled() => return,
             }
         }
-        // The session's end notifies too, so that this task ends with it.
         tokio::select! {
             () = due.notified() => {}
             () = shutdown.cancelled() => return,
@@ -959,4 +862,53 @@ fn exit_of(status: std::process::ExitStatus) -> Exit {
 
 pub fn internal(err: impl std::fmt::Display) -> Fail {
     (ErrorCode::Internal, err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TIMING: ParkTiming = ParkTiming {
+        interval: Duration::from_secs(300),
+        quiet: Duration::from_secs(2),
+        gap: Duration::from_secs(5),
+        busy: Duration::from_secs(30),
+    };
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn a_change_is_due_once_quiet() {
+        let t0 = Instant::now();
+        let changes = Unparked {
+            first: t0,
+            latest: t0 + secs(1),
+        };
+        assert_eq!(TIMING.next_due(changes, None), t0 + secs(3));
+    }
+
+    #[test]
+    fn continuing_changes_are_due_when_busy() {
+        let t0 = Instant::now();
+        let changes = Unparked {
+            first: t0,
+            latest: t0 + secs(29),
+        };
+        assert_eq!(TIMING.next_due(changes, None), t0 + secs(30));
+    }
+
+    #[test]
+    fn a_recent_park_holds_the_next_off_for_the_gap() {
+        let t0 = Instant::now();
+        assert_eq!(
+            TIMING.next_due(Unparked::at(t0 + secs(1)), Some(t0)),
+            t0 + secs(5)
+        );
+        assert_eq!(
+            TIMING.next_due(Unparked::at(t0 + secs(10)), Some(t0)),
+            t0 + secs(12)
+        );
+    }
 }

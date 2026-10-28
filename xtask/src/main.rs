@@ -49,8 +49,6 @@ fn bindings(check: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Types the `GHOSTTY_MODS_*` bits as `GhosttyMods`, which they combine
-/// into, rather than `u32`.
 #[derive(Debug)]
 struct ModsBits;
 
@@ -64,12 +62,9 @@ impl bindgen::callbacks::ParseCallbacks for ModsBits {
     }
 }
 
-/// Renders PROTOCOL.md's generated regions and the web package's protocol
-/// types from the catalog.
 fn protocol(check: bool) -> ExitCode {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    // Neither shows the release.
-    let catalog = proto::catalog::catalog("");
+    let catalog = proto::catalog::catalog(None);
     let doc_path = root.join("PROTOCOL.md");
     let doc = std::fs::read_to_string(&doc_path).expect("read PROTOCOL.md");
     let doc = match proto::render::splice(&doc, &catalog) {

@@ -1,5 +1,3 @@
-//! Byte-bounded queues. Permits stay with queued (or in-flight) values.
-
 use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -25,9 +23,6 @@ pub(crate) enum SendError {
     Closed,
 }
 
-/// A byte-bounded receive queue. Receiving releases the item's byte budget.
-/// Attachment overflow delivers a final local `ERROR too_slow`; an event
-/// queue overflow ends the connection, whose `ended()` reports the loss.
 pub struct Receiver<T> {
     pub(crate) rx: mpsc::UnboundedReceiver<Queued<T>>,
 }
@@ -65,8 +60,6 @@ impl<T> Sender<T> {
             .map_err(|_| SendError::Closed)
     }
 
-    /// One reserved ending, after the bounded prefix. Consumes the sender
-    /// so overflow cannot grow a second queue of loss notifications.
     pub fn end(self, value: T) {
         let _ = self.tx.send(Queued {
             value,

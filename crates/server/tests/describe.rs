@@ -1,12 +1,7 @@
-//! `describe` (PROTOCOL.md, Control): the catalog, one method of it, and
-//! the methods it lists being the ones the server dispatches.
-
-mod common;
-
-use common::*;
 use proto::catalog::{Catalog, Description};
 use proto::*;
 use serde_json::{Value, json};
+use testkit::*;
 
 #[tokio::test]
 async fn describe_answers_the_catalog_with_the_server_s_release() {
@@ -15,7 +10,7 @@ async fn describe_answers_the_catalog_with_the_server_s_release() {
     let catalog: Catalog = serde_json::from_value(c.ok("describe", json!({})).await).unwrap();
     assert_eq!(
         catalog,
-        proto::catalog::catalog(&server.registry.config.version)
+        proto::catalog::catalog(Some(&server.registry.config.version))
     );
 }
 
@@ -45,9 +40,6 @@ async fn describe_with_a_method_answers_that_entry_alone() {
     );
 }
 
-/// Every method the catalog lists reaches its handler, which refuses
-/// `null` params as malformed, and a name it does not list is unknown:
-/// `dispatch` serves only the catalog's methods.
 #[tokio::test]
 async fn the_catalog_lists_exactly_the_methods_the_server_dispatches() {
     let server = start(fast_limits());
@@ -69,9 +61,6 @@ async fn the_catalog_lists_exactly_the_methods_the_server_dispatches() {
     }
 }
 
-/// Each method's examples, run against a live session, answer with a
-/// result of the shape its schema names: the same fields, required and
-/// optional, as the example result.
 #[tokio::test]
 async fn a_live_reply_has_the_fields_its_schema_names() {
     let server = start(fast_limits());

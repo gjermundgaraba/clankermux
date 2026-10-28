@@ -29,7 +29,6 @@ fn frame_type_vectors() {
     for (name, value) in types {
         let value = u8::try_from(value.as_u64().unwrap()).unwrap();
         let frame_type = FrameType::from_u8(value).unwrap_or_else(|| panic!("{name}"));
-        // The vectors name types in snake_case; the enum in CamelCase.
         let camel: String = name
             .split('_')
             .map(|w| w[..1].to_uppercase() + &w[1..])
@@ -58,8 +57,6 @@ fn frame_vectors() {
         if let Some(expected) = v.get("error") {
             let err = parse_frame(&bytes, max_frame).expect_err(name);
             assert_eq!(error_kind(err), expected.as_str().unwrap(), "{name}");
-            // The stream decoder sees the same header errors, and waits
-            // for more bytes otherwise.
             match decoder.next_frame(max_frame) {
                 Err(stream_err) => assert_eq!(stream_err, err, "{name}"),
                 Ok(_) => assert!(
@@ -110,8 +107,6 @@ fn stream_decoder_handles_pieces_and_boundaries() {
         decoder.push(&[*byte]);
         assert_eq!(decoder.next_frame(max_frame).unwrap(), None);
     }
-    // Two frames and part of a third arrive together: both decode, the
-    // partial one is kept after compaction, then completes.
     let mut rest = first[first.len() - 1..].to_vec();
     rest.extend_from_slice(&second);
     rest.extend_from_slice(&third[..5]);
@@ -135,7 +130,6 @@ fn stream_decoder_handles_pieces_and_boundaries() {
     decoder.push(&third[5..]);
     assert_eq!(decoder.next_frame(max_frame).unwrap().unwrap().1, b"xyz");
 
-    // A length equal to max_frame passes; one above fails.
     assert!(parse_frame(&first, max_frame).is_ok());
     assert_eq!(
         parse_frame(&first, max_frame - 1),
@@ -146,7 +140,6 @@ fn stream_decoder_handles_pieces_and_boundaries() {
     );
 }
 
-/// Whether a value is a type, unchanged by a round trip through it.
 pub(crate) type Check = fn(&Value) -> Result<(), String>;
 
 pub(crate) fn same<T: serde::Serialize + serde::de::DeserializeOwned>(
@@ -162,8 +155,6 @@ pub(crate) fn same<T: serde::Serialize + serde::de::DeserializeOwned>(
 #[test]
 fn message_vectors() {
     let vectors: serde_json::Map<String, Value> = serde_json::from_str(catalog::VECTORS).unwrap();
-    // A method's params vectors are named after it, and checked as the
-    // catalog declares its params.
     let typed = catalog::typed();
     for (name, json) in &vectors {
         let mut parts = name.split('/');
@@ -242,8 +233,6 @@ fn client_payloads_refuse_unknown_fields_and_server_payloads_ignore_them() {
     assert_eq!(gap.to, 2);
 }
 
-/// Whether each object `schema` reaches, through its references,
-/// refuses undefined fields.
 fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &mut Vec<bool>) {
     fn walk(schema: &Value, out: &mut Vec<bool>) {
         match schema {
@@ -276,7 +265,7 @@ fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &m
 
 #[test]
 fn params_schemas_are_closed_and_the_server_s_are_open() {
-    let catalog = catalog::catalog("0");
+    let catalog = catalog::catalog(Some("0"));
     for method in &catalog.methods {
         let mut params = Vec::new();
         closed_objects(&method.params, &catalog.defs, &mut params);
@@ -297,7 +286,6 @@ fn params_schemas_are_closed_and_the_server_s_are_open() {
         };
         let mut fields = Vec::new();
         closed_objects(schema, &catalog.defs, &mut fields);
-        // `HELLO.client` and `REQUEST.params` are objects of their own.
         let closed = frame.direction == catalog::Direction::Client;
         assert!(
             fields.iter().all(|&c| c == closed),
@@ -309,7 +297,7 @@ fn params_schemas_are_closed_and_the_server_s_are_open() {
 
 #[test]
 fn every_method_s_examples_are_its_types() {
-    let catalog = catalog::catalog("0");
+    let catalog = catalog::catalog(Some("0"));
     for (name, params, result) in catalog::typed() {
         let method = catalog.method(name).unwrap();
         assert!(!method.examples.is_empty(), "{name}: no example");
@@ -323,7 +311,7 @@ fn every_method_s_examples_are_its_types() {
 
 #[test]
 fn method_names_are_unique() {
-    let catalog = catalog::catalog("0");
+    let catalog = catalog::catalog(Some("0"));
     let names: std::collections::BTreeSet<&str> =
         catalog.methods.iter().map(|m| m.name.as_str()).collect();
     assert_eq!(names.len(), catalog.methods.len());
@@ -331,7 +319,7 @@ fn method_names_are_unique() {
 
 #[test]
 fn every_method_can_refuse_its_params() {
-    for method in catalog::catalog("0").methods {
+    for method in catalog::catalog(Some("0")).methods {
         assert!(
             method.errors.contains(&ErrorCode::InvalidRequest),
             "{}",
@@ -342,7 +330,7 @@ fn every_method_can_refuse_its_params() {
 
 #[test]
 fn every_method_event_and_error_code_says_what_it_does() {
-    let catalog = catalog::catalog("0");
+    let catalog = catalog::catalog(Some("0"));
     let summaries = catalog
         .methods
         .iter()
@@ -361,7 +349,7 @@ fn every_method_event_and_error_code_says_what_it_does() {
 
 #[test]
 fn a_frame_has_a_schema_exactly_when_its_payload_is_json() {
-    for frame in catalog::catalog("0").frames {
+    for frame in catalog::catalog(Some("0")).frames {
         assert_eq!(
             frame.schema.is_some(),
             frame.payload == catalog::Payload::Json,
@@ -373,7 +361,7 @@ fn a_frame_has_a_schema_exactly_when_its_payload_is_json() {
 
 #[test]
 fn references_and_definitions_match_and_nothing_is_null() {
-    let catalog = catalog::catalog("0");
+    let catalog = catalog::catalog(Some("0"));
     let json = serde_json::to_value(&catalog).unwrap();
     let mut names = std::collections::BTreeSet::new();
     catalog::refs(&json, &mut names);
@@ -384,7 +372,6 @@ fn references_and_definitions_match_and_nothing_is_null() {
     );
     let text = serde_json::to_string(&json).unwrap();
     assert!(!text.contains(r#""null""#), "a schema allows null");
-    // Well inside a reply.
     assert!(
         (text.len() as u64) < Limits::default().max_frame / 4,
         "{}",
@@ -394,13 +381,11 @@ fn references_and_definitions_match_and_nothing_is_null() {
 
 #[test]
 fn describe_one_method_carries_what_it_refers_to() {
-    let catalog = catalog::catalog("1.2.3");
+    let catalog = catalog::catalog(Some("1.2.3"));
     for method in &catalog.methods {
         let one = catalog.describe(&method.name).unwrap();
         assert_eq!((one.protocol, one.version.as_str()), (VERSION, "1.2.3"));
         assert_eq!(&one.method, method);
-        // The examples are values, not schemas: `describe`'s holds a
-        // Description with `$defs` of its own.
         let mut names = Vec::new();
         catalog::refs(&one.method.params, &mut names);
         catalog::refs(&one.method.result, &mut names);
@@ -411,7 +396,6 @@ fn describe_one_method_carries_what_it_refers_to() {
         assert!(one.defs.len() < catalog.defs.len(), "{}", method.name);
     }
     assert!(catalog.describe("no_such_method").is_none());
-    // Both answers read back as `Described`, each as its own shape.
     let whole: catalog::Described =
         serde_json::from_value(serde_json::to_value(&catalog).unwrap()).unwrap();
     assert!(matches!(whole, catalog::Described::Catalog(c) if c == catalog));
@@ -423,7 +407,7 @@ fn describe_one_method_carries_what_it_refers_to() {
 
 #[test]
 fn splice_renders_regions_and_keeps_the_rest() {
-    let catalog = catalog::catalog("");
+    let catalog = catalog::catalog(None);
     let doc = "Prose.\n<!-- generated: type Cancelled -->\nold\n<!-- end generated -->\nMore.\n";
     let once = render::splice(doc, &catalog).unwrap();
     assert_eq!(
@@ -435,7 +419,6 @@ fn splice_renders_regions_and_keeps_the_rest() {
          <!-- end generated -->\nMore.\n"
     );
     assert_eq!(render::splice(&once, &catalog).unwrap(), once);
-    // A mark inside a line is prose that shows one.
     let quoted = "Write `<!-- generated: methods -->` and `<!-- end generated -->`.\n";
     assert_eq!(render::splice(quoted, &catalog).unwrap(), quoted);
     for bad in [
@@ -451,7 +434,7 @@ fn splice_renders_regions_and_keeps_the_rest() {
 
 #[test]
 fn one_method_renders_with_the_types_it_uses() {
-    let catalog = catalog::catalog("");
+    let catalog = catalog::catalog(None);
     let send = render::method(&catalog.describe("send").unwrap());
     for part in [
         "# send\n",

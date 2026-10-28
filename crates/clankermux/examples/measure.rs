@@ -1,8 +1,3 @@
-//! Measurements recorded in MEASUREMENTS.md: bootstrap time and snapshot
-//! size against scrollback, stream throughput per carrier, idle cost per
-//! session, and a park. Prints a Markdown report.
-//!
-//!     cargo run --release -p clankermux --example measure
 #![expect(
     clippy::cast_precision_loss,
     reason = "byte counts as f64 for MiB, far below 2^53"
@@ -19,7 +14,6 @@ use testkit::connect_ws;
 use tokio_rustls::TlsConnector;
 
 const MIB: u64 = 1024 * 1024;
-/// A producer of `bytes` of distinct 80-column lines.
 fn producer(bytes: u64) -> String {
     format!(
         "awk 'BEGIN {{ for (i = 0;; i++) printf \"%08d %s\\n\", i, \"{}\" }}' | head -c {bytes}",
@@ -115,7 +109,6 @@ fn open(session: &str, resume: Option<Resume>) -> Open {
     }
 }
 
-/// OPEN to `SNAPSHOT_END`, and the snapshot's size.
 async fn bootstrap(conn: &Connection, session: &str) -> (Duration, u64) {
     let started = Instant::now();
     let mut rx = conn.open(1, &open(session, None)).unwrap();
@@ -142,7 +135,6 @@ async fn bootstrap(conn: &Connection, session: &str) -> (Duration, u64) {
     (elapsed, size)
 }
 
-/// Bytes per second of OUTPUT from the first byte to the marker.
 async fn throughput(lab: &Lab, carrier: &str, bytes: u64) -> (f64, usize) {
     let conn = lab.connect(carrier).await;
     let session = create(
@@ -189,7 +181,6 @@ async fn throughput(lab: &Lab, carrier: &str, bytes: u64) -> (f64, usize) {
     (received as f64 / elapsed.as_secs_f64() / MIB as f64, gaps)
 }
 
-/// A command's trimmed stdout.
 fn stdout(program: &str, args: &[&str]) -> std::io::Result<String> {
     std::process::Command::new(program)
         .args(args)
@@ -237,7 +228,6 @@ fn dir_size(path: &Path) -> u64 {
     })
 }
 
-/// macOS only; empty elsewhere.
 fn sysctl(name: &str) -> String {
     stdout("sysctl", &["-n", name]).unwrap_or_default()
 }

@@ -1,9 +1,3 @@
-/**
- * The catalog a real server answers to `describe`, against ajv: every
- * method's examples and every shared vector pass the catalog's JSON
- * Schemas, and a params object with a field the protocol does not define
- * fails them. The TS types are generated from the same catalog.
- */
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { afterAll, beforeAll, expect, test } from "vitest";
 
@@ -28,7 +22,6 @@ afterAll(async () => {
   await served?.stop();
 });
 
-/** Validates against one of the catalog's schemas, its `$defs` beside it. */
 function validator(schema: unknown): (value: unknown) => boolean {
   // `uint64` and the like are schemars' notes on Rust's integer types.
   const ajv = new Ajv2020({ strict: false, validateFormats: false });
@@ -58,14 +51,11 @@ test("every method's examples pass its schemas, and an undefined field fails", (
   }
 });
 
-/** The schema of a shared vector: its frame's, its method's params, or its type's. */
 function schemaOf(name: string): unknown {
-  // `params/list-first` is `list`'s params.
   const [kind, variant] = name.split("/") as [string, string];
   if (kind === "params") return catalog.methods.find((m) => m.name === variant.split("-")[0])?.params;
   const frame = catalog.frames.find((f) => f.name.toLowerCase() === kind);
   if (frame) return frame.schema;
-  // `session/running` is a `Session`.
   const type = kind.charAt(0).toUpperCase() + kind.slice(1);
   return Object.hasOwn(catalog.$defs, type) ? { $ref: `#/$defs/${type}` } : undefined;
 }

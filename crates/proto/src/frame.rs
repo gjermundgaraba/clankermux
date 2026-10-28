@@ -1,8 +1,5 @@
-//! The 10-byte frame header and the raw payload shapes.
-
 pub const HEADER_LEN: usize = 10;
 
-/// Defines the enum and the table `from_u8` searches from one list.
 macro_rules! frame_types {
     ($($name:ident = $value:literal),* $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,15 +41,26 @@ impl FrameType {
         Self::ALL.iter().copied().find(|t| *t as u8 == byte)
     }
 
-    /// Frames the server sends have the high bit set.
     pub fn is_server(self) -> bool {
         self as u8 & 0x80 != 0
     }
 
-    /// Whether the type belongs on channel 0 (`Error` belongs on either).
-    pub fn is_control(self) -> bool {
+    pub fn channel_kind(self) -> ChannelKind {
         use FrameType::*;
-        matches!(self, Hello | Request | Welcome | Reply | Event | Error)
+        match self {
+            Hello | Request | Welcome | Reply | Event => ChannelKind::Control,
+            Error => ChannelKind::Either,
+            Open | Input | Viewport | Close | Attached | Snapshot | SnapshotReady | SnapshotEnd
+            | Output | Resized | Exited | Gap | Closed => ChannelKind::Attachment,
+        }
+    }
+
+    pub fn allowed_on(self, channel: u32) -> bool {
+        match self.channel_kind() {
+            ChannelKind::Control => channel == 0,
+            ChannelKind::Attachment => channel != 0,
+            ChannelKind::Either => true,
+        }
     }
 
     pub fn is_json(self) -> bool {
@@ -65,6 +73,13 @@ impl FrameType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelKind {
+    Control,
+    Attachment,
+    Either,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     pub frame_type: FrameType,
     pub channel: u32,
@@ -74,17 +89,9 @@ pub struct Header {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameError {
     UnknownType(u8),
-    TooLong {
-        length: u32,
-        max_frame: u64,
-    },
-    /// A message shorter than a header.
+    TooLong { length: u32, max_frame: u64 },
     Short,
-    /// A message whose header length is not its payload length.
-    LengthMismatch {
-        length: u32,
-        payload: usize,
-    },
+    LengthMismatch { length: u32, payload: usize },
 }
 
 impl std::fmt::Display for FrameError {
@@ -112,7 +119,6 @@ pub(crate) fn encode_header(frame_type: FrameType, channel: u32, length: u32) ->
     out
 }
 
-/// Parses a header, ignoring `flags`.
 pub fn parse_header(bytes: &[u8; HEADER_LEN], max_frame: u64) -> Result<Header, FrameError> {
     let frame_type = FrameType::from_u8(bytes[0]).ok_or(FrameError::UnknownType(bytes[0]))?;
     let channel = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
@@ -127,7 +133,6 @@ pub fn parse_header(bytes: &[u8; HEADER_LEN], max_frame: u64) -> Result<Header, 
     })
 }
 
-/// A complete frame: header followed by the payload.
 pub fn encode_frame(frame_type: FrameType, channel: u32, payload: &[u8]) -> Vec<u8> {
     let length = u32::try_from(payload.len()).expect("frame payload longer than u32");
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
@@ -136,7 +141,6 @@ pub fn encode_frame(frame_type: FrameType, channel: u32, payload: &[u8]) -> Vec<
     out
 }
 
-/// A complete frame with a JSON payload.
 pub fn encode_json_frame<T: serde::Serialize>(
     frame_type: FrameType,
     channel: u32,
@@ -149,7 +153,6 @@ pub fn encode_json_frame<T: serde::Serialize>(
     )
 }
 
-/// Parses one message that carries exactly one frame.
 pub fn parse_frame(message: &[u8], max_frame: u64) -> Result<(Header, &[u8]), FrameError> {
     let (head, payload) = message
         .split_at_checked(HEADER_LEN)
@@ -164,7 +167,6 @@ pub fn parse_frame(message: &[u8], max_frame: u64) -> Result<(Header, &[u8]), Fr
     Ok((header, payload))
 }
 
-/// Splits a byte stream into frames.
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
@@ -201,10 +203,8 @@ impl FrameDecoder {
     }
 }
 
-/// The bytes of the stream offset that starts an `OUTPUT` payload.
 pub const OUTPUT_OFFSET_LEN: usize = 8;
 
-/// `OUTPUT` payload: the stream offset of the first byte, then the bytes.
 pub fn encode_output(offset: u64, bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(OUTPUT_OFFSET_LEN + bytes.len());
     out.extend_from_slice(&offset.to_le_bytes());
@@ -212,7 +212,6 @@ pub fn encode_output(offset: u64, bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// A complete OUTPUT frame from two adjacent slices of the stream.
 pub fn encode_output_frame(channel: u32, offset: u64, first: &[u8], second: &[u8]) -> Vec<u8> {
     let length = OUTPUT_OFFSET_LEN + first.len() + second.len();
     let mut out = Vec::with_capacity(HEADER_LEN + length);

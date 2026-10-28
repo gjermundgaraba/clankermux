@@ -1,5 +1,3 @@
-//! Ghostty binary snapshot encoding and incremental decoding.
-
 use std::ffi::c_void;
 use std::ptr;
 
@@ -18,7 +16,6 @@ const TAG_PAGE: u16 = 3;
 const TAG_READY: u16 = 5;
 const TAG_FINISH: u16 = 6;
 
-/// Encodes the whole terminal, history included, into one buffer.
 pub fn encode(term: &Term) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     // SAFETY: the writer borrows `out` only for the duration of this call.
@@ -33,8 +30,6 @@ pub fn encode(term: &Term) -> Result<Vec<u8>> {
     }
 }
 
-/// The record starting at `pos`: its tag and the position just past it,
-/// or `None` when the buffer ends before the record does.
 fn record_at(buf: &[u8], pos: usize) -> Option<(u16, usize)> {
     let header = buf.get(pos..pos + RECORD_HEADER_LEN)?;
     let tag = u16::from_le_bytes([header[0], header[1]]);
@@ -43,8 +38,6 @@ fn record_at(buf: &[u8], pos: usize) -> Option<(u16, usize)> {
     (end <= buf.len()).then_some((tag, end))
 }
 
-/// Position just past the `READY` record, once every byte through it is
-/// in `buf`.
 pub fn ready_end(buf: &[u8]) -> Option<usize> {
     end_of_step(buf, ENVELOPE_LEN, |tag| tag == TAG_READY)
 }
@@ -88,6 +81,18 @@ unsafe extern "C" fn read_source(
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Page,
+    Finished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoTerminal {
+    BeforeReady,
+    Replaced,
+}
+
 /// A pull decoder fed from a buffer the caller fills incrementally. It
 /// owns the terminal it restores until [`Decoder::into_terminal`], because
 /// the library writes history into that terminal on every page.
@@ -102,11 +107,8 @@ pub struct Decoder<H: Handler = ()> {
     /// The terminal the library retains between steps, kept alive here
     /// whatever is done through `terminal`.
     owner: Option<Terminal<H>>,
-    /// The wrapper handed out; it must still be the owner's terminal.
     terminal: Option<Terminal<H>>,
-    /// Installed on the terminal once it exists.
     handler: Option<H>,
-    /// `FINISH` was validated.
     finished: bool,
 }
 
@@ -117,8 +119,6 @@ impl Decoder<()> {
 }
 
 impl<H: Handler> Decoder<H> {
-    /// A decoder whose restored terminal gets `handler` as soon as it
-    /// exists, so effects raised while history is written reach it.
     pub fn with_handler(handler: H) -> Result<Self> {
         let source = Box::into_raw(Box::new(Source {
             data: Vec::new(),
@@ -134,8 +134,6 @@ impl<H: Handler> Decoder<H> {
         if let Err(err) =
             check(unsafe { sys::ghostty_snapshot_decoder_new(ptr::null(), &raw mut raw, reader) })
         {
-            // SAFETY: source came from Box::into_raw above and was not
-            // handed to a decoder.
             drop(unsafe { Box::from_raw(source) });
             return Err(err);
         }
@@ -149,7 +147,6 @@ impl<H: Handler> Decoder<H> {
         })
     }
 
-    /// Wraps the terminal the library just returned, with the handler.
     unsafe fn adopt(&mut self, raw: sys::GhosttyTerminal) -> &mut Terminal<H> {
         let handler = self.handler.take().expect("one terminal per decoder");
         // SAFETY: raw is a caller-owned terminal from the decoder.
@@ -171,7 +168,6 @@ impl<H: Handler> Decoder<H> {
         }
     }
 
-    /// Whether `FINISH` was validated: the snapshot is complete.
     pub fn finished(&self) -> bool {
         self.finished
     }
@@ -183,7 +179,6 @@ impl<H: Handler> Decoder<H> {
     }
 
     fn source_mut(&mut self) -> &mut Source {
-        // SAFETY: as in `source`.
         unsafe { &mut *self.source }
     }
 
@@ -203,15 +198,12 @@ impl<H: Handler> Decoder<H> {
         self.source_mut().data.extend_from_slice(bytes);
     }
 
-    /// Bytes pushed but not yet consumed.
     #[cfg(test)]
     pub(crate) fn buffered(&self) -> usize {
         let source = self.source();
         source.data.len() - source.pos
     }
 
-    /// Whether every byte through `READY` is buffered. Only meaningful
-    /// before [`Decoder::ready`].
     pub fn ready_available(&self) -> bool {
         ready_end(&self.source().data).is_some()
     }
@@ -221,7 +213,6 @@ impl<H: Handler> Decoder<H> {
         !self.finished && step_end(&source.data, source.pos).is_some()
     }
 
-    /// Decodes through `READY`; the terminal is then renderable.
     pub fn ready(&mut self) -> Result<&mut Terminal<H>> {
         let mut raw = ptr::null_mut();
         // SAFETY: raw is a live decoder.
@@ -231,18 +222,16 @@ impl<H: Handler> Decoder<H> {
         Ok(unsafe { self.adopt(raw) })
     }
 
-    /// Decodes one history page into the terminal. Returns `false` once
-    /// `FINISH` is validated.
-    pub fn next_page(&mut self) -> Result<bool> {
+    pub fn next_page(&mut self) -> Result<Step> {
         self.intact()?;
         // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_next(self.raw) };
         if result == sys::GHOSTTY_NO_VALUE {
             self.finished = true;
-            return Ok(false);
+            return Ok(Step::Finished);
         }
         check(result)?;
-        Ok(true)
+        Ok(Step::Page)
     }
 
     /// Decodes a complete snapshot in one call; the engine refuses it
@@ -258,17 +247,15 @@ impl<H: Handler> Decoder<H> {
         Ok(unsafe { self.adopt(raw) })
     }
 
-    /// The terminal restored so far, for rendering and live input between
-    /// pages.
     pub fn terminal(&mut self) -> Option<&mut Terminal<H>> {
         self.terminal.as_mut()
     }
 
-    /// Frees the decoder and releases the terminal, finished or not;
-    /// `None` before `READY` or when the wrapper handed out was replaced.
-    pub fn into_terminal(mut self) -> Option<Terminal<H>> {
-        self.intact().ok()?;
-        self.terminal.take()
+    pub fn into_terminal(mut self) -> std::result::Result<Terminal<H>, NoTerminal> {
+        if self.intact().is_err() {
+            return Err(NoTerminal::Replaced);
+        }
+        self.terminal.take().ok_or(NoTerminal::BeforeReady)
     }
 
     fn compact(&mut self) {
@@ -289,7 +276,6 @@ impl<H: Handler> Drop for Decoder<H> {
     }
 }
 
-/// Decodes a complete snapshot held in memory.
 pub fn decode(bytes: &[u8]) -> Result<Terminal> {
     let mut decoder = Decoder::new()?;
     decoder.push(bytes);
@@ -316,7 +302,7 @@ mod tests {
         let mut pages = 0;
         while decoder.step_available() {
             let pos = decoder.source().pos;
-            assert!(decoder.next_page().unwrap());
+            assert_eq!(decoder.next_page().unwrap(), Step::Page);
             assert!(decoder.source().pos > pos);
             assert_eq!(decoder.source().data.len(), split);
             pages += 1;
@@ -328,7 +314,7 @@ mod tests {
         assert_eq!(decoder.source().pos, 0);
         assert_eq!(&decoder.source().data[..tail.len()], tail);
         assert!(decoder.step_available());
-        assert!(!decoder.next_page().unwrap());
+        assert_eq!(decoder.next_page().unwrap(), Step::Finished);
         assert!(decoder.finished());
         assert_eq!(decoder.buffered(), 0);
         let restored = decoder.into_terminal().unwrap();

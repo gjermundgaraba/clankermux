@@ -1,5 +1,3 @@
-/** The browser suite's page: one client, terminals mounted from it by
- * name, and what they reported, for the suite to drive and read. */
 import {
   type Client,
   ClientError,
@@ -29,6 +27,10 @@ const clientLinks: Link[] = [];
 const frames: Extract<ToPage, { type: "frame" }>[] = [];
 const paints = new Map<number, FrameRequestCallback>();
 let nextPaint = 0;
+
+async function afterServerRoundTrip(): Promise<void> {
+  await client!.list();
+}
 
 const harness = {
   async connect(url: string): Promise<void> {
@@ -81,7 +83,6 @@ const harness = {
 
   link: (name: string): Link | undefined => mounted.get(name)?.links.at(-1),
   clientLinks: (): Link[] => clientLinks,
-  /** What a listener added now gets at once. */
   latest(name: string): { link: Link | undefined; scroll: number | undefined; status: string | undefined } {
     const terminal = mounted.get(name)!.terminal;
     const seen: { link?: Link; scroll?: number; status?: string } = {};
@@ -90,10 +91,9 @@ const harness = {
     terminal.onStatus((text) => (seen.status = text))();
     return { link: seen.link, scroll: seen.scroll, status: seen.status };
   },
-  /** A wait pending when the client closes. */
   async closedWhileWaiting(session: string): Promise<{ kind: string } | undefined> {
     const waiting = client!.wait(session, { output: { text: "never-printed" } });
-    await client!.list();
+    await afterServerRoundTrip();
     client!.close();
     try {
       await waiting;
@@ -106,8 +106,6 @@ const harness = {
   copies: (name: string): Copy[] => mounted.get(name)?.copies ?? [],
   events: (): (Event | EventGap)[] => events,
 
-  /** A wait through the client; aborted after `abortMs` when given, and
-   * before it starts when that is 0. */
   async wait(
     session: string,
     until: Until,
@@ -124,12 +122,10 @@ const harness = {
     }
   },
 
-  /** A wait started now, its outcome kept for `waited`; resolves once a
-   * request sent after it was answered, so the wait is armed. */
   waiting: undefined as Promise<Waited> | undefined,
   async startWait(session: string, until: Until): Promise<void> {
     harness.waiting = client!.wait(session, until);
-    await client!.list();
+    await afterServerRoundTrip();
   },
   waited: (): Promise<Waited> => harness.waiting!,
 };
@@ -137,7 +133,6 @@ const harness = {
 export type Harness = typeof harness;
 
 declare global {
-  /** The page's harness, as the suite's `page.evaluate` calls it. */
   var harness: () => Harness;
 }
 

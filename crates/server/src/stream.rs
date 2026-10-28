@@ -1,6 +1,3 @@
-//! The per-session output stream: a bounded ring of PTY bytes with
-//! lifetime offsets, plus the markers that happened in it.
-
 use std::collections::VecDeque;
 
 use proto::Exit;
@@ -18,7 +15,6 @@ pub struct Marker {
 
 pub struct Stream {
     ring: VecDeque<u8>,
-    /// Offset of the first retained byte.
     start: u64,
     markers: VecDeque<Marker>,
     latest_seq: u64,
@@ -38,7 +34,6 @@ impl Stream {
         }
     }
 
-    /// Offset of the next byte.
     pub fn offset(&self) -> u64 {
         self.start + self.ring.len() as u64
     }
@@ -74,14 +69,11 @@ impl Stream {
         }
     }
 
-    /// The retained bytes from `offset` up to `end` or the stream's end,
-    /// or `None` when the stream does not hold `offset`.
     pub fn read(&self, offset: u64, end: u64) -> Option<Vec<u8>> {
         let (first, second) = self.read_slices(offset, end)?;
         Some([first, second].concat())
     }
 
-    /// A retained range as the ring's (possibly wrapped) borrowed slices.
     pub fn read_slices(&self, offset: u64, end: u64) -> Option<(&[u8], &[u8])> {
         if offset < self.start || offset > self.offset() {
             return None;
@@ -95,25 +87,19 @@ impl Stream {
         ))
     }
 
-    /// The latest marker `seq` at or before `offset`, as a cursor at
-    /// `offset` reflects it.
     pub fn seq_at(&self, offset: u64) -> u64 {
         let later = self.markers.iter().filter(|m| m.offset > offset).count();
         self.latest_seq - later as u64
     }
 
-    /// The bytes from `offset` on, which is retained: from
-    /// `retained_start` up to `offset()`.
     pub fn bytes_from(&self, offset: u64) -> impl Iterator<Item = u8> + '_ {
         self.ring.range(self.index(offset)..).copied()
     }
 
-    /// The ring index of a retained `offset`.
     fn index(&self, offset: u64) -> usize {
         usize::try_from(offset - self.start).expect("offset within the ring")
     }
 
-    /// Whether every marker with `seq` above `after` is still retained.
     pub fn markers_retained_after(&self, after: u64) -> bool {
         after >= self.latest_seq || self.markers.front().is_some_and(|m| m.seq <= after + 1)
     }

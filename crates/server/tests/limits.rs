@@ -1,25 +1,16 @@
-//! Limits conformance: the rows of PROTOCOL.md's Limits table that no
-//! other suite checks (`max_frame` both ways, `scrollback`,
-//! `continuation`, `label`, `text`, `markers`, and the default limits
-//! against the largest replies).
-
-mod common;
-
-use common::*;
 use proto::*;
 use serde_json::json;
+use testkit::*;
 use tokio::io::AsyncWriteExt;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn max_frame_bounds_every_frame() {
-    // Above the 4 KiB of JSON a `read` reply keeps around its text.
     const MAX: usize = 16 * 1024;
     let server = start(Limits {
         max_frame: MAX as u64,
         ..fast_limits()
     });
     let mut c = client(&server).await;
-    // A payload of max_frame bytes passes, one more closes the connection.
     let mut padded = br#"{"id": 1, "method": "list", "params": {"after": ""#.to_vec();
     padded.resize(MAX - 3, b'x');
     padded.extend(br#""}}"#);
@@ -29,7 +20,6 @@ async fn max_frame_bounds_every_frame() {
         .unwrap();
     let (_, body) = c.recv_json().await;
     assert_eq!(body["id"], 1);
-    // The server may close on the header before the payload is written.
     let _ = c
         .stream
         .write_all(&encode_frame(FrameType::Request, 0, &vec![b' '; MAX + 1]))
@@ -40,7 +30,6 @@ async fn max_frame_bounds_every_frame() {
     assert!(body.get("id").is_none(), "a connection error has no id");
     assert!(c.recv().await.is_none());
 
-    // Server frames are bounded too: a snapshot arrives in max_frame pieces.
     let mut c = client(&server).await;
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", "seq 1 3000; echo END; exec cat"]}))
@@ -108,9 +97,6 @@ async fn label_and_text_are_bounded_everywhere() {
         ErrorCode::LimitExceeded,
         "argv is bounded as a whole: two elements under the limit, over it together"
     );
-    // argv is bounded as a whole, so the long title is typed into `cat`,
-    // which writes it back to the terminal.
-    // The harness's default cwd is a long temporary path.
     let session = c
         .create(json!({"label": "12345678", "argv": ["/bin/cat"], "cwd": "/tmp"}))
         .await;
@@ -129,8 +115,6 @@ async fn label_and_text_are_bounded_everywhere() {
         .await,
         ErrorCode::LimitExceeded
     );
-    // The PTY echoes the typed line (ESC as `^[`) before `cat` writes it
-    // back raw, so "titled" appears twice once the title is set.
     let mut echoed = false;
     for _ in 0..1000 {
         if c.read(&session.id, 0).await.text.matches("titled").count() == 2 {
@@ -161,7 +145,6 @@ async fn markers_bound_what_a_resume_can_find() {
     .await;
     let boot = c.bootstrap(1).await;
     let first = boot.attached.marker;
-    // Three resizes add three markers; only the last two are retained.
     for rows in [10, 11, 12] {
         c.ok(
             "resize",
@@ -174,9 +157,6 @@ async fn markers_bound_what_a_resume_can_find() {
     assert_eq!(c.expect_closed(1).await, ClosedReason::Closed);
     let inspected = c.inspect(&session.id).await;
     assert_eq!(inspected.marker, first + 3);
-    // A cursor at `first` has not received `first + 1`, which is gone: the
-    // spec requires at least `markers` retained; this server keeps exactly
-    // that many, which is what makes the limit observable.
     c.open(
         2,
         json!({"session": session.id, "viewport": {"cols": 80, "rows": 12},
@@ -190,7 +170,6 @@ async fn markers_bound_what_a_resume_can_find() {
     );
     c.send(FrameType::Close, 2, &[]).await;
     assert_eq!(c.expect_closed(2).await, ClosedReason::Closed);
-    // One past that has received `first + 1`; the two after it remain.
     c.open(
         3,
         json!({"session": session.id, "viewport": {"cols": 80, "rows": 12},
@@ -204,14 +183,10 @@ async fn markers_bound_what_a_resume_can_find() {
     );
 }
 
-/// A record field at the protocol's maxima, with the bytes that JSON
-/// escapes to two (OSC 7501 forbids control characters in records).
 fn worst(len: usize) -> String {
     "\"".repeat(len)
 }
 
-/// A session field at its maximum, with the bytes that JSON escapes to
-/// six (`\u0001`); labels, argv and cwd come from clients unfiltered.
 fn worst_text(len: usize) -> String {
     "\u{1}".repeat(len)
 }
@@ -228,7 +203,6 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
         msg: Some(worst(2048)),
         progress: Some(100),
         updated_at: "2026-10-18T16:00:00.123456789Z".into(),
-        // Only `done` and `error` carry it; here for the bytes.
         seen: Some(false),
     };
     let attention = Attention {
@@ -238,8 +212,6 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
         msg: Some(worst(2048)),
         record: worst(128),
     };
-    // The server cuts the client's name and version to 32 bytes and
-    // replaces control characters, so `"` (escaped to two) is the worst.
     let attachment = AttachmentInfo {
         channel: u64::MAX,
         client: Peer {
@@ -300,8 +272,6 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
         inspect <= limits.max_frame,
         "inspect reply of {inspect} bytes"
     );
-    // A page is cut to what fits (`a_page_is_cut_to_max_frame`), so only
-    // one worst session must fit with the page's overhead.
     let one = reply(
         serde_json::to_value(Page {
             sessions: vec![session(false)],
@@ -316,15 +286,11 @@ fn default_limits_keep_the_largest_replies_under_max_frame() {
 async fn read_replies_stay_under_max_frame() {
     let server = start(Limits::default());
     let mut c = client(&server).await;
-    // 16,000 lines of 79 bytes: over max_frame of text, each newline
-    // escaping to two bytes in the reply.
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c",
             "awk 'BEGIN { for (i = 0; i < 16000; i++) printf \"%08d %s\\n\", i, \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\" }'; echo END; exec cat"]}))
         .await;
     wait_text(&mut c, &session.id, "END").await;
-    // The harness decodes with the server's max_frame; a larger frame
-    // fails the test there.
     let reply = c
         .ok(
             "read",
@@ -348,8 +314,6 @@ async fn a_page_is_cut_to_max_frame() {
         ..Limits::default()
     });
     let mut c = client(&server).await;
-    // Sessions whose label and argv escape to six bytes a character: about
-    // 14 KiB each, so a page of 100 would be over max_frame.
     let label = "\u{1}".repeat(proto::cap(Limits::default().label));
     let arg = "\u{1}".repeat(2000);
     let mut ids = std::collections::BTreeSet::new();
@@ -383,7 +347,6 @@ async fn a_page_is_cut_to_max_frame() {
     }
     assert_eq!(seen, ids);
     assert!(pages >= 2);
-    // The first `subscribe` page is cut the same way.
     let reply = c.ok("subscribe", json!({})).await;
     let page: Page = serde_json::from_value(reply.clone()).unwrap();
     let encoded = serde_json::to_vec(&json!({"id": 1, "result": reply})).unwrap();
@@ -402,14 +365,11 @@ async fn continuation_bounds_a_snapshot() {
         ..fast_limits()
     });
     let mut c = client(&server).await;
-    // An OSC left open with more bytes than the limit tracks.
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c",
             "printf 'up\\033]2;'; head -c 6000 /dev/zero | tr '\\0' a; exec cat"]}))
         .await;
     inspect_until(&mut c, &session.id, |s| s.offset >= 6000).await;
-    // No snapshot can be taken for the whole 5 s retry window, so the
-    // bootstrap fails and the attachment ends.
     c.open(1, json!({"session": session.id})).await;
     assert_eq!(c.expect_error(1).await, ErrorCode::LimitExceeded);
     c.wait_attachments(&session.id, 0).await;

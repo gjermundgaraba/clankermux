@@ -1,8 +1,3 @@
-//! The handler of a client's local engine: it records the answers the
-//! server's terminal gives to the program's queries, so that the answers
-//! an outer terminal produces to the same queries (passed through) can
-//! be dropped instead of forwarded as input.
-
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -10,13 +5,10 @@ use ghostty_vt::{ColorScheme, Handler, SizeReport};
 
 use crate::vt::{self, Scan, Shape};
 
-/// How long an expected answer stays armed.
 const EXPIRY: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 pub struct Expect {
-    /// Whether output is passed to an outer terminal, which then answers
-    /// the queries in it. Only then are answers expected.
     pub passthrough: bool,
     expected: VecDeque<(Shape, Instant)>,
 }
@@ -41,8 +33,6 @@ impl Handler for Expect {
         }
     }
 
-    /// The server answers size queries; the local engine stays silent
-    /// but expects the outer terminal's `CSI … t`.
     fn size(&mut self) -> Option<SizeReport> {
         self.arm(Shape::Csi {
             private: None,
@@ -52,8 +42,6 @@ impl Handler for Expect {
         None
     }
 
-    /// The server answers `CSI ? 996 n` from the profile; the outer
-    /// terminal's `CSI ? 997 ; … n` is expected either way.
     fn color_scheme(&mut self) -> Option<ColorScheme> {
         self.arm(Shape::Csi {
             private: Some(b'?'),
@@ -83,8 +71,6 @@ impl Expect {
         self.expected.iter().any(|(shape, _)| shape.is_string())
     }
 
-    /// Removes from `input` (whole sequences only) the responses that an
-    /// outer terminal gave to queries answered by the server.
     pub fn filter(&mut self, input: &[u8]) -> Vec<u8> {
         self.expire();
         if self.expected.is_empty() {
@@ -140,8 +126,6 @@ mod tests {
     #[test]
     fn drops_the_outer_terminal_answers_to_what_the_engine_queried() {
         let mut term = passthrough();
-        // DA1, CPR, two size queries, the colour scheme, a kitty graphics
-        // query and OSC 11: the outer terminal answers each.
         term.vt_write(b"\x1b[c\x1b[6n\x1b[18t\x1b[14t\x1b[?996n\x1b_Gi=31,s=1,v=1,a=q;AAAA\x1b\\\x1b]11;?\x1b\\");
         let answers: &[&[u8]] = &[
             b"\x1b[?1;2c",
@@ -161,7 +145,6 @@ mod tests {
                 String::from_utf8_lossy(answer)
             );
         }
-        // Each is dropped once; a second CPR is a key.
         assert_eq!(e.filter(b"x\x1b[10;5Ry"), b"x\x1b[10;5Ry");
     }
 

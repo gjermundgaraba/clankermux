@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Run the release binary as a development server: its own state directory
-# and socket under target/dev, so it runs beside a server on the real state
-# directory, and a TLS WebSocket on loopback with a self-signed certificate
-# made once (loopback --ws without certificate files asks Tailscale).
-#
-# usage: scripts/dev-serve.sh [serve options...]
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 dev="$root/target/dev"

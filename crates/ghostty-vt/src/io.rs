@@ -1,5 +1,3 @@
-//! Writer and reader callbacks over Rust buffers.
-
 use std::ffi::c_void;
 
 use ghostty_vt_sys as sys;
@@ -23,7 +21,6 @@ pub(crate) unsafe fn bytes<'a>(data: *const u8, len: usize) -> &'a [u8] {
     if data.is_null() || len == 0 {
         return &[];
     }
-    // SAFETY: the caller's.
     unsafe { std::slice::from_raw_parts(data, len) }
 }
 
@@ -34,7 +31,6 @@ pub(crate) fn writer(out: &mut Vec<u8>) -> sys::GhosttyWriter {
     }
 }
 
-/// Copies a borrowed `GhosttyString` into an owned string, lossily.
 pub(crate) unsafe fn string(s: &sys::GhosttyString) -> String {
     // SAFETY: the library guarantees ptr points at len bytes for the
     // duration of the call this string was received in.

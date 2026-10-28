@@ -1,4 +1,3 @@
-/** The page: the session bar around a terminal mounted from a client. */
 import { type Link, type Session, connect } from "@gjermundgaraba/clankermux";
 
 const canvas = document.getElementById("screen") as HTMLCanvasElement;
@@ -13,10 +12,10 @@ const linkText = document.getElementById("link") as HTMLElement;
 const where = document.getElementById("where") as HTMLElement;
 const scrolled = document.getElementById("scrolled") as HTMLElement;
 
+const DEFAULT_WS_PORT = 7438;
+
 const params = new URLSearchParams(location.search);
-// The server's default WebSocket port on the host the page came from;
-// `?ws=wss://<node>:<port>/` names any other.
-const wsUrl = params.get("ws") ?? `wss://${location.hostname}:7438/`;
+const wsUrl = params.get("ws") ?? `wss://${location.hostname}:${DEFAULT_WS_PORT}/`;
 
 const style = getComputedStyle(document.documentElement);
 
@@ -25,7 +24,6 @@ const client = await connect({
   wasm: "./ghostty-vt.wasm",
   url: wsUrl,
 });
-/** The session shown, as the page last attached or created it. */
 let current = params.get("session") ?? undefined;
 const terminal = client.mount({
   canvas,
@@ -41,8 +39,6 @@ const terminal = client.mount({
 });
 terminal.onStatus((text) => (status.textContent = text));
 terminal.onLink((link) => (linkText.textContent = describeLink(link)));
-// Scrolled back with the wheel or Shift+PageUp: how far above the live
-// screen the view ends.
 terminal.onScroll((rows) => {
   scrolled.hidden = rows === 0;
   scrolled.textContent = `\u2191 ${rows} rows`;
@@ -53,8 +49,6 @@ client.onSessions((sessions) => {
   showSessions();
 });
 
-/** The link in a few words, so the page shows what a consumer would
- * switch on. */
 function describeLink(link: Link): string {
   switch (link.state) {
     case "connecting":
@@ -76,9 +70,6 @@ function showSessions(): void {
       return new Option(text, s.id, s.id === current, s.id === current);
     }),
   );
-  // The status line: `sessions` follows the program's title (OSC 0/2),
-  // working directory (OSC 7) and the session's size as they change. The
-  // size is the one of the page last visible and focused.
   const attached = listed.find((s) => s.id === current);
   where.textContent = attached
     ? [attached.title, attached.pwd, `${attached.cols}\u00d7${attached.rows}`].filter(Boolean).join(" \u2014 ")
@@ -105,15 +96,12 @@ newButton.onclick = () => {
     .catch(failed);
   canvas.focus();
 };
-// `not_running`: there is nothing left to end.
 endButton.onclick = () => {
   if (current) client.end(current).catch((err) => err.code === "not_running" || failed(err));
 };
 removeButton.onclick = () => {
   if (current) client.remove(current).catch(failed);
 };
-// Pins the page's scheme; the terminal notices the attribute and reports
-// the canvas's scheme and colours again.
 schemeSelect.onchange = () => {
   if (schemeSelect.value) document.documentElement.dataset["scheme"] = schemeSelect.value;
   else delete document.documentElement.dataset["scheme"];

@@ -1,10 +1,3 @@
-/**
- * The worker as the page drives it, against a server played by the test:
- * the page's requests become the right protocol requests on the one
- * connection, their outcomes come back by id, each mounted terminal has
- * its own attachment on that connection, and its link reports what
- * happened to its session.
- */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
@@ -24,7 +17,6 @@ beforeAll(async () => {
   engine = await Engine.load(wasm);
 });
 
-/** The browser's WebSocket as the worker uses it; the test is the server. */
 class FakeSocket {
   static all: FakeSocket[] = [];
   binaryType = "";
@@ -56,14 +48,12 @@ class FakeSocket {
     this.onmessage?.({ data: bytes.slice().buffer });
   }
 
-  /** The JSON bodies sent with `type`. */
   bodies(type: FrameType): { channel: number; body: Record<string, unknown> }[] {
     return this.sent
       .filter((f) => f.header.type === type)
       .map((f) => ({ channel: f.header.channel, body: JSON.parse(new TextDecoder().decode(f.payload)) }));
   }
 
-  /** The first request with `method` and an id above `after`, once sent. */
   async request(method: string, after = 0): Promise<{ id: number; params: Record<string, unknown> }> {
     let found: { id: number; params: Record<string, unknown> } | undefined;
     await vi.waitFor(() => {
@@ -75,14 +65,11 @@ class FakeSocket {
     return found!;
   }
 
-  /** Answers `HELLO`. */
   async welcome(incarnation = "i"): Promise<void> {
     await vi.waitFor(() => expect(this.bodies(FrameType.Hello)).toHaveLength(1));
     this.push(FrameType.Welcome, 0, welcome(incarnation));
   }
 
-  /** Answers `HELLO` and the `subscribe`: with `sessions` as its first
-   * page, or, for a `subscribe` after a reconnect, with `gap`. */
   async serve(sessions: Session[] = [], { incarnation = "i", latest = 0, gap = false } = {}): Promise<void> {
     await this.welcome(incarnation);
     const subscribe = await this.request("subscribe");
@@ -95,7 +82,6 @@ class FakeSocket {
     }
   }
 
-  /** The channel of the latest `OPEN` for `session`. */
   async opened(session: string): Promise<number> {
     let channel = 0;
     await vi.waitFor(() => {
@@ -109,7 +95,6 @@ class FakeSocket {
   }
 }
 
-/** A whole snapshot bootstrap of `s` on `channel`, its terminal showing `text`. */
 function bootstrap(socket: FakeSocket, channel: number, s: Session, text = "hello"): void {
   const source = engine.terminalNew(10, 3);
   source.write(new TextEncoder().encode(text));
@@ -131,7 +116,6 @@ function bootstrap(socket: FakeSocket, channel: number, s: Session, text = "hell
 
 type Message<T extends ToPage["type"]> = Extract<ToPage, { type: T }>;
 
-/** A worker on a port as the page's: what it posted, and a send to it. */
 function run(autoPaint = true) {
   const posted: ToPage[] = [];
   const port = {
@@ -148,8 +132,6 @@ function run(autoPaint = true) {
   return { posted, send };
 }
 
-/** A worker started as `connect` starts it, once its engine is loaded,
- * and what it posted. */
 async function start(autoPaint = true) {
   const { posted, send } = run(autoPaint);
   send({ type: "init", wasm: "ghostty-vt.wasm", url: "wss://127.0.0.1:7438/", client: undefined });
@@ -159,7 +141,6 @@ async function start(autoPaint = true) {
   return {
     send,
     posted,
-    /** Mounts terminal `mount`, as `client.mount` does. */
     mount(mount: number, session?: string, extra: { active?: boolean; visible?: boolean; readOnly?: boolean; ackOnFocus?: boolean } = {}) {
       send({
         type: "mount",
@@ -173,11 +154,9 @@ async function start(autoPaint = true) {
         ackOnFocus: extra.ackOnFocus ?? false,
       });
     },
-    /** A message for terminal `mount`. */
     to(mount: number, message: ToMount) {
       send({ ...message, mount } as ToWorker);
     },
-    /** A request as `Client` sends it; its reply, once posted. */
     request(method: string, params: unknown) {
       const id = nextId++;
       send({ type: "request", id, method, params });
@@ -193,7 +172,6 @@ async function start(autoPaint = true) {
         },
       };
     },
-    /** The latest frame's scrollbar of terminal `mount`, once one was posted. */
     scrollbar: (mount = 1) => of("frame").filter((m) => m.mount === mount).at(-1)?.frame.scrollbar,
     links: (mount = 1) => of("link").flatMap((m) => (m.mount === mount ? [m.link] : [])),
     screens: (mount = 1) => of("status").flatMap((m) => (m.mount === mount ? [m.text] : [])),
@@ -203,13 +181,10 @@ async function start(autoPaint = true) {
   };
 }
 
-/** A key press, or its release. */
 function key(code: string, extra: Partial<KeyInput> = {}): KeyInput {
   return { code, key: code, action: "press", shift: false, ctrl: false, alt: false, meta: false, ...extra };
 }
 
-/** The `index`th socket, once the worker opened it: the first waits for
- * the engine's compile, so it gets a few seconds. */
 async function socket(index: number): Promise<FakeSocket> {
   await vi.waitFor(() => expect(FakeSocket.all.length).toBeGreaterThan(index), { timeout: 5000 });
   return FakeSocket.all[index]!;
@@ -270,7 +245,6 @@ test("a wait cancelled by the page is cancelled on the server by its own request
   server.push(FrameType.Reply, 0, { id: cancel.id, result: { cancelled: true } });
   expect((await wait.reply()).error?.server?.code).toBe("cancelled");
 
-  // A request no longer pending is not cancelled again.
   worker.send({ type: "cancel", id: wait.id });
   await new Promise((resolve) => setTimeout(resolve, 20));
   expect(server.bodies(FrameType.Request).filter((r) => r.body.method === "cancel")).toHaveLength(1);
@@ -304,7 +278,6 @@ test("two terminals share the one connection, each with its own channel, screen 
   );
   expect(FakeSocket.all).toHaveLength(1);
 
-  // One terminal's end leaves the other attached.
   worker.send({ type: "unmount", mount: 1 });
   await vi.waitFor(() => expect(server.sent.some((f) => f.header.type === FrameType.Close && f.header.channel === s)).toBe(true));
   server.push(FrameType.Exited, t, { seq: 1, offset: 6, exit: { code: 0 } });
@@ -325,8 +298,6 @@ test("a terminal mounted later sees the connection as it is, up or retrying, and
   await (await socket(1)).serve([session("s")]);
   await vi.waitFor(() => expect(worker.links(1).at(-1)).toEqual({ state: "connected", session: undefined }));
 
-  // An established connection lost: a terminal mounted before the next
-  // attempt sees it connecting, not connected.
   FakeSocket.all[1]!.close();
   await vi.waitFor(() => expect(worker.links(1).at(-1)).toEqual({ state: "ended", reason: "closed", retry: true }));
   worker.mount(5);
@@ -342,7 +313,6 @@ test("a terminal mounted later sees the connection as it is, up or retrying, and
   const refused = { state: "ended", reason: "error", code: "protocol_error", message: "bad frame", retry: false };
   await vi.waitFor(() => expect(worker.links(1).at(-1)).toEqual(refused));
   expect(worker.links(3).at(-1)).toEqual(refused);
-  // A terminal mounted now connects again, for every terminal.
   worker.mount(4);
   expect(worker.links(4)).toEqual([{ state: "connecting", attempt: 1 }]);
   expect(worker.links(1).at(-1)).toEqual({ state: "connecting", attempt: 1 });
@@ -438,7 +408,6 @@ test("after a restart the events cannot be replayed: the gap is posted and the s
   expect(worker.sessions()).toEqual([session("t", { status: "restored" })]);
   expect(next.bodies(FrameType.Request).at(0)?.body.params).toEqual({ after: 3, incarnation: "i" });
 
-  // The next reconnect replays from the new incarnation.
   next.close();
   const third = await socket(2);
   void third.serve([], { incarnation: "j", latest: 2 });
@@ -463,22 +432,18 @@ test("ack on focus: only when the page opted in, the terminal has the focus and 
   expect(acks()).toEqual([]);
   worker.to(1, { type: "focus", focused: true });
   await vi.waitFor(() => expect(acks()).toEqual([{ session: "s" }]));
-  // One at a time: a change while it is under way asks for no other.
   server.push(FrameType.Event, 0, { seq: 2, event: "session_changed", session: done });
   await new Promise((resolve) => setTimeout(resolve, 20));
   expect(acks()).toHaveLength(1);
   const first = await server.request("ack");
   server.push(FrameType.Reply, 0, { id: first.id, result: { record_ids: [""] } });
 
-  // A record that wants the user while the terminal has the focus is
-  // seen at once; a blocked one is not a record ack marks.
   const blocked = { ...session("s"), attention: { state: "blocked", record: "q" } };
   server.push(FrameType.Event, 0, { seq: 3, event: "session_changed", session: blocked });
   const error = { ...session("s"), attention: { state: "error", record: "e" } };
   server.push(FrameType.Event, 0, { seq: 4, event: "session_changed", session: error });
   await vi.waitFor(() => expect(acks()).toEqual([{ session: "s" }, { session: "s" }]));
 
-  // Blurred: no more.
   worker.to(1, { type: "focus", focused: false });
   const second = await server.request("ack", first.id);
   server.push(FrameType.Reply, 0, { id: second.id, result: { record_ids: ["e"] } });
@@ -551,7 +516,6 @@ test("the link: detached by another client, for good", async () => {
   await vi.waitFor(() =>
     expect(worker.links().at(-1)).toEqual({ state: "ended", reason: "detached", message: "taken over", retry: false }),
   );
-  // A reconnect does not attach the session again.
   server.close();
   const next = await socket(1);
   await next.serve([session("s")]);
@@ -572,7 +536,6 @@ test("only a page in use reports its size: OPEN and VIEWPORT carry none until it
   const size = { cols: 100, rows: 30 };
   worker.to(1, { type: "viewport", size, profile: { scheme: "dark" }, active: false });
   expect(server.bodies(FrameType.Viewport)).toEqual([]);
-  // Focused again with the same size: reported, to take the size back.
   worker.to(1, { type: "viewport", size, profile: { scheme: "dark" }, active: true });
   expect(server.bodies(FrameType.Viewport)).toEqual([{ channel, body: { ...size, profile: { scheme: "dark" } } }]);
 });
@@ -638,7 +601,6 @@ test("the link: an exited or refused session ends it, a server stopping is retri
       { state: "connecting", attempt: 1 },
     ]),
   );
-  // The reconnect attaches the same session again.
   const next = await socket(1);
   await next.serve([session("s", { status: "restored" })], { incarnation: "j", gap: true });
   bootstrap(next, await next.opened("s"), session("s", { status: "restored" }));
@@ -664,11 +626,9 @@ test("the link: an answered connection's error ends it, and nothing reconnects u
       retry: false,
     }),
   );
-  // Past the first backoff: no new connection, no new link.
   await new Promise((resolve) => setTimeout(resolve, 400));
   expect(FakeSocket.all).toHaveLength(1);
   expect(worker.links().at(-1)?.state).toBe("ended");
-  // Until the page attaches: that connects again.
   worker.to(1, { type: "attach", session: "s" });
   const next = await socket(1);
   await next.serve([session("s")]);
@@ -700,6 +660,19 @@ test("the link: a refused subscription closes the connection for good", async ()
   await new Promise((resolve) => setTimeout(resolve, 400));
   expect(FakeSocket.all).toHaveLength(1);
   expect(worker.links().at(-1)?.state).toBe("ended");
+});
+
+test("the link: a connection lost while subscribing is retried, not refused", async () => {
+  const worker = await start();
+  worker.mount(1);
+  const server = await socket(0);
+  await server.welcome();
+  await server.request("subscribe");
+  server.close();
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connecting", attempt: 1 }));
+  expect(worker.links()).not.toContainEqual(expect.objectContaining({ retry: false }));
+  await (await socket(1)).serve();
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: undefined }));
 });
 
 test("the link: a resume onto a session that exited meanwhile ends once, at its EXITED", async () => {
@@ -787,11 +760,9 @@ test("the wheel and Shift+PageUp scroll the history; input goes back to the live
   expect(worker.scrollbar()).toEqual({ total: 6, offset: 3, len: 3 });
   worker.to(1, { type: "key", input: key("Home", { shift: true }) });
   expect(worker.scrollbar()).toEqual({ total: 6, offset: 0, len: 3 });
-  // A modifier alone encodes to nothing and stays where it is.
   worker.to(1, { type: "key", input: key("ShiftLeft", { key: "Shift", shift: true }) });
   expect(worker.scrollbar()).toEqual({ total: 6, offset: 0, len: 3 });
 
-  // The page's own scrolling: by rows, and back to the live screen.
   worker.to(1, { type: "view", rows: 2 });
   expect(worker.scrollbar()).toEqual({ total: 6, offset: 2, len: 3 });
   worker.to(1, { type: "view", rows: "live" });
@@ -799,13 +770,10 @@ test("the wheel and Shift+PageUp scroll the history; input goes back to the live
   worker.to(1, { type: "view", rows: -3 });
   expect(worker.scrollbar()).toEqual({ total: 6, offset: 0, len: 3 });
 
-  // Output while scrolled back leaves the view where it is.
   server.pushRaw(encodeFrame(FrameType.Output, channel, output(0, "\r\nl7")));
   await vi.waitFor(() => expect(worker.scrollbar()).toEqual({ total: 7, offset: 0, len: 3 }));
   expect(inputs()).toEqual([]);
 
-  // Typing goes back to the live screen, and is sent; so does composed
-  // text, as UTF-8.
   worker.to(1, { type: "key", input: key("KeyA", { key: "a" }) });
   expect(worker.scrollbar()).toEqual({ total: 7, offset: 4, len: 3 });
   worker.to(1, { type: "wheel", rows: -1 });
@@ -830,7 +798,6 @@ test("on the alternate screen the wheel is arrow keys and Shift+PageUp is a key"
   await vi.waitFor(() => expect(inputs()).toEqual(["\x1b[A\x1b[A", "\x1b[B", "\x1b[5;2~"]));
   expect(worker.scrollbar()).toEqual({ total: 3, offset: 0, len: 3 });
 
-  // Without alternate scroll (mode 1007) the wheel does nothing.
   server.pushRaw(encodeFrame(FrameType.Output, channel, output(0, "\x1b[?1007l")));
   worker.to(1, { type: "wheel", rows: -2 });
   await new Promise((resolve) => setTimeout(resolve, 50));
@@ -845,8 +812,6 @@ test("a drag selects and copies on release; a click, input or a new screen clear
   const channel = await server.opened("s");
   bootstrap(server, channel, session("s"), "one two\r\nthree four five");
   await vi.waitFor(() => expect(worker.scrollbar()).toBeDefined());
-  // A release is always answered by its number, with undefined when
-  // nothing is selected.
   const selections = () => worker.selections().filter((m) => m.text !== undefined || m.copy === undefined);
   const answer = () => worker.selections().at(-1);
   const selectedRows = () =>
@@ -859,12 +824,10 @@ test("a drag selects and copies on release; a click, input or a new screen clear
   worker.to(1, { type: "select", action: "release", at: { x: 2.6, y: 1.5 }, time: 1100, copy: 1 });
   expect(selections()).toEqual([{ type: "selection", mount: 1, text: "two\nthr", copy: 1 }]);
 
-  // A key clears it, and the page forgets the text.
   worker.to(1, { type: "key", input: key("KeyA", { key: "a" }) });
   expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: undefined });
   expect(selectedRows()).toEqual([undefined, undefined, undefined]);
 
-  // A double click selects the word at once; a single click clears it.
   worker.to(1, { type: "select", action: "press", at: { x: 1, y: 1.5 }, time: 5000 });
   worker.to(1, { type: "select", action: "release", at: { x: 1, y: 1.5 }, time: 5050, copy: 2 });
   worker.to(1, { type: "select", action: "press", at: { x: 1, y: 1.5 }, time: 5100 });
@@ -876,7 +839,6 @@ test("a drag selects and copies on release; a click, input or a new screen clear
   expect(selections()).toHaveLength(4);
   expect(answer()).toEqual({ type: "selection", mount: 1, text: undefined, copy: 4 });
 
-  // Selected again, then a new screen: gone.
   worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 20000 });
   worker.to(1, { type: "select", action: "drag", at: { x: 5, y: 0.5 }, time: 0 });
   worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 20100, copy: 5 });
@@ -884,8 +846,6 @@ test("a drag selects and copies on release; a click, input or a new screen clear
   server.push(FrameType.Gap, channel, { from: 0, to: 10 });
   expect(selections().at(-1)).toEqual({ type: "selection", mount: 1, text: undefined });
 
-  // A press, then a new screen: the drag that follows is not anchored in
-  // the freed terminal, and selects nothing until a new press.
   worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 30000 });
   bootstrap(server, channel, session("s"), "new screen");
   await vi.waitFor(() => expect(worker.links().filter((l) => l.state === "connected")).toHaveLength(2));
@@ -897,8 +857,6 @@ test("a drag selects and copies on release; a click, input or a new screen clear
   worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 40100, copy: 7 });
   expect(answer()).toEqual({ type: "selection", mount: 1, text: "new s", copy: 7 });
 
-  // With no terminal (detached, or before its screen) a release is
-  // answered too.
   worker.to(1, { type: "detach" });
   worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0.5 }, time: 50000 });
   worker.to(1, { type: "select", action: "release", at: { x: 5, y: 0.5 }, time: 50100, copy: 8 });
@@ -916,12 +874,10 @@ test("a page still in use takes the size back at its next input after another cl
   const size = { cols: 10, rows: 3 };
   worker.to(1, { type: "viewport", size, profile: {}, active: true });
   expect(server.bodies(FrameType.Viewport)).toHaveLength(1);
-  // Its own size coming back changes nothing.
   server.push(FrameType.Resized, channel, { seq: 1, offset: 0, cols: 10, rows: 3 });
   worker.to(1, { type: "key", input: key("KeyA", { key: "a" }) });
   await vi.waitFor(() => expect(server.sent.filter((f) => f.header.type === FrameType.Input)).toHaveLength(1));
   expect(server.bodies(FrameType.Viewport)).toHaveLength(1);
-  // Another client's: the next input reports this page's size first, once.
   server.push(FrameType.Resized, channel, { seq: 2, offset: 0, cols: 20, rows: 5 });
   worker.to(1, { type: "wheel", rows: -1 });
   worker.to(1, { type: "key", input: key("KeyB", { key: "b" }) });
@@ -957,7 +913,6 @@ test("one frame per mount waits for paint while burst rows accumulate in the eng
     }
     expect(frames()).toHaveLength(1);
     expect(extracts).toHaveBeenCalledTimes(2);
-    // The second mount can paint even while the first is waiting.
     worker.to(2, { type: "painted" });
     worker.to(2, { type: "repaint" });
     expect(frames(2)).toHaveLength(2);
@@ -972,7 +927,6 @@ test("one frame per mount waits for paint while burst rows accumulate in the eng
     expect(screen).toEqual(final.lines);
     expect(frames().at(-1)!.cursor).toEqual(final.cursor);
     expected.free();
-    // Resizing during another in-flight frame replaces the whole grid.
     server.push(FrameType.Resized, channel, { seq: 1, offset, cols: 12, rows: 4 });
     term.resize(12, 4);
     expect(frames()).toHaveLength(2);
@@ -1024,7 +978,6 @@ test("hidden mounts skip extraction and return with a full frame even without fo
     expect(frames()).toHaveLength(1);
     expect(frames()[0]!.full).toBe(true);
     worker.to(1, { type: "visibility", visible: false });
-    // The page discards this frame while hidden, releasing its slot.
     worker.to(1, { type: "painted" });
     server.pushRaw(encodeFrame(FrameType.Output, channel, output(0, "\r\nnew")));
     worker.to(1, { type: "repaint" });

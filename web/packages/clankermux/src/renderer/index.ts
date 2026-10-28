@@ -1,4 +1,18 @@
-import { type Cell, FLAG, type Frame, type FrameRow, NO_COLOR, PACKED_STRIDE, type PackedCells, packedText } from "../engine/render.ts";
+import {
+  type Cell,
+  FLAG,
+  type Frame,
+  type FrameRow,
+  NO_COLOR,
+  PACKED_BG,
+  PACKED_FG,
+  PACKED_FLAGS_MASK,
+  PACKED_STRIDE,
+  PACKED_STYLE,
+  PACKED_UNDERLINE_SHIFT,
+  type PackedCells,
+  packedText,
+} from "../engine/render.ts";
 
 type Cells = Cell[] | PackedCells;
 
@@ -30,12 +44,9 @@ export interface Context2D {
 }
 
 const hex = (color: number) => `#${color.toString(16).padStart(6, "0")}`;
-/** A cell or cursor colour, or `fallback` when it has none. */
 const css = (color: number, fallback: string) => (color === NO_COLOR ? fallback : hex(color));
 
-/** Width in CSS pixels of the mark at the right edge that shows the view
- * scrolled back, and where it is in the history. */
-const MARK_WIDTH = 3;
+const SCROLLBACK_MARK_WIDTH_PX = 3;
 
 /**
  * Draws frames onto a 2D context: changed rows only, then the cursor, then
@@ -45,8 +56,7 @@ const MARK_WIDTH = 3;
 export class CanvasRenderer {
   private rows = new Map<number, FrameRow<Cells>>();
   private cursorRow: number | undefined;
-  /** The scrollback mark drawn last, in pixels from the top. */
-  private mark: { top: number; height: number } | undefined;
+  private lastScrollbackMark: { top: number; height: number } | undefined;
   private cols = 0;
   private background = "";
   private foreground = "";
@@ -58,13 +68,12 @@ export class CanvasRenderer {
   ) {}
 
   draw(frame: Frame<Cells>): void {
-    // The frame always carries the default colours.
     this.background = hex(frame.background);
     this.foreground = hex(frame.foreground);
     if (frame.full || frame.cols !== this.cols) {
       this.cols = frame.cols;
       this.rows.clear();
-      this.mark = undefined;
+      this.lastScrollbackMark = undefined;
       this.ctx.globalAlpha = 1;
       this.ctx.fillStyle = this.background;
       this.ctx.fillRect(0, 0, frame.cols * this.metrics.cellWidth, frame.rows * this.metrics.cellHeight);
@@ -75,27 +84,10 @@ export class CanvasRenderer {
       this.drawRow(row);
       drawn.add(row.y);
     }
-    // The last mark is erased with the rows under it, every frame: it is
-    // translucent, so one drawn over itself would darken.
     const mark = this.markOf(frame);
-    if (this.mark) {
-      const { cellHeight } = this.metrics;
-      const last = Math.ceil((this.mark.top + this.mark.height) / cellHeight);
-      for (let y = Math.floor(this.mark.top / cellHeight); y < last; y++) {
-        const row = this.rows.get(y);
-        if (row && !drawn.has(y)) {
-          this.drawRow(row);
-          drawn.add(y);
-        }
-      }
-    }
-    // The cursor's old row is redrawn from the cache when the cursor
-    // moved or went away; the engine marks no row dirty for either.
+    this.eraseLastMark(drawn);
     const cursor = frame.cursor?.visible ? frame.cursor : undefined;
-    if (this.cursorRow !== undefined && this.cursorRow !== cursor?.y && !drawn.has(this.cursorRow)) {
-      const row = this.rows.get(this.cursorRow);
-      if (row) this.drawRow(row);
-    }
+    this.redrawVacatedCursorRow(cursor, drawn);
     this.cursorRow = undefined;
     if (cursor) {
       if (!drawn.has(cursor.y)) {
@@ -105,18 +97,41 @@ export class CanvasRenderer {
       this.drawCursor(cursor);
       this.cursorRow = cursor.y;
     }
-    // Over everything, on rows just drawn.
-    this.mark = mark;
+    this.lastScrollbackMark = mark;
     if (mark) {
       this.ctx.globalAlpha = 0.5;
       this.ctx.fillStyle = this.foreground;
-      this.ctx.fillRect(this.cols * this.metrics.cellWidth - MARK_WIDTH, mark.top, MARK_WIDTH, mark.height);
+      this.ctx.fillRect(
+        this.cols * this.metrics.cellWidth - SCROLLBACK_MARK_WIDTH_PX,
+        mark.top,
+        SCROLLBACK_MARK_WIDTH_PX,
+        mark.height,
+      );
       this.ctx.globalAlpha = 1;
     }
   }
 
-  /** The scrollback mark for `frame`: the viewport's share of the history
-   * at the right edge, while the view is scrolled back. */
+  private eraseLastMark(drawn: Set<number>): void {
+    const last = this.lastScrollbackMark;
+    if (!last) return;
+    const { cellHeight } = this.metrics;
+    const end = Math.ceil((last.top + last.height) / cellHeight);
+    for (let y = Math.floor(last.top / cellHeight); y < end; y++) {
+      const row = this.rows.get(y);
+      if (row && !drawn.has(y)) {
+        this.drawRow(row);
+        drawn.add(y);
+      }
+    }
+  }
+
+  private redrawVacatedCursorRow(cursor: Frame["cursor"], drawn: Set<number>): void {
+    const vacated = this.cursorRow;
+    if (vacated === undefined || vacated === cursor?.y || drawn.has(vacated)) return;
+    const row = this.rows.get(vacated);
+    if (row) this.drawRow(row);
+  }
+
   private markOf(frame: Frame<Cells>): { top: number; height: number } | undefined {
     const { total, offset, len } = frame.scrollbar;
     if (offset + len >= total) return undefined;
@@ -140,18 +155,19 @@ export class CanvasRenderer {
       } else {
         const at = x * PACKED_STRIDE;
         text = packedText(cells, x);
-        foreground = cells.data[at + 1]!;
-        background = cells.data[at + 2]!;
-        flags = cells.data[at + 3]! & 0xffff;
-        underline = cells.data[at + 3]! >>> 16;
+        const style = cells.data[at + PACKED_STYLE]!;
+        foreground = cells.data[at + PACKED_FG]!;
+        background = cells.data[at + PACKED_BG]!;
+        flags = style & PACKED_FLAGS_MASK;
+        underline = style >>> PACKED_UNDERLINE_SHIFT;
       }
       if (flags & FLAG.SPACER) continue;
       const width = flags & FLAG.WIDE ? 2 : 1;
       let fg = css(foreground, this.foreground);
       let bg = css(background, this.background);
-      // A selected cell is drawn inverted, an inverse one the other way.
       const selected = row.selection !== undefined && x >= row.selection[0] && x <= row.selection[1];
-      if (((flags & FLAG.INVERSE) !== 0) !== selected) [fg, bg] = [bg, fg];
+      const inverted = ((flags & FLAG.INVERSE) !== 0) !== selected;
+      if (inverted) [fg, bg] = [bg, fg];
       if (bg !== this.background) {
         this.ctx.fillStyle = bg;
         this.ctx.fillRect(x * cellWidth, y, width * cellWidth, cellHeight);
@@ -204,7 +220,6 @@ export class CanvasRenderer {
         return;
       default: {
         this.ctx.fillRect(x, y, cellWidth, cellHeight);
-        // The cell's text in the background colour, over the block.
         const cells = this.rows.get(cursor.y)?.cells;
         let text = "", flags = 0;
         if (Array.isArray(cells)) {
@@ -212,7 +227,7 @@ export class CanvasRenderer {
           if (cell) ({ text, flags } = cell);
         } else if (cells && cursor.x < cells.data.length / PACKED_STRIDE) {
           text = packedText(cells, cursor.x);
-          flags = cells.data[cursor.x * PACKED_STRIDE + 3]! & 0xffff;
+          flags = cells.data[cursor.x * PACKED_STRIDE + PACKED_STYLE]! & PACKED_FLAGS_MASK;
         }
         if (text !== "" && text !== " ") {
           this.ctx.fillStyle = this.background;

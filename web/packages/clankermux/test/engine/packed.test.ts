@@ -8,7 +8,6 @@ beforeAll(async () => {
   engine = await Engine.load(readFileSync(new URL("../../ghostty-vt.wasm", import.meta.url)));
 });
 
-/** Decode the wire layout independently of the canvas's packed-cell reads. */
 function unpack(frame: PackedFrame): Frame {
   return {
     ...frame,
@@ -50,8 +49,6 @@ for (const [cols, rows] of [[80, 24], [160, 50], [240, 80]] as const) {
       const first = compare();
       expect(first.lines.reduce((n, row) => n + row.cells.data.byteLength, 0)).toBe(cols * rows * 16);
       expect(first.lines.every((row) => row.cells.graphemes.length === 0)).toBe(true);
-      // A grapheme exceeding the engine's initial UTF-8 scratch capacity,
-      // a wide cell and an emoji sequence all retain their complete text.
       write("\x1b[H\x1b[1;2;3;4;5;7;8;9;53m漢e" + "\u0301".repeat(40) + "👩‍💻\x1b[0m");
       expect(compare().lines.some((row) => row.cells.graphemes.length > 0)).toBe(true);
       for (const term of terms) {

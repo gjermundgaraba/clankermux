@@ -23,4 +23,5 @@ jobs:
         with:
           node-version: 24
       - uses: Swatinem/rust-cache@v2
+      - run: pnpm -C web install --frozen-lockfile && pnpm -C web/apps/client browsers
       - run: just check

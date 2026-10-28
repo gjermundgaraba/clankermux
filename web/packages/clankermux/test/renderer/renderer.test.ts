@@ -6,7 +6,6 @@ import { CanvasRenderer, type Context2D, type Metrics } from "../../src/renderer
 
 type Op = ["rect", string, number, number, number, number] | ["text", string, string, number, number];
 
-/** Records what is drawn. */
 class Recording implements Context2D {
   fillStyle = "";
   font = "";
@@ -65,29 +64,23 @@ test("a full frame clears, rows draw their cells, and the cursor moves between f
   expect(ctx.ops).toContainEqual(["text", "b", "a", 0, 15]);
   expect(ctx.ops).toContainEqual(["text", "r", "漢", 10, 15]);
   expect(ctx.ops).toContainEqual(["rect", "#0000ff", 0, 20, 10, 20]);
-  // The block cursor, then the cell's text over it in the background colour.
   expect(ctx.ops.slice(-2)).toEqual([
     ["rect", "#0f0", 0, 20, 10, 20],
     ["text", "r", "b", 0, 35],
   ]);
   expect(ctx.texts().filter((t) => t === " ")).toEqual([]);
 
-  // Only row 0 changed, but the cursor left row 1: that row is redrawn
-  // from the cache without the cursor, and the cursor drawn on row 0.
   ctx.ops = [];
   r.draw(frame([{ y: 0, cells: [cell("c"), blank(), blank()] }], { x: 2, y: 0, visible: true, blinking: false, style: "bar", color: 0x00ff00 }));
   expect(ctx.ops[0]).toEqual(["rect", "#000000", 0, 0, 30, 20]);
   expect(ctx.texts()).toEqual(["c", "b"]);
   expect(ctx.ops.at(-1)).toEqual(["rect", "#00ff00", 20, 0, 2, 20]);
 
-  // Hiding the cursor on its own row erases it: row 0 is redrawn from
-  // the cache without the cursor. Inverse swaps the colours.
   ctx.ops = [];
   r.draw(frame([{ y: 1, cells: [cell("x", { flags: FLAG.INVERSE }), blank(), blank()] }], { x: 2, y: 0, visible: false, blinking: false, style: "bar", color: 0x00ff00 }));
   expect(ctx.ops).toContainEqual(["rect", "#ffffff", 0, 20, 10, 20]);
   expect(ctx.texts()).toEqual(["x", "c"]);
   expect(ctx.ops.filter((op) => op[1] === "#0f0" || op[1] === "#00ff00")).toEqual([]);
-  // Nothing to erase the next time.
   ctx.ops = [];
   r.draw(frame([], { x: 2, y: 0, visible: false, blinking: false, style: "bar", color: 0x00ff00 }));
   expect(ctx.ops).toEqual([]);
@@ -100,34 +93,25 @@ test("a view scrolled back has a mark at the right edge, moved and erased with t
     { y: 0, cells: [cell("a"), blank(), blank()] },
     { y: 1, cells: [cell("b"), blank(), blank()] },
   ];
-  // 2 of 8 rows, at the top of the history: the mark is a quarter of the
-  // 40px grid, at least a row high.
   r.draw(frame(rows, undefined, true, { total: 8, offset: 0, len: 2 }));
   expect(ctx.ops.at(-1)).toEqual(["rect", "#ffffff", 27, 0, 3, 20]);
   expect(ctx.globalAlpha).toBe(1);
 
-  // Output while scrolled back moves no row, but the history grew and the
-  // view moved within it: row 0 under the old mark is redrawn first.
   ctx.ops = [];
   r.draw(frame([], undefined, false, { total: 16, offset: 8, len: 2 }));
   expect(ctx.texts()).toEqual(["a"]);
   expect(ctx.ops.at(-1)).toEqual(["rect", "#ffffff", 27, 20, 3, 20]);
 
-  // Unchanged: drawn again over a row drawn under it.
   ctx.ops = [];
   r.draw(frame([{ y: 1, cells: [cell("c"), blank(), blank()] }], undefined, false, { total: 16, offset: 8, len: 2 }));
   expect(ctx.texts()).toEqual(["c"]);
   expect(ctx.ops.at(-1)).toEqual(["rect", "#ffffff", 27, 20, 3, 20]);
 
-  // Unchanged with no row under it changed: the row is redrawn first, so
-  // the translucent mark is never drawn over itself.
   ctx.ops = [];
   r.draw(frame([], undefined, false, { total: 16, offset: 8, len: 2 }));
   expect(ctx.texts()).toEqual(["c"]);
   expect(ctx.ops.at(-1)).toEqual(["rect", "#ffffff", 27, 20, 3, 20]);
 
-  // Back at the live screen without a full frame: the rows under it are
-  // redrawn and no mark is drawn.
   ctx.ops = [];
   r.draw(frame([], undefined, false, { total: 16, offset: 14, len: 2 }));
   expect(ctx.texts()).toEqual(["c"]);
@@ -139,8 +123,6 @@ test("selected cells are drawn inverted, and stay so when the cursor leaves thei
   const r = new CanvasRenderer(ctx, metrics, palette);
   const selected = { y: 0, cells: [cell("a"), cell("b", { flags: FLAG.INVERSE }), blank()], selection: [0, 1] as [number, number] };
   r.draw(frame([selected, { y: 1, cells: [blank(), blank(), blank()] }], { x: 2, y: 0, visible: true, blinking: false, style: "bar", color: NO_COLOR }, true));
-  // "a" selected: foreground background, background text; "b" inverse
-  // and selected: as it was.
   expect(ctx.ops).toContainEqual(["rect", "#ffffff", 0, 0, 10, 20]);
   expect(ctx.ops).not.toContainEqual(["rect", "#ffffff", 10, 0, 10, 20]);
   ctx.ops = [];

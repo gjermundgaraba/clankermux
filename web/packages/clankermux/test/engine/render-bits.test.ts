@@ -37,8 +37,6 @@ for (const [cols, rows] of [[80, 24], [160, 50], [240, 80]] as const) {
     const render = new RenderState(engine);
     const oldRender = new RenderState(original);
     const row = (styled ? "\x1b[1;38;2;123;234;45m" : "") + "x".repeat(cols - 1) + "\r\n";
-    // The review's full-dirty grids, then a partial update with wide and
-    // combining characters and every boolean style bit.
     for (const text of [
       "\x1b[H" + row.repeat(rows - 1),
       "\x1b[H\x1b[1;2;3;4;5;7;8;9;53;48;2;10;20;30m漢e\u0301👩‍💻\x1b[0m",

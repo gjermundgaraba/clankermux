@@ -8,15 +8,14 @@ export { SelectionGesture } from "./selection.ts";
 export type { CellPoint } from "./selection.ts";
 
 type Field = { offset: number; size: number; type: string };
-/** Struct fields to set: numbers, or the fields of a nested struct. */
 type Packed = { [field: string]: number | Packed };
-/** A bit field of a packed type; a union arm nests its own bits. */
 type Bits = { lsb: number; width: number; arms?: Record<string, { bits: Record<string, Bits> }> };
-type TypeInfo =
-  | { kind: "struct"; size: number; fields: Record<string, Field> }
-  | { kind: "enum"; size: number; values: Record<string, number> }
-  | { kind: "packed"; size: number; bits: Record<string, Bits> }
-  | { kind: "pointer" | "array" | "union" | "opaque" | "primitive" | "alias"; size: number };
+type TypeInfo = { size: number; align: number } & (
+  | { kind: "struct"; fields: Record<string, Field> }
+  | { kind: "enum"; values: Record<string, number> }
+  | { kind: "packed"; bits: Record<string, Bits> }
+  | { kind: "pointer" | "array" | "union" | "opaque" | "primitive" | "alias" }
+);
 
 /** The viewport's place in the screen's rows, history included. */
 export interface Scrollbar {
@@ -28,7 +27,6 @@ export interface Scrollbar {
   len: number;
 }
 
-/** Position and width of a bit field, from the manifest. */
 export interface BitField {
   lsb: number;
   width: number;
@@ -43,12 +41,10 @@ export class EngineError extends Error {
   }
 }
 
-/** A loaded ghostty-vt.wasm instance. */
 export class Engine {
   private readonly types: Record<string, TypeInfo>;
   private memoryView: Uint8Array | undefined;
   private dataView: DataView | undefined;
-  /** The `GhosttyResult` members the wrapper branches on. */
   readonly result: { SUCCESS: number; OUT_OF_SPACE: number; NO_VALUE: number; INVALID_VALUE: number };
 
   private constructor(
@@ -89,14 +85,11 @@ export class Engine {
     return fn(...args) as number;
   }
 
-  /** Calls a function returning GhosttyResult and throws on failure. */
   check(name: string, ...args: number[]): void {
     const code = this.call(name, ...args);
     if (code !== this.result.SUCCESS) throw new EngineError(name, code);
   }
 
-  /** Calls a function returning GhosttyResult: true for a value, false
-   * for `NO_VALUE`; throws on failure. */
   present(name: string, ...args: number[]): boolean {
     const code = this.call(name, ...args);
     if (code === this.result.NO_VALUE) return false;
@@ -114,8 +107,6 @@ export class Engine {
     this.call("ghostty_wasm_free", ptr, len);
   }
 
-  /** Runs `f` with `bytes` copied into wasm memory, or with a null
-   * pointer for no bytes (which the allocator cannot serve). */
   withBytes<T>(bytes: Uint8Array, f: (ptr: number) => T): T {
     if (bytes.length === 0) return f(0);
     const ptr = this.alloc(bytes.length);
@@ -127,7 +118,6 @@ export class Engine {
     }
   }
 
-  /** Runs `f` with a scratch allocation of `len` bytes. */
   scratch<T>(len: number, f: (ptr: number) => T): T {
     const ptr = this.alloc(len);
     try {
@@ -137,7 +127,6 @@ export class Engine {
     }
   }
 
-  /** Runs `f` with an opaque-handle slot; the handle is taken out before the slot is freed. */
   private withSlot<T>(f: (slot: number) => T): T {
     const slot = this.call("ghostty_wasm_alloc_opaque");
     try {
@@ -147,7 +136,6 @@ export class Engine {
     }
   }
 
-  /** Creates an opaque handle through a `(allocator, out_slot, ...args)` constructor. */
   construct(name: string, ...args: number[]): number {
     return this.withSlot((slot) => {
       this.check(name, 0, slot, ...args);
@@ -155,7 +143,6 @@ export class Engine {
     });
   }
 
-  /** Takes an opaque handle from a `(...args, out_slot)` call. */
   take(name: string, ...args: number[]): number {
     return this.withSlot((slot) => {
       this.check(name, ...args, slot);
@@ -176,7 +163,6 @@ export class Engine {
     return info;
   }
 
-  /** Builds a zeroed, sized struct with the given fields set. */
   pack(name: string, values: Packed): Uint8Array {
     const info = this.struct(name);
     const out = new Uint8Array(info.size);
@@ -201,7 +187,6 @@ export class Engine {
     return out;
   }
 
-  /** Reads one numeric or boolean field of a struct at `ptr`. */
   field(name: string, ptr: number, key: string): number {
     const field = this.struct(name).fields[key];
     if (!field) throw new Error(`${name} has no field ${key}`);
@@ -219,8 +204,6 @@ export class Engine {
     }
   }
 
-  /** A bit field of a packed type: `path` names the field, or a union
-   * field, its arm and the arm's field. */
   bits(name: string, ...path: [field: string] | [field: string, arm: string, inner: string]): BitField {
     const info = this.types[name];
     if (!info || info.kind !== "packed") throw new Error(`unknown packed type ${name}`);
@@ -233,7 +216,6 @@ export class Engine {
     return { lsb: top.lsb + nested.lsb, width: nested.width };
   }
 
-  /** Reads a bit field of a 64-bit packed value at `ptr`. */
   readBits(ptr: number, field: BitField): number {
     const bit = field.lsb % 32;
     if (bit + field.width <= 32) {
@@ -245,8 +227,6 @@ export class Engine {
     return Number((value >> BigInt(field.lsb)) & ((1n << BigInt(field.width)) - 1n));
   }
 
-  /** Runs an encoder that reports `OUT_OF_SPACE` with the needed size,
-   * growing the output buffer until it fits. */
   growing(name: string, initial: number, encode: (buf: number, cap: number, len: number) => number): Uint8Array {
     let cap = initial;
     for (;;) {
@@ -264,8 +244,6 @@ export class Engine {
     }
   }
 
-  /** Runs an `*_alloc` call that returns bytes through `(ptr, len)` out
-   * parameters and frees them after copying. */
   allocated(call: (ptr: number, len: number) => void): Uint8Array {
     return this.scratch(8, (out) => {
       call(out, out + 4);
@@ -279,7 +257,6 @@ export class Engine {
     });
   }
 
-  /** The offset of a struct field, for nested reads. */
   offsetOf(name: string, key: string): number {
     const field = this.struct(name).fields[key];
     if (!field) throw new Error(`${name} has no field ${key}`);
@@ -300,19 +277,25 @@ export class Engine {
   }
 
   sizeOf(name: string): number {
-    const info = this.types[name];
-    if (!info) throw new Error(`unknown type ${name}`);
-    return info.size;
+    return this.type(name).size;
   }
 
-  /** Reads a GhosttyString at `ptr` using the manifest's layout. */
+  alignOf(name: string): number {
+    return this.type(name).align;
+  }
+
+  private type(name: string): TypeInfo {
+    const info = this.types[name];
+    if (!info) throw new Error(`unknown type ${name}`);
+    return info;
+  }
+
   readString(ptr: number): string {
     const data = this.field("GhosttyString", ptr, "ptr");
     const len = this.field("GhosttyString", ptr, "len");
     return new TextDecoder().decode(this.memory.subarray(data, data + len));
   }
 
-  /** A `GhosttyColorRgb` at `ptr` as 0xRRGGBB. */
   readRgb(ptr: number): number {
     const channel = (key: string) => this.field("GhosttyColorRgb", ptr, key);
     return ((channel("r") << 16) | (channel("g") << 8) | channel("b")) >>> 0;
@@ -322,7 +305,6 @@ export class Engine {
     return new Terminal(this, this.construct("ghostty_terminal_new", cols, rows));
   }
 
-  /** Decodes a complete snapshot held in memory. */
   decodeSnapshot(bytes: Uint8Array): Terminal {
     return this.withBytes(bytes, (src) => {
       const decoder = this.construct("ghostty_snapshot_decoder_new_buf", src, bytes.length);
@@ -334,10 +316,6 @@ export class Engine {
     });
   }
 
-  /**
-   * Paste text encoded for the PTY: unsafe bytes blanked, wrapped in
-   * bracketed paste when `bracketed`, newlines to carriage returns otherwise.
-   */
   encodePaste(text: string, bracketed: boolean): Uint8Array {
     const data = new TextEncoder().encode(text);
     if (data.length === 0) return data;
@@ -349,7 +327,6 @@ export class Engine {
   }
 }
 
-/** `ghostty_terminal_new` with the given `GhosttyTerminal` handle wrapped. */
 export class Terminal {
   constructor(
     readonly engine: Engine,
@@ -385,8 +362,6 @@ export class Terminal {
     return this.get("SCROLLBACK_ROWS", 4);
   }
 
-  /** Whether the alternate screen (full-screen programs) is active; it
-   * has no history to scroll. */
   get alternate(): boolean {
     return this.get("ACTIVE_SCREEN", 4) === this.engine.enumValue("GhosttyTerminalScreen", "ALTERNATE");
   }
@@ -400,9 +375,6 @@ export class Terminal {
     });
   }
 
-  /** Moves the viewport `rows` rows (up when negative) through the
-   * history, or to its top or the live screen at its bottom. Output does
-   * not move a viewport scrolled into the history. */
   scroll(to: number | "top" | "bottom"): void {
     const e = this.engine;
     const size = e.sizeOf("GhosttyTerminalScrollViewport");
@@ -425,8 +397,6 @@ export class Terminal {
     );
   }
 
-  /** An untracked `GhosttyGridRef` to the viewport cell at `at`, valid
-   * until the terminal changes. */
   gridRef(at: { x: number; y: number }): Uint8Array {
     const e = this.engine;
     const point = e.sizeOf("GhosttyPoint");
@@ -446,17 +416,12 @@ export class Terminal {
     });
   }
 
-  /** Installs `selection` (a `GhosttySelection`) as the terminal's, which
-   * the terminal then tracks through output, scrolling and resizes, or
-   * clears it. */
   select(selection: Uint8Array | undefined): void {
     const option = this.engine.enumValue("GhosttyTerminalOption", "SELECTION");
     if (!selection) this.engine.check("ghostty_terminal_set", this.handle, option, 0);
     else this.engine.withBytes(selection, (ptr) => this.engine.check("ghostty_terminal_set", this.handle, option, ptr));
   }
 
-  /** The selection's text: soft-wrapped lines joined, trailing blanks
-   * trimmed, as Ghostty copies it; undefined with no selection. */
   selectionText(): string | undefined {
     const e = this.engine;
     const options = e.pack("GhosttyTerminalSelectionFormatOptions", {
@@ -481,7 +446,6 @@ export class Terminal {
     );
   }
 
-  /** Whether the active screen has a selection. */
   get selected(): boolean {
     const e = this.engine;
     const size = e.sizeOf("GhosttySelection");
@@ -491,7 +455,6 @@ export class Terminal {
     });
   }
 
-  /** Whether DEC private mode `number` is set. */
   mode(number: number): boolean {
     const config = this.engine.pack("GhosttyTerminalModeConfig", { mode: number });
     return this.engine.withBytes(config, (ptr) => {
@@ -505,26 +468,22 @@ export class Terminal {
     });
   }
 
-  /** No cell size in pixels: `RESIZED` carries none. */
   resize(cols: number, rows: number): void {
     this.engine.check("ghostty_terminal_resize", this.handle, cols, rows, 0, 0);
   }
 
-  /** Sets a default colour (0xRRGGBB), as OSC 10, 11 and 12 report it. */
   setColor(kind: "foreground" | "background" | "cursor", color: number): void {
     const option = this.engine.enumValue("GhosttyTerminalOption", `COLOR_${kind.toUpperCase()}`);
     const rgb = this.engine.pack("GhosttyColorRgb", { r: (color >> 16) & 0xff, g: (color >> 8) & 0xff, b: color & 0xff });
     this.engine.withBytes(rgb, (ptr) => this.engine.check("ghostty_terminal_set", this.handle, option, ptr));
   }
 
-  /** The whole terminal, history included, as a snapshot. */
   snapshot(): Uint8Array {
     return this.engine.allocated((ptr, len) =>
       this.engine.check("ghostty_snapshot_encode_alloc", this.handle, 0, ptr, len),
     );
   }
 
-  /** The active screen as plain text, one line per row. */
   formatPlain(): string {
     const options = this.engine.pack("GhosttyFormatterTerminalOptions", {
       emit: this.engine.enumValue("GhosttyFormatterFormat", "PLAIN"),

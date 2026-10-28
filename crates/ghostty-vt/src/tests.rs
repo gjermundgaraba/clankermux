@@ -1,4 +1,6 @@
-use crate::formatter::{self, Format, Options, Region};
+use std::num::NonZeroU32;
+
+use crate::formatter::{self, Format, Options, Region, VtExtras};
 use crate::snapshot;
 use crate::*;
 
@@ -11,7 +13,7 @@ fn writes_and_formats() {
     let mut term = Terminal::new(10, 3).unwrap();
     term.vt_write(b"hello\r\nworld");
     assert_eq!(plain(&term).trim_end(), "hello\nworld");
-    assert_eq!(term.cursor(), (5, 1));
+    assert_eq!(term.cursor(), CursorPosition { col: 5, row: 1 });
     assert_eq!((term.cols(), term.rows()), (10, 3));
 }
 
@@ -29,8 +31,6 @@ fn formats_a_tail_of_rows() {
     for i in 1..=6 {
         term.vt_write(format!("line{i}\r\n").as_bytes());
     }
-    // Three rows of history, then the screen: line4, line5, line6 and a
-    // blank cursor row.
     assert_eq!(term.scrollback_rows().unwrap(), 4);
     let trimmed = |region| {
         String::from_utf8(
@@ -46,14 +46,14 @@ fn formats_a_tail_of_rows() {
         )
         .unwrap()
     };
-    let tail = |start_row| trimmed(Region::FromRow(start_row));
+    let tail = |start_row| trimmed(Region::FromRow(ScrollbackRow(start_row)));
     assert_eq!(tail(4), "line5\nline6");
     assert_eq!(tail(2), "line3\nline4\nline5\nline6");
     assert_eq!(tail(0), "line1\nline2\nline3\nline4\nline5\nline6");
 
-    let clip = |from_row, cols, rows| {
+    let clip = |screen_row, cols, rows| {
         trimmed(Region::Clip {
-            from_row,
+            screen_row,
             cols,
             rows,
         })
@@ -70,9 +70,11 @@ fn vt_format_carries_modes_not_history() {
     let vt = formatter::format(
         &term,
         Options {
-            format: Format::Vt,
-            modes: true,
-            cursor: true,
+            format: Format::Vt(VtExtras {
+                modes: true,
+                cursor: true,
+                ..VtExtras::default()
+            }),
             ..Default::default()
         },
     )
@@ -104,8 +106,6 @@ fn snapshot_round_trip() {
     );
 }
 
-/// Decodes `bytes` by steps, pushing `chunk` bytes at a time, and returns
-/// the restored terminal and the number of history pages.
 fn decode_in_chunks(bytes: &[u8], chunk: usize) -> (Terminal, usize) {
     let mut decoder = snapshot::Decoder::new().unwrap();
     let mut pos = 0;
@@ -123,9 +123,8 @@ fn decode_in_chunks(bytes: &[u8], chunk: usize) -> (Terminal, usize) {
             ready = true;
         }
         while decoder.step_available() {
-            if decoder.next_page().unwrap() {
+            if decoder.next_page().unwrap() == snapshot::Step::Page {
                 pages += 1;
-                // Live output between pages goes to the same terminal.
                 decoder.terminal().unwrap().vt_write(b"\x1b]2;between\x07");
             }
         }
@@ -162,22 +161,24 @@ fn decoder_refuses_a_replaced_terminal() {
     let mut decoder = snapshot::Decoder::new().unwrap();
     decoder.push(&bytes);
     let handed_out = decoder.ready().unwrap();
-    // The library still holds the terminal it returned; dropping it
-    // through the `&mut` must not let the next step use freed memory.
     drop(std::mem::replace(
         handed_out,
         Terminal::new(80, 24).unwrap(),
     ));
     assert_eq!(decoder.next_page(), Err(Error::InvalidValue));
-    assert!(decoder.into_terminal().is_none());
-    // What was moved out stays a terminal of its own after the decoder
-    // is gone.
+    assert_eq!(
+        decoder.into_terminal().err(),
+        Some(snapshot::NoTerminal::Replaced)
+    );
     let mut decoder = snapshot::Decoder::new().unwrap();
     decoder.push(&bytes);
     decoder.ready().unwrap();
     let mut stale = std::mem::replace(decoder.terminal().unwrap(), Terminal::new(5, 5).unwrap());
     let (cols, rows) = (stale.cols(), stale.rows());
-    assert!(decoder.into_terminal().is_none());
+    assert_eq!(
+        decoder.into_terminal().err(),
+        Some(snapshot::NoTerminal::Replaced)
+    );
     stale.vt_write(b"still mine");
     assert_eq!((stale.cols(), stale.rows()), (cols, rows));
     assert!(plain(&stale).contains("still mine"));
@@ -193,8 +194,6 @@ fn decoder_reports_finish_and_releases_an_unfinished_terminal() {
     decoder.ready().unwrap();
     assert!(!decoder.step_available());
     assert!(!decoder.finished());
-    // An unfinished terminal is released all the same, and usable (an
-    // attachment that ends mid-bootstrap keeps what it has).
     let mut partial = decoder.into_terminal().unwrap();
     assert_eq!((partial.cols(), partial.rows()), (20, 4));
     partial.vt_write(b"after");
@@ -202,10 +201,10 @@ fn decoder_reports_finish_and_releases_an_unfinished_terminal() {
     let mut decoder = snapshot::Decoder::new().unwrap();
     decoder.push(&bytes);
     decoder.ready().unwrap();
-    while decoder.step_available() && decoder.next_page().unwrap() {}
+    while decoder.step_available() && decoder.next_page().unwrap() == snapshot::Step::Page {}
     assert!(decoder.finished());
     assert!(!decoder.step_available());
-    assert!(decoder.into_terminal().is_some());
+    assert!(decoder.into_terminal().is_ok());
 }
 
 #[derive(Default)]
@@ -217,7 +216,7 @@ struct Recorder {
     exits: Vec<Option<i32>>,
     bells: usize,
     notifications: Vec<(String, String)>,
-    progress: Vec<(ProgressState, i8)>,
+    progress: Vec<(ProgressState, Option<u8>)>,
 }
 
 impl Handler for Recorder {
@@ -237,8 +236,8 @@ impl Handler for Recorder {
         Some(SizeReport {
             cols: 80,
             rows: 24,
-            cell_width: 9,
-            cell_height: 18,
+            cell_width: NonZeroU32::new(9),
+            cell_height: NonZeroU32::new(18),
         })
     }
     fn title_changed(&mut self) {
@@ -253,7 +252,7 @@ impl Handler for Recorder {
     fn desktop_notification(&mut self, title: String, body: String) {
         self.notifications.push((title, body));
     }
-    fn progress_report(&mut self, state: ProgressState, progress: i8) {
+    fn progress_report(&mut self, state: ProgressState, progress: Option<u8>) {
         self.progress.push((state, progress));
     }
 }
@@ -293,13 +292,12 @@ fn effects_reach_the_handler() {
     assert_eq!(statuses[0].title, "Build");
 
     term.vt_write(b"\x1b]133;A\x07\x1b]133;C\x07\x1b]133;P;k=s\x07");
-    let mark = |kind, prompt| SemanticPrompt { kind, prompt };
     assert_eq!(
         term.handler().prompts,
         [
-            mark(SemanticPromptKind::PromptStart, PromptKind::Primary),
-            mark(SemanticPromptKind::OutputStart, PromptKind::Primary),
-            mark(SemanticPromptKind::PromptStart, PromptKind::Secondary),
+            SemanticPrompt::PromptStart(PromptKind::Primary),
+            SemanticPrompt::OutputStart,
+            SemanticPrompt::PromptStart(PromptKind::Secondary),
         ]
     );
 
@@ -323,9 +321,9 @@ fn effects_reach_the_handler() {
     assert_eq!(
         term.handler().progress,
         [
-            (ProgressState::Set, 40),
-            (ProgressState::Indeterminate, -1),
-            (ProgressState::Remove, -1)
+            (ProgressState::Set, Some(40)),
+            (ProgressState::Indeterminate, None),
+            (ProgressState::Remove, None)
         ]
     );
 }
@@ -336,7 +334,6 @@ fn modes_and_colors() {
     assert!(!term.mode(2031).unwrap());
     term.vt_write(b"\x1b[?2031h");
     assert!(term.mode(2031).unwrap());
-    // Colours are observed as a program would, through OSC 11's answer.
     term.vt_write(b"\x1b]11;?\x07");
     assert_eq!(term.handler().pty, b"", "no background set, no answer");
     term.set_color(ColorKind::Background, Some(Rgb { r: 1, g: 2, b: 3 }))
@@ -352,8 +349,10 @@ fn modes_and_colors() {
     let vt = formatter::format(
         &term,
         Options {
-            format: Format::Vt,
-            style: true,
+            format: Format::Vt(VtExtras {
+                style: true,
+                ..VtExtras::default()
+            }),
             ..Options::default()
         },
     )
@@ -409,11 +408,9 @@ mod keys {
     fn keys_follow_the_kitty_keyboard_flags() {
         let mut term = Terminal::new(80, 24).unwrap();
         assert_eq!(press(&term, "ctrl+c"), b"\x03");
-        // Disambiguate escape codes.
         term.vt_write(b"\x1b[>1u");
         assert_eq!(press(&term, "ctrl+c"), b"\x1b[99;5u");
         assert_eq!(press(&term, "esc"), b"\x1b[27u");
-        // Text that shift made goes as text.
         assert_eq!(press(&term, "A"), b"A");
         assert_eq!(press(&term, "?"), b"?");
         assert_eq!(press(&term, "shift+1"), b"!");
@@ -457,7 +454,6 @@ mod keys {
             "enterr",
             "ab",
             "\n",
-            // Only the protocol's names: no aliases.
             "return",
             "escape",
             "control+a",
@@ -479,7 +475,6 @@ mod keys {
             b"\x1b[200~a\nb\x1b[201~"
         );
         let injected = encode_paste(b"x\x1b[201~y", true).unwrap();
-        // The injected ESC becomes a space.
         assert_eq!(injected, b"\x1b[200~x [201~y\x1b[201~");
     }
 }
@@ -503,20 +498,20 @@ fn html_rows_and_the_alternate_screen() {
         "<div style=\"font-family: monospace; white-space: pre;\">a<div style=\"display: \
          inline;color: var(--vt-palette-1);\">red</div> &lt;b&gt;&amp;\nabcdefghijklm</div>"
     );
-    // The first row scrolled off; the second wrapped once.
     assert_eq!(term.scrollback_rows().unwrap(), 1);
-    let continues: Vec<bool> = (0..4).map(|y| term.row_continues(y).unwrap()).collect();
+    let continues: Vec<bool> = (0..4)
+        .map(|y| term.row_continues(ScrollbackRow(y)).unwrap())
+        .collect();
     assert_eq!(continues, [false, false, true, false]);
-    assert_eq!(term.history_start(0).unwrap(), 1);
-    assert_eq!(term.history_start(1).unwrap(), 0);
-    assert_eq!(term.history_start(5).unwrap(), 0);
-    // A line across the top of the screen counts as the screen's.
+    assert_eq!(term.history_start(0).unwrap(), ScrollbackRow(1));
+    assert_eq!(term.history_start(1).unwrap(), ScrollbackRow(0));
+    assert_eq!(term.history_start(5).unwrap(), ScrollbackRow(0));
     let mut term = Terminal::new(10, 3).unwrap();
     term.vt_write(b"first\r\naaaaaaaaaabbbbbbbbbbcc\r\nx");
     assert_eq!(term.scrollback_rows().unwrap(), 2);
-    assert!(term.row_continues(2).unwrap());
-    assert_eq!(term.history_start(0).unwrap(), 1);
-    assert_eq!(term.history_start(1).unwrap(), 0);
+    assert!(term.row_continues(ScrollbackRow(2)).unwrap());
+    assert_eq!(term.history_start(0).unwrap(), ScrollbackRow(1));
+    assert_eq!(term.history_start(1).unwrap(), ScrollbackRow(0));
 
     assert!(!term.alternate_screen());
     term.vt_write(b"\x1b[?1049hALT");

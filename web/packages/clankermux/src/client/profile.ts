@@ -1,7 +1,5 @@
 import type { Profile, Scheme } from "../proto/index.ts";
 
-/** `#rrggbb` from a CSS colour as a custom property holds it (hex, or
- * `rgb()` when the stylesheet writes it that way); undefined otherwise. */
 export function hexColor(value: string): string | undefined {
   const text = value.trim();
   const hex = /^#([0-9a-f]{6})$/i.exec(text);
@@ -14,9 +12,6 @@ export function hexColor(value: string): string | undefined {
   return `#${channel(rgb[1]!)}${channel(rgb[2]!)}${channel(rgb[3]!)}`;
 }
 
-/** The scheme of an element whose computed `color-scheme` is
- * `colorScheme`: the one it names when it names one of `light` and
- * `dark`, else (`normal`, or both) the page's preference. */
 export function schemeOf(colorScheme: string, prefersLight: boolean): Scheme {
   const names = colorScheme.split(/\s+/);
   const light = names.includes("light");
@@ -25,7 +20,6 @@ export function schemeOf(colorScheme: string, prefersLight: boolean): Scheme {
   return prefersLight ? "light" : "dark";
 }
 
-/** The profile a page with these colours and scheme reports. */
 export function profileFrom(colors: { fg: string; bg: string; cursor: string }, scheme: Scheme): Profile {
   const profile: Profile = { scheme };
   const fg = hexColor(colors.fg);

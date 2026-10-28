@@ -1,16 +1,6 @@
-//! Errors conformance: the placement rule that an attachment-channel
-//! error ends the attachment and frees the channel. The codes
-//! themselves, request errors carrying their id, and id-less connection
-//! errors before a close are raised across the other suites.
-//! `signal_failed` needs a running session whose process group is empty
-//! and whose PTY nobody holds, which cannot exist (an unheld PTY ends the
-//! stream), so it is not exercised.
-
-mod common;
-
-use common::*;
 use proto::*;
 use serde_json::json;
+use testkit::*;
 use tokio::io::AsyncWriteExt;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -30,7 +20,6 @@ async fn an_open_error_frees_the_channel() {
     ] {
         c.open(7, open).await;
         assert_eq!(c.expect_error(7).await, code);
-        // The channel is free again right after the error.
         c.open(7, json!({"session": session.id})).await;
         c.bootstrap(7).await;
         c.send(FrameType::Close, 7, &[]).await;
@@ -41,9 +30,6 @@ async fn an_open_error_frees_the_channel() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn nothing_follows_an_id_less_error() {
-    // An OPEN starts an attach task that queues ATTACHED and the
-    // snapshot concurrently with the connection's own frames. A closing
-    // error right behind it must still be the last frame written.
     let server = start(fast_limits());
     let session = {
         let mut c = client(&server).await;
@@ -57,7 +43,6 @@ async fn nothing_follows_an_id_less_error() {
             1,
             &serde_json::to_vec(&json!({"session": session.id})).unwrap(),
         );
-        // An INPUT on channel 0 is misplaced.
         bytes.extend(encode_frame(FrameType::Input, 0, b"x"));
         c.stream.write_all(&bytes).await.unwrap();
         c.stream.flush().await.unwrap();

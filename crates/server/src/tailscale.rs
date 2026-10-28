@@ -1,9 +1,3 @@
-//! The Tailscale local API: the node's tailnet address and its certificate.
-//!
-//! Two requests do not justify an HTTP client: this is a minimal HTTP/1.1
-//! GET with `Connection: close`, reading the response to its end and
-//! parsing it with `httparse`.
-
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -13,12 +7,9 @@ use base64::Engine as _;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Where tailscaled listens for the local API.
 #[derive(Debug, Clone)]
 enum Endpoint {
-    /// tailscaled's Unix socket.
     Unix(PathBuf),
-    /// The macOS app: loopback TCP with a token shared through a file.
     Tcp { port: u16, token: String },
 }
 
@@ -30,12 +21,10 @@ pub struct LocalApi {
 #[derive(Debug)]
 struct Response {
     status: u16,
-    /// `Retry-After` in seconds, when present.
     retry_after: Option<Duration>,
     body: Vec<u8>,
 }
 
-/// The parts of `/localapi/v0/status` the server uses.
 #[derive(Debug, Deserialize)]
 pub struct Status {
     #[serde(rename = "Self")]
@@ -50,12 +39,10 @@ pub struct Node {
     pub tailscale_ips: Vec<IpAddr>,
 }
 
-/// A certificate request's outcome.
 #[derive(Debug)]
 pub enum Cert {
     /// The private key PEM followed by the certificate PEM.
     Pem(Vec<u8>),
-    /// A 429: ask again after this long.
     RetryAfter(Duration),
 }
 
@@ -63,7 +50,6 @@ const SOCKET: &str = "/var/run/tailscaled.socket";
 const MACSYS: &str = "/Library/Tailscale";
 /// The App Store app's group container, `<team id>.io.tailscale.ipn.macos`.
 const MACOS_CONTAINER: &str = "io.tailscale.ipn.macos";
-/// The status request is answered from memory.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 /// A certificate request may wait on an ACME issuance.
 const CERT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -210,7 +196,6 @@ impl LocalApi {
     }
 }
 
-/// One GET over `stream`, response read to the end of the stream.
 async fn get<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     path: &str,
@@ -235,8 +220,6 @@ fn invalid(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("local API: {what}"))
 }
 
-/// Parses a complete response: the status, `Retry-After`, and the body,
-/// de-chunked when the transfer encoding ends with `chunked`.
 fn parse(raw: &[u8]) -> io::Result<Response> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut response = httparse::Response::new(&mut headers);
@@ -290,8 +273,6 @@ fn parse(raw: &[u8]) -> io::Result<Response> {
 mod tests {
     use super::*;
 
-    /// A one-shot HTTP server: answers the first request with `reply` and
-    /// returns what it received.
     async fn serve_once(reply: &'static str) -> (u16, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

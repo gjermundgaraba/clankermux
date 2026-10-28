@@ -66,6 +66,8 @@ test("bootstraps, holds after a resize, and resumes", () => {
   expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo\nxy");
   expect(a.term()!.cols).toBe(20);
   expect(a.resume()).toEqual({ incarnation: "inc", offset: 102, marker: 3 });
+  const resumed: Attached = { mode: "resume", offset: 102, marker: 3, cols: 20, rows: 5, session: session("s") };
+  expect(a.handle(json(FrameType.Attached, resumed))).toEqual([{ type: "resumed" }]);
   expect(() => a.handle(outputFrame(5, "z"))).toThrow(expect.objectContaining({ kind: "desync", message: expect.stringMatching(/OUTPUT at 5/) }));
   expect(() => a.handle(json(FrameType.Resized, { seq: 9, offset: 102, cols: 1, rows: 1 }))).toThrow(
     expect.objectContaining({ kind: "desync" }),
@@ -76,7 +78,6 @@ test("bootstraps, holds after a resize, and resumes", () => {
   expect(a.ended()).toBe(true);
   expect(a.closed()).toBe(false);
   expect(a.resume()).toBeUndefined();
-  // The terminal stays for display but takes no more of the stream.
   expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo\nxy");
   expect(() => a.handle(outputFrame(102, "late"))).toThrow(/outside the stream/);
   expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo\nxy");

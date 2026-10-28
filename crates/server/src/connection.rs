@@ -1,8 +1,6 @@
-//! One client connection: framing, handshake, dispatch and the channel
-//! table.
-
 use std::collections::HashMap;
 use std::io;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -14,41 +12,49 @@ use proto::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc, oneshot};
 
-use crate::attach::{self, Handle};
+use crate::attach::{self, ChannelState, Handle};
 use crate::control;
 use crate::registry::{Fail, Registry};
 use crate::session::{self, Shared};
 
-/// Queued bytes above which attachments stop pulling from their streams
-/// until the socket drains, so a slow client falls behind in the ring
-/// instead of growing server memory.
 pub const HIGH_WATER: usize = 256 * 1024;
 
-/// How long a closing connection may take to flush its queue.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The connection's outgoing frame queue, shared by control, events and
-/// attachments.
+enum Outgoing {
+    Frame(Vec<u8>),
+    Last(Vec<u8>),
+}
+
+enum Writable {
+    Ok { id: u64, session: Shared },
+    Missing,
+    ReadOnly,
+}
+
+impl Outgoing {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Outgoing::Frame(bytes) | Outgoing::Last(bytes) => bytes,
+        }
+    }
+
+    fn is_last(&self) -> bool {
+        matches!(self, Outgoing::Last(_))
+    }
+}
+
 #[derive(Clone)]
 pub struct Writer {
-    /// Frames in order; the flag marks the last one, after which the
-    /// writer stops whatever else was queued.
-    tx: mpsc::UnboundedSender<(Vec<u8>, bool)>,
+    tx: mpsc::UnboundedSender<Outgoing>,
     queued: Arc<AtomicUsize>,
     drained: Arc<Notify>,
-    /// Queued bytes above which the connection is closed: a client that
-    /// stops reading altogether would otherwise grow its queue of events
-    /// and replies without bound. Attachments may legitimately overshoot
-    /// the high-water mark by a few frames.
     ceiling: usize,
     overflow: Arc<Notify>,
-    /// Set once the last frame is queued (an id-less `ERROR`, or the
-    /// ceiling was passed): nothing is accepted after it.
     closing: Arc<AtomicBool>,
 }
 
 impl Writer {
-    /// Queues a frame. False once the connection is gone or closing.
     pub fn send(&self, frame: Vec<u8>) -> bool {
         if self.closing.load(Ordering::Acquire) {
             return false;
@@ -58,16 +64,14 @@ impl Writer {
             self.closing.store(true, Ordering::Release);
             self.overflow.notify_one();
         }
-        self.tx.send((frame, false)).is_ok()
+        self.tx.send(Outgoing::Frame(frame)).is_ok()
     }
 
-    /// Queues the frame that precedes closing the connection. A frame
-    /// another task queues meanwhile lands behind it and is not written.
     pub fn send_last(&self, frame: Vec<u8>) {
         if self.closing.swap(true, Ordering::AcqRel) {
             return;
         }
-        let _ = self.tx.send((frame, true));
+        let _ = self.tx.send(Outgoing::Last(frame));
     }
 
     pub fn is_closed(&self) -> bool {
@@ -87,7 +91,6 @@ impl Writer {
         self.queued.load(Ordering::Acquire) > HIGH_WATER
     }
 
-    /// Resolves once the queue is at or below the high-water mark.
     pub async fn drained(&self) {
         loop {
             let notified = self.drained.notified();
@@ -101,15 +104,13 @@ impl Writer {
     }
 }
 
-/// Serves one connection from `accepted` on: `HELLO` is due within
-/// `hello_timeout` of that instant.
 pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
     stream: S,
     registry: Arc<Registry>,
     accepted: tokio::time::Instant,
 ) {
     let (mut reader, socket) = tokio::io::split(stream);
-    let (tx, rx) = mpsc::unbounded_channel::<(Vec<u8>, bool)>();
+    let (tx, rx) = mpsc::unbounded_channel::<Outgoing>();
     let writer = Writer {
         tx,
         queued: Arc::new(AtomicUsize::new(0)),
@@ -120,9 +121,6 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
     };
     let overflow = writer.overflow.clone();
     let shutdown = registry.shutdown.clone();
-    // Subscribers hold clones of the sender, so the writer ends on this
-    // signal rather than on the channel closing: it flushes what is
-    // queued, then closes.
     let (close_tx, close_rx) = oneshot::channel::<()>();
     let mut write_task = tokio::spawn(write_queued(
         socket,
@@ -157,19 +155,14 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
         };
         let n = tokio::select! {
             n = read => n,
-            // A client that is not reading is not flushed to: the writer
-            // may be stuck in a write.
             () = overflow.notified() => {
                 tracing::warn!("client stopped reading; closing");
                 flush = false;
                 break;
             }
-            // The stop has ended every attachment; their `CLOSED` is
-            // queued.
             () = shutdown.cancelled() => break,
         };
         match n {
-            // A carrier found the bytes malformed (`ws::WsStream`).
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 state.fatal(ErrorCode::ProtocolError, e.to_string());
                 break;
@@ -177,12 +170,10 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
             Ok(0) | Err(_) => break,
             Ok(n) => state.decoder.push(&buf[..n]),
         }
-        if !state.drain().await {
+        if state.drain().await.is_break() {
             break;
         }
     }
-    // Dropping the channel table ends every attachment silently, and
-    // dropping what stops each pending wait ends it.
     state.pending.lock().unwrap().clear();
     drop(state);
     if flush {
@@ -197,25 +188,23 @@ pub async fn serve_connection<S: AsyncRead + AsyncWrite + Send + 'static>(
     write_task.abort();
 }
 
-/// Writes the queued frames to `socket` until the last one, a failed
-/// write, or `close`; on `close`, what is queued then is flushed first.
 async fn write_queued<W: AsyncWrite + Unpin>(
     mut socket: W,
-    mut rx: mpsc::UnboundedReceiver<(Vec<u8>, bool)>,
+    mut rx: mpsc::UnboundedReceiver<Outgoing>,
     queued: Arc<AtomicUsize>,
     drained: Arc<Notify>,
     mut close: oneshot::Receiver<()>,
 ) {
     loop {
-        let (bytes, last) = tokio::select! {
+        let outgoing = tokio::select! {
             next = rx.recv() => match next {
                 Some(next) => next,
                 None => break,
             },
             _ = &mut close => {
                 rx.close();
-                while let Ok((bytes, last)) = rx.try_recv() {
-                    if socket.write_all(&bytes).await.is_err() || last {
+                while let Ok(outgoing) = rx.try_recv() {
+                    if socket.write_all(outgoing.bytes()).await.is_err() || outgoing.is_last() {
                         break;
                     }
                 }
@@ -223,7 +212,11 @@ async fn write_queued<W: AsyncWrite + Unpin>(
                 break;
             }
         };
-        if socket.write_all(&bytes).await.is_err() || socket.flush().await.is_err() || last {
+        let bytes = outgoing.bytes();
+        if socket.write_all(bytes).await.is_err()
+            || socket.flush().await.is_err()
+            || outgoing.is_last()
+        {
             break;
         }
         if queued.fetch_sub(bytes.len(), Ordering::AcqRel) - bytes.len() <= HIGH_WATER {
@@ -233,7 +226,6 @@ async fn write_queued<W: AsyncWrite + Unpin>(
     let _ = socket.shutdown().await;
 }
 
-/// An id-less `ERROR` on `channel`.
 pub fn error_frame(channel: u32, code: ErrorCode, message: String) -> Vec<u8> {
     encode_json_frame(
         FrameType::Error,
@@ -246,7 +238,6 @@ pub fn error_frame(channel: u32, code: ErrorCode, message: String) -> Vec<u8> {
     )
 }
 
-/// Sends the reply or error that answers request `id`.
 pub fn reply(writer: &Writer, id: i64, outcome: Result<serde_json::Value, Fail>) {
     match outcome {
         Ok(result) => writer.send_json(FrameType::Reply, 0, &proto::Reply { id, result }),
@@ -277,22 +268,19 @@ impl Connection {
         self.writer.send(error_frame(channel, code, message.into()));
     }
 
-    /// Sends the `ERROR` that precedes closing the connection; nothing is
-    /// queued after it.
     fn fatal(&self, code: ErrorCode, message: impl Into<String>) {
         self.writer.send_last(error_frame(0, code, message.into()));
     }
 
-    /// Handles every buffered frame; false closes the connection.
-    async fn drain(&mut self) -> bool {
+    async fn drain(&mut self) -> ControlFlow<()> {
         let limits = self.registry.config.limits;
         loop {
             let (header, payload) = match self.decoder.next_frame(limits.max_frame) {
                 Ok(Some(frame)) => frame,
-                Ok(None) => return true,
+                Ok(None) => return ControlFlow::Continue(()),
                 Err(err) => {
                     self.fatal(ErrorCode::ProtocolError, err.to_string());
-                    return false;
+                    return ControlFlow::Break(());
                 }
             };
             let Header {
@@ -300,13 +288,8 @@ impl Connection {
                 channel,
                 ..
             } = header;
-            let misplaced = if channel == 0 {
-                !frame_type.is_control()
-            } else {
-                frame_type.is_control()
-            };
             if frame_type.is_server()
-                || misplaced
+                || !frame_type.allowed_on(channel)
                 || (frame_type.is_json() && payload.len() > proto::cap(limits.control_body))
             {
                 self.fatal(
@@ -316,28 +299,22 @@ impl Connection {
                         payload.len()
                     ),
                 );
-                return false;
+                return ControlFlow::Break(());
             }
             if frame_type == FrameType::Hello {
                 if self.hello.is_some() {
                     self.fatal(ErrorCode::ProtocolError, "second HELLO");
-                    return false;
+                    return ControlFlow::Break(());
                 }
-                if !self.hello(&payload) {
-                    return false;
-                }
+                self.hello(&payload)?;
                 continue;
             }
             if self.hello.is_none() {
                 self.fatal(ErrorCode::ProtocolError, "frame before HELLO");
-                return false;
+                return ControlFlow::Break(());
             }
             match frame_type {
-                FrameType::Request => {
-                    if !self.request(&payload) {
-                        return false;
-                    }
-                }
+                FrameType::Request => self.request(&payload)?,
                 FrameType::Open => self.open(channel, &payload).await,
                 FrameType::Input => self.input(channel, &payload),
                 FrameType::Viewport => self.viewport(channel, &payload),
@@ -351,15 +328,12 @@ impl Connection {
         }
     }
 
-    /// Handles HELLO; false closes the connection.
-    fn hello(&mut self, payload: &[u8]) -> bool {
-        // The version is read before the typed parse so that another
-        // version's shape still gets `version_mismatch`.
+    fn hello(&mut self, payload: &[u8]) -> ControlFlow<()> {
         let raw = match serde_json::from_slice::<serde_json::Value>(payload) {
             Ok(raw) if raw.is_object() => raw,
             _ => {
                 self.fatal(ErrorCode::ProtocolError, "malformed HELLO");
-                return false;
+                return ControlFlow::Break(());
             }
         };
         if raw.get("version").and_then(serde_json::Value::as_u64) != Some(u64::from(proto::VERSION))
@@ -368,13 +342,13 @@ impl Connection {
                 ErrorCode::VersionMismatch,
                 format!("version {} is not {}", raw["version"], proto::VERSION),
             );
-            return false;
+            return ControlFlow::Break(());
         }
         let hello = match serde_json::from_value::<Hello>(raw) {
             Ok(hello) => hello,
             Err(err) => {
                 self.fatal(ErrorCode::InvalidRequest, format!("bad HELLO: {err}"));
-                return false;
+                return ControlFlow::Break(());
             }
         };
         self.hello = Some(hello);
@@ -393,26 +367,23 @@ impl Connection {
                 limits: self.registry.config.limits,
             },
         );
-        true
+        ControlFlow::Continue(())
     }
 
-    /// Handles one request; false closes the connection.
-    fn request(&mut self, payload: &[u8]) -> bool {
+    fn request(&mut self, payload: &[u8]) -> ControlFlow<()> {
         let request: proto::Request = match serde_json::from_slice(payload) {
             Ok(request) => request,
             Err(err) => {
-                // Without an integer id there is no request to answer, and
-                // an error without id precedes closing the connection.
                 let message = format!("malformed request: {err}");
                 if let Some(id) = serde_json::from_slice::<serde_json::Value>(payload)
                     .ok()
                     .and_then(|v| v.get("id")?.as_i64())
                 {
                     reply(&self.writer, id, Err((ErrorCode::InvalidRequest, message)));
-                    return true;
+                    return ControlFlow::Continue(());
                 }
                 self.fatal(ErrorCode::InvalidRequest, message);
-                return false;
+                return ControlFlow::Break(());
             }
         };
         control::dispatch(
@@ -422,42 +393,43 @@ impl Connection {
             &mut self.subscribed,
             request,
         );
-        true
+        ControlFlow::Continue(())
     }
 
-    /// The attachment on `channel`, if the channel is in use.
     fn handle(&self, channel: u32) -> Option<&Handle> {
-        self.channels.get(&channel).filter(|h| h.is_open())
+        self.channels
+            .get(&channel)
+            .filter(|h| h.state() == ChannelState::Open)
     }
 
-    /// Ends the attachment on `channel`, if any, with `ERROR code` after
-    /// its pending frames.
     fn end(&mut self, channel: u32, code: ErrorCode, message: String) {
         let taken = self
             .handle(channel)
-            .is_some_and(|h| h.end(code, message.clone()));
+            .is_some_and(|h| h.end(code, message.clone()).is_ok());
         if !taken {
             self.error(channel, code, message);
         }
     }
 
     async fn open(&mut self, channel: u32, payload: &[u8]) {
-        // The channel stays in use until the task has queued CLOSED, so a
-        // pipelined CLOSE + OPEN is refused and, per the Errors rule, the
-        // attachment that was there ends. A task that is ending is waited
-        // for, so its last frame precedes the new attachment's first.
         if let Some(previous) = self.channels.remove(&channel) {
-            if previous.is_open() && !previous.finished() {
-                if previous.end(ErrorCode::ChannelInUse, "channel in use".into()) {
-                    self.channels.insert(channel, previous);
-                } else {
-                    self.error(channel, ErrorCode::ChannelInUse, "channel in use");
+            match previous.state() {
+                ChannelState::Open => {
+                    if previous
+                        .end(ErrorCode::ChannelInUse, "channel in use".into())
+                        .is_ok()
+                    {
+                        self.channels.insert(channel, previous);
+                    } else {
+                        self.error(channel, ErrorCode::ChannelInUse, "channel in use");
+                    }
+                    return;
                 }
-                return;
+                ChannelState::Ending | ChannelState::Finished => previous.join().await,
             }
-            previous.join().await;
         }
-        self.channels.retain(|_, h| !h.finished());
+        self.channels
+            .retain(|_, h| h.state() != ChannelState::Finished);
         if self.registry.is_stopping() {
             self.error(channel, ErrorCode::Internal, "server stopping");
             return;
@@ -525,21 +497,31 @@ impl Connection {
         }
     }
 
-    /// The attachment id and session of the writable attachment on
-    /// `channel`; `read_only` keeps the attachment and drops the frame.
-    /// None when the channel is not in use.
-    fn writable(&self, channel: u32) -> Option<(u64, Shared)> {
-        let handle = self.handle(channel)?;
+    fn writable(&self, channel: u32) -> Writable {
+        let Some(handle) = self.handle(channel) else {
+            return Writable::Missing;
+        };
         if handle.read_only {
-            self.error(channel, ErrorCode::ReadOnly, "attachment is read-only");
-            return None;
+            return Writable::ReadOnly;
         }
-        Some((handle.id, handle.session()?))
+        match handle.session() {
+            Some(session) => Writable::Ok {
+                id: handle.id,
+                session,
+            },
+            None => Writable::Missing,
+        }
+    }
+
+    fn refuse_read_only(&self, channel: u32) {
+        self.error(channel, ErrorCode::ReadOnly, "attachment is read-only");
     }
 
     fn input(&mut self, channel: u32, payload: &[u8]) {
-        let Some((id, session)) = self.writable(channel) else {
-            return;
+        let (id, session) = match self.writable(channel) {
+            Writable::Ok { id, session } => (id, session),
+            Writable::ReadOnly => return self.refuse_read_only(channel),
+            Writable::Missing => return,
         };
         let pushed = {
             let mut s = session.lock().unwrap();
@@ -578,8 +560,10 @@ impl Connection {
             self.end(channel, code, message);
             return;
         }
-        let Some((id, session)) = self.writable(channel) else {
-            return;
+        let (id, session) = match self.writable(channel) {
+            Writable::Ok { id, session } => (id, session),
+            Writable::ReadOnly => return self.refuse_read_only(channel),
+            Writable::Missing => return,
         };
         if let Err((code, message)) = session.lock().unwrap().running() {
             self.error(channel, code, message);

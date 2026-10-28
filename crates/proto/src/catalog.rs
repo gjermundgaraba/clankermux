@@ -1,7 +1,3 @@
-//! The catalog: every method, event, frame and error code, with JSON
-//! Schemas derived from the types of this crate. `describe` answers it,
-//! and PROTOCOL.md's tables are rendered from it (see `render`).
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::generate::SchemaSettings;
@@ -10,13 +6,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    AckParams, Acked, CancelParams, Cancelled, CreateParams, DetachParams, Empty, ErrorCode,
-    ErrorMessage, FrameType, LabelParams, ListParams, Numbered, Page, Read, ReadParams,
+    AckParams, Acked, CancelParams, Cancelled, ChannelKind, CreateParams, DetachParams, Empty,
+    ErrorCode, ErrorMessage, FrameType, LabelParams, ListParams, Numbered, Page, Read, ReadParams,
     ResizeParams, SendParams, Sent, Session, SessionParams, SignalParams, SubscribeParams,
     Subscribed, Tail, TailParams, VERSION, WaitParams, Waited,
 };
 
-/// The shared message vectors; the examples come from them.
 pub(crate) const VECTORS: &str = include_str!("../vectors/messages.json");
 
 /// What a method does to the server's state.
@@ -155,19 +150,16 @@ pub struct ErrorInfo {
     pub summary: String,
 }
 
-/// One method as declared below: its types stand for its schemas.
 struct Spec {
     name: &'static str,
     class: Class,
     params: fn(&mut SchemaGenerator) -> schemars::Schema,
     result: fn(&mut SchemaGenerator) -> schemars::Schema,
     errors: &'static [ErrorCode],
-    /// Vector names: params, then result.
     examples: &'static [(&'static str, &'static str)],
     summary: &'static str,
 }
 
-/// Declares the methods, in the order the catalog lists them.
 macro_rules! methods {
     ($(
         $name:literal $class:ident ($params:ty) -> $result:ty,
@@ -187,8 +179,6 @@ macro_rules! methods {
             }),*]
         }
 
-        /// Per method, the checks that a value is its params type and its
-        /// result type.
         #[cfg(test)]
         pub(crate) fn typed() -> Vec<(&'static str, crate::tests::Check, crate::tests::Check)> {
             use crate::tests::same;
@@ -268,10 +258,8 @@ methods! {
         "This catalog, or one method of it.";
 }
 
-/// The `describe` example asks for this method.
 const DESCRIBE_EXAMPLE: &str = "params/describe-method";
 
-/// What a frame is for.
 fn frame_summary(frame_type: FrameType) -> &'static str {
     use FrameType::*;
     match frame_type {
@@ -297,32 +285,30 @@ fn frame_summary(frame_type: FrameType) -> &'static str {
     }
 }
 
-/// The schema of a frame's JSON payload, if it has one.
 fn frame_schema(
     frame_type: FrameType,
-    de: &mut SchemaGenerator,
-    ser: &mut SchemaGenerator,
+    server_reads: &mut SchemaGenerator,
+    server_writes: &mut SchemaGenerator,
 ) -> Option<schemars::Schema> {
     use FrameType::*;
     Some(match frame_type {
-        Hello => de.subschema_for::<crate::Hello>(),
-        Request => de.subschema_for::<crate::Request>(),
-        Open => de.subschema_for::<crate::Open>(),
-        Viewport => de.subschema_for::<crate::Viewport>(),
-        Welcome => ser.subschema_for::<crate::Welcome>(),
-        Reply => ser.subschema_for::<crate::Reply>(),
-        Event => ser.subschema_for::<Numbered>(),
-        Error => ser.subschema_for::<ErrorMessage>(),
-        Attached => ser.subschema_for::<crate::Attached>(),
-        Resized => ser.subschema_for::<crate::Resized>(),
-        Exited => ser.subschema_for::<crate::Exited>(),
-        Gap => ser.subschema_for::<crate::Gap>(),
-        Closed => ser.subschema_for::<crate::Closed>(),
+        Hello => server_reads.subschema_for::<crate::Hello>(),
+        Request => server_reads.subschema_for::<crate::Request>(),
+        Open => server_reads.subschema_for::<crate::Open>(),
+        Viewport => server_reads.subschema_for::<crate::Viewport>(),
+        Welcome => server_writes.subschema_for::<crate::Welcome>(),
+        Reply => server_writes.subschema_for::<crate::Reply>(),
+        Event => server_writes.subschema_for::<Numbered>(),
+        Error => server_writes.subschema_for::<ErrorMessage>(),
+        Attached => server_writes.subschema_for::<crate::Attached>(),
+        Resized => server_writes.subschema_for::<crate::Resized>(),
+        Exited => server_writes.subschema_for::<crate::Exited>(),
+        Gap => server_writes.subschema_for::<crate::Gap>(),
+        Closed => server_writes.subschema_for::<crate::Closed>(),
         Input | Close | Snapshot | SnapshotReady | SnapshotEnd | Output => return None,
     })
 }
 
-/// `SnapshotReady` as `SNAPSHOT_READY`.
 fn frame_name(frame_type: FrameType) -> String {
     let mut name = String::new();
     for (i, c) in format!("{frame_type:?}").chars().enumerate() {
@@ -341,7 +327,11 @@ fn vector(vectors: &Map<String, Value>, name: &str) -> Value {
         .clone()
 }
 
-fn frame_info(t: FrameType, de: &mut SchemaGenerator, ser: &mut SchemaGenerator) -> FrameInfo {
+fn frame_info(
+    t: FrameType,
+    server_reads: &mut SchemaGenerator,
+    server_writes: &mut SchemaGenerator,
+) -> FrameInfo {
     FrameInfo {
         name: frame_name(t),
         frame_type: t as u8,
@@ -350,10 +340,10 @@ fn frame_info(t: FrameType, de: &mut SchemaGenerator, ser: &mut SchemaGenerator)
         } else {
             Direction::Client
         },
-        channel: match t {
-            FrameType::Error => "0 or n",
-            t if t.is_control() => "0",
-            _ => "n",
+        channel: match t.channel_kind() {
+            ChannelKind::Control => "0",
+            ChannelKind::Attachment => "n",
+            ChannelKind::Either => "0 or n",
         }
         .into(),
         payload: match t {
@@ -362,12 +352,10 @@ fn frame_info(t: FrameType, de: &mut SchemaGenerator, ser: &mut SchemaGenerator)
             _ => Payload::Raw,
         },
         summary: frame_summary(t).into(),
-        schema: frame_schema(t, de, ser).map(schemars::Schema::to_value),
+        schema: frame_schema(t, server_reads, server_writes).map(schemars::Schema::to_value),
     }
 }
 
-/// An event from its branch of `Event`, with the vectors named after it
-/// (`event/NAME` or `event/NAME-...`) as examples.
 fn event_info(branch: &Value, vectors: &Map<String, Value>) -> EventInfo {
     let name = branch["properties"]["event"]["const"]
         .as_str()
@@ -389,15 +377,11 @@ fn event_info(branch: &Value, vectors: &Map<String, Value>) -> EventInfo {
     }
 }
 
-/// The catalog of this crate's protocol, for a server of release
-/// `version`.
-pub fn catalog(version: &str) -> Catalog {
-    // Params are what the server reads; the rest is what it writes, so an
-    // optional field reads as optional on both sides.
-    let mut de = SchemaSettings::draft2020_12()
+pub fn catalog(release: Option<&str>) -> Catalog {
+    let mut server_reads = SchemaSettings::draft2020_12()
         .for_deserialize()
         .into_generator();
-    let mut ser = SchemaSettings::draft2020_12()
+    let mut server_writes = SchemaSettings::draft2020_12()
         .for_serialize()
         .into_generator();
     let vectors: Map<String, Value> = serde_json::from_str(VECTORS).expect("vectors");
@@ -408,8 +392,8 @@ pub fn catalog(version: &str) -> Catalog {
             name: spec.name.into(),
             class: spec.class,
             summary: spec.summary.into(),
-            params: (spec.params)(&mut de).to_value(),
-            result: (spec.result)(&mut ser).to_value(),
+            params: (spec.params)(&mut server_reads).to_value(),
+            result: (spec.result)(&mut server_writes).to_value(),
             errors: spec.errors.to_vec(),
             examples: spec
                 .examples
@@ -424,12 +408,16 @@ pub fn catalog(version: &str) -> Catalog {
 
     let frames = FrameType::ALL
         .iter()
-        .map(|&t| frame_info(t, &mut de, &mut ser))
+        .map(|&t| frame_info(t, &mut server_reads, &mut server_writes))
         .collect();
 
-    ser.subschema_for::<ErrorCode>();
+    server_writes.subschema_for::<ErrorCode>();
     let mut sorted = BTreeMap::new();
-    for (name, schema) in de.definitions().iter().chain(ser.definitions()) {
+    for (name, schema) in server_reads
+        .definitions()
+        .iter()
+        .chain(server_writes.definitions())
+    {
         if let Some(seen) = sorted.insert(name, schema) {
             assert_eq!(seen, schema, "{name} differs between params and results");
         }
@@ -458,14 +446,13 @@ pub fn catalog(version: &str) -> Catalog {
 
     let mut catalog = Catalog {
         protocol: VERSION,
-        version: version.into(),
+        version: release.unwrap_or_default().into(),
         methods,
         events,
         frames,
         errors,
         defs,
     };
-    // `describe`'s example is the catalog's own answer.
     let params = vector(&vectors, DESCRIBE_EXAMPLE);
     let asked: DescribeParams = serde_json::from_value(params.clone()).expect("describe params");
     let answer = catalog
@@ -484,8 +471,6 @@ pub fn catalog(version: &str) -> Catalog {
 }
 
 impl Catalog {
-    /// The entry for `name` with the definitions it refers to, directly
-    /// or through others.
     pub fn describe(&self, name: &str) -> Option<Description> {
         let method = self.method(name)?.clone();
         let mut wanted = Vec::new();
@@ -517,7 +502,6 @@ impl Catalog {
     }
 }
 
-/// The names `#/$defs/NAME` references in `schema` lead to.
 pub(crate) fn refs(schema: &Value, out: &mut impl Extend<String>) {
     match schema {
         Value::Object(map) => {
@@ -537,7 +521,6 @@ pub(crate) fn refs(schema: &Value, out: &mut impl Extend<String>) {
     }
 }
 
-/// The `oneOf` branches of an enum's schema.
 fn variants(schema: &Value) -> impl Iterator<Item = &Value> {
     schema["oneOf"].as_array().into_iter().flatten()
 }
@@ -586,7 +569,6 @@ fn tidy(schema: &mut Value) {
     map.values_mut().for_each(tidy);
 }
 
-/// `schema` without its `null` alternative.
 fn without_null(schema: &mut Value) {
     let null = json!({"type": "null"});
     let Value::Object(map) = schema else { return };

@@ -1,6 +1,3 @@
-//! Keys by name, encoded by the engine against a terminal's modes (cursor
-//! keys, keypad, kitty keyboard, modifyOtherKeys), and pastes.
-
 use std::ptr;
 
 use ghostty_vt_sys as sys;
@@ -8,7 +5,6 @@ use ghostty_vt_sys as sys;
 use crate::error::{Error, Result, check};
 use crate::terminal::Term;
 
-/// Modifiers held with a key, as the engine's `GHOSTTY_MODS_*` bits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Mods(sys::GhosttyMods);
 
@@ -18,8 +14,6 @@ impl Mods {
     }
 }
 
-/// One key press: the physical key (US layout), its modifiers, and the
-/// text the key produces with them, before Ctrl or Alt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyPress {
     key: sys::GhosttyKey,
@@ -32,7 +26,6 @@ pub struct KeyPress {
     shift_consumed: bool,
 }
 
-/// Named keys that produce no text.
 const NAMED: &[(&str, sys::GhosttyKey)] = &[
     ("enter", sys::GHOSTTY_KEY_ENTER),
     ("tab", sys::GHOSTTY_KEY_TAB),
@@ -50,8 +43,6 @@ const NAMED: &[(&str, sys::GhosttyKey)] = &[
     ("delete", sys::GHOSTTY_KEY_DELETE),
 ];
 
-/// The US layout's punctuation keys: the character unshifted, shifted,
-/// and the key.
 const PUNCTUATION: &[(char, char, sys::GhosttyKey)] = &[
     ('`', '~', sys::GHOSTTY_KEY_BACKQUOTE),
     ('-', '_', sys::GHOSTTY_KEY_MINUS),
@@ -85,7 +76,6 @@ impl KeyPress {
     /// character's: `A` is `shift+a`. None for anything else.
     pub fn parse(name: &str) -> Option<KeyPress> {
         let mut parts: Vec<&str> = name.split('+').collect();
-        // `ctrl++` and `+` name the plus key.
         let key = match parts.as_slice() {
             [.., "", ""] => {
                 parts.truncate(parts.len() - 2);
@@ -152,7 +142,6 @@ impl KeyPress {
             let text = if mods.shift() { shifted } else { plain };
             return Some(Self::character(code, mods, text, plain));
         }
-        // Any other character is text with no key of its own.
         Some(KeyPress {
             key: sys::GHOSTTY_KEY_UNIDENTIFIED,
             mods,
@@ -183,7 +172,6 @@ impl KeyPress {
     }
 }
 
-/// The engine's key encoder; configure from a terminal per key.
 pub struct KeyEncoder {
     encoder: sys::GhosttyKeyEncoder,
     event: sys::GhosttyKeyEvent,
@@ -195,7 +183,6 @@ impl KeyEncoder {
         // SAFETY: a null allocator selects the default allocator.
         check(unsafe { sys::ghostty_key_encoder_new(ptr::null(), &raw mut encoder) })?;
         let mut event = ptr::null_mut();
-        // SAFETY: as above.
         if let Err(err) = check(unsafe { sys::ghostty_key_event_new(ptr::null(), &raw mut event) })
         {
             // SAFETY: the encoder was just created and is freed once.
@@ -205,8 +192,6 @@ impl KeyEncoder {
         Ok(KeyEncoder { encoder, event })
     }
 
-    /// The bytes a press of `key` sends to the program behind `term`, by
-    /// its current modes; empty when the key encodes to nothing.
     pub fn encode(&mut self, term: &Term, key: &KeyPress) -> Result<Vec<u8>> {
         // SAFETY: encoder, event and terminal are live; the text outlives
         // the encode call that reads it.

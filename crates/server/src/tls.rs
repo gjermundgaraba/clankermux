@@ -1,6 +1,3 @@
-//! The WebSocket carrier's certificate: from files or from Tailscale,
-//! renewed on a timer.
-
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -19,9 +16,7 @@ const RENEW_EVERY: Duration = Duration::from_hours(12);
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(3600);
 
 pub enum Source {
-    /// PEM files, re-read at every renewal.
     Files { cert: PathBuf, key: PathBuf },
-    /// `/localapi/v0/cert/<domain>`.
     Tailscale { api: LocalApi, domain: String },
 }
 
@@ -38,8 +33,6 @@ impl Source {
     }
 }
 
-/// A server configuration from PEM holding the private key and the
-/// certificate chain, in any order.
 fn config(pem: &[u8]) -> io::Result<Arc<ServerConfig>> {
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<_, _>>()
@@ -54,15 +47,12 @@ fn config(pem: &[u8]) -> io::Result<Arc<ServerConfig>> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS: {e}")))
 }
 
-/// The current certificate; the acceptor is built per connection so a
-/// renewal takes effect at the next one.
 pub struct Tls {
     current: Mutex<Arc<ServerConfig>>,
     source: Source,
 }
 
 impl Tls {
-    /// Fetches the certificate once; a failure fails the carrier.
     pub async fn start(source: Source) -> io::Result<Arc<Self>> {
         let config = match source.fetch().await? {
             Cert::Pem(pem) => config(&pem)?,
@@ -83,8 +73,6 @@ impl Tls {
         TlsAcceptor::from(self.current.lock().unwrap().clone())
     }
 
-    /// Renews on a timer; a rate limit waits as told, another failure
-    /// keeps the current certificate and tries again later.
     pub async fn renew_forever(self: Arc<Self>) {
         let mut wait = RENEW_EVERY;
         loop {

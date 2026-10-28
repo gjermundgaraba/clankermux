@@ -63,7 +63,6 @@ impl Default for Limits {
     }
 }
 
-/// `limit` as a `usize`; a limit past the address space is no limit.
 pub fn cap(limit: u64) -> usize {
     usize::try_from(limit).unwrap_or(usize::MAX)
 }

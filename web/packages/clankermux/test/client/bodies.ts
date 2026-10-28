@@ -1,4 +1,3 @@
-/** What a server sends, for the suites that play one. */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -18,7 +17,6 @@ export function welcome(incarnation: string): Welcome {
   };
 }
 
-/** A 10×3 session, running unless `fields` say otherwise. */
 export function session(id: string, fields: Partial<Session> = {}): Session {
   return {
     id,
@@ -40,7 +38,6 @@ export function session(id: string, fields: Partial<Session> = {}): Session {
   };
 }
 
-/** An `OUTPUT` payload: `text` at stream `offset`. */
 export function output(offset: number, text: string): Uint8Array {
   const bytes = new TextEncoder().encode(text);
   const payload = new Uint8Array(8 + bytes.length);

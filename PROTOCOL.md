@@ -918,15 +918,16 @@ the park time as Unix epoch milliseconds, mode 0700, files 0600:
 
 | File                | Contents                                                     |
 | ------------------- | ------------------------------------------------------------ |
-| `session.json`      | `{protocol: 1, engine, parked_at, session, history_lines, commands}`: the `inspect` object (`attachments: 0`, as servers before the list wrote it, `size` without `owner`, no `pid`, `program_status` as reported with no inherited `app`, with `seen`, oldest report first; no `attention`), how many leading lines of `screen.txt` are history, and the commands kept (see Commands) |
+| `session.json`      | `{version: 2, engine, parked_at, session, history_lines, commands}`: the `inspect` object (`attachments: []`, `size` without `owner`, no `pid`, `program_status` as reported with no inherited `app`, with `seen`, oldest report first; no `attention`), how many leading lines of `screen.txt` are history, and the commands kept (see Commands) |
 | `snapshot.ghostsnp` | The snapshot bytes                                           |
 | `screen.txt`        | The `read` text with all retained history, at `parked_at`   |
 
 A park writes the three files into a temporary directory named with a
 leading dot, syncs each file and the directory, renames the directory to
 its generation name, syncs `sessions/<id>/`, then deletes older
-generations. On start, the newest directory holding all three files is the
-session's state; the others, and any dot-named directory, are deleted.
+generations. On start, the newest directory holding all three files whose
+`session.json` parses with `version` 2 is the session's state; the others,
+and any dot-named directory, are deleted.
 
 A running session is parked:
 
@@ -953,16 +954,14 @@ An `ack` that marks a record of a running session counts as a change; of
 an exited, kept session it parks the session once more; of a session
 loaded from a park file it replaces `session.json` in the newest
 generation, writing `.session.json` there, syncing it, renaming it over
-`session.json` and syncing the directory. A `session.json` without
-`seen` loads its `done` and `error` records unseen.
+`session.json` and syncing the directory.
 The whole `sessions/<id>/` directory is deleted whenever the session is
 removed. On start, a `session.json` whose `session.id` is not its
 directory's name is skipped with a warning.
 
 On start, each session directory becomes a session: `status` is `exited`
 if `session.json` says so, `restored` otherwise, with the size policy it
-recorded. One without `size`, as servers before the policy wrote it,
-loads as `latest`. `read` serves
+recorded. `read` serves
 `screen.txt` for `text` of `screen` and `history`, with `scrollback`
 taken from its history lines, and decodes `snapshot.ghostsnp` for the
 rest. Stream bytes are not parked: `tail` and `last_command` have none. `OPEN`

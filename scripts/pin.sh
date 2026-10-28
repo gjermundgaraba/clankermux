@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# Vendor the libghostty-vt source archive for one upstream Ghostty commit.
-#
-# usage: scripts/pin.sh <sha>
-#
-# Downloads https://tip.files.ghostty.org/<sha>/libghostty-vt-source.tar.gz
-# into a fresh temporary directory, records its sha256 in vendor/pin.json,
-# replaces vendor/libghostty-vt with the extracted tree, and writes the
-# engine id into web/packages/clankermux/src/engine/pin.ts. When pin.json
-# already names this sha, the download must match the recorded sha256.
 set -euo pipefail
 sha=${1:?usage: scripts/pin.sh <sha>}
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -36,7 +27,6 @@ jq -n --arg sha "$sha" --arg sha256 "$sum" \
     --arg date "$(date -u +%Y-%m-%d)" \
     '{sha: $sha, sha256: $sha256, date: $date, engine: ("ghostty-vt@" + $version)}' \
     > "$pin"
-# The web engine names the same id; the server refuses any other at OPEN.
 jq -r '"// Written by scripts/pin.sh from vendor/pin.json.\n/** Engine id of the vendored libghostty-vt build, matched by the server. */\nexport const ENGINE = \(.engine | tojson);"' \
     "$pin" > "$root/web/packages/clankermux/src/engine/pin.ts"
 cat "$pin"

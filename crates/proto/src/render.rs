@@ -1,7 +1,3 @@
-//! Markdown from the catalog: PROTOCOL.md's generated regions, each
-//! between `<!-- generated: WHAT -->` and `<!-- end generated -->`, and
-//! one method as `api describe` prints it.
-
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt::Write as _;
 
@@ -13,8 +9,6 @@ use crate::catalog::{Catalog, Description, Payload, refs};
 const BEGIN: &str = "<!-- generated: ";
 const END: &str = "<!-- end generated -->";
 
-/// Types PROTOCOL.md calls by name, each with a table or a paragraph of
-/// its own; any other is spelt out where it is used.
 const NAMED: &[&str] = &[
     "Session",
     "AttachmentInfo",
@@ -32,8 +26,6 @@ const NAMED: &[&str] = &[
     "ErrorCode",
 ];
 
-/// `doc` with every generated region rendered again from `catalog`. A
-/// mark counts only at the start of a line.
 pub fn splice(doc: &str, catalog: &Catalog) -> Result<String, String> {
     let mut out = String::new();
     let mut rest = doc;
@@ -68,15 +60,12 @@ pub fn splice(doc: &str, catalog: &Catalog) -> Result<String, String> {
     Ok(out)
 }
 
-/// Where `text` has `mark` at the start of a line.
 fn mark(text: &str, mark: &str) -> Option<usize> {
     text.match_indices(mark)
         .map(|(at, _)| at)
         .find(|&at| at == 0 || text[..at].ends_with('\n'))
 }
 
-/// One region: `frames`, `methods`, `events`, `errors`, or `type NAME`
-/// for the fields of a definition.
 fn render(what: &str, catalog: &Catalog) -> Result<String, String> {
     let defs = &catalog.defs;
     Ok(match what.split_once(' ') {
@@ -145,8 +134,6 @@ fn render(what: &str, catalog: &Catalog) -> Result<String, String> {
     })
 }
 
-/// One method: what it does, its params and result with the types they
-/// use, its errors and its examples.
 pub fn method(description: &Description) -> String {
     let m = &description.method;
     let defs = &description.defs;
@@ -162,7 +149,6 @@ pub fn method(description: &Description) -> String {
         out.push_str(&fields_table(result, defs));
         out.push('\n');
     }
-    // The objects the tables above use, each with its own, nearest first.
     let mut seen = BTreeSet::new();
     let mut queue = VecDeque::new();
     for top in [&m.params, &m.result] {
@@ -197,7 +183,6 @@ pub fn method(description: &Description) -> String {
     out
 }
 
-/// Error codes in code style, comma-separated.
 fn codes(errors: &[ErrorCode]) -> String {
     errors
         .iter()
@@ -206,8 +191,6 @@ fn codes(errors: &[ErrorCode]) -> String {
         .join(", ")
 }
 
-/// A shape in code style, unless it is names alone (`Session`,
-/// `Description | Catalog`).
 fn code(shape: &str) -> String {
     if shape.split(" | ").all(|part| NAMED.contains(&part)) {
         shape.to_string()
@@ -220,14 +203,12 @@ pub(crate) fn ref_name(schema: &Value) -> Option<&str> {
     schema.get("$ref")?.as_str()?.strip_prefix("#/$defs/")
 }
 
-/// The definition a `$ref` leads to, or the schema itself.
 fn resolve<'a>(schema: &'a Value, defs: &'a Map<String, Value>) -> &'a Value {
     ref_name(schema)
         .and_then(|name| defs.get(name))
         .unwrap_or(schema)
 }
 
-/// A type's own doc comment, as a paragraph, if it has one.
 fn about(schema: &Value) -> String {
     schema
         .get("description")
@@ -248,7 +229,6 @@ pub(crate) fn required(schema: &Value) -> BTreeSet<&str> {
         .unwrap_or_default()
 }
 
-/// `a, b?`: an object's fields, the optional ones marked.
 fn field_names(schema: &Value) -> String {
     let required = required(schema);
     schema
@@ -271,8 +251,6 @@ fn field_names(schema: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// A schema as the tables write a type: `int`, `string[]`, `Session`,
-/// `{offset, marker}`, `` `a` | `b` ``.
 fn shape(schema: &Value, defs: &Map<String, Value>) -> String {
     if let Some(name) = ref_name(schema) {
         if NAMED.contains(&name) {
@@ -332,7 +310,6 @@ fn shape(schema: &Value, defs: &Map<String, Value>) -> String {
     }
 }
 
-/// | Field | Type | Meaning | for an object's properties.
 fn fields_table(schema: &Value, defs: &Map<String, Value>) -> String {
     let required = required(schema);
     let rows = schema
@@ -361,7 +338,6 @@ fn fields_table(schema: &Value, defs: &Map<String, Value>) -> String {
     table(&["Field", "Type", "Meaning"], rows)
 }
 
-/// A Markdown table, columns but the last padded to their widest cell.
 fn table(head: &[&str], rows: impl Iterator<Item = Vec<String>>) -> String {
     let mut rows: Vec<Vec<String>> = rows
         .map(|row| {
@@ -388,7 +364,6 @@ fn table(head: &[&str], rows: impl Iterator<Item = Vec<String>>) -> String {
                 _ => format!("{cell:<width$}"),
             })
             .collect();
-        // An empty last cell closes without a second space.
         let mut text = format!("| {}", padded.join(" | "));
         text.push_str(if text.ends_with(' ') { "|\n" } else { " |\n" });
         text

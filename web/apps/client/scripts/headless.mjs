@@ -1,10 +1,3 @@
-// Drives the page in headless Chrome over the DevTools protocol: waits for
-// the attach, types a line, screenshots, and checks the typed text reached
-// the session's screen through the server's own `read`. Exits non-zero
-// when any step fails. A development check; it types plain ASCII only, so
-// it says nothing about modifiers or layouts.
-//
-//   node scripts/headless.mjs <page url> <socket> <session id> <screenshot.png>
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { connect } from "node:net";
@@ -19,7 +12,10 @@ if (!url || !socket || !session || !shot) {
 const marker = `browser-ok-${process.pid}`;
 const typed = `echo ${marker}\n`;
 
-/** The session's screen text, through the control plane. */
+function occurrences(text, part) {
+  return text.split(part).length - 1;
+}
+
 function readScreen() {
   return new Promise((resolve, reject) => {
     const unix = connect(socket);
@@ -47,7 +43,6 @@ const chrome = process.env.CHROME ?? "/Applications/Google Chrome.app/Contents/M
 const proc = spawn(chrome, [
   "--headless=new",
   "--no-first-run",
-  // A loopback check runs on a self-signed certificate.
   "--ignore-certificate-errors",
   "--disable-gpu",
   `--user-data-dir=/tmp/clankermux-headless-${process.pid}`,
@@ -129,8 +124,8 @@ try {
     }
     await sleep(700);
     const screen = await readScreen();
-    // The echo appears once as the command line and once as output.
-    ok = screen.split(marker).length >= 3;
+    const echoedAndPrinted = occurrences(screen, marker) >= 2;
+    ok = echoedAndPrinted;
     console.log(ok ? `typed text reached the session` : `typed text missing from the screen:\n${screen}`);
   }
   const { data } = await send("Page.captureScreenshot", { format: "png" });

@@ -1,5 +1,3 @@
-//! PTY master plus child process.
-
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io;
@@ -14,12 +12,9 @@ use tokio::process::{Child, Command};
 
 pub struct Pty {
     pub master: OwnedFd,
-    /// Path of the slave device, used to find processes holding it open.
     pub slave_path: String,
 }
 
-/// Opens a PTY pair and starts `argv` on the slave as a session leader
-/// with the PTY as its controlling terminal.
 pub fn spawn(
     argv: &[String],
     cwd: &Path,
@@ -94,8 +89,6 @@ pub fn set_size(master: &impl AsFd, cols: u16, rows: u16) -> io::Result<()> {
     Ok(rustix::termios::tcsetwinsize(master, size)?)
 }
 
-/// Sends `signal` to the child's process group, else to every process that
-/// holds the slave open. Returns false when no process was signalled.
 pub fn signal(pgid: u32, slave_path: &str, signal: Signal) -> bool {
     let kill = |pid: u32, group: bool| {
         i32::try_from(pid)
@@ -119,7 +112,6 @@ pub fn signal(pgid: u32, slave_path: &str, signal: Signal) -> bool {
     any
 }
 
-/// Signal names without the `SIG` prefix and their numbers.
 const SIGNALS: &[(&str, i32)] = &[
     ("HUP", libc::SIGHUP),
     ("INT", libc::SIGINT),
@@ -152,7 +144,6 @@ const SIGNALS: &[(&str, i32)] = &[
     ("SYS", libc::SIGSYS),
 ];
 
-/// The signal named `name`, with or without the `SIG` prefix.
 pub fn signal_by_name(name: &str) -> Option<Signal> {
     let name = name.strip_prefix("SIG").unwrap_or(name);
     let (_, number) = SIGNALS.iter().find(|(n, _)| *n == name)?;
@@ -166,7 +157,6 @@ pub fn signal_name(number: i32) -> String {
         .map_or_else(|| number.to_string(), |(name, _)| name.to_string())
 }
 
-/// Processes holding a path open, by platform.
 mod holders {
     #[cfg(target_os = "linux")]
     pub fn holders(path: &str) -> Vec<u32> {

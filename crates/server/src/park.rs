@@ -1,6 +1,3 @@
-//! Parked sessions on disk: `sessions/<id>/<generation>/` with
-//! `session.json`, `snapshot.ghostsnp` and `screen.txt`.
-
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -8,25 +5,18 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL: u32 = 1;
+pub const VERSION: u32 = 2;
 
-/// `session.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParkFile {
-    pub protocol: u32,
+    pub version: u32,
     pub engine: String,
     pub parked_at: String,
-    /// The session as `inspect` reports it, records included.
     pub session: proto::Session,
-    /// How many leading lines of `screen.txt` are history, the rest being
-    /// the screen; `read` takes `scrollback` from them.
     pub history_lines: usize,
-    /// The last commands, oldest first.
-    #[serde(default)]
     pub commands: Vec<proto::Command>,
 }
 
-/// A session's newest complete park, as loaded at start.
 pub struct Loaded {
     pub file: ParkFile,
     pub screen: String,
@@ -36,7 +26,6 @@ pub struct Loaded {
 const SESSION_JSON: &str = "session.json";
 const SNAPSHOT: &str = "snapshot.ghostsnp";
 const SCREEN: &str = "screen.txt";
-/// A complete generation holds all three.
 const FILES: [&str; 3] = [SESSION_JSON, SNAPSHOT, SCREEN];
 
 fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -54,17 +43,6 @@ fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-/// `session.json`, with `attachments` as the count, always 0, that
-/// servers before the list wrote: one rolled back to still loads it.
-fn session_json(file: &ParkFile) -> serde_json::Result<Vec<u8>> {
-    let mut value = serde_json::to_value(file)?;
-    value["session"]["attachments"] = 0.into();
-    serde_json::to_vec(&value)
-}
-
-/// Writes one generation for `file.session.id` under `sessions`: into a
-/// dot-directory first, each file and the directory synced, then renamed
-/// to `generation`; older generations are deleted after.
 pub fn write(
     sessions: &Path,
     file: &ParkFile,
@@ -82,13 +60,12 @@ pub fn write(
     let _ = fs::remove_dir_all(&temp);
     fs::DirBuilder::new().mode(0o700).create(&temp)?;
     let result = (|| {
-        write_file(&temp.join(SESSION_JSON), &session_json(file)?)?;
+        write_file(&temp.join(SESSION_JSON), &serde_json::to_vec(file)?)?;
         write_file(&temp.join(SNAPSHOT), snapshot)?;
         write_file(&temp.join(SCREEN), screen.as_bytes())?;
         sync_dir(&temp)?;
         fs::rename(&temp, dir.join(generation.to_string()))?;
         sync_dir(&dir)?;
-        // The session's own directory entry is new too.
         if first { sync_dir(sessions) } else { Ok(()) }
     })();
     if result.is_err() {
@@ -108,11 +85,6 @@ pub fn write(
     Ok(())
 }
 
-/// Loads every session under `sessions`: the newest generation holding all
-/// three files and a readable `session.json`; the others and any
-/// dot-directory are deleted, as is a session directory left with
-/// nothing. A session that cannot be read is logged and skipped, never a
-/// reason not to start.
 pub fn load(sessions: &Path) -> Vec<Loaded> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(sessions) else {
@@ -132,14 +104,10 @@ pub fn load(sessions: &Path) -> Vec<Loaded> {
     out
 }
 
-/// The newest readable generation of one session, `None` when there is
-/// none left. A file naming another session is an error: its id would
-/// be removed under a path of its choosing.
 fn load_session(session_dir: &Path) -> io::Result<Option<Loaded>> {
     let mut generations: Vec<(u64, PathBuf)> = Vec::new();
     for entry in fs::read_dir(session_dir)?.flatten() {
         let path = entry.path();
-        // A dot-directory is an unfinished park; its name does not parse.
         match entry.file_name().to_string_lossy().parse::<u64>() {
             Ok(generation) if FILES.iter().all(|f| path.join(f).is_file()) => {
                 generations.push((generation, path));
@@ -177,25 +145,17 @@ fn load_session(session_dir: &Path) -> io::Result<Option<Loaded>> {
     Ok(chosen)
 }
 
-/// Reads a `session.json` as `session_json` wrote it.
 fn read_session_json(path: &Path) -> io::Result<ParkFile> {
-    let invalid = |e| io::Error::new(io::ErrorKind::InvalidData, e);
-    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(path)?).map_err(invalid)?;
-    // A park counts the attachments, always 0, where `inspect` lists them.
-    if let Some(attachments) = raw.pointer_mut("/session/attachments")
-        && attachments.is_number()
-    {
-        *attachments = serde_json::Value::Array(Vec::new());
-    }
-    serde_json::from_value(raw).map_err(invalid)
+    serde_json::from_slice(&fs::read(path)?)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 fn read_generation(dir: &Path) -> io::Result<Loaded> {
     let file = read_session_json(&dir.join(SESSION_JSON))?;
-    if file.protocol != PROTOCOL {
+    if file.version != VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("park protocol {}", file.protocol),
+            format!("park version {}", file.version),
         ));
     }
     Ok(Loaded {
@@ -205,8 +165,6 @@ fn read_generation(dir: &Path) -> io::Result<Loaded> {
     })
 }
 
-/// Replaces the records in the `session.json` of the generation that
-/// holds `snapshot`, by a rename, keeping the rest of the file.
 pub fn rewrite_records(snapshot: &Path, records: Vec<proto::StatusRecord>) -> io::Result<()> {
     let dir = snapshot
         .parent()
@@ -216,12 +174,11 @@ pub fn rewrite_records(snapshot: &Path, records: Vec<proto::StatusRecord>) -> io
     file.session.program_status = Some(records);
     let temp = dir.join(format!(".{SESSION_JSON}"));
     let _ = fs::remove_file(&temp);
-    write_file(&temp, &session_json(&file)?)?;
+    write_file(&temp, &serde_json::to_vec(&file)?)?;
     fs::rename(&temp, &path)?;
     sync_dir(dir)
 }
 
-/// Deletes everything parked for `id`.
 pub fn remove(sessions: &Path, id: &str) {
     let _ = fs::remove_dir_all(sessions.join(id));
 }

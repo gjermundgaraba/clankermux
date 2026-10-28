@@ -1,5 +1,3 @@
-/** The page's copies to the clipboard, and what each came to. */
-
 /** What started a copy: the release of a selection, Ctrl+Shift+C, the
  * browser's copy (Cmd+C, the Copy menu), or the program (OSC 52). */
 export type CopySource = "release" | "keys" | "browser" | "program";
@@ -15,32 +13,23 @@ export type Copy =
   | { ok: true; source: CopySource; chars: number }
   | { ok: false; source: CopySource; reason: CopyFailure; chars?: number; message?: string };
 
-/** The parts of `navigator.clipboard` a copy uses. */
 export interface ClipboardLike {
   write?(items: ClipboardItem[]): Promise<void>;
   writeText?(text: string): Promise<void>;
 }
 
 export interface CopyHost {
-  /** The clipboard, read at each copy; undefined where there is none. */
   clipboard(): ClipboardLike | undefined;
-  /** A `ClipboardItem` of text to come; undefined where the browser has
-   * no `ClipboardItem`. */
   item: ((text: Promise<Blob>) => ClipboardItem) | undefined;
   report(copy: Copy): void;
 }
 
-/** How long a copy may take: the worker's answer and the write. */
 const COPY_TIMEOUT_MS = 2000;
 
-/** How a clipboard write went. */
 type Written = { ok: true } | { ok: false; reason: CopyFailure; message?: string };
 
-/** Characters by code point, as a page counts them for display. */
-const length = (text: string) => [...text].length;
+const codePointLength = (text: string) => [...text].length;
 
-/** One copy under way, reported once: when both its text's length and
- * the write's result are known, or at the timeout. */
 class Attempt {
   private done = false;
   private chars: number | undefined;
@@ -50,9 +39,7 @@ class Attempt {
   constructor(
     private readonly source: CopySource,
     private readonly report: (copy: Copy) => void,
-    /** Once, when it is reported or dropped. */
     private readonly ended: () => void,
-    /** At the timeout, after the report. */
     timedOut?: () => void,
   ) {
     this.timer = setTimeout(() => {
@@ -62,7 +49,7 @@ class Attempt {
   }
 
   text(text: string): void {
-    this.chars = length(text);
+    this.chars = codePointLength(text);
     this.settle();
   }
 
@@ -71,7 +58,6 @@ class Attempt {
     this.settle();
   }
 
-  /** Not a copy: nothing was selected, or a newer copy took its place. */
   drop(): void {
     if (this.done) return;
     this.done = true;
@@ -91,7 +77,6 @@ class Attempt {
     else this.report({ source: this.source, ...result, ...(chars !== undefined ? { chars } : {}) });
   }
 
-  /** Follows a write's promise. */
   follow(write: Promise<void>): void {
     write.then(
       () => this.wrote({ ok: true }),
@@ -100,21 +85,15 @@ class Attempt {
   }
 }
 
-/** A release's copy, waiting for the worker to say what was selected. */
 interface Pending {
-  /** The release's number, for the worker's answer. */
   id: number;
   attempt: Attempt;
-  /** The text for the write under way; none where it waits to start. */
   text?: { resolve: (text: string) => void; reject: () => void };
 }
 
-/** A mounted terminal's copies. */
 export class Copier {
-  /** The latest release's copy, while it waits for the worker's answer. */
   private pending: Pending | undefined;
   private next = 1;
-  /** Every copy not yet reported or dropped, for `dispose`. */
   private readonly live = new Set<Attempt>();
 
   constructor(private readonly host: CopyHost) {}
@@ -132,7 +111,6 @@ export class Copier {
     const id = this.next++;
     const pending: Pending = {
       id,
-      // At the timeout the write is left without its text.
       attempt: this.attempt("release", () => {
         if (this.pending === pending) this.pending = undefined;
         pending.text?.reject();
@@ -163,9 +141,6 @@ export class Copier {
     return id;
   }
 
-  /** The worker's answer to release `id`: the selected text, or undefined
-   * when nothing was selected, which is no copy. An answer to a copy that
-   * was dropped or timed out is ignored. */
   answer(id: number, text: string | undefined): void {
     const pending = this.pending;
     if (pending?.id !== id) return;
@@ -176,19 +151,16 @@ export class Copier {
     else this.writeText(pending.attempt, text);
   }
 
-  /** Copies `text` known now. */
   write(text: string, source: CopySource): void {
     const attempt = this.attempt(source);
     attempt.text(text);
     this.writeText(attempt, text);
   }
 
-  /** A copy the browser made itself (the `copy` event's data). */
   copied(text: string): void {
-    this.host.report({ ok: true, source: "browser", chars: length(text) });
+    this.host.report({ ok: true, source: "browser", chars: codePointLength(text) });
   }
 
-  /** Drops every copy under way, unreported. */
   dispose(): void {
     if (this.pending) this.dropOne(this.pending);
     this.pending = undefined;

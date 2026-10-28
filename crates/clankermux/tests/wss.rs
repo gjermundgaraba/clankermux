@@ -1,6 +1,3 @@
-//! The Rust client over the WebSocket carrier: the writer's flush per
-//! frame is what gets `HELLO` through a message carrier.
-
 use client::Connection;
 use client::connection::hello;
 use proto::*;

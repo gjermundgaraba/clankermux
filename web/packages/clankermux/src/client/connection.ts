@@ -18,7 +18,6 @@ import {
 
 import pkg from "../../package.json" with { type: "json" };
 
-/** A message-oriented byte transport: one frame per message, as over WebSocket. */
 export interface Transport {
   send(bytes: Uint8Array): void;
   close(): void;
@@ -26,8 +25,6 @@ export interface Transport {
   onClose: (() => void) | undefined;
 }
 
-/** `desync`: a stream frame did not continue from the cursor; a fresh
- * OPEN recovers it, where any other fault would only repeat. */
 export type ErrorKind = "protocol" | "desync" | "server" | "closed";
 
 /** A failed request or connection. `kind: "server"` carries the server's
@@ -60,12 +57,8 @@ export class ClientError extends Error {
   }
 }
 
-/** Frames before `WELCOME` tells us the real limit: the protocol's
- * default `max_frame`, as the Rust client. */
 const HELLO_MAX_FRAME = 1024 * 1024;
 
-/** `HELLO` for `client`: a name and version, or a name with this
- * package's version. */
 export function hello(client: string | Peer, engine?: string): Hello {
   const peer = typeof client === "string" ? { name: client, version: pkg.version } : client;
   const h: Hello = { version: VERSION, client: peer, capabilities: [] };
@@ -73,18 +66,12 @@ export function hello(client: string | Peer, engine?: string): Hello {
   return h;
 }
 
-/**
- * One protocol connection: the handshake, requests answered by id, events,
- * and attachment channels routed to their receivers.
- */
 export class Connection {
   private nextId = 1;
   private readonly pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: ClientError) => void }>();
   private readonly channels = new Map<number, (frame: Frame) => void>();
   private ended: ClientError | undefined;
-  /** Session events, once subscribed. */
   onEvent: ((event: Event) => void) | undefined;
-  /** The connection ended: the transport closed, or an error without id. */
   onEnd: ((error: ClientError) => void) | undefined;
 
   private constructor(
@@ -95,7 +82,6 @@ export class Connection {
     transport.onClose = () => this.end(new ClientError("closed", "connection closed"));
   }
 
-  /** Sends `HELLO` and resolves at `WELCOME`; rejects on an `ERROR` or close. */
   static connect(transport: Transport, hello: Hello): Promise<Connection> {
     return new Promise((resolve, reject) => {
       transport.onMessage = (bytes) => {
@@ -127,12 +113,10 @@ export class Connection {
     this.send(type, channel, new TextEncoder().encode(JSON.stringify(body)));
   }
 
-  /** A request; the reply's `result`, or a rejection with the server's error. */
   call<R>(method: string, params: unknown): Promise<R> {
     return this.request<R>(method, params).reply;
   }
 
-  /** A request and its id on this connection, which `cancel` takes. */
   request<R>(method: string, params: unknown): { id: number; reply: Promise<R> } {
     const id = this.nextId++;
     const reply = new Promise<R>((resolve, reject) => {
@@ -147,22 +131,18 @@ export class Connection {
     return { id, reply };
   }
 
-  /** The server's catalog (`describe {}`), or one method of it. */
   describe(): Promise<Catalog>;
   describe(method: string): Promise<Description>;
   describe(method?: string): Promise<Catalog | Description> {
     return this.call("describe", method === undefined ? {} : { method });
   }
 
-  /** Opens `channel`; its frames go to `receive` until `release` or the
-   * connection's end. */
   open(channel: number, open: unknown, receive: (frame: Frame) => void): void {
     if (this.ended) throw this.ended;
     this.channels.set(channel, receive);
     this.sendJson(FrameType.Open, channel, open);
   }
 
-  /** Stops routing `channel`; later frames on it are dropped. */
   release(channel: number): void {
     this.channels.delete(channel);
   }
@@ -192,7 +172,6 @@ export class Connection {
     }
     switch (frame.header.type) {
       case FrameType.Reply: {
-        // A reply or error for a request no longer waited for is dropped.
         const reply = body as Reply;
         this.pending.get(reply.id)?.resolve(reply.result);
         this.pending.delete(reply.id);

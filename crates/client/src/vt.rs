@@ -1,13 +1,7 @@
-//! Splitting terminal byte streams into whole escape sequences.
-
-/// What the start of a buffer holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scan {
-    /// A complete escape sequence of this length.
     Sequence(usize),
-    /// Plain bytes (no ESC) of this length.
     Plain(usize),
-    /// An escape sequence that has not fully arrived.
     Incomplete,
 }
 
@@ -30,7 +24,6 @@ pub fn scan(buf: &[u8], strings: bool) -> Scan {
         return Scan::Incomplete;
     };
     match kind {
-        // CSI: parameters, intermediates, then a final byte.
         b'[' => {
             for (i, &b) in buf.iter().enumerate().skip(2) {
                 match b {
@@ -41,7 +34,6 @@ pub fn scan(buf: &[u8], strings: bool) -> Scan {
             }
             Scan::Incomplete
         }
-        // OSC ends with BEL or ST; DCS, SOS, PM and APC end with ST.
         b']' | b'P' | b'X' | b'^' | b'_' if strings => {
             let mut i = 2;
             while i < buf.len() {
@@ -59,7 +51,6 @@ pub fn scan(buf: &[u8], strings: bool) -> Scan {
             }
             Scan::Incomplete
         }
-        // SS3.
         b'O' => {
             if buf.len() >= 3 {
                 Scan::Sequence(3)
@@ -71,8 +62,6 @@ pub fn scan(buf: &[u8], strings: bool) -> Scan {
     }
 }
 
-/// The length of the longest prefix of `buf` made of whole sequences,
-/// whole UTF-8 characters and plain bytes; the rest has not fully arrived.
 pub fn complete_prefix(buf: &[u8], strings: bool) -> usize {
     let mut pos = 0;
     while pos < buf.len() {
@@ -91,8 +80,6 @@ pub fn complete_prefix(buf: &[u8], strings: bool) -> usize {
     pos
 }
 
-/// Bytes at the end of `bytes` that begin a UTF-8 character without
-/// completing it.
 fn utf8_tail(bytes: &[u8]) -> usize {
     let Some(start) = bytes
         .iter()
@@ -115,8 +102,6 @@ fn utf8_tail(bytes: &[u8]) -> usize {
     }
 }
 
-/// The shape of a terminal response, enough to recognise another
-/// terminal's answer to the same query.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shape {
     Csi {
@@ -126,19 +111,15 @@ pub enum Shape {
     },
     Osc(Vec<u8>),
     Dcs(Vec<u8>),
-    /// By the first byte after the introducer: `G` for kitty graphics.
     Apc(Option<u8>),
 }
 
 impl Shape {
-    /// Whether the response is a string (OSC, DCS or APC) rather than a
-    /// CSI sequence.
     pub fn is_string(&self) -> bool {
         !matches!(self, Shape::Csi { .. })
     }
 }
 
-/// The shape of one complete sequence, when it can be a response.
 pub fn shape(seq: &[u8]) -> Option<Shape> {
     match seq.get(1)? {
         b'[' => {
@@ -187,19 +168,24 @@ pub fn shape(seq: &[u8]) -> Option<Shape> {
 /// 2, ctrl 4, super 8), as the terminal sends them when a program
 /// enabled the protocol; the lock bits (caps 64, num 128) are dropped. A
 /// release (event 3) is `None`.
-pub fn kitty_key(seq: &[u8]) -> Option<(u32, u32)> {
-    let (code, mods, event) = kitty_event(seq)?;
-    (event != 3).then_some((code, mods))
+pub fn kitty_key(seq: &[u8]) -> Option<KittyKey> {
+    let (key, event) = kitty_event(seq)?;
+    (event != KITTY_RELEASE).then_some(key)
 }
 
-/// Whether `seq` is a kitty key release.
 pub fn kitty_release(seq: &[u8]) -> bool {
-    kitty_event(seq).is_some_and(|(_, _, event)| event == 3)
+    kitty_event(seq).is_some_and(|(_, event)| event == KITTY_RELEASE)
 }
 
-/// Any kitty key event: code, modifier bits and event type (1 press, 2
-/// repeat, 3 release).
-fn kitty_event(seq: &[u8]) -> Option<(u32, u32, u32)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KittyKey {
+    pub code: u32,
+    pub mods: u32,
+}
+
+const KITTY_RELEASE: u32 = 3;
+
+fn kitty_event(seq: &[u8]) -> Option<(KittyKey, u32)> {
     let body = seq.strip_prefix(b"\x1b[")?.strip_suffix(b"u")?;
     let body = std::str::from_utf8(body).ok()?;
     let mut fields = body.split(';');
@@ -217,7 +203,7 @@ fn kitty_event(seq: &[u8]) -> Option<(u32, u32, u32)> {
         }
         None => (0, 1),
     };
-    Some((code, mods, event))
+    Some((KittyKey { code, mods }, event))
 }
 
 #[cfg(test)]
@@ -245,8 +231,6 @@ mod tests {
 
     #[test]
     fn alt_keys_are_not_string_introducers_unless_expected() {
-        // Alt-] then "abc" and Enter: whole keys when no string answer is
-        // expected, one unfinished OSC otherwise.
         let typed = b"\x1b]abc\r";
         assert_eq!(scan(typed, false), Scan::Sequence(2));
         assert_eq!(complete_prefix(typed, false), typed.len());
@@ -291,12 +275,28 @@ mod tests {
 
     #[test]
     fn kitty_keys_decode() {
-        assert_eq!(kitty_key(b"\x1b[92;5u"), Some((92, 4)));
-        assert_eq!(kitty_key(b"\x1b[100u"), Some((100, 0)));
-        assert_eq!(kitty_key(b"\x1b[100;1:1u"), Some((100, 0)));
-        assert_eq!(kitty_key(b"\x1b[100;5:2u"), Some((100, 4)), "repeat");
+        assert_eq!(
+            kitty_key(b"\x1b[92;5u"),
+            Some(KittyKey { code: 92, mods: 4 })
+        );
+        assert_eq!(
+            kitty_key(b"\x1b[100u"),
+            Some(KittyKey { code: 100, mods: 0 })
+        );
+        assert_eq!(
+            kitty_key(b"\x1b[100;1:1u"),
+            Some(KittyKey { code: 100, mods: 0 })
+        );
+        assert_eq!(
+            kitty_key(b"\x1b[100;5:2u"),
+            Some(KittyKey { code: 100, mods: 4 }),
+            "repeat"
+        );
         assert_eq!(kitty_key(b"\x1b[100;5:3u"), None, "release");
-        assert_eq!(kitty_key(b"\x1b[97:65;2u"), Some((97, 1)));
+        assert_eq!(
+            kitty_key(b"\x1b[97:65;2u"),
+            Some(KittyKey { code: 97, mods: 1 })
+        );
         assert_eq!(kitty_key(b"\x1b[A"), None);
         assert_eq!(kitty_key(b"\x1b[1;2R"), None);
     }

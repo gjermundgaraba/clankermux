@@ -1,8 +1,4 @@
-//! The attachment state machine: frames in, actions out. It keeps the
-//! local engine current (bootstrapping from the snapshot, then feeding
-//! the stream) and tracks the cursor for resuming.
-
-use ghostty_vt::snapshot::Decoder;
+use ghostty_vt::snapshot::{Decoder, Step};
 use ghostty_vt::{Handler, Terminal};
 use proto::{
     AttachMode, Attached, Closed, ErrorMessage, Exit, Exited, FrameType, Gap, Resized, Resume,
@@ -11,7 +7,6 @@ use proto::{
 
 use crate::connection::{Error, Frame};
 
-/// Payloads and frame overhead held behind a bootstrap's first marker.
 const MAX_HELD_BYTES: usize = 4 * 1024 * 1024;
 
 pub(crate) fn keeps_attachment(code: proto::ErrorCode) -> bool {
@@ -21,28 +16,16 @@ pub(crate) fn keeps_attachment(code: proto::ErrorCode) -> bool {
     )
 }
 
-/// What a client does in response to frames.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    /// The screen is renderable from the local engine; paint it. The
-    /// session may already have exited: see [`Attachment::session`].
     Screen,
-    /// Stream bytes, already applied to the local engine.
     Output(Vec<u8>),
-    /// The session was resized at the current position.
-    Resized {
-        cols: u16,
-        rows: u16,
-    },
+    Resized { cols: u16, rows: u16 },
     Exited(Exit),
-    /// Bytes were lost; the terminal was discarded and a new bootstrap
-    /// follows.
     Gap(Gap),
-    /// `CLOSED`, with the message a `detach` gave.
     Closed(Closed),
-    /// `read_only`, `not_running` and `input_overflow` keep the
-    /// attachment; any other code ended it.
-    Error(ErrorMessage),
+    Refused(ErrorMessage),
+    Ended(ErrorMessage),
 }
 
 #[derive(Clone, Copy)]
@@ -52,29 +35,25 @@ struct Cursor {
 }
 
 enum State<H: Handler> {
-    /// Before `ATTACHED`.
     Opening,
     Bootstrapping {
         decoder: Decoder<H>,
-        /// Stream frames held back after a `RESIZED` or `EXITED` until
-        /// `SNAPSHOT_END`.
         held: Vec<Frame>,
         held_bytes: usize,
     },
     Streaming(Terminal<H>),
-    /// After the final marker, `CLOSED` or a fatal error. The terminal,
-    /// when there was one, stays renderable for the final screen.
     Ended(Option<Terminal<H>>),
 }
 
-/// The attachment of one channel. `H` is the handler installed on the
-/// local engine from `READY` on; a fresh `H::default()` per bootstrap.
-pub struct Attachment<H: Handler + Default = ()> {
-    /// The server the cursor was obtained from, and its limit.
+struct NextOpen {
     incarnation: String,
     continuation: usize,
-    /// The server of the connection the next `ATTACHED` arrives on.
-    next: Option<(String, usize)>,
+}
+
+pub struct Attachment<H: Handler + Default = ()> {
+    incarnation: String,
+    continuation: usize,
+    next: Option<NextOpen>,
     state: State<H>,
     cursor: Cursor,
     pub session: Option<Session>,
@@ -101,16 +80,13 @@ impl<H: Handler + Default> Attachment<H> {
         }
     }
 
-    /// Records the server an `OPEN` is about to go to; its incarnation
-    /// becomes the cursor's once that `ATTACHED` arrives.
     pub fn open_on(&mut self, welcome: &Welcome) {
-        self.next = Some((
-            welcome.incarnation.clone(),
-            proto::cap(welcome.limits.continuation),
-        ));
+        self.next = Some(NextOpen {
+            incarnation: welcome.incarnation.clone(),
+            continuation: proto::cap(welcome.limits.continuation),
+        });
     }
 
-    /// The cursor to resume from, once the terminal reflects the stream.
     pub fn resume(&self) -> Option<Resume> {
         match self.state {
             State::Streaming(_) => Some(Resume {
@@ -126,7 +102,6 @@ impl<H: Handler + Default> Attachment<H> {
         matches!(self.state, State::Ended(_))
     }
 
-    /// The local engine, once `READY` has been decoded.
     pub fn term(&mut self) -> Option<&mut Terminal<H>> {
         match &mut self.state {
             State::Bootstrapping { decoder, .. } => decoder.terminal(),
@@ -136,11 +111,10 @@ impl<H: Handler + Default> Attachment<H> {
         }
     }
 
-    /// Ends the attachment, keeping the terminal it had.
     fn end(&mut self) {
         let term = match std::mem::replace(&mut self.state, State::Opening) {
             State::Streaming(term) | State::Ended(Some(term)) => Some(term),
-            State::Bootstrapping { decoder, .. } => decoder.into_terminal(),
+            State::Bootstrapping { decoder, .. } => decoder.into_terminal().ok(),
             State::Opening | State::Ended(None) => None,
         };
         self.state = State::Ended(term);
@@ -167,7 +141,9 @@ impl<H: Handler + Default> Attachment<H> {
                         actions.push(Action::Screen);
                     }
                 } else {
-                    while decoder.step_available() && decoder.next_page().map_err(engine)? {}
+                    while decoder.step_available()
+                        && decoder.next_page().map_err(engine)? == Step::Page
+                    {}
                 }
             }
             FrameType::SnapshotReady => {
@@ -216,19 +192,24 @@ impl<H: Handler + Default> Attachment<H> {
             }
             FrameType::Error => {
                 let error: ErrorMessage = frame.json()?;
-                if !keeps_attachment(error.code) {
+                if keeps_attachment(error.code) {
+                    actions.push(Action::Refused(error));
+                } else {
                     self.end();
+                    actions.push(Action::Ended(error));
                 }
-                actions.push(Action::Error(error));
             }
             other => return Err(Error::Protocol(format!("{other:?} on an attachment"))),
         }
         Ok(())
     }
 
-    /// `ATTACHED`: the cursor, and a bootstrap for a snapshot.
     fn attached(&mut self, attached: Attached) -> Result<(), Error> {
-        if let Some((incarnation, continuation)) = self.next.take() {
+        if let Some(NextOpen {
+            incarnation,
+            continuation,
+        }) = self.next.take()
+        {
             self.incarnation = incarnation;
             self.continuation = continuation;
         }
@@ -258,8 +239,6 @@ impl<H: Handler + Default> Attachment<H> {
         Ok(())
     }
 
-    /// `SNAPSHOT_END`: the decoded terminal streams on, starting with the
-    /// frames held during the bootstrap.
     fn snapshot_end(&mut self, actions: &mut Vec<Action>) -> Result<(), Error> {
         if !matches!(self.state, State::Bootstrapping { .. }) {
             return Err(Error::Protocol("SNAPSHOT_END outside a bootstrap".into()));
@@ -273,13 +252,13 @@ impl<H: Handler + Default> Attachment<H> {
         if decoder.terminal().is_none() {
             return Err(Error::Protocol("SNAPSHOT_END before READY".into()));
         }
-        while decoder.step_available() && decoder.next_page().map_err(engine)? {}
+        while decoder.step_available() && decoder.next_page().map_err(engine)? == Step::Page {}
         if !decoder.finished() {
             return Err(Error::Protocol("SNAPSHOT_END before FINISH".into()));
         }
         let term = decoder
             .into_terminal()
-            .ok_or_else(|| Error::Protocol("the decoder's terminal was replaced".into()))?;
+            .map_err(|_| Error::Protocol("the decoder's terminal was replaced".into()))?;
         self.state = State::Streaming(term);
         for frame in held {
             self.step(frame, actions)?;
@@ -287,7 +266,6 @@ impl<H: Handler + Default> Attachment<H> {
         Ok(())
     }
 
-    /// A stream frame at the cursor.
     fn stream(&mut self, frame: &Frame, actions: &mut Vec<Action>) -> Result<(), Error> {
         let cursor = self.cursor;
         match frame.header.frame_type {
@@ -484,8 +462,6 @@ mod tests {
         let mut a: Attachment = Attachment::new();
         a.open_on(&welcome("inc"));
         assert_eq!(a.handle(attached(100, 2, &bytes)).unwrap(), vec![]);
-        // The snapshot arrives in two pieces: the READY part split oddly,
-        // then the rest.
         assert_eq!(
             a.handle(frame(FrameType::Snapshot, bytes[..ready - 1].to_vec()))
                 .unwrap(),
@@ -501,8 +477,6 @@ mod tests {
             vec![]
         );
         assert_eq!(text(a.term().unwrap()), "one\ntwo");
-        // Output before SNAPSHOT_END is applied at once; after a RESIZED
-        // it is held until SNAPSHOT_END.
         let out = proto::encode_output(100, b"x");
         assert_eq!(
             a.handle(frame(FrameType::Output, out)).unwrap(),
@@ -546,8 +520,6 @@ mod tests {
             })
         );
 
-        // A wrong offset is a lost place in the stream, which a fresh OPEN
-        // recovers; so is a wrong marker.
         assert!(matches!(
             a.handle(frame(FrameType::Output, proto::encode_output(5, b"z"))),
             Err(Error::Desync(_))
@@ -603,7 +575,6 @@ mod tests {
             vec![Action::Exited(Exit::Code { code: 3 })]
         );
         assert!(a.ended());
-        // Nothing more is accepted on an ended attachment.
         assert!(a.handle(frame(FrameType::SnapshotEnd, vec![])).is_err());
         assert!(a.ended());
     }
@@ -639,8 +610,6 @@ mod tests {
         a.handle(frame(FrameType::SnapshotReady, vec![])).unwrap();
         a.handle(frame(FrameType::SnapshotEnd, vec![])).unwrap();
         assert_eq!(a.resume().unwrap().incarnation, "first");
-        // Reconnected to a restarted server: the resume offered carries
-        // the old incarnation until the new ATTACHED arrives.
         a.open_on(&welcome("second"));
         assert_eq!(a.resume().unwrap().incarnation, "first");
         a.handle(attached(0, 0, &bytes)).unwrap();
@@ -666,7 +635,7 @@ mod tests {
         };
         assert_eq!(
             a.handle(json(FrameType::Error, &soft)).unwrap(),
-            vec![Action::Error(soft.clone())]
+            vec![Action::Refused(soft.clone())]
         );
         assert!(!a.ended());
         let hard = ErrorMessage {
@@ -674,7 +643,10 @@ mod tests {
             code: proto::ErrorCode::TooSlow,
             message: String::new(),
         };
-        a.handle(json(FrameType::Error, &hard)).unwrap();
+        assert_eq!(
+            a.handle(json(FrameType::Error, &hard)).unwrap(),
+            vec![Action::Ended(hard.clone())]
+        );
         assert!(a.ended());
     }
 }

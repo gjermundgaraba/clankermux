@@ -1,8 +1,3 @@
-/**
- * Framing properties with a seeded generator: no input throws anything
- * but a FrameError, and every chunking of a valid stream yields the same
- * frames.
- */
 import { expect, test } from "vitest";
 
 import { FrameError, FrameType, HEADER_LEN, StreamFramer, encodeFrame, parseFrame } from "../../src/proto/index.ts";
@@ -10,10 +5,6 @@ import { FrameError, FrameType, HEADER_LEN, StreamFramer, encodeFrame, parseFram
 const MAX_FRAME = 1024;
 const CASES = Number(process.env["CLANKERMUX_FUZZ_CASES"] ?? 400);
 
-/**
- * xorshift32 from a mixed seed, so a failure reproduces from its case
- * number and small seeds do not start with tiny values.
- */
 function rng(seed: number): () => number {
   let x = Math.imul(seed + 1, 0x9e37_79b1) >>> 0 || 1;
   const next = () => {
@@ -30,7 +21,6 @@ const int = (r: () => number, max: number) => Math.floor(r() * max);
 const bytes = (r: () => number, len: number) => Uint8Array.from({ length: len }, () => int(r, 256));
 const types = Object.values(FrameType);
 
-/** `stream` split at random points, concatenation preserved. */
 function chunk(r: () => number, stream: Uint8Array): Uint8Array[] {
   const cuts = Array.from({ length: int(r, 8) }, () => int(r, stream.length + 1)).sort((a, b) => a - b);
   const out: Uint8Array[] = [];
@@ -62,7 +52,6 @@ interface Spec {
   payload: Uint8Array;
 }
 
-/** Random frames: small payloads, and some at the frame limit. */
 function specs(r: () => number): Spec[] {
   return Array.from({ length: int(r, 12) }, () => ({
     type: types[int(r, types.length)]!,
@@ -101,8 +90,6 @@ test("any bytes decode or fail with a FrameError", () => {
   let decoded = 0;
   for (let n = 0; n < CASES; n++) {
     const r = rng(1000 + n);
-    // Random bytes, or a valid stream with up to four bytes changed, so
-    // that frames decode before the damage.
     let stream: Uint8Array;
     if (r() < 0.5) {
       stream = bytes(r, int(r, 2048));
@@ -112,7 +99,6 @@ test("any bytes decode or fail with a FrameError", () => {
     }
     const { frames, error } = decodeAll(chunk(r, stream));
     decoded += frames.length;
-    // Each frame is a whole message a message parser accepts.
     let pos = 0;
     for (const f of frames) {
       expect(f.length, `case ${n}`).toBe(HEADER_LEN + parseFrame(f, MAX_FRAME).header.length);
@@ -120,7 +106,6 @@ test("any bytes decode or fail with a FrameError", () => {
       pos += f.length;
     }
     if (error) {
-      // The failure is at the header after the last frame.
       expect(() => parseFrame(stream.subarray(pos), MAX_FRAME), `case ${n}`).toThrow(FrameError);
     }
     try {

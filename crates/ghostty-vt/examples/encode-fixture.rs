@@ -1,7 +1,3 @@
-//! Writes snapshot fixtures for the cross-engine test: each `<name>.ghostsnp`
-//! is a native-encoded snapshot and `<name>.txt` the plain-text screen the
-//! native formatter produces for it.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -23,19 +19,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     basic.vt_write(b"\x1b]2;fixture\x07cursor here");
     write(&dir, "basic", &basic)?;
 
-    // History spanning several pages, decoded page by page in the browser.
     let mut history = Terminal::new(20, 5)?;
     for i in 1..=5000 {
         history.vt_write(format!("history {i}\r\n").as_bytes());
     }
     write(&dir, "history", &history)?;
 
-    // Alternate screen active: two SCREEN and two HISTORY groups.
     let mut alternate = Terminal::new(20, 5)?;
     alternate.vt_write(b"primary\r\n\x1b[?1049halternate");
     write(&dir, "alternate", &alternate)?;
 
-    // Parser mid-sequence: a non-ground CONTINUATION record.
     let mut continuation = Terminal::new(20, 5)?;
     continuation.set_continuation_max_bytes(1 << 20)?;
     continuation.vt_write(b"partial\x1b[3");

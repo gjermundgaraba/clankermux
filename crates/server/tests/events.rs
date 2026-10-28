@@ -1,17 +1,11 @@
-//! Event numbers and replay, the program's signals as events, `ack` and
-//! attention.
-
-mod common;
-
-use common::*;
 use proto::*;
 use serde_json::{Value, json};
+use testkit::*;
 
 fn from<T: serde::de::DeserializeOwned>(value: Value) -> T {
     serde_json::from_value(value).unwrap()
 }
 
-/// `send` of `text` to a session running `cat`, which writes it back.
 fn typed(id: &str, text: &str) -> Value {
     json!({"session": id, "data": b64(format!("{text}\n"))})
 }
@@ -42,7 +36,6 @@ async fn events_are_numbered_and_replayed_after_a_cursor() {
     assert_eq!(seen.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2, 3]);
     assert!(matches!(seen[0].event, Event::SessionCreated { .. }));
 
-    // After the first event: the other two again, then the live ones.
     let mut resumed = client(&server).await;
     let replay: Subscribed = from(
         resumed
@@ -61,7 +54,6 @@ async fn events_are_numbered_and_replayed_after_a_cursor() {
     assert_eq!(live.seq, 4);
     assert_eq!(resumed.numbered().await, live);
 
-    // At the latest: nothing to replay.
     let mut caught_up = client(&server).await;
     let replay: Subscribed = from(
         caught_up
@@ -73,8 +65,6 @@ async fn events_are_numbered_and_replayed_after_a_cursor() {
         .await;
     assert_eq!(caught_up.numbered().await.seq, 5);
 
-    // A cursor above the latest, half a cursor, and a second subscription
-    // with one are refused; a second plain one replies with a page.
     let mut refused = client(&server).await;
     for params in [
         json!({"after": 99, "incarnation": incarnation}),
@@ -117,7 +107,6 @@ async fn a_cursor_before_the_retained_events_or_from_another_server_is_a_gap() {
         c.ok("label", json!({"session": session.id, "label": label}))
             .await;
     }
-    // Six events, the last three retained.
     let mut b = client(&server).await;
     let reply: Subscribed = from(
         b.ok("subscribe", json!({"after": 2, "incarnation": incarnation}))
@@ -139,8 +128,6 @@ async fn a_cursor_before_the_retained_events_or_from_another_server_is_a_gap() {
 
     c.ok("label", json!({"session": session.id, "label": "6"}))
         .await;
-    // A gap replays nothing; the live events follow, and the
-    // connection serves on.
     assert_eq!(b.numbered().await.seq, 7);
     assert_eq!(o.numbered().await.seq, 7);
     for seq in 4..=7 {
@@ -207,7 +194,6 @@ async fn the_programs_signals_are_events_at_their_offsets() {
             },
         ]
     );
-    // The BELs that end the sequences rang nothing.
     c.ok("send", typed(&id, "\x1b]9;after\x07")).await;
     let after = event_where(&mut c, |e| match e {
         Event::SessionChanged { .. } => None,
@@ -234,8 +220,6 @@ async fn an_st_split_across_two_reads_ends_the_sequence_after_it() {
         _ => None,
     })
     .await;
-    // The engine ends the sequence at the ESC; the server holds what it
-    // raised until it sees the `\`.
     assert_eq!(offset, b"ab\x1b]133;C\x1b\\".len() as u64);
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
@@ -281,8 +265,6 @@ async fn attachments_open_and_close_as_events() {
         _ => None,
     })
     .await;
-    // The event's channel is the one the attachments list shows and
-    // `detach` takes, not the frame channel.
     let Event::SessionChanged { session } = c.event().await else {
         panic!("session_changed after attachment_opened");
     };
@@ -316,7 +298,6 @@ async fn attachments_open_and_close_as_events() {
         matches!(c.event().await, Event::SessionChanged { session } if session.attachments.is_empty())
     );
 
-    // A `detach` by the channel from the event.
     o.open(3, json!({"session": id})).await;
     o.bootstrap(3).await;
     let detached = event_where(&mut c, |e| match e {
@@ -363,8 +344,6 @@ async fn attachments_open_and_close_as_events() {
         .await;
 }
 
-/// The next `program_status_*` event of the session: the record set, or
-/// the ids removed, with the reason.
 async fn status_event(c: &mut Client) -> (Result<StatusRecord, Vec<String>>, StatusReason) {
     event_where(c, |e| match e {
         Event::ProgramStatusChanged { record, reason, .. } => Some((Ok(record.clone()), *reason)),
@@ -376,7 +355,6 @@ async fn status_event(c: &mut Client) -> (Result<StatusRecord, Vec<String>>, Sta
     .await
 }
 
-/// The attention of the next `session_changed`.
 async fn attention_changed(c: &mut Client) -> Option<(String, String)> {
     event_where(c, |e| match e {
         Event::SessionChanged { session } => Some(
@@ -474,7 +452,6 @@ async fn ack_marks_done_and_error_seen_and_attention_follows() {
     let acked: Acked = from(c.ok("ack", json!({"session": id})).await);
     assert!(acked.record_ids.is_empty(), "already seen");
 
-    // A new report on the id is unseen again; a clear removes it.
     c.ok("send", report(&id, "state=error:id=a")).await;
     let (record, _) = status_event(&mut c).await;
     assert_eq!(record.unwrap().seen, Some(false));
@@ -491,8 +468,6 @@ async fn ack_marks_done_and_error_seen_and_attention_follows() {
     assert_eq!(attention_changed(&mut c).await, None);
 }
 
-/// Beyond `records` the least recently updated goes; an exit drops the
-/// working record.
 #[tokio::test(flavor = "multi_thread")]
 async fn records_beyond_the_limit_evict_the_least_recently_updated() {
     let server = start(Limits {
@@ -583,8 +558,6 @@ async fn seen_survives_park_and_restore() {
             .map(|a| a.record.as_str()),
         Some("e")
     );
-    // The working record dropped at the load is the new incarnation's
-    // first event.
     let replay: Subscribed = from(
         c.ok(
             "subscribe",
@@ -605,8 +578,6 @@ async fn seen_survives_park_and_restore() {
         }
     );
 
-    // An ack of the restored session is announced and reaches its files
-    // before the stop, which writes nothing for a session not live.
     c.ok("ack", json!({"session": id})).await;
     let (record, reason) = status_event(&mut c).await;
     assert_eq!(
@@ -618,9 +589,8 @@ async fn seen_survives_park_and_restore() {
         !json.contains("\"seen\":false")
     })
     .await;
-    // Still readable by a server that counts attachments.
     let json = std::fs::read_to_string(generation.join("session.json")).unwrap();
-    assert!(json.contains("\"attachments\":0"), "{json}");
+    assert!(json.contains("\"attachments\":[]"), "{json}");
     drop(c);
     b.registry.stop().await;
     drop(b);
@@ -646,7 +616,6 @@ async fn an_ack_after_the_exit_of_a_kept_session_parks_it_again() {
             "printf '\\033]7501;state=done:id=d\\033\\\\'; exit 0"]}))
         .await;
     c.wait_exit(&session.id).await;
-    // The park at the exit, then the ack's.
     wait_parked(&state, &session.id, "session.json", |json| {
         json.contains("\"seen\":false")
     })
@@ -702,7 +671,6 @@ async fn an_ack_of_a_running_session_reaches_its_next_park() {
     let a = Server::start_with_park(fast_limits(), state.clone(), prompt_parks(50, 50, 500));
     let mut c = client(&a).await;
     let session = c.create(json!({"argv": ["/bin/cat"]})).await;
-    // The report's park, then the ack's.
     c.ok("send", report(&session.id, "state=done:id=d")).await;
     wait_parked(&state, &session.id, "session.json", |json| {
         json.contains("\"seen\":false")
@@ -758,7 +726,7 @@ async fn empty_effects_still_deliver_answers_and_announce_metadata_changes() {
     s.flush_effects();
     assert_eq!(s.take_events(), []);
     s.output(b"\x1b[5n");
-    assert_eq!(answers.try_recv().unwrap().0, b"\x1b[0n");
+    assert_eq!(answers.try_recv().unwrap().bytes, b"\x1b[0n");
     assert_eq!(s.take_events(), []);
     for (bytes, title, pwd) in [
         (&b"\x1b]2;title\x07"[..], "title", ""),

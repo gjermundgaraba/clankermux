@@ -1,63 +1,62 @@
-//! Format a terminal's active screen as plain text, VT sequences or HTML.
-
 use std::ptr;
 
 use ghostty_vt_sys as sys;
 
 use crate::error::{Result, check};
 use crate::io;
-use crate::terminal::Term;
+use crate::terminal::{ScrollbackRow, Term};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Format {
     #[default]
     Plain,
-    Vt,
-    /// HTML with inline styles.
+    Vt(VtExtras),
     Html,
 }
 
-/// Formatting options. `Default` is plain text of the whole screen with
-/// nothing extra. The extras apply to VT output only.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "mirrors GhosttyFormatterTerminalOptions"
+    reason = "mirrors GhosttyFormatterScreenExtra and GhosttyFormatterTerminalExtra"
 )]
-pub struct Options {
-    pub format: Format,
-    /// Join soft-wrapped rows into one line.
-    pub unwrap: bool,
-    /// Drop trailing blanks.
-    pub trim: bool,
+pub struct VtExtras {
     pub cursor: bool,
     pub style: bool,
     pub hyperlink: bool,
     pub modes: bool,
     pub keyboard: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    pub format: Format,
+    pub unwrap: bool,
+    pub trim: bool,
     pub region: Region,
 }
 
-/// The part of the terminal to format.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Region {
-    /// History and screen.
     #[default]
     All,
-    /// From this row (counted from the top of the scrollback) to the end
-    /// of the screen.
-    FromRow(u32),
-    /// A `cols` by `rows` window of the screen starting at its row
-    /// `from_row`, left-aligned.
-    Clip { from_row: u16, cols: u16, rows: u16 },
+    FromRow(ScrollbackRow),
+    Clip {
+        screen_row: u16,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
+    let extras = match options.format {
+        Format::Vt(extras) => extras,
+        Format::Plain | Format::Html => VtExtras::default(),
+    };
     let mut raw_options = sys::GhosttyFormatterTerminalOptions {
         size: size_of::<sys::GhosttyFormatterTerminalOptions>(),
         emit: match options.format {
             Format::Plain => sys::GHOSTTY_FORMATTER_FORMAT_PLAIN,
-            Format::Vt => sys::GHOSTTY_FORMATTER_FORMAT_VT,
+            Format::Vt(_) => sys::GHOSTTY_FORMATTER_FORMAT_VT,
             Format::Html => sys::GHOSTTY_FORMATTER_FORMAT_HTML,
         },
         unwrap: options.unwrap,
@@ -65,18 +64,18 @@ pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
         extra: sys::GhosttyFormatterTerminalExtra {
             size: size_of::<sys::GhosttyFormatterTerminalExtra>(),
             palette: false,
-            modes: options.modes,
+            modes: extras.modes,
             scrolling_region: false,
             tabstops: false,
             pwd: false,
-            keyboard: options.keyboard,
+            keyboard: extras.keyboard,
             screen: sys::GhosttyFormatterScreenExtra {
                 size: size_of::<sys::GhosttyFormatterScreenExtra>(),
-                cursor: options.cursor,
-                style: options.style,
-                hyperlink: options.hyperlink,
+                cursor: extras.cursor,
+                style: extras.style,
+                hyperlink: extras.hyperlink,
                 protection: false,
-                kitty_keyboard: options.keyboard,
+                kitty_keyboard: extras.keyboard,
                 charsets: false,
             },
         },
@@ -85,7 +84,7 @@ pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
     let active = sys::GHOSTTY_POINT_TAG_ACTIVE;
     let selection = match options.region {
         Region::All => None,
-        Region::FromRow(row) => Some(selection(
+        Region::FromRow(ScrollbackRow(row)) => Some(selection(
             point(term, sys::GHOSTTY_POINT_TAG_SCREEN, 0, row)?,
             point(
                 term,
@@ -96,11 +95,11 @@ pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
             false,
         )),
         Region::Clip {
-            from_row,
+            screen_row,
             cols,
             rows,
         } => {
-            let top = from_row.min(term.rows().saturating_sub(1));
+            let top = screen_row.min(term.rows().saturating_sub(1));
             let bottom = (u32::from(top) + u32::from(rows)).min(u32::from(term.rows())) - 1;
             Some(selection(
                 point(term, active, 0, u32::from(top))?,

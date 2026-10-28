@@ -68,8 +68,6 @@ test("message vectors equal the typed literals", () => {
   expect(file).toEqual(messages);
 });
 
-// framing.test.ts cuts streams at random; the edges of a header and of a
-// frame it reaches only by chance.
 test("a stream cut at a header's or a frame's edge splits into the same frames", () => {
   const a = encodeFrame(FrameType.Input, 1, new TextEncoder().encode("abc"));
   const b = encodeFrame(FrameType.Close, 1, new Uint8Array());

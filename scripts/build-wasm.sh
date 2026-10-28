@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Build ghostty-vt.wasm from the vendored tree into web/packages/clankermux.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out="$root/target/wasm"

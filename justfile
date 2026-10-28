@@ -1,4 +1,3 @@
-# Zig 0.16 as mise pins it, for build-wasm.sh and ghostty-vt-sys; ZIG wins.
 export ZIG := env("ZIG", `mise which zig 2>/dev/null || echo zig`)
 
 # Required checks for every commit.

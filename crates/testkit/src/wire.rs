@@ -1,30 +1,26 @@
-//! Shared test harness: the test kit's server and a framed client.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ghostty_vt::{formatter, snapshot};
-use proto::*;
+use proto::{
+    AttachMode, Attached, Closed, ClosedReason, ErrorCode, ErrorMessage, Event, FrameDecoder,
+    FrameType, Header, Limits, Numbered, Page, Read, Resized, Session, Welcome, encode_frame,
+    parse_output,
+};
 use serde_json::{Value, json};
-pub use testkit::Server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+use crate::Server;
 
 pub fn start(limits: Limits) -> Server {
     Server::start(limits)
 }
 
-/// A server on `state_dir`, which may hold a previous server's parks.
 pub fn start_with(limits: Limits, state_dir: PathBuf) -> Server {
     Server::start_with_state(limits, state_dir)
 }
 
-/// What a `read` reply keeps of `max_frame` for the JSON around its
-/// text: the server's private `REPLY_MARGIN`.
-pub const READ_MARGIN: usize = 4096;
-
-/// Standard base64, as `send` takes its data.
 pub fn b64(data: impl AsRef<[u8]>) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(data)
@@ -39,17 +35,14 @@ pub fn fast_limits() -> Limits {
     }
 }
 
-/// Any byte stream a carrier speaks over.
 pub trait Transport: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Transport for T {}
 
 pub struct Client {
     pub stream: Box<dyn Transport>,
     pub decoder: FrameDecoder,
-    /// The server's limit, from `WELCOME`; a larger server frame fails.
     pub max_frame: u64,
     pub next_id: i64,
-    /// Events that arrived while waiting for a reply.
     pub events: std::collections::VecDeque<Numbered>,
 }
 
@@ -58,7 +51,6 @@ impl Client {
         Self::over(UnixStream::connect(&server.socket).await.unwrap())
     }
 
-    /// A client over any carrier's stream.
     pub fn over(stream: impl Transport + 'static) -> Self {
         Client {
             stream: Box::new(stream),
@@ -74,7 +66,6 @@ impl Client {
             .write_all(&encode_frame(frame_type, channel, payload))
             .await
             .unwrap();
-        // A message carrier sends on flush.
         self.stream.flush().await.unwrap();
     }
 
@@ -83,7 +74,6 @@ impl Client {
             .await;
     }
 
-    /// The next frame, or `None` when the server closed the connection.
     pub async fn recv(&mut self) -> Option<(Header, Vec<u8>)> {
         let mut buf = [0u8; 4096];
         loop {
@@ -105,7 +95,6 @@ impl Client {
         (header, serde_json::from_slice(&payload).unwrap())
     }
 
-    /// HELLO naming the server's engine.
     pub async fn hello(&mut self) -> Welcome {
         self.hello_with(Some(ghostty_vt::ENGINE)).await
     }
@@ -114,7 +103,6 @@ impl Client {
         self.hello_as("test", "0", engine).await
     }
 
-    /// HELLO from the client `name` at `version`.
     pub async fn hello_as(&mut self, name: &str, version: &str, engine: Option<&str>) -> Welcome {
         let mut hello = json!({"version": 1, "client": {"name": name, "version": version},
                                "capabilities": []});
@@ -129,8 +117,6 @@ impl Client {
         welcome
     }
 
-    /// Sends a request and returns its reply or error, queuing events that
-    /// arrive first.
     pub async fn request(&mut self, method: &str, params: Value) -> Result<Value, ErrorMessage> {
         let id = self.next_id;
         self.next_id += 1;
@@ -161,7 +147,6 @@ impl Client {
         self.numbered().await.event
     }
 
-    /// The next event with its `seq`.
     pub async fn numbered(&mut self) -> Numbered {
         if let Some(event) = self.events.pop_front() {
             return event;
@@ -232,13 +217,11 @@ impl Client {
         serde_json::from_slice(&payload).unwrap()
     }
 
-    /// Reads a `snapshot` bootstrap through `SNAPSHOT_READY`.
     pub async fn bootstrap_ready(&mut self, channel: u32) -> Bootstrap {
         let attached = self.attached(channel).await;
         self.ready_after(channel, attached).await
     }
 
-    /// The `READY` prefix that follows an `ATTACHED` already read.
     pub async fn ready_after(&mut self, channel: u32, attached: Attached) -> Bootstrap {
         assert_eq!(attached.mode, AttachMode::Snapshot);
         let mut ready = Vec::new();
@@ -259,13 +242,11 @@ impl Client {
         }
     }
 
-    /// Reads a whole `snapshot` bootstrap through `SNAPSHOT_END`.
     pub async fn bootstrap(&mut self, channel: u32) -> Bootstrap {
         let boot = self.bootstrap_ready(channel).await;
         self.bootstrap_rest(channel, boot).await
     }
 
-    /// The rest of a bootstrap whose `READY` prefix was read.
     pub async fn bootstrap_rest(&mut self, channel: u32, mut boot: Bootstrap) -> Bootstrap {
         loop {
             let (header, payload) = self.recv_on(channel).await;
@@ -303,8 +284,6 @@ impl Client {
         serde_json::from_slice(&payload).unwrap()
     }
 
-    /// Reads OUTPUT frames until `needle` appears; returns the offset of
-    /// the first frame and the bytes, asserting contiguous offsets.
     pub async fn output_until(&mut self, channel: u32, needle: &[u8]) -> (u64, Vec<u8>) {
         let mut bytes = Vec::new();
         let mut first = None;
@@ -321,21 +300,15 @@ impl Client {
         }
     }
 
-    /// Polls `inspect` until the session reports `count` attachments.
     pub async fn wait_attachments(&mut self, id: &str, count: usize) {
         inspect_until(self, id, |s| s.attachments.len() == count).await;
     }
 }
 
-/// The bootstrap of a `snapshot` attachment: ATTACHED, snapshot frames
-/// and `SNAPSHOT_READY` / `SNAPSHOT_END` markers.
 pub struct Bootstrap {
     pub attached: Attached,
-    /// Snapshot bytes through the READY record.
     pub ready: Vec<u8>,
-    /// The remaining snapshot bytes.
     pub rest: Vec<u8>,
-    /// Stream frames interleaved after `SNAPSHOT_READY`.
     pub stream: Vec<(Header, Vec<u8>)>,
 }
 
@@ -366,7 +339,6 @@ pub async fn client(server: &Server) -> Client {
     c
 }
 
-/// Polls `read` until `needle` appears on the screen.
 pub async fn wait_text(c: &mut Client, id: &str, needle: &str) -> Read {
     for _ in 0..1000 {
         let read: Read =
@@ -379,7 +351,6 @@ pub async fn wait_text(c: &mut Client, id: &str, needle: &str) -> Read {
     panic!("{needle:?} never appeared");
 }
 
-/// Polls `inspect` until `pick` accepts the session.
 pub async fn inspect_until(c: &mut Client, id: &str, pick: impl Fn(&Session) -> bool) -> Session {
     for _ in 0..1000 {
         let session = c.inspect(id).await;
@@ -391,7 +362,6 @@ pub async fn inspect_until(c: &mut Client, id: &str, pick: impl Fn(&Session) -> 
     panic!("inspect never matched: {:?}", c.inspect(id).await);
 }
 
-/// The next event that `pick` takes, skipping the others.
 pub async fn event_where<T>(c: &mut Client, mut pick: impl FnMut(&Event) -> Option<T>) -> T {
     for _ in 0..50 {
         let event = c.event().await;
@@ -402,7 +372,6 @@ pub async fn event_where<T>(c: &mut Client, mut pick: impl FnMut(&Event) -> Opti
     panic!("no matching event within 50 events");
 }
 
-/// Parks soon after a change; the timer and the stop never in a test.
 pub fn prompt_parks(quiet_ms: u64, gap_ms: u64, busy_ms: u64) -> server::ParkTiming {
     server::ParkTiming {
         interval: Duration::from_secs(3600),
@@ -416,7 +385,6 @@ pub fn sessions_dir(state: &Path) -> PathBuf {
     state.join("sessions")
 }
 
-/// The complete generation directories of `id`, oldest first.
 pub fn generations(state: &Path, id: &str) -> Vec<PathBuf> {
     let mut found: Vec<(u64, PathBuf)> = std::fs::read_dir(sessions_dir(state).join(id))
         .map(|entries| {
@@ -437,8 +405,6 @@ pub fn generations(state: &Path, id: &str) -> Vec<PathBuf> {
     found.into_iter().map(|(_, path)| path).collect()
 }
 
-/// Waits until the newest complete generation of `id` has a `file`
-/// whose text `pick` accepts, and returns the generation.
 pub async fn wait_parked(
     state: &Path,
     id: &str,

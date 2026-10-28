@@ -1,17 +1,11 @@
-//! Conformance tests for the Control section of PROTOCOL.md, driven over
-//! a Unix socket against an in-process server.
-
-mod common;
-
 use std::time::Duration;
 
-use common::*;
 use proto::*;
 use serde_json::json;
+use testkit::*;
 use tokio::io::AsyncWriteExt;
 
-/// What `read` may return under `max_frame` 8192.
-const TEXT_BUDGET: usize = 8192 - READ_MARGIN;
+const TEXT_BUDGET: usize = 8192 - server::REPLY_MARGIN;
 
 #[tokio::test]
 async fn handshake_and_protocol_errors() {
@@ -209,10 +203,6 @@ async fn the_program_s_title_and_pwd_are_announced_until_a_reset() {
     events.ok("subscribe", json!({})).await;
     let session = c.create(json!({"argv": ["/bin/cat"]})).await;
     assert!(matches!(events.event().await, Event::SessionCreated { .. }));
-    // A title (OSC 2) and a working directory (OSC 7) set by the program
-    // are announced, and so is their clearing by a full reset (RIS),
-    // which the engine reports separately. `cat` passes a line on once it
-    // is complete.
     let data = b64("\x1b]2;titled\x07\n");
     c.ok("send", json!({"session": session.id, "data": data}))
         .await;
@@ -228,7 +218,6 @@ async fn the_program_s_title_and_pwd_are_announced_until_a_reset() {
     let data = b64("\x1bc\n");
     c.ok("send", json!({"session": session.id, "data": data}))
         .await;
-    // The reset removes any progress report too.
     assert!(matches!(
         events.event().await,
         Event::Progress {
@@ -390,9 +379,6 @@ async fn events_are_ordered_with_replies() {
     let mut c = client(&server).await;
     c.ok("subscribe", json!({})).await;
     let session = c.create(json!({"argv": ["/bin/sleep", "5"]})).await;
-    // The server emits the event before it sends the reply, and this
-    // connection receives both in that order: the event was queued while
-    // waiting for the reply.
     assert_eq!(c.events.len(), 1, "event before reply");
     assert!(matches!(c.event().await, Event::SessionCreated { session: s } if s.id == session.id));
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
@@ -416,7 +402,6 @@ async fn read_returns_scrollback_then_screen() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // The screen holds line47 to line50 and the blank cursor row.
     assert_eq!(lines.len(), 7, "{lines:?}");
     assert_eq!(lines[0], "line44");
     let read: Read =
@@ -430,7 +415,6 @@ async fn read_returns_scrollback_then_screen() {
 async fn malformed_requests_pipelining_and_the_hello_deadline() {
     let server = start(fast_limits());
 
-    // HELLO and a request in one write are both handled.
     let mut c = Client::connect(&server).await;
     let mut both = encode_frame(
         FrameType::Hello,
@@ -450,8 +434,6 @@ async fn malformed_requests_pipelining_and_the_hello_deadline() {
         (FrameType::Reply, Some(1))
     );
 
-    // A request without an integer id gets an id-less error, then the
-    // connection closes.
     c.send(
         FrameType::Request,
         0,
@@ -463,7 +445,6 @@ async fn malformed_requests_pipelining_and_the_hello_deadline() {
     assert!(body.get("id").is_none());
     assert!(c.recv().await.is_none());
 
-    // A malformed request with an id is answered and the connection stays.
     let mut c = client(&server).await;
     c.send(FrameType::Request, 0, br#"{"id":-7,"method":"list"}"#)
         .await;
@@ -474,14 +455,12 @@ async fn malformed_requests_pipelining_and_the_hello_deadline() {
     );
     assert!(c.request("list", json!({})).await.is_ok());
 
-    // Another version's shape still gets version_mismatch.
     let mut c = Client::connect(&server).await;
     c.send_json(FrameType::Hello, 0, &json!({"version": 2, "peer": "x"}))
         .await;
     assert_eq!(c.recv_json().await.1["code"], "version_mismatch");
     assert!(c.recv().await.is_none());
 
-    // The HELLO deadline runs from connecting, not from the last byte.
     let mut c = Client::connect(&server).await;
     let hello = encode_frame(
         FrameType::Hello,
@@ -496,7 +475,6 @@ async fn malformed_requests_pipelining_and_the_hello_deadline() {
         c.recv().await.is_none(),
         "closed although bytes kept arriving"
     );
-    // A deadline reset by the second byte would close at 500 ms.
     assert!(started.elapsed() < Duration::from_millis(450));
 }
 
@@ -620,7 +598,6 @@ async fn read_screen_only_after_clear_and_bounded_replies() {
     let read = wait_text(&mut c, &session.id, "only").await;
     assert_eq!(read.text, "only\n", "no history without scrollback");
     let read = c.read(&session.id, 2).await;
-    // Before the clear the screen held line997 to line1000 and the cursor row.
     assert_eq!(read.text, "line995\nline996\nonly\n");
     let read = c.read(&session.id, 100_000).await;
     assert!(read.text.len() <= TEXT_BUDGET);
@@ -633,7 +610,6 @@ async fn read_screen_only_after_clear_and_bounded_replies() {
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
 
-    // One line longer than the budget: its newest characters are kept.
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", "i=0; while [ $i -lt 6000 ]; do printf x; i=$((i+1)); done; printf 'END\n'; sleep 5"], "cols": 200, "rows": 5}))
         .await;
@@ -650,8 +626,6 @@ async fn read_screen_only_after_clear_and_bounded_replies() {
 
 #[tokio::test]
 async fn a_connection_that_stops_reading_is_closed() {
-    // The queue ceiling is 256 KiB plus four frames; small frames keep
-    // the test short.
     let server = start(Limits {
         max_frame: 16 * 1024,
         ..fast_limits()
@@ -665,7 +639,6 @@ async fn a_connection_that_stops_reading_is_closed() {
         c.ok("label", json!({"session": session.id, "label": label}))
             .await;
     }
-    // The idle subscriber reads what the socket buffered, then end of file.
     while idle.recv().await.is_some() {}
 }
 
@@ -680,7 +653,6 @@ async fn every_child_knows_its_session_and_socket_whatever_env_says() {
             "env": {"CLANKERMUX_SESSION": "forged", "CLANKERMUX_SOCKET": "/forged", "TERM": "dumb"},
         }))
         .await;
-    // TERM is a default a caller may change; the other two are managed.
     let expected = format!("<{}|{}|dumb>", s.id, server.socket.display());
     wait_text(&mut c, &s.id, &expected).await;
 }

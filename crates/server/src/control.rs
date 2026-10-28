@@ -1,5 +1,3 @@
-//! Channel 0 requests.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,35 +18,25 @@ use crate::registry::{Fail, Registry, internal};
 use crate::session::{self, Shared, Source};
 use crate::wait::{self, Facts, Waiter};
 
-/// A connection's requests that answer later and can be cancelled (a
-/// `wait`, or a `send` carrying one), by id, with what stops each. The
-/// lock is held while the answer is queued, so a `cancel` and the answer
-/// cannot cross: whoever removes the entry answers it.
 pub type Pending = Arc<Mutex<PendingMap>>;
 
 #[derive(Default)]
 pub struct PendingMap {
-    /// Per id: the serial of the request that holds it, and its stop.
     by_id: HashMap<i64, (u64, oneshot::Sender<()>)>,
     serial: u64,
 }
 
 impl PendingMap {
-    /// Drops every entry, which stops their waits.
     pub fn clear(&mut self) {
         self.by_id.clear();
     }
 }
 
-/// One pending request's claim on its id.
 struct Claim {
     id: i64,
     serial: u64,
 }
 
-/// Answers the pending request `claim` with `outcome`, unless a `cancel`
-/// (or the connection's end) took it first; a later request that reused
-/// the id after a cancel is not this one.
 fn finish(pending: &Pending, writer: &Writer, claim: &Claim, outcome: Result<Value, Fail>) {
     let mut pending = pending.lock().unwrap();
     if pending
@@ -61,8 +49,6 @@ fn finish(pending: &Pending, writer: &Writer, claim: &Claim, outcome: Result<Val
     }
 }
 
-/// Runs `waiter` on a task until it fires, fails, or the request
-/// `register` claimed is cancelled; `answer` makes the reply.
 fn spawn_wait(
     pending: &Pending,
     writer: &Writer,
@@ -97,9 +83,6 @@ fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
         .map_err(|e| (ErrorCode::InvalidRequest, format!("bad params: {e}")))
 }
 
-/// Answers `request` on `writer`: `send` from a task once the PTY took
-/// the bytes, `list` and `subscribe` from the registry under its lock,
-/// the rest at once.
 pub fn dispatch(
     registry: &Arc<Registry>,
     writer: &Writer,
@@ -108,7 +91,6 @@ pub fn dispatch(
     request: Request,
 ) {
     let id = request.id;
-    // A method the catalog does not describe is not served.
     if registry.catalog().method(&request.method).is_none() {
         let fail = (
             ErrorCode::InvalidRequest,
@@ -125,7 +107,6 @@ pub fn dispatch(
         }
         "cancel" => match params::<proto::CancelParams>(request.params) {
             Ok(p) => {
-                // The cancelled request's last frame comes first.
                 let mut pending = pending.lock().unwrap();
                 let cancelled = pending.by_id.remove(&p.id).is_some();
                 if cancelled {
@@ -153,14 +134,11 @@ pub fn dispatch(
     }
 }
 
-/// What a `send` writes, before the session's terminal encodes it.
 enum Payload {
     Bytes(Vec<u8>),
     Keys(Vec<KeyPress>),
 }
 
-/// The payload of a `send`: exactly one of text, keys and data, every key
-/// known.
 fn payload(p: &mut proto::SendParams) -> Result<Payload, Fail> {
     let invalid = |m: String| (ErrorCode::InvalidRequest, m);
     match (p.text.take(), p.keys.take(), p.data.take()) {
@@ -186,13 +164,6 @@ fn payload(p: &mut proto::SendParams) -> Result<Payload, Fail> {
     }
 }
 
-/// `send`: answered once the PTY took the bytes, or with a wait once that
-/// fires; meanwhile the connection reads on. The keys are encoded and a
-/// paste bracketed by the session's terminal as the bytes are queued, and
-/// the wait is armed at the cursor then. The write's task is chained on
-/// the session's previous one under the session lock, so the bytes and
-/// the replies without a wait come in queue order; a failure is answered
-/// at once.
 fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p: Value) {
     let started = (|| {
         let mut p: proto::SendParams = params(p)?;
@@ -218,8 +189,6 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
                 bytes
             }
         };
-        // Where the bytes are accepted: the reply's `at`, and where a
-        // wait is armed.
         let at = s.cursor();
         let armed = facts.map(|(facts, timeout)| {
             (
@@ -233,7 +202,6 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
             .push(bytes)
             .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?;
         s.touch();
-        // Pending from here, so a cancel that follows finds it.
         let claim = armed.as_ref().map(|_| register(pending, id));
         let previous = s.send_chain.take();
         let (writer, pending) = (writer.clone(), pending.clone());
@@ -254,7 +222,6 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
                 reply(&writer, id, Ok(json!(Sent { at, wait: None })));
                 return;
             };
-            // The wait goes on off the chain, so later sends answer.
             let answer = move |waited| {
                 json!(Sent {
                     at,
@@ -270,8 +237,6 @@ fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p
     }
 }
 
-/// `wait`: anchored at `after`, or the cursor now, and answered from a
-/// task once a fact holds.
 fn wait(
     registry: &Arc<Registry>,
     writer: &Writer,
@@ -291,7 +256,6 @@ fn wait(
     Ok(())
 }
 
-/// Handles one request but `send`, `list` and `subscribe`.
 fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
     let p = request.params;
     match request.method.as_str() {
@@ -340,7 +304,6 @@ fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
     }
 }
 
-/// Sends `signal` to the session's process group, as `end` and `signal`.
 fn send_signal(registry: &Registry, id: &str, signal: Signal) -> Result<Value, Fail> {
     let session = registry.get(id)?;
     let (pgid, slave) = {
@@ -402,8 +365,6 @@ fn resize(registry: &Registry, p: &proto::ResizeParams) -> Result<Value, Fail> {
     let session = registry.get(&p.session)?;
     let mut s = session.lock().unwrap();
     s.running()?;
-    // The policy first, so that a size given with `smallest`
-    // holds until the next report.
     let mut changed = p.policy.is_some_and(|policy| s.set_policy(policy));
     if p.cols.is_some() || p.rows.is_some() {
         let current = s.size();
@@ -444,7 +405,6 @@ fn detach(registry: &Registry, p: &proto::DetachParams) -> Result<Value, Fail> {
                 format!("no attachment {} on session {}", p.channel, p.session),
             )
         })?;
-    // A connection that dropped the attachment is ending it already.
     if let Some(close) = attachment.close.upgrade() {
         let _ = close.send(Ending::Closed(Closed {
             reason: ClosedReason::Detached,

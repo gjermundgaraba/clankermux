@@ -1,14 +1,9 @@
-//! Conformance tests for the Attach, Size and Queries sections of
-//! PROTOCOL.md.
-
-mod common;
-
 use std::time::Duration;
 
-use common::*;
 use ghostty_vt::snapshot;
 use proto::*;
 use serde_json::json;
+use testkit::*;
 use tokio::io::AsyncWriteExt;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -46,7 +41,6 @@ async fn snapshot_bootstrap_then_stream_then_close() {
 
     c.send(FrameType::Close, 1, b"").await;
     assert_eq!(c.expect_closed(1).await, ClosedReason::Closed);
-    // The attachment is gone and the channel free once CLOSED is read.
     let inspected = c.inspect(&session.id).await;
     assert_eq!(inspected.attachments, []);
     c.open(1, json!({"session": session.id})).await;
@@ -78,10 +72,6 @@ async fn open_checks_in_order() {
     );
     c.wait_attachments(&session.id, 0).await;
 
-    // A channel is in use until CLOSED. A pipelined CLOSE + OPEN gets
-    // CLOSED first, then either `channel_in_use`, when the OPEN was read
-    // before the attachment had ended, or the new attachment; nothing of
-    // the new attachment precedes the old one's CLOSED.
     c.open(3, json!({"session": session.id})).await;
     c.bootstrap(3).await;
     let mut both = encode_frame(FrameType::Close, 3, b"");
@@ -163,7 +153,6 @@ async fn resume_when_retained_else_snapshot() {
     c.send(FrameType::Close, 1, b"").await;
     c.expect_closed(1).await;
 
-    // A marker added while detached is delivered on resume.
     c.ok(
         "resize",
         json!({"session": session.id, "cols": 30, "rows": 8}),
@@ -202,7 +191,6 @@ async fn resume_when_retained_else_snapshot() {
     c.send(FrameType::Close, 1, b"").await;
     c.expect_closed(1).await;
 
-    // Push offset 0 out of the 64-byte ring.
     c.ok(
         "send",
         json!({"session": session.id, "data": b64("x".repeat(100))}),
@@ -266,7 +254,6 @@ async fn viewport_reports_coalesce_and_mark_the_stream() {
         }
     );
 
-    // A report applied at once discards the pending coalesced one.
     c.send_json(FrameType::Viewport, 1, &json!({"cols": 45, "rows": 11}))
         .await;
     c.ok(
@@ -340,8 +327,6 @@ async fn exit_ends_the_stream_and_removal_closes() {
     events.wait_exit(&session.id).await;
     assert!(matches!(events.event().await, Event::SessionRemoved { id } if id == session.id));
 
-    // With a grace far beyond the receive timeout, only an immediate
-    // CLOSED can arrive.
     let server = start(Limits {
         remove_grace: 60_000,
         ..fast_limits()
@@ -361,7 +346,6 @@ async fn exit_ends_the_stream_and_removal_closes() {
         "the snapshot reflects the exit; no EXITED frame"
     );
     assert_eq!(boot.stream, []);
-    // From another connection: the reply and the CLOSED are unordered.
     events.ok("remove", json!({"session": kept.id})).await;
     assert_eq!(
         c.expect_closed(2).await,
@@ -378,22 +362,20 @@ async fn exit_ends_the_stream_and_removal_closes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gap_when_the_client_falls_behind() {
-    // The first burst (1.05 MB) fits the ring but not what the connection
-    // holds in flight (its queue and the socket buffer, which is larger
-    // on Linux), so the cursor stops in it; the second, larger than the
-    // ring, evicts the stopped cursor, not one the server is still
-    // forwarding. Each burst is one line: a PTY passes short lines a few
-    // bytes per read, so a megabyte of them takes seconds, and under load
-    // longer than the events connection waits for a frame.
+    const RING: u64 = 1536 * 1024;
+    const BURST_WITHIN_RING_BEYOND_IN_FLIGHT: usize = 1_050_000;
+    const BURST_BEYOND_RING: usize = 2_250_000;
     let server = start(Limits {
-        ring: 1536 * 1024,
+        ring: RING,
         ..fast_limits()
     });
     let mut c = client(&server).await;
     let mut events = client(&server).await;
     events.ok("subscribe", json!({})).await;
-    let script = "read go; head -c 1050000 /dev/zero | tr '\\0' y; echo; echo FIRST-DONE; \
-                  read go; head -c 2250000 /dev/zero | tr '\\0' y";
+    let script = format!(
+        "read go; head -c {BURST_WITHIN_RING_BEYOND_IN_FLIGHT} /dev/zero | tr '\\0' y; echo; \
+         echo FIRST-DONE; read go; head -c {BURST_BEYOND_RING} /dev/zero | tr '\\0' y"
+    );
     let session = c
         .create(
             json!({"argv": ["/bin/sh", "-c", script], "on_exit": "keep", "cols": 20, "rows": 5}),
@@ -403,7 +385,6 @@ async fn gap_when_the_client_falls_behind() {
     c.open(1, json!({"session": session.id})).await;
     let boot = c.bootstrap(1).await;
     assert_eq!(boot.stream, []);
-    // Read nothing until the session has produced everything and exited.
     events.ok("send", go.clone()).await;
     wait_text(&mut events, &session.id, "FIRST-DONE").await;
     events.ok("send", go).await;
@@ -432,10 +413,6 @@ async fn gap_when_the_client_falls_behind() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn gap_during_a_bootstrap_retries_once_then_too_slow() {
-    // Small frames and a history that does not compress, so a snapshot is
-    // far larger than the connection holds in flight (its queue and the
-    // socket buffer); each burst is larger than the ring, waits for a line
-    // on stdin, and is one line so it pushes little history out.
     let server = start(Limits {
         ring: 16 * 1024,
         max_frame: 16 * 1024,
@@ -457,9 +434,6 @@ async fn gap_during_a_bootstrap_retries_once_then_too_slow() {
 
     c.open(1, json!({"session": session.id})).await;
     let first = c.bootstrap_ready(1).await;
-    // Not reading: the remainder fills the queue to the high-water mark
-    // while the burst pushes the cursor out of the ring. Output (the echo
-    // of `go`, the start of the burst) is forwarded until the queue fills.
     ctl.ok("send", go.clone()).await;
     wait_text(&mut ctl, &session.id, "SECOND-DONE").await;
     let mut delivered = 0u64;
@@ -477,7 +451,6 @@ async fn gap_during_a_bootstrap_retries_once_then_too_slow() {
     assert_eq!(gap.to, second.attached.offset);
     assert!(second.attached.offset > first.attached.offset);
 
-    // The same during the bootstrap that followed the gap is too_slow.
     ctl.ok("send", go).await;
     ctl.wait_exit(&session.id).await;
     loop {
@@ -532,7 +505,6 @@ async fn queries_are_answered_from_the_latest_profile_and_cell_size() {
 
     c.send(FrameType::Input, 1, b"\x1b[>0q").await;
     c.output_until(1, b"\x1bP>|clankermux test\x1b\\").await;
-    // XTGETTCAP TN names the terminfo entry the session runs under.
     c.send(FrameType::Input, 1, b"\x1bP+q544E\x1b\\").await;
     c.output_until(1, b"\x1bP1+r544E=787465726D2D67686F73747479\x1b\\")
         .await;
@@ -546,14 +518,9 @@ async fn queries_are_answered_from_the_latest_profile_and_cell_size() {
     c.output_until(1, b"\x1b]12;rgb:ffff/0000/0000\x1b\\").await;
     c.send(FrameType::Input, 1, b"\x1b[16t").await;
     c.output_until(1, b"\x1b[6;16;8t").await;
-    // `cat` echoes the mode back to the terminal; the answer after it
-    // shows it is set before the other attachment's profile arrives.
     c.send(FrameType::Input, 1, b"\x1b[?2031h\x1b[?996n").await;
     c.output_until(1, b"\x1b[?997;1n").await;
 
-    // A second writable attachment's profile replaces it; with mode 2031
-    // set the changed answer is reported unasked. Its report carries no
-    // cell size, which stays.
     let mut other = client(&server).await;
     other
         .open(
@@ -568,8 +535,6 @@ async fn queries_are_answered_from_the_latest_profile_and_cell_size() {
     c.send(FrameType::Input, 1, b"\x1b[16t").await;
     c.output_until(1, b"\x1b[6;16;8t").await;
 
-    // Two reports in one coalescing window: the cell size of the earlier
-    // one survives the later one that omitted it.
     c.send_json(
         FrameType::Viewport,
         1,
@@ -578,12 +543,10 @@ async fn queries_are_answered_from_the_latest_profile_and_cell_size() {
     .await;
     c.send_json(FrameType::Viewport, 1, &json!({"cols": 82, "rows": 24}))
         .await;
-    // Both reports have applied once the later size has.
     while c.expect_resized(1).await.cols != 82 {}
     c.send(FrameType::Input, 1, b"\x1b[16t").await;
     c.output_until(1, b"\x1b[6;18;9t").await;
 
-    // Without a scheme the background decides.
     other
         .send_json(
             FrameType::Viewport,

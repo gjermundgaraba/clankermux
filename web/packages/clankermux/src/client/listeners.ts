@@ -1,7 +1,13 @@
-/** Listeners of one kind, and the latest value they were told. */
+export type ListenerMode = "replayLatest" | "isolateErrors";
+
 export class Listeners<T> {
   private readonly all = new Set<(value: T) => void>();
   private latest: { value: T } | undefined;
+  private readonly mode: ListenerMode;
+
+  constructor(mode: ListenerMode = "replayLatest") {
+    this.mode = mode;
+  }
 
   add(listener: (value: T) => void): () => void {
     this.all.add(listener);
@@ -10,8 +16,20 @@ export class Listeners<T> {
   }
 
   emit(value: T): void {
-    this.latest = { value };
-    for (const listener of this.all) listener(value);
+    if (this.mode === "replayLatest") {
+      this.latest = { value };
+      for (const listener of this.all) listener(value);
+      return;
+    }
+    for (const listener of this.all) {
+      try {
+        listener(value);
+      } catch (err) {
+        queueMicrotask(() => {
+          throw err;
+        });
+      }
+    }
   }
 
   clear(): void {

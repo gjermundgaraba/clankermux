@@ -5,7 +5,6 @@ import { type Frame, FrameType, encodeFrame, parseFrame } from "../../src/proto/
 import { ClientError, Connection, type Transport, hello } from "../../src/client/connection.ts";
 import { limits } from "./bodies.ts";
 
-/** A transport whose peer is the test. */
 class Fake implements Transport {
   sent: Frame[] = [];
   closed = false;
@@ -21,7 +20,6 @@ class Fake implements Transport {
     this.onClose?.();
   }
 
-  /** The server sends a JSON frame. */
   push(type: FrameType, channel: number, body: unknown): void {
     this.onMessage?.(encodeFrame(type, channel, new TextEncoder().encode(JSON.stringify(body))));
   }
@@ -56,7 +54,6 @@ test("requests are answered by id and errors typed", async () => {
   expect(ids).toEqual([1, 2]);
   fake.push(FrameType.Reply, 0, { id: 2, result: null });
   fake.push(FrameType.Error, 0, { id: 1, code: "no_such_session", message: "nope" });
-  // A reply for a request no longer waited for is dropped.
   fake.push(FrameType.Reply, 0, { id: 99, result: 1 });
   await expect(second).resolves.toBeNull();
   await expect(first).rejects.toMatchObject({ kind: "server", server: { code: "no_such_session" } });
@@ -75,10 +72,8 @@ test("an error without id ends the connection; open and requests refuse afterwar
   expect(fake.closed).toBe(true);
   expect(() => conn.open(1, { session: "s" }, () => {})).toThrow(ClientError);
   await expect(conn.call("list", {})).rejects.toMatchObject({ kind: "server" });
-  // Channel receivers are gone with the connection.
   fake.push(FrameType.Output, 1, {});
   expect(frames).toEqual([]);
-  // A later transport close reports nothing more.
   fake.close();
   expect(ended).toHaveLength(1);
 });
@@ -97,7 +92,6 @@ test("channel frames and events are routed", async () => {
   conn.release(1);
   fake.push(FrameType.Closed, 1, { reason: "closed" });
   expect(frames).toHaveLength(1);
-  // A transport close ends with `closed`.
   const ended: ClientError[] = [];
   conn.onEnd = (e) => ended.push(e);
   fake.close();
@@ -120,7 +114,6 @@ test("before WELCOME a frame may be as long as the protocol's default max_frame"
   const handshake = (length: number) => {
     const fake = new Fake();
     const connecting = Connection.connect(fake, hello("test"));
-    // Trailing spaces, which JSON allows, make up the length.
     const padded = new Uint8Array(length).fill(0x20);
     padded.set(body);
     fake.onMessage?.(encodeFrame(FrameType.Welcome, 0, padded));

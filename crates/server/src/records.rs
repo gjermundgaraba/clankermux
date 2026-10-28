@@ -1,27 +1,27 @@
-//! Program status records (OSC 7501), one per record id.
-
 use std::collections::BTreeMap;
 
 use ghostty_vt::{ProgramStatus, ProgramStatusKind, ProgramStatusState};
 use proto::{Attention, StatusRecord};
 
-/// The records of one session. Each carries the tick of its last report;
-/// the lowest is evicted first.
 #[derive(Default)]
 pub struct Records {
     by_id: BTreeMap<String, (StatusRecord, u64)>,
     tick: u64,
 }
 
-/// What a report changed: a record set, and the ids of records dropped,
-/// by a clear when none was set and by eviction when one was.
-#[derive(Default)]
-pub struct Change {
-    pub set: Option<StatusRecord>,
-    pub removed: Vec<String>,
+pub enum Change {
+    Cleared(Vec<String>),
+    Set {
+        record: StatusRecord,
+        evicted: Option<String>,
+    },
 }
 
-/// A record's state as the protocol names it; `clear` sets no record.
+pub struct Loaded {
+    pub records: Records,
+    pub dropped: Vec<String>,
+}
+
 const fn state_name(state: ProgramStatusState) -> &'static str {
     match state {
         ProgramStatusState::Idle => "idle",
@@ -33,7 +33,6 @@ const fn state_name(state: ProgramStatusState) -> &'static str {
     }
 }
 
-/// Every state a record can be in, which a status wait may name.
 pub const STATES: [&str; 5] = [
     state_name(ProgramStatusState::Idle),
     state_name(ProgramStatusState::Working),
@@ -42,20 +41,14 @@ pub const STATES: [&str; 5] = [
     state_name(ProgramStatusState::Error),
 ];
 
-/// Whether a record's state is one the program is still in the middle
-/// of: dropped at a prompt start, at the end of the stream, and on load.
 fn transient(record: &StatusRecord) -> bool {
     matches!(record.state.as_str(), "working" | "blocked")
 }
 
-/// Whether a record's state is one the user should see once: `done`
-/// and `error`, which carry `seen`.
 fn seeable(state: &str) -> bool {
     matches!(state, "done" | "error")
 }
 
-/// How urgently a record wants the user, most urgent first; `None` for
-/// one that does not.
 fn urgency(record: &StatusRecord) -> Option<u8> {
     match record.state.as_str() {
         "blocked" => Some(0),
@@ -71,26 +64,20 @@ fn text(value: String) -> Option<String> {
 }
 
 impl Records {
-    /// Records loaded from a park file, oldest report first as [`all`]
-    /// writes them, minus the transient ones, whose ids are returned too.
-    /// A file from before `seen` has the `done` and `error` records
-    /// unseen.
-    ///
-    /// [`all`]: Records::all
-    pub fn load(records: Vec<StatusRecord>) -> (Self, Vec<String>) {
+    pub fn load(records: Vec<StatusRecord>) -> Loaded {
         let mut out = Records::default();
         let mut dropped = Vec::new();
-        for mut record in records {
+        for record in records {
             if transient(&record) {
                 dropped.push(record.id);
                 continue;
             }
-            if seeable(&record.state) && record.seen.is_none() {
-                record.seen = Some(false);
-            }
             out.insert(record);
         }
-        (out, dropped)
+        Loaded {
+            records: out,
+            dropped,
+        }
     }
 
     fn insert(&mut self, record: StatusRecord) {
@@ -98,28 +85,23 @@ impl Records {
         self.by_id.insert(record.id.clone(), (record, self.tick));
     }
 
-    /// Applies one report: `clear` removes the record and those beneath
-    /// it; any other state replaces the record, holding exactly the keys
-    /// of this report. Beyond `max` records the least recently updated
-    /// one goes.
     pub fn apply(&mut self, report: ProgramStatus, max: usize, now: &str) -> Change {
-        let mut change = Change::default();
         if report.state == ProgramStatusState::Clear {
             let beneath = |id: &str| {
                 report.id.is_empty()
                     || id == report.id
                     || id.starts_with(&format!("{}/", report.id))
             };
-            change.removed = self
+            let cleared: Vec<String> = self
                 .by_id
                 .keys()
                 .filter(|id| beneath(id))
                 .cloned()
                 .collect();
-            for id in &change.removed {
+            for id in &cleared {
                 self.by_id.remove(id);
             }
-            return change;
+            return Change::Cleared(cleared);
         }
         let state = state_name(report.state);
         // The engine clears `kind` outside `blocked` and `progress` outside
@@ -137,14 +119,13 @@ impl Records {
             app: text(report.app),
             title: text(report.title),
             msg: text(report.message),
-            progress: u8::try_from(report.progress).ok(),
+            progress: report.progress,
             updated_at: now.into(),
             seen: seeable(state).then_some(false),
         };
         let new = !self.by_id.contains_key(&record.id);
         self.insert(record.clone());
-        change.set = Some(record);
-        if new && self.by_id.len() > max {
+        let evicted = (new && self.by_id.len() > max).then(|| {
             let oldest = self
                 .by_id
                 .iter()
@@ -152,12 +133,11 @@ impl Records {
                 .map(|(id, _)| id.clone())
                 .expect("over max means at least one record");
             self.by_id.remove(&oldest);
-            change.removed.push(oldest);
-        }
-        change
+            oldest
+        });
+        Change::Set { record, evicted }
     }
 
-    /// Drops the `working` and `blocked` records; returns their ids.
     pub fn drop_transient(&mut self) -> Vec<String> {
         let ids: Vec<String> = self
             .by_id
@@ -171,8 +151,6 @@ impl Records {
         ids
     }
 
-    /// Marks the unseen `done` and `error` records among `ids` seen, all
-    /// of them when `ids` is `None`; returns them as they are now.
     pub fn ack(&mut self, ids: Option<&[String]>) -> Vec<StatusRecord> {
         let mut acked = Vec::new();
         for (id, (record, _)) in &mut self.by_id {
@@ -184,20 +162,16 @@ impl Records {
         acked
     }
 
-    /// The records as reported, every key of their last report, oldest
-    /// report first: a park file keeps the order the attention reads.
     pub fn all(&self) -> Vec<StatusRecord> {
         let mut records: Vec<_> = self.by_id.values().collect();
         records.sort_by_key(|(_, tick)| *tick);
         records.into_iter().map(|(r, _)| r.clone()).collect()
     }
 
-    /// The tick of the latest report; records set later have a higher one.
     pub fn tick(&self) -> u64 {
         self.tick
     }
 
-    /// The record's `app`, else the nearest ancestor's that has one.
     fn app(&self, record: &StatusRecord) -> Option<String> {
         let app_of = |id: &str| self.by_id.get(id).and_then(|(r, _)| r.app.clone());
         if record.app.is_some() {
@@ -213,13 +187,10 @@ impl Records {
         (!record.id.is_empty()).then(|| app_of("")).flatten()
     }
 
-    /// The records for `inspect`: `app` taken from the nearest ancestor
-    /// that has one when a record lacks it.
     pub fn resolved(&self) -> Vec<StatusRecord> {
         self.resolved_since(0)
     }
 
-    /// `resolved`, of the records set after `tick`.
     pub fn resolved_since(&self, tick: u64) -> Vec<StatusRecord> {
         self.by_id
             .values()
@@ -231,9 +202,6 @@ impl Records {
             .collect()
     }
 
-    /// The most urgent record that wants the user: `blocked`, then an
-    /// unseen `error`, then an unseen `done`, then `working`; among
-    /// those the shallowest id (the root first), then the newest report.
     pub fn attention(&self) -> Option<Attention> {
         let depth = |id: &str| {
             if id.is_empty() {
@@ -272,7 +240,7 @@ mod tests {
         ProgramStatus {
             state,
             kind: ProgramStatusKind::None,
-            progress: -1,
+            progress: None,
             id: id.into(),
             app: app.into(),
             title: String::new(),
@@ -294,22 +262,33 @@ mod tests {
         }
     }
 
+    fn set(change: Change) -> StatusRecord {
+        match change {
+            Change::Set { record, .. } => record,
+            Change::Cleared(_) => panic!("cleared, not set"),
+        }
+    }
+
+    fn removed(change: Change) -> Vec<String> {
+        match change {
+            Change::Cleared(ids) => ids,
+            Change::Set { evicted, .. } => evicted.into_iter().collect(),
+        }
+    }
+
     #[test]
     fn reports_replace_clear_and_evict() {
         let mut r = Records::default();
-        let c = r.apply(report(ProgramStatusState::Working, "", "cargo"), 2, "t1");
-        assert_eq!(c.set.as_ref().map(|s| s.state.as_str()), Some("working"));
-        assert_eq!(c.set.as_ref().unwrap().app.as_deref(), Some("cargo"));
-        assert!(c.set.as_ref().unwrap().progress.is_none());
+        let c = set(r.apply(report(ProgramStatusState::Working, "", "cargo"), 2, "t1"));
+        assert_eq!(c.state, "working");
+        assert_eq!(c.app.as_deref(), Some("cargo"));
+        assert!(c.progress.is_none());
         r.apply(report(ProgramStatusState::Done, "deploy", ""), 2, "t2");
-        // A third record evicts the least recently updated: the root.
         let c = r.apply(report(ProgramStatusState::Idle, "deploy/us", ""), 2, "t3");
-        assert_eq!(c.removed, vec![String::new()]);
+        assert_eq!(removed(c), vec![String::new()]);
         assert_eq!(r.all().len(), 2);
-        // Replacing an existing record does not evict.
         let c = r.apply(report(ProgramStatusState::Done, "deploy", "tf"), 2, "t4");
-        assert_eq!(c.removed, Vec::<String>::new());
-        // The child takes its app from the nearest ancestor at inspect.
+        assert_eq!(removed(c), Vec::<String>::new());
         let resolved = r.resolved();
         assert_eq!(
             resolved
@@ -328,10 +307,9 @@ mod tests {
                 .app
                 .is_none()
         );
-        // Clearing a parent drops its subtree.
         let c = r.apply(report(ProgramStatusState::Clear, "deploy", ""), 2, "t5");
         assert_eq!(
-            c.removed,
+            removed(c),
             vec!["deploy".to_string(), "deploy/us".to_string()]
         );
         assert_eq!(r.all(), []);
@@ -342,9 +320,9 @@ mod tests {
         let mut r = Records::default();
         let mut blocked = report(ProgramStatusState::Blocked, "", "");
         blocked.kind = ProgramStatusKind::Permission;
-        blocked.progress = 40;
+        blocked.progress = Some(40);
         let c = r.apply(blocked, 10, "t");
-        let set = c.set.unwrap();
+        let set = set(c);
         assert_eq!(
             (set.kind.as_deref(), set.progress),
             (Some("permission"), Some(40))
@@ -353,12 +331,15 @@ mod tests {
         assert_eq!(r.drop_transient(), vec![String::new()]);
         assert_eq!(r.all().len(), 1);
         let c = r.apply(report(ProgramStatusState::Clear, "", ""), 10, "t");
-        assert_eq!(c.removed, vec!["x".to_string()]);
+        assert_eq!(removed(c), vec!["x".to_string()]);
     }
 
     #[test]
     fn loading_drops_transient_records() {
-        let (loaded, dropped) = Records::load(vec![
+        let Loaded {
+            records: loaded,
+            dropped,
+        } = Records::load(vec![
             record("c", "done", "t1"),
             record("b", "error", "t2"),
             record("a", "working", "t3"),
@@ -366,7 +347,6 @@ mod tests {
         let ids: Vec<_> = loaded.all().into_iter().map(|x| x.id).collect();
         assert_eq!(ids, vec!["c".to_string(), "b".to_string()], "in file order");
         assert_eq!(dropped, vec!["a".to_string()]);
-        assert!(loaded.all().iter().all(|r| r.seen == Some(false)));
     }
 
     #[test]
@@ -376,7 +356,7 @@ mod tests {
         r.apply(report(ProgramStatusState::Done, "a", ""), 10, "same");
         let ids: Vec<_> = r.all().into_iter().map(|x| x.id).collect();
         assert_eq!(ids, ["b", "a"]);
-        let (loaded, _) = Records::load(r.all());
+        let loaded = Records::load(r.all()).records;
         assert_eq!(loaded.attention().unwrap().record, "a");
         assert_eq!(r.attention().unwrap().record, "a");
     }
@@ -385,16 +365,16 @@ mod tests {
     fn done_and_error_stay_unseen_until_acked_or_replaced() {
         let mut r = Records::default();
         let c = r.apply(report(ProgramStatusState::Done, "a", ""), 10, "t");
-        assert_eq!(c.set.unwrap().seen, Some(false));
+        assert_eq!(set(c).seen, Some(false));
         let c = r.apply(report(ProgramStatusState::Working, "w", ""), 10, "t");
-        assert_eq!(c.set.unwrap().seen, None);
+        assert_eq!(set(c).seen, None);
         r.apply(report(ProgramStatusState::Error, "b", ""), 10, "t");
         let acked = r.ack(Some(&["b".to_string(), "w".to_string()]));
         assert_eq!(acked.len(), 1);
         assert_eq!((acked[0].id.as_str(), acked[0].seen), ("b", Some(true)));
         assert!(r.ack(Some(&["b".to_string()])).is_empty(), "once");
         let c = r.apply(report(ProgramStatusState::Error, "b", ""), 10, "t");
-        assert_eq!(c.set.unwrap().seen, Some(false), "a new report");
+        assert_eq!(set(c).seen, Some(false), "a new report");
         let acked: Vec<_> = r.ack(None).into_iter().map(|x| x.id).collect();
         assert_eq!(acked, vec!["a".to_string(), "b".to_string()]);
     }

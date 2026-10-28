@@ -1,6 +1,6 @@
 {
   "name": "@gjermundgaraba/clankermux",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -13,7 +13,6 @@
     ".": "./src/client/index.ts",
     "./worker": "./src/client/worker.ts",
     "./proto": "./src/proto/index.ts",
-    "./engine": "./src/engine/index.ts",
     "./renderer": "./src/renderer/index.ts",
     "./ghostty-vt.wasm": "./ghostty-vt.wasm"
   },
@@ -35,10 +34,6 @@
       "./proto": {
         "types": "./dist/proto/index.d.ts",
         "default": "./dist/proto/index.js"
-      },
-      "./engine": {
-        "types": "./dist/engine/index.d.ts",
-        "default": "./dist/engine/index.js"
       },
       "./renderer": {
         "types": "./dist/renderer/index.d.ts",

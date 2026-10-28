@@ -1,5 +1,3 @@
-//! The binary against an in-process server, driven through a PTY.
-
 use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::time::Duration;
@@ -18,8 +16,6 @@ fn start() -> Server {
     Server::start(Limits::default())
 }
 
-/// Runs the binary with `args` outside any session (no inherited
-/// `CLANKERMUX_*`) plus `env`; its exit code, stdout and stderr.
 async fn run_status(args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"));
     command
@@ -35,15 +31,12 @@ async fn run_status(args: &[&str], env: &[(&str, &str)]) -> (i32, String, String
     )
 }
 
-/// `run_status` against the server on `socket`, outside any session.
 async fn run_on(socket: &str, args: &[&str]) -> (i32, String, String) {
     let mut all = vec!["--socket", socket];
     all.extend_from_slice(args);
     run_status(&all, &[]).await
 }
 
-/// Runs the binary as `run_status` does and returns its stdout; the
-/// process must succeed.
 async fn run(args: &[&str], env: &[(&str, &str)]) -> String {
     let (code, stdout, stderr) = run_status(args, env).await;
     assert_eq!(code, 0, "{stderr}");
@@ -64,7 +57,6 @@ async fn inspect(conn: &Connection, id: &str) -> Session {
     conn.call("inspect", json!({"session": id})).await.unwrap()
 }
 
-/// Polls `inspect` until `ok` holds.
 async fn wait_session(conn: &Connection, id: &str, ok: impl Fn(&Session) -> bool) -> Session {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -77,7 +69,6 @@ async fn wait_session(conn: &Connection, id: &str, ok: impl Fn(&Session) -> bool
     }
 }
 
-/// The outer terminal the binary runs in.
 struct Term {
     master: AsyncFd<OwnedFd>,
     seen: Vec<u8>,
@@ -85,7 +76,6 @@ struct Term {
 }
 
 impl Term {
-    /// Runs `clankermux attach` with `args` in a `cols` by `rows` PTY.
     fn attach(server: &Server, cols: u16, rows: u16, args: &[&str]) -> Term {
         let mut command = vec![
             env!("CARGO_BIN_EXE_clankermux").to_string(),
@@ -105,7 +95,6 @@ impl Term {
         }
     }
 
-    /// Reads until `needle` has appeared; returns everything read so far.
     async fn read_until(&mut self, needle: &[u8]) -> Vec<u8> {
         let mut buf = [0u8; 4096];
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -142,8 +131,6 @@ impl Term {
         assert_eq!(n, bytes.len());
     }
 
-    /// Detaches with the prefix and returns the output up to the exit
-    /// message, checking the reset came before it.
     async fn detach(&mut self) -> Vec<u8> {
         self.write(b"\x1c");
         self.write(b"d");
@@ -165,9 +152,7 @@ impl Term {
     }
 }
 
-/// The end of the reset sequence the attach writes on exit.
 const RESET_TAIL: &[u8] = b"\x1b[?2026l\x1b[?25h";
-/// The start of a paint.
 const CLEAR: &[u8] = b"\x1b[H\x1b[2J";
 
 fn count(haystack: &[u8], needle: &[u8]) -> usize {
@@ -183,13 +168,10 @@ async fn attach_types_and_detaches() {
     let conn = connect(&server).await;
     let session = create(&conn, json!({"argv": ["/bin/cat"], "cols": 80, "rows": 24})).await;
     let mut term = Term::attach(&server, 80, 24, &[&session.id, "--detach-key", "C-a"]);
-    // The first paint ends by showing the cursor.
     term.read_until(b"\x1b[?25h").await;
 
-    // Raw mode: the outer terminal echoes nothing; the session does.
     term.write(b"hello\n");
     term.read_until(b"hello\r\nhello\r\n").await;
-    // The prefix twice sends it once; the session's cooked mode echoes it.
     term.write(b"\x01\x01\n");
     term.read_until(b"^A\r\n").await;
 
@@ -211,20 +193,15 @@ async fn repaint_clips_a_larger_session_to_the_bottom() {
     )
     .await;
     let mut term = Term::attach(&server, 80, 24, &[&session.id, "--read-only"]);
-    // With `yes` at the bottom row the window is the last 24 rows and the
-    // cursor lands on the outer's last row.
     let out = term.read_until(b"\x1b[24;1H").await;
     assert!(
         count(&out, CLEAR) >= 1,
         "{:?}",
         String::from_utf8_lossy(&out)
     );
-    // Output keeps coming and is repainted, not passed through.
     let out = term.read_until(b"\x1b[24;1H").await;
     let paints = count(&out, CLEAR);
     assert!(paints >= 1);
-    // Each paint carries at most the 24 clipped rows; passthrough would
-    // carry everything `yes` wrote meanwhile.
     assert!(
         count(&out, b"y\r\n") <= 24 * paints,
         "{:?}",
@@ -245,8 +222,6 @@ async fn detaches_while_the_server_is_gone() {
     let mut term = Term::attach(&server, 80, 24, &[&session.id]);
     term.read_until(b"\x1b[?25h").await;
     drop(conn);
-    // The server goes away with its connections; the attach is
-    // reconnecting in the background, and the prefix still works.
     server.shutdown();
     tokio::time::sleep(Duration::from_millis(300)).await;
     term.detach().await;
@@ -262,8 +237,6 @@ async fn a_reconnect_retries_a_bare_close_and_ends_on_a_refusal() {
     term.read_until(b"\x1b[?25h").await;
     drop(conn);
     server.shutdown();
-    // A stand-in on the same path: as a forwarder would, it accepts and
-    // drops two connections, then answers HELLO with a refusal.
     let _ = std::fs::remove_file(&server.socket);
     let listener = tokio::net::UnixListener::bind(&server.socket).unwrap();
     for _ in 0..2 {
@@ -332,8 +305,6 @@ async fn ssh_relays_through_stdio() {
     let server = start();
     let conn = connect(&server).await;
     create(&conn, json!({"label": "over-ssh", "argv": ["/bin/cat"]})).await;
-    // A stand-in `ssh` that runs the relay against the test socket, as
-    // the real one would run it on the remote host.
     let bin = server.dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     std::fs::write(
@@ -364,7 +335,6 @@ async fn ssh_relays_through_stdio() {
 async fn the_relay_ends_when_the_server_side_does() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("sock");
-    // A stand-in server that accepts one connection and drops it.
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
         .args(["--socket", socket.to_str().unwrap(), "--stdio"])
@@ -374,7 +344,6 @@ async fn the_relay_ends_when_the_server_side_does() {
         .unwrap();
     let (stream, _) = listener.accept().await.unwrap();
     drop(stream);
-    // stdin stays open: the relay must not wait for its EOF.
     let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
         .await
         .expect("the relay exits")
@@ -384,8 +353,6 @@ async fn the_relay_ends_when_the_server_side_does() {
 
 #[tokio::test]
 async fn websocket_flags_are_checked_before_serving() {
-    // Isolated, so that a regression of the check cannot start a server on
-    // the user's own socket and state directory.
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("sock");
     for args in [
@@ -464,8 +431,6 @@ async fn send_sends_one_request_even_for_empty_text() {
     assert!(stderr.contains("not_running"));
 }
 
-/// `clankermux serve` as a process on `dir`'s socket and state, parking
-/// soon after a change.
 fn serve(dir: &std::path::Path) -> Child {
     tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
         .arg("--socket")
@@ -479,8 +444,6 @@ fn serve(dir: &std::path::Path) -> Child {
         .unwrap()
 }
 
-/// Connects once the server at `dir` answers; a process start can take
-/// seconds on a loaded machine.
 async fn connect_when_up(dir: &std::path::Path) -> Connection {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -506,7 +469,6 @@ async fn a_killed_server_restores_what_was_parked_after_a_change() {
     )
     .await
     .unwrap();
-    // A park holding the line, not merely one from before the write.
     let parks = dir
         .path()
         .join("state/clankermux/sessions")
@@ -529,7 +491,6 @@ async fn a_killed_server_restores_what_was_parked_after_a_change() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     drop(conn);
-    // SIGKILL: no stop, no park on the way down, as at a power-off.
     first.kill().await.unwrap();
 
     let _second = serve(dir.path());
@@ -567,23 +528,18 @@ async fn a_session_argument_resolves_by_id_label_and_either_end() {
     assert_eq!(label_of(&alpha.id[..8]).await, "Alpha");
     assert_eq!(label_of(&alpha.id[alpha.id.len() - 6..]).await, "Alpha");
 
-    // Several labels match regardless of case: exit 3, the candidates
-    // on stderr by their last six characters.
     let (code, _, err) = run_status(&["--socket", socket, "inspect", "Twin"], &[]).await;
     assert_eq!(code, 3, "{err}");
     for twin in &twins {
         assert!(err.contains(&twin.id[twin.id.len() - 6..]), "{err}");
     }
     assert!(!err.contains(&alpha.id[alpha.id.len() - 6..]), "{err}");
-    // None: every session is a candidate. Three characters are too few.
     let (code, _, err) = run_status(&["--socket", socket, "end", "nosuch"], &[]).await;
     assert_eq!(code, 3, "{err}");
     assert!(err.contains("Alpha") && err.contains("running"), "{err}");
     let (code, _, err) = run_status(&["--socket", socket, "end", &alpha.id[..3]], &[]).await;
     assert_eq!(code, 3, "{err}");
 
-    // Left out: `$CLANKERMUX_SESSION` of the server in
-    // `$CLANKERMUX_SOCKET`, else a usage error.
     let (code, out, err) = run_status(
         &["--socket", socket, "--json", "inspect"],
         &[
@@ -596,7 +552,6 @@ async fn a_session_argument_resolves_by_id_label_and_either_end() {
     assert!(out.contains("Alpha"), "{out}");
     let (code, _, err) = run_status(&["--socket", socket, "inspect"], &[]).await;
     assert_eq!(code, 2, "{err}");
-    // `label` takes the session from there too, and the socket.
     let (code, _, err) = run_status(
         &["label", "renamed"],
         &[
@@ -615,24 +570,19 @@ async fn exit_codes_tell_failure_usage_target_and_server_apart() {
     let conn = connect(&server).await;
     let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
     let socket = server.socket.to_str().unwrap();
-    // The server refused: 1.
     let (code, _, err) = run_status(&["--socket", socket, "remove", &session.id], &[]).await;
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("running"), "{err}");
-    // Usage, clap's and ours: 2.
     let (code, _, _) = run_status(&["--socket", socket, "resize"], &[]).await;
     assert_eq!(code, 2);
     let (code, _, err) =
         run_status(&["--socket", socket, "resize", &session.id, "wide"], &[]).await;
     assert_eq!(code, 2, "{err}");
-    // No such session: 3.
     let (code, _, err) = run_status(&["--socket", socket, "read", "nothing-here"], &[]).await;
     assert_eq!(code, 3, "{err}");
-    // No server: 4.
     let dead = server.dir.path().join("no-server");
     let (code, _, err) = run_status(&["--socket", dead.to_str().unwrap(), "list"], &[]).await;
     assert_eq!(code, 4, "{err}");
-    // `resize` keeps the side left out.
     let (code, _, err) = run_status(&["--socket", socket, "resize", &session.id, "x30"], &[]).await;
     assert_eq!(code, 0, "{err}");
     let resized = wait_session(&conn, &session.id, |s| s.rows == 30).await;
@@ -654,7 +604,6 @@ async fn usage_is_checked_first_and_the_session_default_is_its_server_s() {
         .await
         .unwrap();
     let socket = server.socket.to_str().unwrap();
-    // Usage before the connection: 2, server or not.
     let dead = server.dir.path().join("no-server");
     let dead = dead.to_str().unwrap();
     for args in [
@@ -666,7 +615,6 @@ async fn usage_is_checked_first_and_the_session_default_is_its_server_s() {
         let (code, _, err) = run_status(&[&["--socket", dead], args].concat(), &[]).await;
         assert_eq!(code, 2, "{args:?}: {err}");
     }
-    // Inside the session, one argument is TEXT, unless it names a session.
     let inside = [
         ("CLANKERMUX_SESSION", session.id.as_str()),
         ("CLANKERMUX_SOCKET", socket),
@@ -676,7 +624,6 @@ async fn usage_is_checked_first_and_the_session_default_is_its_server_s() {
     assert!(err.contains("names a session"), "{err}");
     let (code, _, err) = run_status(&["send", "hello", "--enter"], &inside).await;
     assert_eq!(code, 0, "{err}");
-    // `$CLANKERMUX_SESSION` is not a session of another server.
     let elsewhere = [
         ("CLANKERMUX_SESSION", session.id.as_str()),
         ("CLANKERMUX_SOCKET", dead),
@@ -690,7 +637,6 @@ async fn usage_is_checked_first_and_the_session_default_is_its_server_s() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_inside_a_session_reaches_its_server_and_session() {
-    // A relative socket: the child, elsewhere, still finds it.
     let dir = tempfile::tempdir().unwrap();
     let _server = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
         .args(["--socket", "sock", "serve"])
@@ -758,7 +704,6 @@ async fn the_guide_is_printed_without_a_server() {
     }
 }
 
-/// However fast the child exits.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_wait_exits_with_the_child_code() {
     let server = start();
@@ -852,7 +797,6 @@ async fn wait_times_out_with_124_and_send_waits_for_a_match() {
     assert_eq!(sent.wait.unwrap().reason, WaitReason::Matched);
 }
 
-/// Nothing to wait for, or a timeout alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn waits_for_nothing_are_usage_errors() {
     let server = start();
@@ -931,7 +875,6 @@ async fn ack_marks_records_seen_and_list_shows_attention() {
     assert!(!out.contains(" error ") && !out.contains(" done "), "{out}");
 }
 
-/// The first line `events` prints with `args`, and its stderr so far.
 async fn first_event_line(socket: &str, args: &[&str]) -> (String, String) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
@@ -974,7 +917,6 @@ async fn events_after_a_cursor_replay_with_their_seq() {
     let event: Numbered = serde_json::from_str(&line).unwrap();
     assert_eq!(event.seq, 1);
     assert!(matches!(event.event, Event::SessionCreated { session: s } if s.id == session.id));
-    // Another incarnation's cursor: the sessions first, as without one.
     let (line, err) = first_event_line(socket, &["--after", "0", "--incarnation", "gone"]).await;
     assert_eq!(line, "[", "{err}");
     assert!(err.contains("are gone"), "{err}");
@@ -1029,7 +971,6 @@ async fn read_takes_a_format_and_a_scope_and_tail_follows() {
         "$ bold\n"
     );
 
-    // A sequence left open is nothing more to read: `tail` ends.
     let open = create(
         &conn,
         json!({"argv": ["/bin/sh", "-c", "printf 'abc\\033]0;never ends'; exec sleep 30"]}),
@@ -1049,7 +990,6 @@ async fn read_takes_a_format_and_a_scope_and_tail_follows() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    // It has caught up and waits; the program goes on and exits.
     tokio::time::sleep(Duration::from_millis(300)).await;
     conn.request("send", json!({"session": id, "data": "DQ=="}))
         .await
@@ -1083,7 +1023,6 @@ async fn detach_and_resize_policy_from_the_command_line() {
     let channel = attached.attachments[0].channel.to_string();
     let socket = server.socket.to_str().unwrap();
 
-    // Policy alone, then a lone argument that reads as a size.
     let (code, _, err) = run_status(
         &[
             "--socket",
@@ -1167,13 +1106,11 @@ async fn detach_and_resize_policy_from_the_command_line() {
     assert!(err.contains("no_such_attachment"), "{err}");
 }
 
-/// `api list` and `api describe`: the server's catalog and one method of
-/// it.
 #[tokio::test(flavor = "multi_thread")]
 async fn api_lists_and_describes_the_catalog() {
     let server = start();
     let socket = server.socket.to_str().unwrap();
-    let catalog = proto::catalog::catalog(&server.registry.config.version);
+    let catalog = proto::catalog::catalog(Some(&server.registry.config.version));
 
     let (code, listed, err) = run_on(socket, &["api", "list"]).await;
     assert_eq!(code, 0, "{err}");
@@ -1207,7 +1144,6 @@ async fn api_lists_and_describes_the_catalog() {
     assert!(err.contains("invalid_request"), "{err}");
 }
 
-/// `api call` prints the result as the server sent it.
 #[tokio::test(flavor = "multi_thread")]
 async fn api_calls_print_the_result_as_sent() {
     let server = start();
@@ -1229,7 +1165,6 @@ async fn api_calls_print_the_result_as_sent() {
     assert_eq!(code, 0);
     let page: Page = serde_json::from_str(&page).unwrap();
     assert_eq!(page.sessions.len(), 1);
-    // No session is assumed, even inside one of this server's.
     let (code, _, err) = run_status(
         &["--socket", socket, "api", "call", "inspect", "{}"],
         &[
@@ -1240,7 +1175,6 @@ async fn api_calls_print_the_result_as_sent() {
     .await;
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("invalid_request"), "{err}");
-    // A timeout is a result.
     let wait = format!(
         r#"{{"session": "{}", "until": {{"quiet_ms": 60000}}, "timeout_ms": 50}}"#,
         created.id
@@ -1250,7 +1184,6 @@ async fn api_calls_print_the_result_as_sent() {
     assert_eq!(code, 0, "{err}");
     let waited: Waited = serde_json::from_str(&waited).unwrap();
     assert_eq!(waited.reason, WaitReason::Timeout);
-    // Params from stdin.
     let mut piped = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
         .args(["--socket", socket, "api", "call", "inspect", "-"])
         .stdin(std::process::Stdio::piped())
@@ -1269,9 +1202,6 @@ async fn api_calls_print_the_result_as_sent() {
     assert_eq!(inspected.id, created.id);
 }
 
-/// `api call` fails with the CLI's exit codes: a target the server does
-/// not know, a refused request, a method it does not know, params that
-/// are not JSON.
 #[tokio::test(flavor = "multi_thread")]
 async fn api_failures_exit_with_the_cli_codes() {
     let server = start();
@@ -1308,7 +1238,6 @@ async fn api_failures_exit_with_the_cli_codes() {
     assert_eq!(code, 4);
 }
 
-/// `serve` reports the release, in `WELCOME` and in `describe`.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_server_reports_its_release() {
     let dir = tempfile::tempdir().unwrap();

@@ -1,7 +1,3 @@
-//! Framing properties: no input panics the decoder, every chunking of a
-//! valid stream decodes to the same frames, and a valid stream with a few
-//! bytes changed decodes exactly as far as a message parser would.
-
 use proptest::prelude::*;
 
 use crate::*;
@@ -12,7 +8,6 @@ fn frame_type() -> impl Strategy<Value = FrameType> {
     prop::sample::select(FrameType::ALL.to_vec())
 }
 
-/// A payload length: small, or at the frame limit.
 fn payload_len() -> impl Strategy<Value = usize> {
     prop_oneof![
         4 => 0..300usize,
@@ -38,8 +33,6 @@ fn encode_all(frames: &[(FrameType, u32, Vec<u8>)]) -> Vec<u8> {
         .collect()
 }
 
-/// Random bytes, or a valid stream with up to four bytes replaced, so
-/// the decoder meets frames as well as garbage.
 fn bytes() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
         1 => prop::collection::vec(any::<u8>(), 0..2048),
@@ -58,7 +51,6 @@ fn bytes() -> impl Strategy<Value = Vec<u8>> {
     ]
 }
 
-/// Splits `bytes` at the given cut points, in order.
 fn chunks(bytes: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
     let mut cuts: Vec<usize> = cuts.iter().map(|c| c % (bytes.len() + 1)).collect();
     cuts.sort_unstable();
@@ -72,7 +64,6 @@ fn chunks(bytes: &[u8], cuts: &[usize]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Every frame the decoder yields before it stops or fails.
 fn decode_all(chunks: &[Vec<u8>]) -> (Vec<(Header, Vec<u8>)>, Option<FrameError>) {
     let mut decoder = FrameDecoder::default();
     let mut frames = Vec::new();
@@ -105,7 +96,6 @@ proptest! {
             prop_assert_eq!(header.length as usize, payload.len());
             prop_assert!(u64::from(header.length) <= MAX_FRAME);
         }
-        // What the decoder yields is what a message parser yields.
         let mut pos = 0;
         for (header, payload) in &frames {
             let end = pos + HEADER_LEN + payload.len();
@@ -115,7 +105,6 @@ proptest! {
             pos = end;
         }
         if let Some(error) = error {
-            // The failure is at the header that follows the last frame.
             let head: Option<&[u8; HEADER_LEN]> = bytes.get(pos..pos + HEADER_LEN).and_then(|h| h.try_into().ok());
             prop_assert_eq!(head.map(|h| parse_header(h, MAX_FRAME)), Some(Err(error)));
         }
@@ -151,8 +140,6 @@ proptest! {
             prop_assert_eq!(parsed, Err(FrameError::TooLong { length, max_frame: MAX_FRAME }));
         } else {
             prop_assert_eq!(parsed, Ok(Header { frame_type, channel, length }));
-            // A message with exactly `length` payload bytes parses; one
-            // with any other count is a mismatch.
             let mut message = header.to_vec();
             message.extend(std::iter::repeat_n(0u8, length as usize));
             prop_assert_eq!(parse_frame(&message, MAX_FRAME).map(|(h, p)| (h, p.len())), Ok((Header { frame_type, channel, length }, length as usize)));
@@ -160,7 +147,6 @@ proptest! {
             message.resize(HEADER_LEN + payload, 0);
             prop_assert_eq!(parse_frame(&message, MAX_FRAME), Err(FrameError::LengthMismatch { length, payload }));
         }
-        // The flags byte is ignored; an unknown type is not.
         let mut flagged = header;
         flagged[1] = 0xff;
         prop_assert_eq!(parse_header(&flagged, u64::MAX).map(|h| h.frame_type), Ok(frame_type));

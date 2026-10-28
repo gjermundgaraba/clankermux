@@ -1,10 +1,3 @@
-// Development only: serves dist/ over HTTP, on loopback unless `--host`
-// names another address. The page reaches a server through
-// `?ws=wss://<node>:<port>/`, or by default the server's port 7438 on the
-// page's own host: that default works when the page is served on the
-// node's tailnet name (`--host <node>.<tailnet>.ts.net`, the name the
-// server's certificate carries), not from loopback. The server must list
-// the page's origin in its allowlist (`--origin http://<host>:<port>`).
 import { createReadStream, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { extname, join, normalize } from "node:path";

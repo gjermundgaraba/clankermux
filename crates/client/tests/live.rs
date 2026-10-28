@@ -1,6 +1,3 @@
-//! The client library against an in-process server: bootstrap, stream,
-//! reconnect with resume, events.
-
 use std::time::Duration;
 
 use client::{Action, Attachment, Connection, Frame, connection::hello};
@@ -8,7 +5,6 @@ use proto::*;
 use serde_json::json;
 use testkit::Server;
 
-/// A test's whole wait for a condition.
 const DEADLINE: Duration = Duration::from_secs(10);
 
 fn start() -> Server {
@@ -36,7 +32,6 @@ fn text(a: &mut Attachment) -> String {
     String::from_utf8(out).unwrap()
 }
 
-/// Polls `read` until the session's screen holds `needle`.
 async fn wait_screen(conn: &Connection, session: &str, needle: &str) {
     let deadline = tokio::time::Instant::now() + DEADLINE;
     loop {
@@ -52,7 +47,6 @@ async fn wait_screen(conn: &Connection, session: &str, needle: &str) {
     }
 }
 
-/// Feeds frames until `done` holds, returning every action.
 async fn drive(
     a: &mut Attachment,
     rx: &mut client::Receiver<Frame>,
@@ -87,8 +81,6 @@ async fn bootstrap_stream_and_resume() {
     conn.request("send", json!({"session": session.id, "data": "b25lCg=="}))
         .await
         .unwrap();
-    // The echo is on the screen before the attach, so it comes with the
-    // snapshot rather than as OUTPUT.
     wait_screen(&conn, &session.id, "one\none").await;
 
     let open = Open {
@@ -116,8 +108,6 @@ async fn bootstrap_stream_and_resume() {
     let cursor = a.resume().unwrap();
     assert!(cursor.offset > 0);
 
-    // The connection drops; a new one resumes from the cursor and the
-    // terminal is kept.
     drop(conn);
     let conn = connect(&server).await;
     a.open_on(&conn.welcome);
@@ -136,7 +126,6 @@ async fn bootstrap_stream_and_resume() {
     conn.send(FrameType::Input, 1, b"three\n").unwrap();
     drive(&mut a, &mut rx, |a, _| text(a).contains("three\nthree")).await;
 
-    // A resize marker, then the exit.
     let mut events = conn.events();
     conn.request("subscribe", json!({})).await.unwrap();
     conn.send_json(
@@ -189,14 +178,10 @@ async fn server_errors_are_typed_and_a_protocol_error_ends_the_connection() {
     let conn = connect(&server).await;
     let mut events = conn.events();
     conn.request("subscribe", json!({})).await.unwrap();
-    // Server errors arrive typed; the connection reports its end.
     let err = conn.request("inspect", json!({"session": "nope"})).await;
     assert!(matches!(err, Err(client::Error::Server(e)) if e.code == ErrorCode::NoSuchSession));
-    // A second HELLO is a protocol error: the server answers without an
-    // id and closes, which the connection reports.
     conn.send_json(FrameType::Hello, 0, &hello("test", None))
         .unwrap();
-    // The event stream ends with the connection, which says why.
     tokio::time::timeout(Duration::from_secs(5), async {
         while events.recv().await.is_some() {}
     })
@@ -207,7 +192,6 @@ async fn server_errors_are_typed_and_a_protocol_error_ends_the_connection() {
         matches!(&closed, client::Error::Server(e) if e.code == ErrorCode::ProtocolError),
         "{closed}"
     );
-    // Requests after the end fail with the reason, not a bare "closed".
     assert!(matches!(
         conn.request("list", json!({})).await,
         Err(client::Error::Server(e)) if e.code == ErrorCode::ProtocolError
@@ -277,7 +261,7 @@ async fn an_unpolled_attachment_is_bounded_and_recovers_while_another_keeps_up()
         for action in a.handle(frame).unwrap() {
             match action {
                 Action::Output(bytes) => held += bytes.len(),
-                Action::Error(error) => {
+                Action::Ended(error) => {
                     assert_eq!(error.code, ErrorCode::TooSlow);
                     lost = true;
                 }

@@ -1,6 +1,5 @@
 import { type BitField, type Engine, EngineError, type Scrollbar, type Terminal } from "./index.ts";
 
-/** Style flag bits of a [`Cell`]. */
 export const FLAG = {
   BOLD: 1,
   ITALIC: 2,
@@ -10,13 +9,10 @@ export const FLAG = {
   INVISIBLE: 32,
   STRIKETHROUGH: 64,
   OVERLINE: 128,
-  /** The cell is the left half of a wide character. */
   WIDE: 256,
-  /** The cell is the right half of a wide character; draw nothing. */
   SPACER: 512,
 } as const;
 
-/** No explicit colour; the renderer uses the default. */
 export const NO_COLOR = -1;
 
 export interface Cell {
@@ -30,7 +26,6 @@ export interface Cell {
   underline: number;
 }
 
-/** `GhosttyRenderStateCursorVisualStyle` by name. */
 const CURSOR_STYLES = ["bar", "block", "underline", "block_hollow"] as const;
 type CursorStyle = (typeof CURSOR_STYLES)[number];
 
@@ -65,10 +60,13 @@ export interface Frame<Cells = Cell[]> {
   scrollbar: Scrollbar;
 }
 
-/** Four signed words per cell: text code, foreground, background, style.
- * Text is a Unicode scalar (0 for blank), or -(grapheme index + 1).
- * Style holds flags in its low 16 bits and underline in its high 16. */
 export const PACKED_STRIDE = 4;
+export const PACKED_TEXT = 0;
+export const PACKED_FG = 1;
+export const PACKED_BG = 2;
+export const PACKED_STYLE = 3;
+export const PACKED_FLAGS_MASK = 0xffff;
+export const PACKED_UNDERLINE_SHIFT = 16;
 export interface PackedCells {
   data: Int32Array<ArrayBuffer>;
   /** Only multi-codepoint cells need strings; these are cloned on transfer. */
@@ -76,15 +74,23 @@ export interface PackedCells {
 }
 export type PackedFrame = Frame<PackedCells>;
 
+function scratchLayout(e: Engine, types: string[]): { offsets: number[]; size: number } {
+  const offsets: number[] = [];
+  let size = 0;
+  for (const name of types) {
+    const align = e.alignOf(name);
+    size = Math.ceil(size / align) * align;
+    offsets.push(size);
+    size += e.sizeOf(name);
+  }
+  return { offsets, size };
+}
+
 export function packedText(cells: PackedCells, x: number): string {
-  const code = cells.data[x * PACKED_STRIDE]!;
+  const code = cells.data[x * PACKED_STRIDE + PACKED_TEXT]!;
   return code < 0 ? cells.graphemes[-code - 1]! : code === 0 ? "" : String.fromCodePoint(code);
 }
 
-/**
- * The engine's render state: updated from a terminal, read into a
- * [`Frame`] of the rows that changed, then cleaned.
- */
 export class RenderState {
   private readonly state: number;
   private readonly iterator: number;
@@ -92,7 +98,6 @@ export class RenderState {
   private readonly keys: { data: Record<string, number>; row: Record<string, number>; cell: Record<string, number> };
   private readonly tags: { codepoint: number; grapheme: number };
   private readonly wide: { wide: number; tail: number };
-  /** `GhosttyCell` bit fields, from the manifest. */
   private readonly cell: { tag: BitField; codepoint: BitField; wide: BitField };
   private readonly cursorStyles: Map<number, CursorStyle>;
 
@@ -132,7 +137,6 @@ export class RenderState {
     );
   }
 
-  /** Captures the terminal and returns the rows that changed since the last `clean`. */
   update(term: Terminal): Frame {
     return this.frame(term, (cols) => {
       const cells: Cell[] = [];
@@ -143,21 +147,26 @@ export class RenderState {
     });
   }
 
-  /** Captures transferable cell buffers without allocating Cell objects.
-   * Each row owns its buffer so the renderer can retain rows independently. */
   updatePacked(term: Terminal): PackedFrame {
     return this.frame(term, (cols) => {
       const data = new Int32Array(cols * PACKED_STRIDE);
       const graphemes: string[] = [];
       let at = 0;
       this.readRow(cols, (codepoint, text, fg, bg, flags, underline) => {
-        data[at++] = text === "" ? codepoint : -graphemes.push(text);
-        data[at++] = fg;
-        data[at++] = bg;
-        data[at++] = flags | (underline << 16);
+        data[at + PACKED_TEXT] = text === "" ? codepoint : -graphemes.push(text);
+        data[at + PACKED_FG] = fg;
+        data[at + PACKED_BG] = bg;
+        data[at + PACKED_STYLE] = flags | (underline << PACKED_UNDERLINE_SHIFT);
+        at += PACKED_STRIDE;
       });
       return { data: data.subarray(0, at), graphemes };
     });
+  }
+
+  takePackedFrame(term: Terminal): PackedFrame {
+    const frame = this.updatePacked(term);
+    this.clean();
+    return frame;
   }
 
   private frame<Cells>(term: Terminal, readRow: (cols: number) => Cells): Frame<Cells> {
@@ -219,7 +228,6 @@ export class RenderState {
     return { cols, rows, full, background, foreground, cursor, lines, scrollbar };
   }
 
-  /** The row's selected cells, or undefined when the selection misses it. */
   private rowSelection(): [number, number] | undefined {
     const e = this.engine;
     const size = e.sizeOf("GhosttyRenderStateRowSelection");
@@ -242,15 +250,11 @@ export class RenderState {
     });
     const styleSize = e.sizeOf("GhosttyStyle");
     let count = 0;
-    // Scratch: raw cell (8), colour (3, padded to 8), the 8-aligned style,
-    // a UTF-8 buffer struct and its bytes.
     const utf8Cap = 64;
-    e.scratch(16 + styleSize + e.sizeOf("GhosttyBuffer") + utf8Cap, (scratch) => {
-      const raw = scratch;
-      const color = scratch + 8;
-      const style = scratch + 16;
-      const buffer = style + styleSize;
-      const utf8 = buffer + e.sizeOf("GhosttyBuffer");
+    const layout = scratchLayout(e, ["GhosttyCell", "GhosttyColorRgb", "GhosttyStyle", "GhosttyBuffer"]);
+    e.scratch(layout.size + utf8Cap, (scratch) => {
+      const [raw, color, style, buffer] = layout.offsets.map((offset) => scratch + offset) as [number, number, number, number];
+      const utf8 = scratch + layout.size;
       while (e.call("ghostty_render_state_row_cells_next", this.cells) && count < cols) {
         e.check("ghostty_render_state_row_cells_get", this.cells, this.keys.cell["RAW"]!, raw);
         const tag = e.readBits(raw, this.cell.tag);
@@ -308,7 +312,6 @@ export class RenderState {
       return new TextDecoder().decode(e.memory.slice(utf8, utf8 + len));
     }
     if (code !== e.result.OUT_OF_SPACE) throw new EngineError("ghostty_render_state_row_cells_get", code);
-    // The buffer struct reports the needed length; retry through it.
     const needed = e.field("GhosttyBuffer", buffer, "len");
     return new TextDecoder().decode(
       e.growing("ghostty_render_state_row_cells_get", needed, (big, bigCap, len) => {
@@ -321,7 +324,6 @@ export class RenderState {
     );
   }
 
-  /** Clears the captured dirty rows; later terminal writes remain dirty. */
   clean(): void {
     this.engine.check("ghostty_render_state_clean", this.state);
   }

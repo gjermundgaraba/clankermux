@@ -1,17 +1,7 @@
-//! Framing fuzz against a live server: after any sequence of well-framed
-//! or garbage frames and the end of input, the server answers the trailing
-//! request when the bytes framed it, closes after an id-less `ERROR` when
-//! they broke the stream, or closes quietly at the end of input (garbage
-//! can form a valid header the rest of the input does not fill); it never
-//! hangs, and it serves the next connection. The connection is past
-//! `HELLO`; `OPEN` on `@session` reaches a live session.
-
-mod common;
-
-use common::*;
 use proptest::prelude::*;
 use proto::*;
 use serde_json::json;
+use testkit::*;
 use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone)]
@@ -112,8 +102,6 @@ proptest! {
                 &serde_json::to_vec(&json!({"id": 999, "method": "list", "params": {}})).unwrap(),
             );
             bytes.extend(&trailing);
-            // What the server will make of the bytes: the trailing request
-            // is a frame of its own only if everything before it framed.
             let mut decoder = FrameDecoder::default();
             decoder.push(&bytes);
             let mut consumed = 0;
@@ -129,13 +117,8 @@ proptest! {
                 }
             }
             let framed = !broke && consumed == bytes.len();
-            // The server may close before everything is written. The end
-            // of input lets it close rather than wait for a frame the
-            // garbage promised.
             let _ = c.stream.write_all(&bytes).await;
             let _ = c.stream.shutdown().await;
-            // An id-less ERROR on channel 0 is the last frame before the
-            // close; a request error carries its id.
             let mut closing = false;
             let mut answered = false;
             loop {
@@ -166,7 +149,6 @@ proptest! {
             if framed {
                 prop_assert!(answered || closing, "a framed request got no answer");
             }
-            // The server lives on.
             client(&server).await.ok("list", json!({})).await;
             Ok(())
         })?;

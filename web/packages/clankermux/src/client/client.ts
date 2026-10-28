@@ -1,5 +1,3 @@
-/** The page side of a client: one worker, one connection, the control
- * surface, and the terminals mounted from it. */
 import type {
   Acked,
   Catalog,
@@ -106,16 +104,13 @@ export class Client {
     private readonly worker: Worker,
     started: (error?: Error) => void,
   ) {
-    // A worker script that does not load posts nothing, so `connect`
-    // would never settle. Once it runs, an error event is an exception in
-    // one of its handlers, which costs that message only: the browser
-    // reports it, and the client goes on.
-    worker.onerror = (e) => {
+    const failStartIfWorkerDidNotLoad = (e: ErrorEvent) => {
       if (this.started) return;
       e.preventDefault();
       started(new Error(`the worker failed: ${e.message || "it did not load"}`));
       this.close();
     };
+    worker.onerror = failStartIfWorkerDidNotLoad;
     worker.onmessage = (e: MessageEvent<ToPage>) => {
       const message = e.data;
       switch (message.type) {
@@ -166,14 +161,12 @@ export class Client {
     if (this.closed) return Promise.reject(new ClientError("closed", "closed"));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      // Cancelled by the server, so the rejection is its `cancelled`,
-      // also when the signal was aborted already.
-      const cancel = () => this.post({ type: "cancel", id });
-      const done = () => signal?.removeEventListener("abort", cancel);
+      const cancelOnServer = () => this.post({ type: "cancel", id });
+      const done = () => signal?.removeEventListener("abort", cancelOnServer);
       this.pending.set(id, { resolve: resolve as (result: unknown) => void, reject, done });
       this.post({ type: "request", id, method, params });
-      if (signal?.aborted) cancel();
-      else signal?.addEventListener("abort", cancel, { once: true });
+      if (signal?.aborted) cancelOnServer();
+      else signal?.addEventListener("abort", cancelOnServer, { once: true });
     });
   }
 

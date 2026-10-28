@@ -23,7 +23,6 @@ export interface KeyInput {
 
 const MODS = { SHIFT: 1 << 0, CTRL: 1 << 1, ALT: 1 << 2, SUPER: 1 << 3 };
 
-/** `KeyboardEvent.code` as a `GhosttyKey` member name: `KeyA` → `A`, `Digit0` → `DIGIT_0`. */
 export function keyName(code: string): string {
   if (/^F\d+$/.test(code)) return code;
   const stripped = code.startsWith("Key") ? code.slice(3) : code;
@@ -33,10 +32,6 @@ export function keyName(code: string): string {
     .toUpperCase();
 }
 
-/** Whether `key` is text the key produces rather than a key name such as
- * "Enter" or "ArrowUp" (which, per UI Events, is ASCII letters and digits
- * starting with a capital, two or more of them; text of that shape is one
- * character). */
 export function isText(key: string): boolean {
   if (key.length === 0) return false;
   const cp = key.codePointAt(0)!;
@@ -44,7 +39,13 @@ export function isText(key: string): boolean {
   return key.length === 1 || !/^[A-Z][A-Za-z0-9]+$/.test(key);
 }
 
-/** Encodes browser key events with the engine, following the terminal's modes. */
+function shiftProducedText(input: KeyInput, text: string): boolean {
+  if (!input.shift || text === "") return false;
+  const layoutUnknown = input.unshifted === undefined;
+  if (layoutUnknown) return text !== " ";
+  return text !== input.unshifted;
+}
+
 export class KeyEncoder {
   private readonly encoder: number;
   private readonly event: number;
@@ -56,13 +57,11 @@ export class KeyEncoder {
     this.unidentified = engine.enumValue("GhosttyKey", "UNIDENTIFIED");
   }
 
-  /** The bytes to send for `input`, empty when the key encodes to nothing. */
   encode(term: Terminal, input: KeyInput): Uint8Array {
     const e = this.engine;
     e.call("ghostty_key_encoder_setopt_from_terminal", this.encoder, term.handle);
     const name = keyName(input.code);
     const key = e.hasEnumValue("GhosttyKey", name) ? e.enumValue("GhosttyKey", name) : this.unidentified;
-    // Modifiers that composed the text are not modifiers of the key.
     const composed = input.altComposed === true;
     const mods =
       (input.shift ? MODS.SHIFT : 0) |
@@ -73,13 +72,7 @@ export class KeyEncoder {
     e.call("ghostty_key_event_set_key", this.event, key);
     e.call("ghostty_key_event_set_mods", this.event, mods);
     const text = isText(input.key) ? input.key : "";
-    // Shift that made the text is consumed, as a keyboard reports it, so
-    // the kitty protocol's disambiguation sends the text (`:`, `A`) rather
-    // than shift and the key. It made it when the text is not the key's
-    // own character; with no layout to say (no map, or a key it does not
-    // cover, such as the numpad), when it is any text but a space.
-    const shiftMade = input.shift && text !== "" && (input.unshifted !== undefined ? text !== input.unshifted : text !== " ");
-    e.call("ghostty_key_event_set_consumed_mods", this.event, shiftMade ? MODS.SHIFT : 0);
+    e.call("ghostty_key_event_set_consumed_mods", this.event, shiftProducedText(input, text) ? MODS.SHIFT : 0);
     e.call("ghostty_key_event_set_composing", this.event, input.composing ? 1 : 0);
     const utf8 = new TextEncoder().encode(text);
     return e.withBytes(utf8, (textPtr) => {

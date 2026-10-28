@@ -1,6 +1,3 @@
-//! A client connection: framing over any byte stream, requests answered
-//! by id, events, and frames routed to attachment channels.
-
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -25,17 +22,12 @@ const ATTACHMENT_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 const EVENT_QUEUE_BYTES: usize = 1024 * 1024;
 const OUTGOING_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Error {
-    Io(io::Error),
-    /// The server broke the protocol.
+    Io(Arc<io::Error>),
     Protocol(String),
-    /// A stream frame did not continue from the cursor: the attachment
-    /// lost its place and a fresh `OPEN` recovers it.
     Desync(String),
-    /// A server error reply.
     Server(ErrorMessage),
-    /// The connection is closed.
     Closed,
 }
 
@@ -55,7 +47,7 @@ impl std::error::Error for Error {}
 
 impl From<io::Error> for Error {
     fn from(e: io::Error) -> Self {
-        Error::Io(e)
+        Error::Io(Arc::new(e))
     }
 }
 
@@ -65,7 +57,6 @@ impl From<ErrorMessage> for Error {
     }
 }
 
-/// One received frame.
 #[derive(Debug)]
 pub struct Frame {
     pub header: Header,
@@ -93,7 +84,6 @@ impl Frame {
 
 enum Channel {
     Open(Sender<Frame>),
-    /// Discard the old stream until the server acknowledges its end.
     Closing,
 }
 
@@ -102,39 +92,19 @@ struct Routes {
     channels: HashMap<u32, Channel>,
     events: Option<Sender<Numbered>>,
     stop: watch::Sender<bool>,
-    /// Set before receivers close, including local queue overflow.
-    closed: Option<Ended>,
+    closed: Option<Error>,
 }
 
-/// Why a connection ended.
-#[derive(Debug)]
-enum Ended {
-    /// A local queue overflowed; stream state must not be resumed.
-    Desync(String),
-    /// The server sent an `ERROR` without id.
-    Server(ErrorMessage),
-    /// The server broke the protocol.
-    Protocol(String),
-    /// The stream broke.
-    Io(io::ErrorKind, String),
-    /// The server closed the connection, as on a stop.
-    Eof,
+pub struct Reply {
+    id: i64,
+    rx: oneshot::Receiver<Result<Value, ErrorMessage>>,
 }
 
-impl From<&Ended> for Error {
-    fn from(ended: &Ended) -> Self {
-        match ended {
-            Ended::Desync(reason) => Error::Desync(reason.clone()),
-            Ended::Server(error) => Error::Server(error.clone()),
-            Ended::Protocol(reason) => Error::Protocol(reason.clone()),
-            Ended::Io(kind, reason) => Error::Io(io::Error::new(*kind, reason.clone())),
-            Ended::Eof => Error::Closed,
-        }
+impl Reply {
+    pub fn id(&self) -> i64 {
+        self.id
     }
 }
-
-/// The reply to a request in flight.
-pub struct Reply(oneshot::Receiver<Result<Value, ErrorMessage>>);
 
 pub struct Connection {
     tx: Sender<Vec<u8>>,
@@ -143,8 +113,6 @@ pub struct Connection {
     routes: Arc<Mutex<Routes>>,
 }
 
-/// The `HELLO` a client of `name` sends; `engine` is set for attaching
-/// clients.
 pub fn hello(name: &str, engine: Option<&str>) -> Hello {
     Hello {
         version: proto::VERSION,
@@ -163,8 +131,6 @@ impl Connection {
         Self::handshake(stream, hello).await
     }
 
-    /// Sends `HELLO`, waits for `WELCOME`, then routes frames in the
-    /// background until the stream ends.
     pub async fn handshake<S: AsyncRead + AsyncWrite + Send + 'static>(
         stream: S,
         hello: Hello,
@@ -232,7 +198,7 @@ impl Connection {
             Err(SendError::Full) => {
                 end_routes(
                     &self.routes,
-                    Ended::Desync("outgoing queue full; reconnect with fresh OPENs".into()),
+                    Error::Desync("outgoing queue full; reconnect with fresh OPENs".into()),
                 );
                 Err(self.ended().expect("just ended"))
             }
@@ -253,21 +219,18 @@ impl Connection {
         )
     }
 
-    /// A request and its reply.
     pub async fn request<T: Serialize>(&self, method: &str, params: T) -> Result<Value, Error> {
-        let (_, reply) = self.begin(method, params)?;
+        let reply = self.begin(method, params)?;
         self.finish(reply).await
     }
 
-    /// Sends a request; its id, and the reply to pass to `finish`. The id
-    /// is what a `cancel` names.
-    pub fn begin<T: Serialize>(&self, method: &str, params: T) -> Result<(i64, Reply), Error> {
+    pub fn begin<T: Serialize>(&self, method: &str, params: T) -> Result<Reply, Error> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         {
             let mut routes = self.routes.lock().unwrap();
             if let Some(closed) = &routes.closed {
-                return Err(closed.into());
+                return Err(closed.clone());
             }
             routes.pending.insert(id, reply_tx);
         }
@@ -280,21 +243,17 @@ impl Connection {
                 params: serde_json::to_value(params).expect("serializable"),
             },
         )?;
-        Ok((id, Reply(reply_rx)))
+        Ok(Reply { id, rx: reply_rx })
     }
 
-    /// The reply to a request `begin` sent.
     pub async fn finish(&self, reply: Reply) -> Result<Value, Error> {
-        match reply.0.await {
+        match reply.rx.await {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(error)) => Err(error.into()),
-            // The connection ended, and says why (an id-less ERROR among
-            // the reasons).
             Err(_) => Err(self.ended().unwrap_or(Error::Closed)),
         }
     }
 
-    /// A typed request.
     pub async fn call<T: Serialize, R: DeserializeOwned>(
         &self,
         method: &str,
@@ -304,16 +263,12 @@ impl Connection {
         serde_json::from_value(value).map_err(|e| Error::Protocol(format!("{method} reply: {e}")))
     }
 
-    /// Opens `channel` and returns the frames the server sends on it. The
-    /// receiver ends after the attachment or connection ends. A local
-    /// overflow delivers `ERROR too_slow`; use a fresh OPEN on a new channel
-    /// or connection. The old channel stays reserved until its server end.
     pub fn open(&self, channel: u32, open: &Open) -> Result<Receiver<Frame>, Error> {
         let (tx, rx) = queue::channel(ATTACHMENT_QUEUE_BYTES);
         {
             let mut routes = self.routes.lock().unwrap();
             if let Some(closed) = &routes.closed {
-                return Err(closed.into());
+                return Err(closed.clone());
             }
             if routes.channels.contains_key(&channel) {
                 return Err(Error::Protocol("attachment channel is still open".into()));
@@ -324,8 +279,6 @@ impl Connection {
         Ok(rx)
     }
 
-    /// The sink for `EVENT` frames; `subscribe` must be requested too.
-    /// The receiver ends when the connection does.
     pub fn events(&self) -> Receiver<Numbered> {
         let (tx, rx) = queue::channel(EVENT_QUEUE_BYTES);
         let mut routes = self.routes.lock().unwrap();
@@ -335,10 +288,8 @@ impl Connection {
         rx
     }
 
-    /// Why the connection ended, once it has: by the time `events()`,
-    /// a reply or a channel's frames end.
     pub fn ended(&self) -> Option<Error> {
-        self.routes.lock().unwrap().closed.as_ref().map(Error::from)
+        self.routes.lock().unwrap().closed.clone()
     }
 }
 
@@ -363,7 +314,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
                 continue;
             }
             Ok(None) => {}
-            Err(err) => break Ended::Protocol(err.to_string()),
+            Err(err) => break Error::Protocol(err.to_string()),
         }
         let read = tokio::select! {
             biased;
@@ -371,9 +322,9 @@ async fn read_loop<R: AsyncRead + Unpin>(
             read = reader.read(&mut buf) => read,
         };
         match read {
-            Ok(0) => break Ended::Eof,
+            Ok(0) => break Error::Closed,
             Ok(n) => decoder.push(&buf[..n]),
-            Err(err) => break Ended::Io(err.kind(), err.to_string()),
+            Err(err) => break err.into(),
         }
     };
     end_routes(&routes, reason);
@@ -392,9 +343,8 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             next = rx.rx.recv() => next,
         };
         let Some(bytes) = next else {
-            break Ended::Eof;
+            break Error::Closed;
         };
-        // Keep the byte permit until the carrier has flushed this frame.
         let result = tokio::select! {
             biased;
             _ = stopped.changed() => return,
@@ -404,7 +354,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             } => result,
         };
         if let Err(err) = result {
-            break Ended::Io(err.kind(), err.to_string());
+            break err.into();
         }
     };
     end_routes(&routes, reason);
@@ -421,13 +371,13 @@ fn loss_frame(channel: u32, message: &str) -> Frame {
     Frame::new(FrameType::Error, channel, payload)
 }
 
-fn end_routes(routes: &Mutex<Routes>, reason: Ended) {
+fn end_routes(routes: &Mutex<Routes>, reason: Error) {
     let mut routes = routes.lock().unwrap();
     if routes.closed.is_some() {
         return;
     }
     for (channel, state) in routes.channels.drain() {
-        if let (Channel::Open(tx), Ended::Desync(message)) = (state, &reason) {
+        if let (Channel::Open(tx), Error::Desync(message)) = (state, &reason) {
             tx.end(loss_frame(channel, message));
         }
     }
@@ -437,13 +387,11 @@ fn end_routes(routes: &Mutex<Routes>, reason: Ended) {
     routes.stop.send_replace(true);
 }
 
-/// Delivers one frame; an error ends the connection.
 fn route(
     routes: &Mutex<Routes>,
     outgoing: &WeakSender<Vec<u8>>,
     frame: Frame,
-) -> Result<(), Ended> {
-    let lost = |e: Error| Ended::Protocol(e.to_string());
+) -> Result<(), Error> {
     let mut routes = routes.lock().unwrap();
     let channel = frame.header.channel;
     if routes.closed.is_some() {
@@ -455,9 +403,7 @@ fn route(
         };
         let terminal = frame.header.frame_type == FrameType::Closed
             || (frame.header.frame_type == FrameType::Error
-                && !crate::attachment::keeps_attachment(
-                    frame.json::<ErrorMessage>().map_err(lost)?.code,
-                ));
+                && !crate::attachment::keeps_attachment(frame.json::<ErrorMessage>()?.code));
         if let Channel::Open(tx) = state {
             let bytes = proto::HEADER_LEN + frame.payload.len();
             if let Err(error) = tx.send(frame, bytes) {
@@ -472,7 +418,7 @@ fn route(
                 if !terminal {
                     let close = encode_frame(FrameType::Close, channel, &[]);
                     outgoing.send(close, proto::HEADER_LEN).map_err(|_| {
-                        Ended::Desync(
+                        Error::Desync(
                             "cannot queue CLOSE after local loss; reconnect with fresh OPENs"
                                 .into(),
                         )
@@ -487,51 +433,45 @@ fn route(
     }
     match frame.header.frame_type {
         FrameType::Reply => {
-            let reply: proto::Reply = frame.json().map_err(lost)?;
-            // A reply or error for a request no longer waited for is dropped.
+            let reply: proto::Reply = frame.json()?;
             if let Some(tx) = routes.pending.remove(&reply.id) {
                 let _ = tx.send(Ok(reply.result));
             }
         }
         FrameType::Error => {
-            let error: ErrorMessage = frame.json().map_err(lost)?;
+            let error: ErrorMessage = frame.json()?;
             match error.id {
                 Some(id) => {
                     if let Some(tx) = routes.pending.remove(&id) {
                         let _ = tx.send(Err(error));
                     }
                 }
-                // An error without id precedes the server closing.
-                None => return Err(Ended::Server(error)),
+                None => return Err(Error::Server(error)),
             }
         }
         FrameType::Event => {
-            let event: Numbered = frame.json().map_err(lost)?;
+            let event: Numbered = frame.json()?;
             if let Some(tx) = &routes.events {
                 match tx.send(event, proto::HEADER_LEN + frame.payload.len()) {
                     Ok(()) => {}
                     Err(SendError::Closed) => routes.events = None,
                     Err(SendError::Full) => {
-                        return Err(Ended::Desync(
+                        return Err(Error::Desync(
                             "event queue full; reconnect and resubscribe, with fresh OPENs".into(),
                         ));
                     }
                 }
             }
         }
-        other => return Err(Ended::Protocol(format!("{other:?} on channel 0"))),
+        other => return Err(Error::Protocol(format!("{other:?} on channel 0"))),
     }
     Ok(())
 }
 
-/// Where a server is reached: the local socket, a tailnet address, or a
-/// relay over SSH.
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     Unix(std::path::PathBuf),
-    /// `host:port`, plaintext.
     Tcp(String),
-    /// An `ssh` destination running `clankermux --stdio`.
     Ssh(String),
 }
 
@@ -545,11 +485,6 @@ impl Endpoint {
                 Connection::handshake(stream, hello).await
             }
             Endpoint::Ssh(destination) => {
-                // The child outlives this handle: it ends when the pipes
-                // close, and tokio reaps it. Its stderr would otherwise
-                // print into an attached terminal in raw mode; its last
-                // bytes are kept for the error when the handshake fails,
-                // and discarded for as long as the connection lives.
                 let mut child = tokio::process::Command::new("ssh")
                     .arg(destination)
                     .args(["clankermux", "--stdio"])
@@ -576,8 +511,6 @@ impl Endpoint {
                     Ok(connection) => Ok(connection),
                     Err(error) => {
                         drop(child);
-                        // What ssh said explains a transport failure; a
-                        // server's refusal stands on its own.
                         if !matches!(error, Error::Io(_) | Error::Closed) {
                             return Err(error);
                         }
@@ -588,9 +521,7 @@ impl Endpoint {
                             .unwrap_or_default();
                         match said.trim() {
                             "" => Err(error),
-                            said => {
-                                Err(Error::Io(io::Error::other(format!("{error}; ssh: {said}"))))
-                            }
+                            said => Err(io::Error::other(format!("{error}; ssh: {said}")).into()),
                         }
                     }
                 }
@@ -737,13 +668,13 @@ mod tests {
             Frame::new(FrameType::Event, 0, payload),
         )
         .unwrap_err();
-        assert!(matches!(reason, Ended::Desync(_)));
+        assert!(matches!(reason, Error::Desync(_)));
         end_routes(&routes, reason);
         assert_eq!(events_rx.recv().await.unwrap().seq, 1);
         assert!(events_rx.recv().await.is_none());
         assert!(matches!(
             routes.lock().unwrap().closed,
-            Some(Ended::Desync(_))
+            Some(Error::Desync(_))
         ));
         assert_eq!(
             frames_rx
@@ -808,7 +739,7 @@ mod tests {
         let chunk = vec![b'x'; 64 * 1024];
         conn.send(FrameType::Input, 1, &chunk).unwrap();
         tokio::task::yield_now().await;
-        let (_, reply) = conn.begin("list", serde_json::json!({})).unwrap();
+        let reply = conn.begin("list", serde_json::json!({})).unwrap();
         let mut sent = 1;
         loop {
             match conn.send(FrameType::Input, 1, &chunk) {

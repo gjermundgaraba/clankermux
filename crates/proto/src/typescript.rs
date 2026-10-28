@@ -1,7 +1,3 @@
-//! TypeScript from the catalog: the web package's protocol types, one per
-//! definition with its doc comments, and `Methods`, each method's params
-//! and result.
-
 use std::fmt::Write as _;
 
 use serde_json::Value;
@@ -9,7 +5,6 @@ use serde_json::Value;
 use crate::catalog::Catalog;
 use crate::render::{ref_name, required};
 
-/// The module `cargo xtask protocol` writes to the web package.
 pub fn module(catalog: &Catalog) -> String {
     let mut out =
         String::from("// Generated from the catalog by `cargo xtask protocol`; do not edit.\n\n");
@@ -47,15 +42,12 @@ fn description(schema: &Value) -> &str {
         .unwrap_or_default()
 }
 
-/// An object of fields alone.
 fn is_interface(schema: &Value) -> bool {
     schema.get("properties").is_some()
         && schema.get("oneOf").is_none()
         && schema.get("anyOf").is_none()
 }
 
-/// `text` as a doc comment at `indent`, wrapped at 80 columns; nothing
-/// for no text.
 fn doc(text: &str, indent: &str) -> String {
     if text.is_empty() {
         return String::new();
@@ -86,9 +78,6 @@ fn doc(text: &str, indent: &str) -> String {
     out
 }
 
-/// `{ ... }` for an object's properties: one field per line under
-/// `indent` for a `block` or when a field has a doc comment, else one
-/// line.
 fn fields(schema: &Value, indent: &str, block: bool) -> String {
     let required = required(schema);
     let properties: Vec<(&String, &Value)> = schema
@@ -119,7 +108,6 @@ fn fields(schema: &Value, indent: &str, block: bool) -> String {
     out
 }
 
-/// A schema as a TypeScript type, its lines after the first at `indent`.
 fn ty(schema: &Value, indent: &str) -> String {
     let Value::Object(map) = schema else {
         return "unknown".into();
@@ -142,8 +130,6 @@ fn ty(schema: &Value, indent: &str) -> String {
         if !map.contains_key("properties") {
             return union;
         }
-        // An object with a field of its own beside its branches, as
-        // `EVENT`'s `seq`.
         let close = if union.starts_with('\n') {
             format!("\n{indent}")
         } else {
@@ -172,8 +158,6 @@ fn ty(schema: &Value, indent: &str) -> String {
     }
 }
 
-/// Branches as `A | B` on one line, or one per line with their doc
-/// comments when any has one.
 fn union(branches: &[Value], indent: &str) -> String {
     let inner = format!("{indent}  ");
     if branches.iter().all(|b| description(b).is_empty()) {

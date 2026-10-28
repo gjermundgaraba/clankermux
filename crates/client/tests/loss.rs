@@ -1,9 +1,3 @@
-//! Loss testing: several sessions and clients through a proxy that delays
-//! and cuts connections. A carrier is an ordered reliable byte stream, so
-//! packet loss reaches the protocol as delay, stalls and dropped
-//! connections; the proxy produces exactly those. Every client must end
-//! with the server's screen for its session.
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -19,8 +13,6 @@ use tokio::net::{TcpListener, TcpStream};
 const SESSIONS: usize = 8;
 const CUTS: usize = 6;
 
-/// A TCP proxy that delays every chunk, drops every connection on
-/// `cut`, and refuses new ones while `paused`.
 struct Proxy {
     addr: SocketAddr,
     delay_ms: Arc<AtomicU64>,
@@ -81,7 +73,6 @@ impl Proxy {
         }
     }
 
-    /// Drops every connection in flight; clients see a closed socket.
     fn cut(&self) {
         for handle in self.connections.lock().unwrap().drain(..) {
             handle.abort();
@@ -89,7 +80,6 @@ impl Proxy {
     }
 }
 
-/// Copies one direction, holding each chunk for the current delay.
 async fn relay(
     mut from: tokio::net::tcp::OwnedReadHalf,
     mut to: tokio::net::tcp::OwnedWriteHalf,
@@ -125,10 +115,9 @@ async fn start(limits: Limits) -> Server {
     }
 }
 
-/// The screen as the client's engine shows it, trimmed, history excluded.
 fn screen(a: &mut Attachment) -> String {
     let term = a.term().unwrap();
-    let from = term.scrollback_rows().unwrap();
+    let from = term.screen_top().unwrap();
     let out = ghostty_vt::formatter::format(
         term,
         ghostty_vt::formatter::Options {
@@ -141,8 +130,6 @@ fn screen(a: &mut Attachment) -> String {
     String::from_utf8(out).unwrap()
 }
 
-/// What one client saw. `errors` holds server errors and the client's
-/// own protocol errors, which a correct run has none of.
 #[derive(Default, Debug)]
 struct Seen {
     reconnects: usize,
@@ -152,8 +139,6 @@ struct Seen {
     errors: Vec<String>,
 }
 
-/// Runs `follow` on its own thread: the engine behind an attachment is
-/// not `Send`. `bootstrapped` counts the snapshots as they complete.
 fn follow_thread(
     endpoint: Endpoint,
     session: String,
@@ -172,9 +157,6 @@ fn follow_thread(
     })
 }
 
-/// Attaches to `session` through `endpoint` until its screen shows
-/// `done`, reconnecting with resume whenever the connection drops. The
-/// run fails after 60 s, connected or not.
 async fn follow(
     endpoint: Endpoint,
     session: String,
@@ -248,7 +230,9 @@ async fn follow(
             for action in actions {
                 match action {
                     Action::Gap(_) => seen.gaps += 1,
-                    Action::Error(error) => seen.errors.push(format!("server: {error:?}")),
+                    Action::Refused(error) | Action::Ended(error) => {
+                        seen.errors.push(format!("server: {error:?}"));
+                    }
                     _ => {}
                 }
             }
@@ -256,7 +240,6 @@ async fn follow(
                 return (a, seen);
             }
         }
-        // Lost: reconnect.
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -299,7 +282,6 @@ async fn clients_converge_through_delay_and_cuts() {
             )
         })
         .collect();
-    // Cuts while the output flows, then a calm end.
     for _ in 0..CUTS {
         tokio::time::sleep(Duration::from_millis(400)).await;
         proxy.cut();
@@ -332,9 +314,6 @@ async fn clients_converge_through_delay_and_cuts() {
         total.snapshots += seen.snapshots;
         total.gaps += seen.gaps;
     }
-    // Six cuts over eight clients: reconnects happened, and most of them
-    // resumed rather than bootstrapped again (a cut during a bootstrap
-    // costs one more snapshot).
     assert!(total.reconnects >= CUTS, "{total:?}");
     assert!(total.resumes * 2 >= total.reconnects, "{total:?}");
     assert!(total.snapshots <= SESSIONS + CUTS, "{total:?}");
@@ -344,10 +323,6 @@ async fn clients_converge_through_delay_and_cuts() {
     drop(server);
 }
 
-/// A server-side ring too small for what goes by while a client is kept
-/// away: the resume is refused and the client bootstraps again (a refused
-/// resume is a plain snapshot; `GAP` is for an attachment that falls
-/// behind while attached).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_small_ring_turns_a_long_cut_into_a_snapshot() {
     let server = start(Limits {
@@ -360,8 +335,6 @@ async fn a_small_ring_turns_a_long_cut_into_a_snapshot() {
         .connect(hello("control", Some(ghostty_vt::ENGINE)))
         .await
         .unwrap();
-    // A session that runs what is typed, without a prompt; the control
-    // connection types while the client is away.
     let session: Session = control
         .call(
             "create",
@@ -381,7 +354,6 @@ async fn a_small_ring_turns_a_long_cut_into_a_snapshot() {
         "DONE".into(),
         bootstrapped.clone(),
     );
-    // The client is attached and streaming before it is kept away.
     for _ in 0..500 {
         if bootstrapped.load(Ordering::Relaxed) > 0 {
             break;
@@ -391,7 +363,6 @@ async fn a_small_ring_turns_a_long_cut_into_a_snapshot() {
     assert_eq!(bootstrapped.load(Ordering::Relaxed), 1, "no first attach");
     proxy.paused.store(true, Ordering::Relaxed);
     proxy.cut();
-    // More than a ring of output goes by while the client is kept away.
     type_line("i=0; while [ $i -lt 100 ]; do echo \"line $i ..............................\"; i=$((i+1)); done")
         .await
         .unwrap();
@@ -409,7 +380,6 @@ async fn a_small_ring_turns_a_long_cut_into_a_snapshot() {
     }
     assert!(typed, "the typed loop never ran");
     proxy.paused.store(false, Ordering::Relaxed);
-    // The typed command must not show the word the client waits for.
     type_line("printf 'DO%sNE\\n' ''").await.unwrap();
     let (screen, seen) = tokio::task::spawn_blocking(move || client.join().unwrap())
         .await

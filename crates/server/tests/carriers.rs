@@ -1,14 +1,10 @@
-//! The TCP and TLS WebSocket carriers.
-
-mod common;
-
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::*;
 use futures_util::{SinkExt, StreamExt};
 use proto::*;
 use serde_json::json;
+use testkit::*;
 use testkit::{ClientWs, connect_ws};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -16,7 +12,6 @@ use tokio_rustls::TlsConnector;
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
-/// A session, an attach with its bootstrap, and a close, over `c`.
 async fn full_attach(c: &mut Client) {
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", "echo over-the-wire; exec cat"]}))
@@ -42,8 +37,6 @@ async fn tcp_carries_frames() {
     full_attach(&mut c).await;
 }
 
-/// A WebSocket carrier on loopback with a self-signed certificate the
-/// client trusts.
 struct Ws {
     addr: SocketAddr,
     connector: TlsConnector,
@@ -85,7 +78,6 @@ async fn the_websocket_admits_allowed_origins_only() {
     c.hello().await;
     full_attach(&mut c).await;
 
-    // No allowlist admits nobody.
     let closed = serve_ws(&server, Vec::new()).await;
     assert_eq!(
         refused(closed.connect(Some("http://allowed")).await),
@@ -93,7 +85,6 @@ async fn the_websocket_admits_allowed_origins_only() {
     );
 }
 
-/// The next message from the server, which must be one whole frame.
 async fn next(raw: &mut ClientWs) -> (Header, Vec<u8>) {
     let max_frame = Limits::default().max_frame;
     let message = tokio::time::timeout(Duration::from_secs(5), raw.next())
@@ -114,7 +105,6 @@ fn json(frame_type: FrameType, body: &serde_json::Value) -> Message {
     Message::Binary(encode_frame(frame_type, 0, &serde_json::to_vec(body).unwrap()).into())
 }
 
-/// A raw connection past its handshake.
 async fn greeted(ws: &Ws) -> ClientWs {
     let mut raw = ws.connect(Some("http://allowed")).await.unwrap();
     raw.send(json(
@@ -128,8 +118,6 @@ async fn greeted(ws: &Ws) -> ClientWs {
     raw
 }
 
-/// Reads to the close: an `ERROR protocol_error` on channel 0 must come,
-/// and no reply.
 async fn ends_with_protocol_error(raw: &mut ClientWs) -> String {
     let max_frame = Limits::default().max_frame;
     let mut error = None;
@@ -141,7 +129,6 @@ async fn ends_with_protocol_error(raw: &mut ClientWs) -> String {
             None | Some(Err(_) | Ok(Message::Close(_))) => break,
             Some(Ok(Message::Binary(bytes))) => {
                 let (header, payload) = parse_frame(&bytes, max_frame).unwrap();
-                // Whatever was still queued for channel 1 may arrive first.
                 match header.frame_type {
                     FrameType::Reply => panic!("a reply to a bad message"),
                     FrameType::Error if header.channel == 0 => {
@@ -203,7 +190,6 @@ async fn each_message_is_exactly_one_frame() {
     assert_eq!(seen[0], FrameType::Attached);
     assert!(seen.contains(&FrameType::SnapshotReady));
 
-    // Two frames in one message are a protocol error.
     let mut two = encode_frame(
         FrameType::Request,
         0,
@@ -220,7 +206,6 @@ async fn each_message_is_exactly_one_frame() {
         "frame length 36 with 82 payload bytes"
     );
 
-    // A text message, too.
     let mut raw = greeted(&ws).await;
     raw.send(Message::Text("hello".into())).await.unwrap();
     assert!(
@@ -229,8 +214,6 @@ async fn each_message_is_exactly_one_frame() {
             .contains("binary messages")
     );
 
-    // A message shorter than a header, or empty, is not a frame either:
-    // two such messages must not add up to one.
     for short in [&b"\x02\x00\x00\x00\x00"[..], &b""[..]] {
         let mut raw = greeted(&ws).await;
         raw.send(Message::Binary(short.to_vec().into()))
@@ -243,11 +226,8 @@ async fn each_message_is_exactly_one_frame() {
         );
     }
 
-    // A message over the ceiling, too.
     let mut raw = greeted(&ws).await;
     let over = vec![0u8; proto::cap(Limits::default().max_frame) + HEADER_LEN + 1];
-    // The server refuses it from its header, before the bytes are all
-    // written, so the send itself may fail.
     let _ = raw.send(Message::Binary(over.into())).await;
     assert!(
         ends_with_protocol_error(&mut raw)
@@ -255,7 +235,6 @@ async fn each_message_is_exactly_one_frame() {
             .contains("too long")
     );
 
-    // A bad header is reported as on any carrier.
     let mut raw = greeted(&ws).await;
     let mut bad = encode_frame(FrameType::Request, 0, b"{}");
     bad[0] = 0x7f;
@@ -271,7 +250,6 @@ async fn a_silent_connection_closes_within_hello_timeout() {
     let server = start(fast_limits());
     let ws = serve_ws(&server, vec!["http://allowed".into()]).await;
     let started = std::time::Instant::now();
-    // Nothing sent: no TLS handshake, no upgrade.
     let mut tcp = TcpStream::connect(ws.addr).await.unwrap();
     let mut byte = [0u8; 1];
     let read = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut byte))

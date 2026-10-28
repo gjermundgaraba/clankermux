@@ -9,17 +9,21 @@ A terminal multiplexer server with CLI and browser clients; the wire protocol is
 | [mise](https://mise.jdx.dev) | installs zig 0.16 and just from `mise.toml` (`mise install`) |
 | Rust | 1.98 |
 | pnpm | 12 (`web/package.json`), Node 24+ |
+| Playwright Chromium | for the browser tests: `cd web && pnpm install && pnpm -C apps/client browsers` |
 
 ## Commands
 
 | Command | Does |
 | --- | --- |
-| `just check` | fmt, bindings, PROTOCOL.md's generated tables, clippy, Rust and web tests (the web package in the installed Chrome among them; `CHROME` names another), web builds; required for every commit |
+| `just check` | fmt, bindings, PROTOCOL.md's generated tables, clippy, Rust and web tests (the demo page's in Playwright's Chromium among them; `CHROME` names another browser binary), web builds; required for every commit |
 | `just protocol` | renders PROTOCOL.md's tables (between `generated` marks) from the protocol types in `crates/proto` |
 | `just release-build` | `target/release/clankermux` |
 | `just dev-serve` | release server: state and socket in `target/dev/`, `wss://127.0.0.1:7438/` with a self-signed certificate, origins `http://app.clankerspace-dev.localhost:10094` and `http://127.0.0.1:8787` |
 | `cd web/apps/client && pnpm build && pnpm serve` | demo page on `http://127.0.0.1:8787/?ws=wss://127.0.0.1:7438/`; after `just check`, which installs `web/` and builds the wasm |
 | `target/release/clankermux --socket target/dev/sock create` | a session on the dev server |
+| `node web/apps/client/scripts/headless.mjs <page url> <socket> <session id> <screenshot.png>` | a development smoke check: drives the demo page in headless Chrome over the DevTools protocol, types a line, saves a screenshot, and checks through `read` that the line reached the session's screen; plain ASCII only, so it says nothing about modifiers or layouts |
+
+`just dev-serve` makes its self-signed certificate once, in `target/dev/`, because a loopback `--ws` without certificate files asks Tailscale for one. The demo page's server (`pnpm serve`) listens on loopback unless `--host` names another address. Without `?ws=`, the page connects to port 7438 on its own host, which works only when the page is served on the node's tailnet name (`--host <node>.<tailnet>.ts.net`, the name on the server's certificate), not on loopback; the server must then list the page's origin (`--origin http://<host>:<port>`).
 
 ## The command line
 
@@ -65,9 +69,11 @@ A server that dies without a signal (SIGKILL, a machine powered off) starts agai
 
 ## Release
 
-Bump `version` in `crates/clankermux/Cargo.toml` and/or `web/packages/clankermux/package.json`, commit, tag `v<version>` and push the tag. `release.yml` attaches `clankermux-<version>-{x86_64,aarch64}-unknown-linux-gnu` to the tag's GitHub release, named after the tag. `npm.yml` publishes `@gjermundgaraba/clankermux` through npm trusted publishing if npm doesn't have its version yet.
+Bump `version` in `crates/clankermux/Cargo.toml` and/or `web/packages/clankermux/package.json`, commit, tag `v<version>` and push the tag. `release.yml` attaches `clankermux-<version>-{x86_64,aarch64}-unknown-linux-gnu` to the tag's GitHub release, named after the tag. `npm.yml` publishes `@gjermundgaraba/clankermux` through npm trusted publishing if npm doesn't have its version yet. A new package's first version is published by hand (`pnpm publish` in its directory); then `npm trust github <package> --repo <owner>/<repo> --file npm.yml` lets `npm.yml` publish the later ones.
 
 ### Versions
+
+- **0.6.0**: a new park format. `session.json` carries `version: 2` in place of `protocol: 1` and writes `attachments` as the empty list instead of the count 0; a server rolled back to 0.5 cannot load these parks, and 0.6 deletes the parks 0.5 wrote when it starts, so a 0.5 session comes back neither running nor `restored`. The npm package no longer exports `./engine`; import the client, `./worker`, `./proto` or `./renderer`.
 
 - **0.5.0**: removed APIs and bounded buffering for busy sessions. `send --keys` and the server's `send {keys}` no longer accept `return`, `escape`, `control`, `meta`, `opt`, `option`, `cmd` or `command`: use `enter`, `esc`, `ctrl`, `alt` (for `meta`, `opt` and `option`) and `super` (for `cmd` and `command`). `shift` stays. A bad key exits 2 on the command line, or answers `invalid_request` from the server. The exit-code numbers are unchanged; the table and the agent guide now both spell out usage errors and the child's status for `wait --exit`, `send --exit` and `create --wait`, including 1 for a `restored` session. Bad `--policy`, `--format` and `--scope` values now say `unknown variant` and list the accepted values.
 

@@ -1,10 +1,6 @@
-//! `read` formats and scopes, command marks, and `tail`.
-
-mod common;
-
-use common::*;
 use proto::*;
 use serde_json::{Value, json};
+use testkit::*;
 
 async fn read_with(c: &mut Client, params: Value) -> Read {
     serde_json::from_value(c.ok("read", params).await).unwrap()
@@ -14,7 +10,6 @@ async fn tail(c: &mut Client, params: Value) -> Tail {
     serde_json::from_value(c.ok("tail", params).await).unwrap()
 }
 
-/// The `command` of each `session_changed` for `id` received so far.
 fn changed_commands(c: &mut Client, id: &str) -> Vec<Command> {
     std::mem::take(&mut c.events)
         .into_iter()
@@ -25,7 +20,6 @@ fn changed_commands(c: &mut Client, id: &str) -> Vec<Command> {
         .collect()
 }
 
-/// The offset just past the first `needle` in `stream`.
 fn past(stream: &[u8], needle: &[u8]) -> u64 {
     let at = stream
         .windows(needle.len())
@@ -56,7 +50,6 @@ async fn each_format_on_a_known_screen() {
         "<div style=\"font-family: monospace; white-space: pre;\">plain <div style=\"display: \
          inline;color: var(--vt-palette-1);\">red</div> &lt;&amp;&gt;</div>"
     );
-    // The rest of the reply is as for text.
     assert_eq!((html.cols, html.rows, html.cursor), (20, 5, text.cursor));
     assert_eq!(
         c.err("read", json!({"session": session.id, "format": "pdf"}))
@@ -87,8 +80,6 @@ async fn each_scope() {
     )
     .await;
     assert!(html.text.contains(all.trim_end()), "{:?}", html.text);
-    // The screen holds line27 to line30; `scrollback` counts lines before
-    // it in every format.
     let screen = read_with(&mut c, json!({"session": session.id, "scrollback": 2})).await;
     assert_eq!(
         screen.text,
@@ -114,7 +105,6 @@ async fn each_scope() {
             .await,
         ErrorCode::ScopeUnavailable
     );
-    // No shell integration, no command.
     assert_eq!(c.inspect(&session.id).await.command, None);
     assert_eq!(
         c.err(
@@ -142,16 +132,12 @@ async fn each_scope() {
     )
     .await;
     assert!(html.text.contains("var(--vt-palette-1);\">on alt</div>"));
-    // The screen is the active one; the primary is out of reach.
     let history = read_with(&mut c, json!({"session": session.id, "scope": "history"})).await;
     assert_eq!(history.text, "\non alt\n");
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
 }
 
-/// What the scripted shell in `marks_from_a_scripted_shell` writes, as
-/// the PTY passes it on (`\n` becomes `\r\n`), before and after it reads
-/// a line.
 const FIRST: &[u8] = b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07out1\r\n";
 const SECOND: &[u8] = b"out2\r\n\x1b]133;D;3\x07\x1b]133;A\x07$ ";
 const SCRIPT: &str = "stty -echo; printf '\\033]133;A\\007$ \\033]133;B\\007ls\\n\\033]133;C\\007out1\\n'; read x; printf 'out2\\n\\033]133;D;3\\007\\033]133;A\\007$ '; exec cat";
@@ -170,7 +156,6 @@ async fn marks_from_a_scripted_shell() {
         end: None,
         exit: None,
     };
-    // The command runs: its output so far.
     let running = inspect_until(&mut c, &session.id, |s| s.command == Some(first)).await;
     assert_eq!(running.offset, FIRST.len() as u64);
     let read = read_with(
@@ -187,13 +172,11 @@ async fn marks_from_a_scripted_shell() {
         exit: Some(3),
         ..first
     };
-    // At the next prompt, `command` is still the one that ran.
     inspect_until(&mut c, &session.id, |s| {
         s.offset == (FIRST.len() + SECOND.len()) as u64
     })
     .await;
     assert_eq!(c.inspect(&session.id).await.command, Some(ended));
-    // `last_command` is the newest command with output, from C to D.
     for (format, expected) in [("text", "out1\nout2\n"), ("vt", "out1\r\nout2")] {
         let read = read_with(
             &mut c,
@@ -203,9 +186,7 @@ async fn marks_from_a_scripted_shell() {
         assert_eq!(read.text, expected, "{format}");
         assert!(!read.truncated);
     }
-    // One `session_changed` per change of `command`: at C and at D.
     assert_eq!(changed_commands(&mut c, &session.id), [first, ended]);
-    // The stream from the output mark, as plain text.
     let page = tail(
         &mut c,
         json!({"session": session.id, "after": first.output.unwrap()}),
@@ -225,7 +206,7 @@ async fn replies_cut_to_max_frame_are_truncated() {
         ring: 4096,
         ..fast_limits()
     };
-    let budget = 8192 - READ_MARGIN;
+    let budget = 8192 - server::REPLY_MARGIN;
     let server = start(limits);
     let mut c = client(&server).await;
     let session = c
@@ -240,11 +221,8 @@ async fn replies_cut_to_max_frame_are_truncated() {
         .await;
         assert!(read.truncated, "{format}");
         assert!(read.text.len() <= budget, "{format}: {}", read.text.len());
-        // Cut no further than needed: one more line would not fit. The
-        // budget is the text's length as a JSON string.
         let json = serde_json::to_string(&read.text).unwrap().len() - 2;
         assert!(json <= budget && json + 100 > budget, "{format}: {json}");
-        // The newest lines are kept, the oldest gone.
         assert!(read.text.contains("line1000"), "{format}");
         assert!(!read.text.contains("line1\n"), "{format}");
     }
@@ -259,7 +237,6 @@ async fn replies_cut_to_max_frame_are_truncated() {
     c.ok("signal", json!({"session": session.id, "signal": "KILL"}))
         .await;
 
-    // A command whose output start the ring no longer holds.
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", "printf '\\033]133;C\\007'; i=1; while [ $i -le 1000 ]; do echo out$i; i=$((i+1)); done; printf '\\033]133;D;0\\007'; exec sleep 5"], "cols": 20, "rows": 5}))
         .await;
@@ -300,10 +277,8 @@ async fn tail_pages_across_the_ring_boundary() {
         "{:?}",
         whole.text
     );
-    // 1024 bytes are 64 rows of 16: the cut falls on a row's start.
     assert!(whole.text.starts_with("row0237\n"), "{:?}", whole.text);
 
-    // Small pages add up to the same text; each ends on a boundary.
     let mut after = whole.start_offset;
     let mut text = String::new();
     loop {
@@ -358,7 +333,6 @@ async fn exited_and_restored_sessions() {
     let exited = c.wait_exit(&session.id).await;
     let command = exited.command.expect("marked");
     assert_eq!(command.exit, Some(0));
-    // An exited session keeps its stream.
     let page = tail(&mut c, json!({"session": session.id, "after": 0})).await;
     assert_eq!(page.text, "$ kept output\n");
     assert!(page.complete && !page.truncated);
@@ -377,7 +351,6 @@ async fn exited_and_restored_sessions() {
     let mut c = client(&b).await;
     let restored = c.inspect(&session.id).await;
     assert_eq!(restored.command, Some(command), "marks are parked");
-    // A park keeps no stream bytes.
     let page = tail(&mut c, json!({"session": session.id, "after": 0})).await;
     assert_eq!(page.text, "");
     assert_eq!(
@@ -392,7 +365,6 @@ async fn exited_and_restored_sessions() {
     .await;
     assert_eq!(last.text, "");
     assert!(last.truncated);
-    // VT and HTML come from the parked snapshot.
     let parked = read_with(&mut c, json!({"session": session.id, "format": "vt"})).await;
     assert_eq!(parked.text, vt.text);
     assert_eq!(parked.status, Status::Exited);
@@ -414,7 +386,6 @@ async fn prompt_redraws_and_further_lines_start_no_command() {
     let server = start(fast_limits());
     let mut c = client(&server).await;
     c.ok("subscribe", json!({})).await;
-    // A prompt, its redraw, then a command that prints and ends.
     let script = r"printf '\033]133;A;redraw=last;cl=line\007\033]133;P;k=i\007line1\n\033]133;P;k=s\007$ \033]133;B\007'; printf '\033]133;A;redraw=last;cl=line\007\033]133;P;k=i\007line1\n\033]133;P;k=s\007$ \033]133;B\007'; printf 'ls\n\033]133;C\007out\n\033]133;D;0\007'; printf '\033]133;A\007$ '; exec cat";
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", script], "cols": 20, "rows": 5}))
@@ -434,8 +405,6 @@ async fn prompt_redraws_and_further_lines_start_no_command() {
     )
     .await;
     assert_eq!(last.text, "out\n");
-    // The redraw started nothing: every announced command is the one
-    // that ran (C and D in one read are one `session_changed`).
     let changed = changed_commands(&mut c, &session.id);
     assert_eq!(changed.last(), Some(&ran));
     assert!(changed.iter().all(|c| c.start == ran.start), "{changed:?}");
@@ -476,7 +445,6 @@ async fn tail_waits_for_unfinished_sequences_and_characters() {
         .create(json!({"argv": ["/bin/sh", "-c", script], "cols": 20, "rows": 5}))
         .await;
     inspect_until(&mut c, &session.id, |s| s.offset == 6).await;
-    // A CR and its LF in two pages are one newline.
     let one = tail(
         &mut c,
         json!({"session": session.id, "after": 0, "max_bytes": 3}),
@@ -486,7 +454,6 @@ async fn tail_waits_for_unfinished_sequences_and_characters() {
         (one.text.as_str(), one.next_offset, one.complete),
         ("ab\n", 3, false)
     );
-    // The half of a character waits; there is nothing more to read now.
     let two = tail(&mut c, json!({"session": session.id, "after": 3})).await;
     assert_eq!(
         (two.text.as_str(), two.next_offset, two.complete),
@@ -564,7 +531,10 @@ async fn text_regions_keep_wrapped_lines_trailing_blanks_and_alternate_screen() 
             s.live_mut().unwrap().term = term;
             let scrollback = [0, 1, usize::MAX];
             let live_text = scrollback.map(|n| s.read_text(n).unwrap());
-            let (screen, history_lines) = s.live().unwrap().text().unwrap();
+            let server::session::ScreenText {
+                all: screen,
+                history_lines,
+            } = s.live().unwrap().text().unwrap();
             let live = std::mem::replace(
                 &mut s.body,
                 Body::Parked(Parked {

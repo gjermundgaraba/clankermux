@@ -7,7 +7,6 @@ import {
   type Exited,
   type Frame,
   FrameType,
-  type Gap,
   type Resized,
   type Resume,
   type Session,
@@ -17,59 +16,45 @@ import {
 
 import { ClientError } from "./connection.ts";
 
-/** What a client does in response to frames. */
 export type Action =
-  /** The screen is renderable from the local engine. The session may
-   * already have exited: see `Attachment.session`. */
   | { type: "screen" }
+  | { type: "resumed" }
   | { type: "output"; bytes: Uint8Array }
   | { type: "resized"; cols: number; rows: number }
   | { type: "exited"; exit: Exit }
-  /** Bytes were lost; the terminal was discarded and a new bootstrap follows. */
   | { type: "gap" }
   | { type: "closed"; reason: Closed["reason"]; message?: string }
-  /** `read_only`, `not_running` and `input_overflow` keep the attachment;
-   * any other code ended it. */
   | { type: "error"; error: ErrorMessage };
 
 type State =
   | { kind: "opening" }
-  /** `held`: stream frames after a `RESIZED` or `EXITED`, until `SNAPSHOT_END`. */
   | { kind: "bootstrapping"; decoder: Decoder; held: Frame[]; heldBytes: number }
   | { kind: "streaming"; term: Terminal }
-  /** After the final marker, `CLOSED` or a fatal error. The terminal stays
-   * for display only; `closed` says the server ended the attachment, so no
-   * `CLOSE` is owed. */
-  | { kind: "ended"; term: Terminal | undefined; closed: boolean };
+  | { kind: "ended"; term: Terminal | undefined; serverClosed: boolean };
 
 const KEEPS_ATTACHMENT = new Set<ErrorMessage["code"]>(["read_only", "not_running", "input_overflow"]);
 
-/** Payload bytes plus a per-frame charge to bound tiny held frames too. */
 const MAX_HELD_BYTES = 4 * 1024 * 1024;
+const HELD_FRAME_OVERHEAD_BYTES = 64;
 
-/**
- * The attachment state machine: frames in, actions out. It keeps the
- * local engine current and tracks the cursor for resuming.
- */
+function mustHoldUntilSnapshotEnd(held: readonly Frame[], type: FrameType): boolean {
+  return held.length > 0 || type !== FrameType.Output;
+}
+
 export class Attachment {
   private state: State = { kind: "opening" };
   private cursor = { offset: 0, marker: 0 };
-  /** The server the cursor was obtained from, and its limit. */
   private incarnation = "";
   private continuation = 0;
-  /** The server of the connection the next `ATTACHED` arrives on. */
-  private next: { incarnation: string; continuation: number } | undefined;
+  private pendingServer: { incarnation: string; continuation: number } | undefined;
   session: Session | undefined;
 
   constructor(readonly engine: Engine) {}
 
-  /** Records the server an `OPEN` is about to go to; its incarnation
-   * becomes the cursor's once that `ATTACHED` arrives. */
   openOn(welcome: Welcome): void {
-    this.next = { incarnation: welcome.incarnation, continuation: welcome.limits.continuation };
+    this.pendingServer = { incarnation: welcome.incarnation, continuation: welcome.limits.continuation };
   }
 
-  /** The cursor to resume from, once the terminal reflects the stream. */
   resume(): Resume | undefined {
     return this.state.kind === "streaming"
       ? { incarnation: this.incarnation, offset: this.cursor.offset, marker: this.cursor.marker }
@@ -80,12 +65,10 @@ export class Attachment {
     return this.state.kind === "ended";
   }
 
-  /** The server ended the attachment (`CLOSED` or a fatal `ERROR`). */
   closed(): boolean {
-    return this.state.kind === "ended" && this.state.closed;
+    return this.state.kind === "ended" && this.state.serverClosed;
   }
 
-  /** The local engine, once `READY` has been decoded. */
   term(): Terminal | undefined {
     switch (this.state.kind) {
       case "bootstrapping":
@@ -104,10 +87,9 @@ export class Attachment {
     return actions;
   }
 
-  /** Releases the engine objects. */
   free(): void {
     this.discard();
-    this.state = { kind: "ended", term: undefined, closed: true };
+    this.state = { kind: "ended", term: undefined, serverClosed: true };
   }
 
   private json<T>(frame: Frame): T {
@@ -118,15 +100,19 @@ export class Attachment {
     }
   }
 
+  private assertWellFormed(frame: Frame): void {
+    this.json<unknown>(frame);
+  }
+
   private step(frame: Frame, actions: Action[]): void {
     const type = frame.header.type;
     switch (type) {
       case FrameType.Attached: {
         const attached = this.json<Attached>(frame);
-        if (this.next) {
-          this.incarnation = this.next.incarnation;
-          this.continuation = this.next.continuation;
-          this.next = undefined;
+        if (this.pendingServer) {
+          this.incarnation = this.pendingServer.incarnation;
+          this.continuation = this.pendingServer.continuation;
+          this.pendingServer = undefined;
         }
         this.cursor = { offset: attached.offset, marker: attached.marker };
         this.session = attached.session;
@@ -141,7 +127,9 @@ export class Attachment {
             throw err;
           }
           this.state = { kind: "bootstrapping", decoder, held: [], heldBytes: 0 };
-        } else if (this.state.kind !== "streaming") {
+        } else if (this.state.kind === "streaming") {
+          actions.push({ type: "resumed" });
+        } else {
           throw ClientError.protocol("resume without a terminal");
         }
         break;
@@ -178,8 +166,8 @@ export class Attachment {
       case FrameType.Output:
       case FrameType.Resized:
       case FrameType.Exited:
-        if (this.state.kind === "bootstrapping" && (this.state.held.length > 0 || type !== FrameType.Output)) {
-          const bytes = frame.payload.byteLength + 64;
+        if (this.state.kind === "bootstrapping" && mustHoldUntilSnapshotEnd(this.state.held, type)) {
+          const bytes = frame.payload.byteLength + HELD_FRAME_OVERHEAD_BYTES;
           if (bytes > MAX_HELD_BYTES - this.state.heldBytes) {
             this.end(false);
             throw ClientError.desync("bootstrap stream buffer full; fresh OPEN required");
@@ -194,8 +182,7 @@ export class Attachment {
         this.stream(frame, actions);
         break;
       case FrameType.Gap:
-        // Nothing in it is read, but a malformed one is still refused.
-        this.json<Gap>(frame);
+        this.assertWellFormed(frame);
         this.discard();
         actions.push({ type: "gap" });
         break;
@@ -216,7 +203,6 @@ export class Attachment {
     }
   }
 
-  /** A stream frame at the cursor. */
   private stream(frame: Frame, actions: Action[]): void {
     switch (frame.header.type) {
       case FrameType.Output: {
@@ -258,8 +244,7 @@ export class Attachment {
     this.cursor.marker = seq;
   }
 
-  /** Keeps the terminal for display, if there is one. */
-  private end(closed: boolean): void {
+  private end(serverClosed: boolean): void {
     let term: Terminal | undefined;
     switch (this.state.kind) {
       case "bootstrapping":
@@ -270,10 +255,9 @@ export class Attachment {
         term = this.state.term;
         break;
     }
-    this.state = { kind: "ended", term, closed };
+    this.state = { kind: "ended", term, serverClosed };
   }
 
-  /** Frees whatever engine objects the state holds. */
   private discard(): void {
     switch (this.state.kind) {
       case "bootstrapping":

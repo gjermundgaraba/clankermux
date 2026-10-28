@@ -1,7 +1,3 @@
-//! JSON payloads. What a client sends refuses unknown fields; what the
-//! server sends may grow, and unknown fields are ignored on receipt.
-//! Optional fields are omitted when absent.
-
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
@@ -793,7 +789,6 @@ pub enum Event {
 
 /// `EVENT`: an event and its number, from 1 per incarnation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-// The schema has the payload's name; `Event` is only flattened into it.
 #[schemars(rename = "Event")]
 pub struct Numbered {
     pub seq: u64,
@@ -962,7 +957,6 @@ pub struct Gap {
     pub to: u64,
 }
 
-/// Displays a wire enum as its JSON name.
 macro_rules! wire_display {
     ($($t:ty),*) => {$(
         impl std::fmt::Display for $t {

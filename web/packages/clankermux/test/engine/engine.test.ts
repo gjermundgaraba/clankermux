@@ -25,7 +25,6 @@ test("memory views are reused and refreshed after an allocation forces wasm grow
   const view = e.view;
   expect(e.memory).toBe(memory);
   expect(e.view).toBe(view);
-  // Larger than the entire current memory, so the allocator must grow it.
   e.scratch(memory.byteLength + 65536, (ptr) => {
     expect(e.memory.buffer).not.toBe(memory.buffer);
     expect(e.view === view).toBe(false);
@@ -57,7 +56,6 @@ test("the decoder steps through a snapshot as its bytes arrive", () => {
   expect([term.cols, term.rows]).toEqual([20, 5]);
   const before = term.scrollbackRows;
   expect(decoder.stepAvailable()).toBe(false);
-  // One page, then FINISH.
   const page = stepEnd(bytes, ready)!;
   decoder.push(bytes.subarray(ready, page));
   expect(decoder.stepAvailable()).toBe(true);
@@ -93,8 +91,6 @@ test("render state reports changed rows, styles, wide cells and the cursor", () 
   expect(frame.cursor).toMatchObject({ x: 5, y: 0, visible: true });
   state.clean();
 
-  // Only the rows that changed come back: the one written to and the
-  // one the cursor left.
   term.write(utf8("\r\n\x1b[4mu"));
   frame = state.update(term);
   expect(frame.full).toBe(false);
@@ -132,7 +128,6 @@ test("keys encode with the terminal's modes", () => {
   expect(press("KeyA", "A", { shift: true })).toBe("A");
   expect(press("KeyC", "c", { ctrl: true })).toBe("\x03");
   expect(press("KeyX", "x", { alt: true })).toBe("\x1bx");
-  // Option and AltGr compose characters: the text goes through as typed.
   expect(press("Digit8", "[", { alt: true, altComposed: true, unshifted: "8" })).toBe("[");
   expect(press("Digit8", "{", { alt: true, shift: true, altComposed: true, unshifted: "8" })).toBe("{");
   expect(press("Digit2", "@", { ctrl: true, alt: true, altComposed: true, unshifted: "2" })).toBe("@");
@@ -144,7 +139,6 @@ test("keys encode with the terminal's modes", () => {
   expect(press("KeyA", "a", { composing: true })).toBe("");
   term.write(utf8("\x1b[?1h"));
   expect(press("ArrowUp", "ArrowUp")).toBe("\x1bOA");
-  // Under the kitty protocol the key is the unshifted character.
   term.write(utf8("\x1b[>11u"));
   expect(press("Digit1", "!", { shift: true, unshifted: "1" })).toBe("\x1b[49;2u");
   expect(press("Digit1", "!", { shift: true, ctrl: true, unshifted: "1" })).toBe("\x1b[49;6u");
@@ -158,34 +152,25 @@ test("under the kitty protocol's disambiguation, text that shift made goes as te
   const keys = new KeyEncoder(engine);
   const press = (code: string, key: string, mods: Partial<KeyInput> = {}): string =>
     text(keys.encode(term, { code, key, action: "press", shift: false, ctrl: false, alt: false, meta: false, ...mods }));
-  // Neovim's flags: disambiguate, and report event types.
   for (const flags of ["1", "3"]) {
     term.write(utf8(`\x1b[>${flags}u`));
     expect(press("Escape", "Escape")).toBe("\x1b[27u");
     expect(press("KeyC", "c", { ctrl: true, unshifted: "c" })).toBe("\x1b[99;5u");
     expect(press("KeyA", "A", { shift: true, unshifted: "a" })).toBe("A");
     expect(press("Semicolon", ":", { shift: true, unshifted: ";" })).toBe(":");
-    // A Norwegian layout: Shift+. is `:`, and Shift on the key whose own
-    // character is æ is `"`; neither goes as the key's own character.
     expect(press("Period", ":", { shift: true, unshifted: "." })).toBe(":");
     expect(press("Quote", '"', { shift: true, unshifted: "\u00e6" })).toBe('"');
     expect(press("Backslash", "|", { shift: true, unshifted: "@" })).toBe("|");
     expect(press("Equal", "`", { shift: true, unshifted: "\\" })).toBe("`");
     expect(press("Digit8", "{", { alt: true, shift: true, altComposed: true, unshifted: "8" })).toBe("{");
-    // Without a layout (Safari, Firefox): a letter's own is its lower case,
-    // and other text is taken as shift's.
     expect(press("KeyA", "A", { shift: true })).toBe("A");
     expect(press("Digit1", "!", { shift: true })).toBe("!");
-    // Shift that made no text stays a modifier.
     expect(press("Tab", "Tab", { shift: true })).toBe("\x1b[9;2u");
     expect(press("Space", " ", { shift: true })).toBe("\x1b[32;2u");
     expect(press("KeyA", "A", { shift: true, ctrl: true, unshifted: "a" })).toBe("\x1b[97;6u");
     term.write(utf8("\x1b[<u"));
   }
   expect(press("Escape", "Escape")).toBe("\x1b");
-  // Reporting all keys, the key is the layout's own character with shift,
-  // the shifted one among the alternates when asked for, and the text when
-  // asked for.
   term.write(utf8("\x1b[>11u"));
   expect(press("Quote", '"', { shift: true, unshifted: "\u00e6" })).toBe("\x1b[230;2u");
   term.write(utf8("\x1b[=15u"));
@@ -219,7 +204,6 @@ test("the viewport scrolls through the history and stays there while output arri
   expect(render.update(term).scrollbar).toEqual({ total: 6, offset: 3, len: 3 });
   render.clean();
 
-  // A move is a full frame; the cursor, below the view, is not in it.
   term.scroll(-2);
   let frame = render.update(term);
   render.clean();
@@ -228,7 +212,6 @@ test("the viewport scrolls through the history and stays there while output arri
   expect(frame.cursor).toBeUndefined();
   expect(frame.scrollbar).toEqual({ total: 6, offset: 1, len: 3 });
 
-  // Output adds history below the view and changes no row of it.
   term.write(utf8("\r\nl7\r\nl8"));
   frame = render.update(term);
   render.clean();
@@ -243,7 +226,6 @@ test("the viewport scrolls through the history and stays there while output arri
   expect(rows(frame)).toEqual(["l6", "l7", "l8"]);
   expect(frame.scrollbar).toEqual({ total: 8, offset: 5, len: 3 });
 
-  // The alternate screen has no history to scroll.
   expect(term.alternate).toBe(false);
   term.write(utf8("\x1b[?1049h"));
   expect(term.alternate).toBe(true);
@@ -256,15 +238,12 @@ test("the viewport scrolls through the history and stays there while output arri
 
 test("a selection drags by cells, words and lines, copies wrapped lines whole, and follows output", () => {
   const term = engine.terminalNew(10, 3);
-  // "three four five" wraps after ten columns.
   term.write(utf8("one two\r\nthree four five"));
   const gesture = new SelectionGesture(engine);
   const render = new RenderState(engine);
   render.update(term);
   render.clean();
 
-  // A press selects nothing; a drag selects from the pressed cell to the
-  // pointer's, the half of a cell it passed deciding the last.
   expect(gesture.press(term, { x: 0.2, y: 0.5 }, 1000)).toBeUndefined();
   expect(gesture.drag(term, { x: 0.4, y: 0.5 })).toBeUndefined();
   const drag = gesture.drag(term, { x: 2.6, y: 2.5 });
@@ -272,7 +251,6 @@ test("a selection drags by cells, words and lines, copies wrapped lines whole, a
   term.select(drag);
   gesture.release(term, { x: 2.6, y: 2.5 });
   expect(term.selected).toBe(true);
-  // The wrapped line comes back whole.
   expect(term.selectionText()).toBe("one two\nthree four fi");
   const frame = render.update(term);
   render.clean();
@@ -282,13 +260,11 @@ test("a selection drags by cells, words and lines, copies wrapped lines whole, a
     [0, 2],
   ]);
 
-  // Output scrolls the selected text up a row; the selection goes with it.
   term.write(utf8("\r\nsix"));
   expect(term.selectionText()).toBe("one two\nthree four fi");
   expect(render.update(term).lines.map((l) => l.selection)).toEqual([[0, 9], [0, 2], undefined]);
   render.clean();
 
-  // Two presses select a word, three a line (the wrapped one whole).
   const at = { x: 1.5, y: 0.5 };
   gesture.press(term, at, 5000);
   gesture.release(term, at);

@@ -1,6 +1,3 @@
-//! The WebSocket carrier: TLS, the `Origin` allowlist, one frame per
-//! binary message.
-
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,10 +18,6 @@ use crate::Registry;
 use crate::connection::serve_connection;
 use crate::tls::Tls;
 
-/// Serves `listener` until cancelled. Every connection is TLS; the
-/// upgrade is refused with 403 unless its `Origin` is in `origins`, so an
-/// empty allowlist refuses them all. The TLS handshake and the upgrade
-/// count against `hello_timeout` like the bytes before `HELLO`.
 pub async fn serve_ws(
     listener: TcpListener,
     registry: Arc<Registry>,
@@ -116,21 +109,15 @@ pub fn origin(text: &str) -> Result<String, String> {
     })
 }
 
-/// The longest message that can hold one frame.
 fn message_ceiling(max_frame: u64) -> usize {
     usize::try_from(max_frame).map_or(usize::MAX, |n| n.saturating_add(HEADER_LEN))
 }
 
-/// Frames over a WebSocket as a byte stream: a message read must be exactly
-/// one frame; bytes written are sent as one message per frame once they
-/// complete one. The writer flushes after every frame.
 pub struct WsStream<S> {
     ws: WebSocketStream<S>,
     max_frame: u64,
-    /// The last message, read from `pos`.
     incoming: Bytes,
     pos: usize,
-    /// Written bytes short of a whole frame.
     outgoing: Vec<u8>,
 }
 
@@ -146,8 +133,6 @@ impl<S> WsStream<S> {
     }
 }
 
-/// The length of the frame `bytes` starts with, when its header is there
-/// and valid.
 fn frame_len(bytes: &[u8], max_frame: u64) -> Option<usize> {
     let head = bytes.get(..HEADER_LEN)?;
     let header = parse_header(head.try_into().unwrap(), max_frame).ok()?;
@@ -158,15 +143,11 @@ fn other(error: tokio_tungstenite::tungstenite::Error) -> io::Error {
     use tokio_tungstenite::tungstenite::Error;
     match error {
         Error::Io(e) => e,
-        // A message over the ceiling is the peer's protocol error, reported
-        // as on any carrier.
         Error::Capacity(e) => io::Error::new(io::ErrorKind::InvalidData, e.to_string()),
         e => io::Error::other(e),
     }
 }
 
-/// A carrier-level protocol error: the connection reports it before
-/// closing.
 fn invalid(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
@@ -206,8 +187,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> WsStream<S> {
-    /// Sends the whole frames buffered so far, one message each, as far
-    /// as the sink is ready.
     fn send_frames(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while let Some(len) = frame_len(&self.outgoing, self.max_frame)
             && len <= self.outgoing.len()

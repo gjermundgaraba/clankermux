@@ -1,5 +1,3 @@
-//! One attachment: its bootstrap, the stream from its cursor, and its end.
-
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -23,13 +21,10 @@ use crate::stream::MarkerKind;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Bytes kept of the client's name and of its version.
 const CLIENT_TEXT: usize = 32;
 
-/// Bytes pulled from the stream per lock hold.
 const PULL_BUDGET: usize = 64 * 1024;
 
-/// Only output following a recent send waits; the first after idle is immediate.
 const OUTPUT_COALESCE: Duration = Duration::from_millis(1);
 
 fn coalesce_until(
@@ -42,44 +37,44 @@ fn coalesce_until(
     (bytes > 0 && bytes < PULL_BUDGET as u64 && !marker && now < until).then_some(until)
 }
 
-/// How an attachment ends, as the session or the connection decides it.
-/// The task sends the frame after whatever it had queued.
 pub enum Ending {
     Closed(Closed),
     Error(ErrorCode, String),
 }
 
-/// The connection's side of an attachment. The task holds the session;
-/// the handle only reaches it while the task runs.
+pub struct Gone;
+
 pub struct Handle {
-    /// Unique on the server: `AttachmentInfo.channel`.
     pub id: u64,
     pub read_only: bool,
     session: Weak<std::sync::Mutex<Session>>,
     close: mpsc::UnboundedSender<Ending>,
-    /// Set by the task once it has detached and will send nothing but
-    /// its ending.
     ended: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 
-impl Handle {
-    /// Whether the attachment still takes frames; a channel is free again
-    /// only once the task has [`Handle::finished`].
-    pub fn is_open(&self) -> bool {
-        !self.ended.load(Ordering::Acquire)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelState {
+    Open,
+    Ending,
+    Finished,
+}
 
-    /// Whether the task has queued its last frame and returned.
-    pub fn finished(&self) -> bool {
-        self.task.is_finished()
+impl Handle {
+    pub fn state(&self) -> ChannelState {
+        if self.task.is_finished() {
+            ChannelState::Finished
+        } else if self.ended.load(Ordering::Acquire) {
+            ChannelState::Ending
+        } else {
+            ChannelState::Open
+        }
     }
 
     pub fn session(&self) -> Option<Shared> {
         self.session.upgrade()
     }
 
-    /// `CLOSE`: the task sends `CLOSED closed` after its pending frames.
     pub fn close(&self) {
         let _ = self.close.send(Ending::Closed(Closed {
             reason: ClosedReason::Closed,
@@ -87,24 +82,17 @@ impl Handle {
         }));
     }
 
-    /// Asks the task to end with `ERROR code` after its pending frames.
-    /// False when the task is gone: it sends nothing more, and the caller
-    /// sends the error itself.
-    pub fn end(&self, code: ErrorCode, message: String) -> bool {
-        self.close.send(Ending::Error(code, message)).is_ok()
+    pub fn end(&self, code: ErrorCode, message: String) -> Result<(), Gone> {
+        self.close
+            .send(Ending::Error(code, message))
+            .map_err(|_| Gone)
     }
 
-    /// Waits for the task, which has queued every frame of the
-    /// attachment by then.
     pub async fn join(self) {
         let _ = self.task.await;
     }
 }
 
-/// Starts serving `open` on `channel` for a connection whose `HELLO`
-/// named `client`. The checks that precede this (channel, session,
-/// engine, size) are the connection's; a session at
-/// `limits.attachments` is `limit_exceeded`.
 pub fn open(
     registry: &Arc<Registry>,
     writer: &Writer,
@@ -136,7 +124,6 @@ pub fn open(
             close: close_tx.downgrade(),
             finished: finished.clone(),
         });
-        // The same channel and client as the attachments list.
         let opened = Event::AttachmentOpened {
             id: s.id.clone(),
             channel: id,
@@ -144,8 +131,6 @@ pub fn open(
             read_only: open.read_only,
         };
         s.events.push(opened);
-        // A writable OPEN's viewport is an immediate report; a profile
-        // alone is applied as it is.
         if !open.read_only && s.running().is_ok() {
             match open.viewport {
                 Some(size) => {
@@ -196,8 +181,6 @@ pub fn open(
     })
 }
 
-/// The first `CLIENT_TEXT` bytes of a client's `HELLO` text, printable,
-/// so that the attachments list stays small within `inspect`.
 fn client_text(text: &str) -> String {
     truncate(printable(text), CLIENT_TEXT)
 }
@@ -208,20 +191,23 @@ struct Cursor {
     marker: u64,
 }
 
-/// Snapshot bytes not yet sent.
 struct PendingSnapshot {
     bytes: Vec<u8>,
     sent: usize,
-    /// Live bytes sent since history last got a turn.
     live_bytes: usize,
-    /// The bootstrap followed a gap; another gap before it completes is
-    /// `too_slow`.
     after_gap: bool,
 }
 
-/// The frame that ends an attachment; `None` when the connection dropped
-/// the handle, which ends it silently.
-type End = Option<Ending>;
+enum End {
+    Disconnected,
+    Frame(Ending),
+}
+
+impl End {
+    fn received(ending: Option<Ending>) -> Self {
+        ending.map_or(End::Disconnected, End::Frame)
+    }
+}
 
 enum Pull {
     Sent,
@@ -243,15 +229,12 @@ struct Task {
     cursor: Cursor,
     snapshot: Option<PendingSnapshot>,
     last_output: Option<Instant>,
-    /// The final marker has been sent.
     done: bool,
 }
 
 impl Task {
     async fn run(mut self, resume: Option<Resume>) {
         let end = self.serve(resume).await;
-        // Detach before the ending frame goes out, so a client that reads
-        // it finds the channel free and the attachment gone.
         let (events, snapshot, last) = {
             let mut s = self.session.lock().unwrap();
             s.remove_attachment(self.id);
@@ -260,7 +243,6 @@ impl Task {
             (s.take_events(), s.to_proto(false), last)
         };
         self.registry.emit_all(events);
-        // The last detach parks: what the user left is on disk.
         if last {
             let registry = self.registry.clone();
             let session = self.session.clone();
@@ -268,23 +250,19 @@ impl Task {
         }
         let removed = matches!(
             &end,
-            Some(Ending::Closed(Closed {
+            End::Frame(Ending::Closed(Closed {
                 reason: ClosedReason::Removed,
                 ..
             }))
         );
         let reason = match &end {
-            Some(Ending::Closed(closed)) => closed.reason.to_string(),
-            Some(Ending::Error(code, _)) => code.to_string(),
-            None => "disconnected".into(),
+            End::Frame(Ending::Closed(closed)) => closed.reason.to_string(),
+            End::Frame(Ending::Error(code, _)) => code.to_string(),
+            End::Disconnected => "disconnected".into(),
         };
-        if let Some(ending) = end {
+        if let End::Frame(ending) = end {
             self.send_ending(ending);
         }
-        // An ending the connection queued meanwhile (an `OPEN` on this
-        // channel before it read the `CLOSED`) follows in order; closing
-        // the channel first makes a later one fail, so the connection
-        // sends it after this task's frames.
         self.close.close();
         while let Ok(ending) = self.close.try_recv() {
             if let Ending::Error(..) = ending {
@@ -347,10 +325,9 @@ impl Task {
         }
         let wake = self.session.lock().unwrap().wake.clone();
         loop {
-            // A close is observed every iteration, not only when idle.
             match self.close.try_recv() {
-                Ok(ending) => return Some(ending),
-                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                Ok(ending) => return End::Frame(ending),
+                Err(mpsc::error::TryRecvError::Disconnected) => return End::Disconnected,
                 Err(mpsc::error::TryRecvError::Empty) => {}
             }
             let notified = wake.notified();
@@ -358,7 +335,7 @@ impl Task {
             notified.as_mut().enable();
             if self.writer.over_high_water() {
                 tokio::select! {
-                    ending = self.close.recv() => return ending,
+                    ending = self.close.recv() => return End::received(ending),
                     () = self.writer.drained() => {}
                 }
                 continue;
@@ -374,19 +351,19 @@ impl Task {
             match self.pull() {
                 Pull::Sent => {
                     if self.writer.is_closed() {
-                        return None;
+                        return End::Disconnected;
                     }
                 }
                 Pull::Wait(until) => {
                     tokio::select! {
-                        ending = self.close.recv() => return ending,
+                        ending = self.close.recv() => return End::received(ending),
                         () = notified => {},
                         () = tokio::time::sleep_until(until) => {}
                     }
                 }
                 Pull::Gap => {
                     if self.snapshot.as_ref().is_some_and(|p| p.after_gap) {
-                        return Some(Ending::Error(
+                        return End::Frame(Ending::Error(
                             ErrorCode::TooSlow,
                             "fell behind again during a bootstrap".into(),
                         ));
@@ -400,7 +377,7 @@ impl Task {
                         continue;
                     }
                     tokio::select! {
-                        ending = self.close.recv() => return ending,
+                        ending = self.close.recv() => return End::received(ending),
                         () = notified => {}
                     }
                 }
@@ -408,19 +385,17 @@ impl Task {
         }
     }
 
-    /// The cursor to resume from, when `resume` qualifies.
     fn resume_cursor(&self, resume: Option<Resume>) -> Result<Option<Cursor>, End> {
         let Some(resume) = resume.filter(|r| r.incarnation == self.registry.incarnation) else {
             return Ok(None);
         };
         let s = self.session.lock().unwrap();
         let above_latest = || {
-            Err(Some(Ending::Error(
+            Err(End::Frame(Ending::Error(
                 ErrorCode::InvalidRequest,
                 "resume marker above the latest".into(),
             )))
         };
-        // A parked session has no stream to resume on.
         let live = match &s.body {
             Body::Live(live) => live,
             Body::Parked(parked) if resume.marker > parked.marker => {
@@ -440,15 +415,10 @@ impl Task {
         }))
     }
 
-    /// Takes a snapshot, retrying while the continuation limit is exceeded,
-    /// then sends `GAP` (after a gap), `ATTACHED`, the snapshot through
-    /// `READY` and `SNAPSHOT_READY`. The rest of the snapshot is sent as
-    /// the stream allows. A parked session streams its park file, nothing
-    /// after.
     async fn bootstrap(&mut self, gap_from: Option<u64>) -> Result<(), End> {
         self.done = false;
         self.last_output = None;
-        let internal = |message: String| Some(Ending::Error(ErrorCode::Internal, message));
+        let internal = |message: String| End::Frame(Ending::Error(ErrorCode::Internal, message));
         let parked_path = {
             let s = self.session.lock().unwrap();
             s.parked().map(|p| p.snapshot_path.clone())
@@ -483,7 +453,7 @@ impl Task {
                         s.to_proto(false),
                     )
                 }) => taken,
-                ending = self.close.recv() => return Err(ending),
+                ending = self.close.recv() => return Err(End::received(ending)),
             };
             match taken {
                 Ok(Some(taken)) => taken,
@@ -493,11 +463,13 @@ impl Task {
                         ghostty_vt::Error::LimitExceeded => ErrorCode::LimitExceeded,
                         _ => ErrorCode::Internal,
                     };
-                    return Err(Some(Ending::Error(code, format!("snapshot failed: {err}"))));
+                    return Err(End::Frame(Ending::Error(
+                        code,
+                        format!("snapshot failed: {err}"),
+                    )));
                 }
             }
         };
-        // A file from disk is checked before anything is promised.
         let Some(ready) = snapshot::ready_end(&bytes) else {
             return Err(internal("snapshot has no READY".into()));
         };
@@ -523,12 +495,10 @@ impl Task {
                 snapshot_bytes: Some(bytes.len() as u64),
             },
         );
-        // Paced like the rest of the snapshot: a prefix can hold the whole
-        // continuation, more than the writer's ceiling.
         for chunk in bytes[..ready].chunks(self.max_frame) {
             if self.writer.over_high_water() {
                 tokio::select! {
-                    ending = self.close.recv() => return Err(ending),
+                    ending = self.close.recv() => return Err(End::received(ending)),
                     () = self.writer.drained() => {}
                 }
             }
@@ -544,8 +514,6 @@ impl Task {
         Ok(())
     }
 
-    /// Sends the next remaining snapshot chunk, and `SNAPSHOT_END` after
-    /// the last. False when no snapshot is pending.
     fn send_snapshot_chunk(&mut self) -> bool {
         let Some(pending) = self.snapshot.as_mut() else {
             return false;
@@ -567,19 +535,12 @@ impl Task {
         true
     }
 
-    /// Records that the final marker and, if bootstrapping, `SNAPSHOT_END`
-    /// are being sent; before they are queued, so a client that has read
-    /// them and sends `remove` finds the attachment finished. A `CLOSED`
-    /// that follows still comes after them: the task reads its close
-    /// channel only once they are queued.
     fn note_finished(&self) {
         if self.done && self.snapshot.is_none() {
             self.finished.store(true, Ordering::Release);
         }
     }
 
-    /// Sends the stream from the cursor: each marker before any byte at or
-    /// past its offset, up to `PULL_BUDGET` bytes.
     fn pull(&mut self) -> Pull {
         let mut frames = Vec::new();
         {

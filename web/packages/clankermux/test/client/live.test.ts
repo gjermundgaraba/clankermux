@@ -1,8 +1,3 @@
-/**
- * The client against a real server, from node: over the Unix socket, where
- * the test reframes the byte stream itself, and over the TLS WebSocket
- * carrier the browser uses, one frame per message.
- */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, expect, test } from "vitest";
@@ -17,7 +12,6 @@ import { type Served, StreamTransport, serve } from "./server.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 
-/** Frames over a WebSocket, as the browser carries them. */
 class WsTransport implements Transport {
   onMessage: ((bytes: Uint8Array) => void) | undefined;
   onClose: (() => void) | undefined;
@@ -30,7 +24,6 @@ class WsTransport implements Transport {
 
   static connect(url: string, origin: string): Promise<WsTransport> {
     return new Promise((resolve, reject) => {
-      // The fixture certificate is self-signed.
       const ws = new WebSocket(url, { origin, rejectUnauthorized: false });
       ws.once("open", () => resolve(new WsTransport(ws)));
       ws.once("error", reject);
@@ -62,7 +55,6 @@ async function connect(): Promise<Connection> {
   return Connection.connect(await StreamTransport.connect(served.socket), hello("test", ENGINE));
 }
 
-/** Opens channel 1 and queues its frames. */
 function attach(conn: Connection, a: Attachment, open: unknown): { frames: Frame[]; wake: () => Promise<void> } {
   const frames: Frame[] = [];
   let notify: (() => void) | undefined;
@@ -84,7 +76,6 @@ function attach(conn: Connection, a: Attachment, open: unknown): { frames: Frame
   };
 }
 
-/** Feeds queued frames until `done`, returning every action. */
 async function drive(
   a: Attachment,
   queue: { frames: Frame[]; wake: () => Promise<void> },
@@ -127,15 +118,13 @@ test("bootstraps, streams, resumes and sees the exit", async () => {
   const cursor = a.resume()!;
   expect(cursor.offset).toBeGreaterThan(0);
 
-  // The connection drops; a new one resumes from the cursor.
   conn.close();
   const again = await connect();
   queue = attach(again, a, { ...open, resume: cursor });
   actions = await drive(a, queue, () => a.resume() !== undefined);
-  expect(actions).toEqual([]);
+  expect(actions).toEqual([{ type: "resumed" }]);
   expect(screen(a)).toBe("one\none\ntwo\ntwo");
 
-  // A viewport report resizes; a kill ends the stream and the events say so.
   const events: Event[] = [];
   again.onEvent = (e) => events.push(e);
   await again.call("subscribe", {});
@@ -151,7 +140,6 @@ test("bootstraps, streams, resumes and sees the exit", async () => {
   }
   expect(events.some((e) => e.event === "session_exited" && e.session.id === session.id)).toBe(true);
 
-  // Server errors arrive typed; a second HELLO ends the connection.
   await expect(again.call("inspect", { session: "nope" })).rejects.toMatchObject({
     server: { code: "no_such_session" },
   });

@@ -1,12 +1,19 @@
 name: release
-# On v* tags: builds the Linux binaries and attaches them to the tag's GitHub release.
 on:
   push:
     tags: ["v*"]
 permissions:
   contents: write
 jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME"
   build:
+    needs: release
     strategy:
       matrix:
         include:
@@ -30,6 +37,4 @@ jobs:
           asset=clankermux-${GITHUB_REF_NAME#v}-$TARGET
           cp "target/$TARGET/release/clankermux" "$asset"
           strip "$asset"
-          # Both jobs try to create the release; the second one finds it there.
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" || true
           gh release upload "$GITHUB_REF_NAME" "$asset" --clobber

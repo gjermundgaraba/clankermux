@@ -1,8 +1,3 @@
-// The message vectors as typed literals. The test checks that
-// crates/proto/vectors/messages.json holds exactly these values, so a
-// field that drifts from the TS types fails `tsc`, and one that drifts
-// from the Rust types fails the Rust round trip.
-
 import limits from "../../../../../crates/proto/vectors/limits.json";
 import type {
   AckParams,

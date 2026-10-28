@@ -5,8 +5,6 @@ import { type ClipboardLike, type Copy, Copier, type CopyHost } from "../../src/
 beforeEach(() => void vi.useFakeTimers());
 afterEach(() => void vi.useRealTimers());
 
-/** A clipboard as a browser has it: `write` reads the item's text, then
- * does what `refuse` says, never settling when it is "hang". */
 function clipboard(refuse?: Error | "hang"): ClipboardLike & { written: string[] } {
   const written: string[] = [];
   const settle = async (text: string) => {
@@ -65,14 +63,12 @@ test("a refused write is told with the browser's reason, once the text's length 
   expect(copies).toEqual([
     { ok: false, source: "release", reason: "refused", chars: 3, message: "NotAllowedError: Document is not focused." },
   ]);
-  // Refused, then nothing selected: no copy either.
   c.answer(c.start(), undefined);
   await vi.advanceTimersByTimeAsync(5000);
   expect(copies).toHaveLength(1);
 });
 
 test("a copy that does not finish in two seconds times out, and is told once", async () => {
-  // The worker never answers.
   const board = clipboard();
   const { copier: c, copies } = copier(board);
   const late = c.start();
@@ -85,7 +81,6 @@ test("a copy that does not finish in two seconds times out, and is told once", a
   expect(copies).toHaveLength(1);
   expect(board.written).toEqual([]);
 
-  // The write never settles: its length is known.
   const hung = copier(clipboard("hang"));
   hung.copier.answer(hung.copier.start(), "abc");
   hung.copier.write("keys", "keys");
@@ -132,7 +127,6 @@ test("without ClipboardItem the text is written once it arrives; without a clipb
   expect(board.written).toEqual(["abc"]);
   expect(plain.copies).toEqual([{ ok: true, source: "release", chars: 3 }]);
 
-  // A ClipboardItem that takes no text to come, as older browsers have.
   const older = clipboard();
   const copies: Copy[] = [];
   const c = new Copier({

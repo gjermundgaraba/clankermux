@@ -1,15 +1,10 @@
-//! Park files, restart, and program status records.
-
-mod common;
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::*;
 use proto::*;
 use serde_json::json;
+use testkit::*;
 
-/// The milliseconds between consecutive generations, by their names.
 fn spacing(parked: &[PathBuf]) -> Vec<u64> {
     let ms: Vec<u64> = parked
         .iter()
@@ -18,9 +13,6 @@ fn spacing(parked: &[PathBuf]) -> Vec<u64> {
     ms.windows(2).map(|w| w[1] - w[0]).collect()
 }
 
-/// Writes `tick-N` lines to `id` every `every` for at most `max`,
-/// collecting each new newest generation until there are `want`; also
-/// the longest time between two writes.
 async fn tick(
     c: &mut Client,
     state: &Path,
@@ -63,7 +55,6 @@ async fn a_change_parks_once_quiet_and_while_busy() {
         Server::start_with_park(fast_limits(), state.clone(), prompt_parks(400, 200, 1000));
     let mut c = client(&server).await;
 
-    // Input echoed once, then quiet.
     let quiet = c
         .create(json!({"argv": ["/bin/sh", "-c", "exec cat"]}))
         .await;
@@ -77,9 +68,6 @@ async fn a_change_parks_once_quiet_and_while_busy() {
     })
     .await;
 
-    // A line every 50 ms is never quiet for 400 ms: it parks every
-    // second all the same, and no more often. The test writes the lines itself:
-    // a loop of processes would load the machine the other tests share.
     let busy = c
         .create(json!({"argv": ["/bin/sh", "-c", "exec cat"]}))
         .await;
@@ -93,7 +81,6 @@ async fn a_change_parks_once_quiet_and_while_busy() {
     )
     .await;
     if longest >= Duration::from_millis(400) {
-        // The machine let the session go quiet: not this test's case.
         eprintln!("skipped: {longest:?} between two writes");
         return;
     }
@@ -113,8 +100,6 @@ async fn bursts_park_no_more_often_than_the_gap() {
     let server =
         Server::start_with_park(fast_limits(), state.clone(), prompt_parks(100, 800, 5000));
     let mut c = client(&server).await;
-    // A line every 250 ms is quiet for 100 ms each time; without the
-    // gap it would park four times a second.
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", "exec cat"]}))
         .await;
@@ -157,8 +142,6 @@ async fn the_last_detach_parks() {
         "no park within the quiet time"
     );
     c.send(FrameType::Close, 1, &[]).await;
-    // The echo matched; cat's own copy of the line may still be on its
-    // way ahead of `CLOSED`.
     loop {
         let (header, payload) = c.recv_on(1).await;
         if header.frame_type == FrameType::Closed {
@@ -195,15 +178,12 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
     c.bootstrap(1).await;
 
     a.registry.stop().await;
-    // The binary exits right after the stop: the stop has flushed every
-    // connection by then.
     a.shutdown();
     assert_eq!(c.expect_closed(1).await, ClosedReason::Stopping);
     assert!(c.recv().await.is_none());
     let generation = generations(&state, &session.id)
         .pop()
         .expect("parked by the stop");
-    // Private to the user: directories 0700, files 0600, as the socket.
     let mode = |path: &Path| {
         std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions())
             & 0o777
@@ -253,7 +233,6 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
         ErrorCode::NotRunning
     );
 
-    // OPEN streams the park file as a bootstrap with nothing after it.
     c.open(
         1,
         json!({"session": session.id, "viewport": {"cols": 80, "rows": 24}}),
@@ -273,7 +252,6 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
     assert_eq!(c.expect_closed(1).await, ClosedReason::Closed);
     c.wait_attachments(&session.id, 0).await;
 
-    // Removal deletes the files.
     c.ok("remove", json!({"session": session.id})).await;
     for _ in 0..1000 {
         if !sessions_dir(&state).join(&session.id).exists() {
@@ -315,7 +293,6 @@ async fn keep_parks_at_exit_and_restores_as_exited() {
     assert_eq!(loaded.status, Status::Exited);
     assert_eq!(loaded.exit, Some(Exit::Code { code: 3 }));
     assert_eq!(loaded.on_exit, OnExit::Keep);
-    // The working record ended with the stream; the error one persists.
     let records = loaded.program_status.unwrap();
     assert_eq!(
         records
@@ -329,9 +306,6 @@ async fn keep_parks_at_exit_and_restores_as_exited() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stop_parks_an_exited_session_whose_final_park_is_waiting() {
-    // A kept session's park at exit queues behind a park in flight. A
-    // stop meanwhile makes that queued park a no-op, so the stop's own
-    // park must cover the exited session.
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let a = start_with(fast_limits(), state.clone());
@@ -349,7 +323,6 @@ async fn a_stop_parks_an_exited_session_whose_final_park_is_waiting() {
         .park_lock
         .clone();
     let held = park_lock.lock().await;
-    // Not before: the exit's park could finish before the lock is held.
     c.ok("send", json!({"session": session.id, "data": b64("go\n")}))
         .await;
     assert_eq!(
@@ -432,7 +405,6 @@ async fn program_status_records_follow_the_protocol() {
         "app from the nearest ancestor"
     );
 
-    // A third record evicts the least recently updated one.
     c.ok("send", report("state=done:id=third")).await;
     let removed = event_where(&mut c, |e| match e {
         Event::ProgramStatusRemoved { record_ids, .. } => Some(record_ids.clone()),
@@ -441,7 +413,6 @@ async fn program_status_records_follow_the_protocol() {
     .await;
     assert_eq!(removed, vec![String::new()]);
 
-    // A prompt start drops the blocked record, not the done one.
     c.ok(
         "send",
         json!({"session": session.id, "data": b64("printf '\\033]133;A\\033\\\\'\n")}),
@@ -454,7 +425,6 @@ async fn program_status_records_follow_the_protocol() {
     .await;
     assert_eq!(removed, vec!["deploy/us".to_string()]);
 
-    // Clear with no id removes everything.
     c.ok("send", report("state=clear")).await;
     let removed = event_where(&mut c, |e| match e {
         Event::ProgramStatusRemoved { record_ids, .. } => Some(record_ids.clone()),
@@ -478,7 +448,7 @@ async fn the_lock_refuses_a_second_server() {
             home: dir.path().to_path_buf(),
             version: "test".into(),
             state_dir: state.clone(),
-            socket: dir.path().join("sock"),
+            socket: server::AbsolutePath::new(&dir.path().join("sock")).unwrap(),
             park: server::ParkTiming::default(),
         })
     };
@@ -513,16 +483,12 @@ async fn loading_keeps_the_newest_complete_generation_only() {
         ]),
         ..file.session
     };
-    // As 0.3.0 wrote it: a count of attachments, no size.
-    let mut old = serde_json::to_value(&file).unwrap();
-    old["session"]["attachments"] = 3.into();
-    old["session"].as_object_mut().unwrap().remove("size");
     let write = |generation: &str, files: &[&str]| {
         let g = session_dir.join(generation);
         std::fs::create_dir_all(&g).unwrap();
         for name in files {
             let bytes = match *name {
-                "session.json" => serde_json::to_vec(&old).unwrap(),
+                "session.json" => serde_json::to_vec(&file).unwrap(),
                 "screen.txt" => format!("line one\nline two {generation}\n").into_bytes(),
                 _ => b"GHOSTSNP".to_vec(),
             };
@@ -533,7 +499,6 @@ async fn loading_keeps_the_newest_complete_generation_only() {
     write("200", &["session.json", "snapshot.ghostsnp"]);
     write(".300", &["session.json", "snapshot.ghostsnp", "screen.txt"]);
     write("50", &["session.json", "snapshot.ghostsnp", "screen.txt"]);
-    // An unrelated session directory with nothing complete goes away.
     std::fs::create_dir_all(sessions_dir(&state).join("empty").join("1")).unwrap();
 
     let server = start_with(fast_limits(), state.clone());
@@ -551,7 +516,6 @@ async fn loading_keeps_the_newest_complete_generation_only() {
         .collect();
     assert_eq!(names, vec!["100"]);
     assert!(!sessions_dir(&state).join("empty").exists());
-    // One history line before the screen.
     assert_eq!(c.read(id, 1).await.text, "line one\nline two 100\n");
     assert_eq!(c.read(id, 0).await.text, "line two 100\n");
     assert_eq!(c.read(id, 5).await.text, "line one\nline two 100\n");
@@ -567,7 +531,6 @@ async fn loading_keeps_the_newest_complete_generation_only() {
         "the working record is dropped on load"
     );
 
-    // A resume marker above the parked one is invalid, as on a live session.
     c.open(
         1,
         json!({"session": id, "viewport": {"cols": 80, "rows": 24},
@@ -575,7 +538,6 @@ async fn loading_keeps_the_newest_complete_generation_only() {
     )
     .await;
     assert_eq!(c.expect_error(1).await, ErrorCode::InvalidRequest);
-    // The fixture's snapshot is not one: the attach fails and is gone.
     c.open(
         1,
         json!({"session": id, "viewport": {"cols": 80, "rows": 24}}),
@@ -585,12 +547,35 @@ async fn loading_keeps_the_newest_complete_generation_only() {
     c.wait_attachments(id, 0).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_park_of_another_version_is_deleted() {
+    let id = "11111111-2222-3333-4444-555555555555";
+    let mut older = serde_json::to_value(park_file(id)).unwrap();
+    older["version"] = 1.into();
+    let mut unversioned = serde_json::to_value(park_file(id)).unwrap();
+    unversioned.as_object_mut().unwrap().remove("version");
+    unversioned["protocol"] = 1.into();
+    for file in [older, unversioned] {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let generation = sessions_dir(&state).join(id).join("100");
+        std::fs::create_dir_all(&generation).unwrap();
+        std::fs::write(generation.join("session.json"), file.to_string()).unwrap();
+        std::fs::write(generation.join("snapshot.ghostsnp"), b"GHOSTSNP").unwrap();
+        std::fs::write(generation.join("screen.txt"), b"").unwrap();
+
+        let server = start_with(fast_limits(), state.clone());
+        let mut c = client(&server).await;
+        assert_eq!(c.list().await.sessions.len(), 0, "{file}");
+        assert!(!sessions_dir(&state).join(id).exists(), "{file}");
+    }
+}
+
 const OTHER: &str = "99999999-2222-3333-4444-555555555555";
 
-/// A running session's park, as written by this engine and protocol.
 fn park_file(id: &str) -> server::park::ParkFile {
     server::park::ParkFile {
-        protocol: server::park::PROTOCOL,
+        version: server::park::VERSION,
         engine: ghostty_vt::ENGINE.into(),
         parked_at: "2026-10-18T00:00:00Z".into(),
         history_lines: 0,
@@ -621,7 +606,6 @@ fn park_file(id: &str) -> server::park::ParkFile {
     }
 }
 
-/// A record with nothing but its id, state and app.
 fn record(id: &str, state: &str, app: Option<&str>) -> StatusRecord {
     StatusRecord {
         id: id.into(),
@@ -636,7 +620,6 @@ fn record(id: &str, state: &str, app: Option<&str>) -> StatusRecord {
     }
 }
 
-/// After an engine change only `read` and `remove` work.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_parked_by_another_engine_is_only_read_and_removed() {
     let dir = tempfile::tempdir().unwrap();
@@ -667,9 +650,6 @@ async fn a_session_parked_by_another_engine_is_only_read_and_removed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_park_naming_another_session_is_skipped() {
-    // A `remove` of the restored session would delete `sessions/<id>`
-    // for the id the file claims, so a file under the wrong directory is
-    // left alone and not restored.
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().to_path_buf();
     let dir = sessions_dir(&state).join("mislabeled").join("1");
@@ -692,15 +672,11 @@ async fn a_stopped_server_leaves_the_directory_to_its_successor() {
     let state = dir.path().join("state");
     let a = start_with(fast_limits(), state.clone());
     let mut c = client(&a).await;
-    // `on_exit: remove` with a 200 ms grace: once the stop's SIGHUP ends
-    // the process, the old server must not delete the park.
     let session = c
         .create(json!({"argv": ["/bin/sh", "-c", "echo left-behind; exec cat"]}))
         .await;
     wait_text(&mut c, &session.id, "left-behind").await;
     a.registry.stop().await;
-    // The stop closed the connection, and the old registry accepts
-    // nothing new.
     assert!(c.recv().await.is_none(), "closed by the stop");
     assert_eq!(
         a.registry
@@ -746,7 +722,6 @@ async fn a_parked_read_takes_scrollback_from_the_history_only() {
     wait_text(&mut c, &session.id, "TOP").await;
     let live_screen = c.read(&session.id, 0).await.text;
     let live_two = c.read(&session.id, 2).await.text;
-    // Ten rows: the last scroll before the clear left 1 to 31 in history.
     assert_eq!(live_screen, "TOP\n");
     assert_eq!(live_two, "30\n31\nTOP\n");
     a.registry.stop().await;
@@ -769,8 +744,6 @@ async fn a_deferred_remove_keeps_a_parked_session_until_the_grace() {
     };
     let a = start_with(limits, state.clone());
     let mut c = client(&a).await;
-    // Enough history that a bootstrap pauses for a client that stops
-    // reading, which keeps its attachment unfinished.
     let session = c
         .create(json!({
             "on_exit": "keep",
@@ -795,11 +768,8 @@ async fn a_deferred_remove_keeps_a_parked_session_until_the_grace() {
     idle.attached(1).await;
     c.wait_attachments(&session.id, 1).await;
     c.ok("remove", json!({"session": session.id})).await;
-    // Within the grace the session is listed and its files serve a
-    // bootstrap.
     c.open(2, json!({"session": session.id})).await;
     assert!(c.bootstrap(2).await.text().contains("filled"));
-    // A stop within the grace does not bring it back.
     b.registry.stop().await;
     drop(b);
     let d = start_with(limits, state);

@@ -1,12 +1,3 @@
-/**
- * The web package in Chrome against a real server: terminals mounted from
- * one client share its connection, survive a lost connection by resuming,
- * and come back from a server restart; `wait` runs through the client and
- * an abort cancels it; a terminal that opted in marks its session's
- * records seen when it gets the focus. The page reaches the server's TLS
- * WebSocket carrier through a TCP proxy the suite counts connections on
- * and cuts. Chrome is the installed one (`CHROME` names another).
- */
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { type Server, createServer } from "node:http";
@@ -27,15 +18,11 @@ const run = promisify(execFile);
 const here = fileURLToPath(new URL(".", import.meta.url));
 const root = `${here}../../../../`;
 const binary = `${root}target/debug/clankermux`;
-// `just check` builds the binary before the web suites run; a missing one
-// is a failure, not a reason to skip.
 if (!existsSync(binary)) throw new Error(`${binary} is missing: run cargo build first`);
 const tls = `${root}web/packages/clankermux/test/client/fixtures/tls/`;
 
 vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 
-/** A TCP proxy to the server's carrier: it counts the connections it
- * took, and while `down` it cuts the ones it has and refuses new ones. */
 class Proxy {
   private readonly server = createTcpServer((socket) => this.take(socket));
   private readonly open = new Set<Socket>();
@@ -84,7 +71,6 @@ const proxy = new Proxy();
 let proxyUrl: string;
 let browser: Browser;
 
-/** Starts the server on the state in `dir`; resolves with its carrier's port. */
 async function serve(): Promise<void> {
   server = spawn(
     binary,
@@ -104,7 +90,6 @@ async function serve(): Promise<void> {
   await eventually("the server's socket", () => cli("list").then(() => true).catch(() => undefined));
 }
 
-/** Stops the server as a machine's shutdown does: it parks its sessions. */
 async function stop(): Promise<void> {
   const running = server;
   if (!running || running.exitCode !== null) return;
@@ -153,13 +138,11 @@ beforeAll(async () => {
   proxyUrl = `wss://127.0.0.1:${await proxy.listen()}/`;
   await serve();
   browser = await chromium.launch({
-    ...(process.env["CHROME"] ? { executablePath: process.env["CHROME"] } : { channel: "chrome" }),
-    // The fixture certificate is self-signed.
+    ...(process.env["CHROME"] && { executablePath: process.env["CHROME"] }),
     args: ["--ignore-certificate-errors"],
   });
 });
 
-// A failed test leaves neither its page reconnecting nor the proxy down.
 const contexts: { close(): Promise<void> }[] = [];
 afterEach(async () => {
   for (const context of contexts.splice(0)) await context.close().catch(() => {});
@@ -174,8 +157,6 @@ afterAll(async () => {
   if (dir) rmSync(dir, { recursive: true, force: true });
 });
 
-/** A fresh page, connected through the proxy; in a fresh context unless
- * given one. */
 async function opened(given?: BrowserContext): Promise<Page> {
   const context = given ?? (await browser.newContext({ ignoreHTTPSErrors: true }));
   contexts.push(context);
@@ -196,7 +177,6 @@ const connectedTo = (page: Page, name: string, status = "running") =>
     return link?.state === "connected" && link.session?.status === status ? link : undefined;
   });
 
-/** Types `line` and Enter into the terminal `name`. */
 async function typed(page: Page, name: string, line: string): Promise<void> {
   await page.click(`#${name}`);
   await page.keyboard.type(`${line}\n`);
@@ -218,7 +198,6 @@ test("two terminals mounted from one client share its one connection", async () 
     expect(attachments.map((a) => a.client.name)).toEqual(["clankermux-web"]);
   }
 
-  // Each terminal's keys reach its own session.
   await typed(page, "left", "to-the-left");
   await typed(page, "right", "to-the-right");
   await eventually("the left line", async () => ((await screenOf(left)).includes("to-the-left\nto-the-left") ? true : undefined));
@@ -240,9 +219,7 @@ test("a lost connection: each terminal resumes, and the events missed meanwhile 
 
   proxy.cut();
   await eventually("the link lost", async () => ((await linkOf(page, "left"))?.state === "connecting" ? true : undefined));
-  // Output and a bell while the page is away.
   await cli("send", left, "\x07rung-while-away", "--enter");
-  // Echoed by the terminal, then printed by `cat`, with the bell.
   await eventually("the line printed", async () => ((await screenOf(left)).split("rung-while-away").length > 2 ? true : undefined));
   proxy.down = false;
 
@@ -257,7 +234,6 @@ test("a lost connection: each terminal resumes, and the events missed meanwhile 
   });
   expect((await page.evaluate(() => harness().events())).some((e) => e.event === "gap")).toBe(false);
 
-  // And input after the resume goes through.
   await typed(page, "right", "after-the-resume");
   await eventually("the line typed after", async () =>
     (await screenOf(right)).includes("after-the-resume\nafter-the-resume") ? true : undefined,
@@ -282,17 +258,19 @@ test("a server restart: the terminals come back to their restored sessions, and 
   await page.context().close();
 });
 
+const KITTY_DISAMBIGUATE = "\\033[>1u";
+
 test("under the kitty keyboard protocol, shifted symbols reach the program as typed", async () => {
-  // Disambiguation, as neovim asks for it; the program prints the bytes
-  // of four keys in hex, once the terminal is raw.
-  const session = await create("/bin/sh", "-c", "printf '\\033[>1u'; stty raw -echo; printf ready; dd bs=1 count=4 2>/dev/null | od -An -tx1; exec cat");
+  const session = await create(
+    "/bin/sh",
+    "-c",
+    `printf '${KITTY_DISAMBIGUATE}'; stty raw -echo; printf ready; dd bs=1 count=4 2>/dev/null | od -An -tx1; exec cat`,
+  );
   const page = await opened();
   await page.evaluate((s) => harness().mount("only", s), session);
   await connectedTo(page, "only");
   await eventually("the terminal raw", async () => ((await screenOf(session)).includes("ready") ? true : undefined));
   await page.click("#only");
-  // Shift held, as a keyboard sends it: whatever the machine's layout has
-  // on these keys unshifted, the text is what Shift made.
   await page.keyboard.down("Shift");
   for (const key of ["Semicolon", "Quote", "Digit1"]) await page.keyboard.press(key);
   await page.keyboard.up("Shift");
@@ -308,9 +286,6 @@ test("a key the input method processes puts the input element at the cursor", as
   const page = await opened();
   await page.evaluate((s) => harness().mount("only", s), session);
   await connectedTo(page, "only");
-  // `Process` as a browser may report it: key code 0, not composing. The
-  // input method's window opens at the input element, which follows the
-  // cursor after `abcdef` on the first row.
   await eventually("the input element at the cursor", () =>
     page.evaluate(() => {
       const canvas = document.querySelector<HTMLCanvasElement>("#only")!;
@@ -332,8 +307,6 @@ test("a selection's copy is told to the page once the clipboard has it", async (
   await page.evaluate((s) => harness().mount("only", s), session);
   await connectedTo(page, "only");
   await eventually("the word drawn", async () => ((await screenOf(session)).includes("copyme") ? true : undefined));
-  // A double click selects the word; the first click selected nothing,
-  // which is no copy.
   const box = (await page.locator("#only").boundingBox())!;
   await page.mouse.dblclick(box.x + 10, box.y + 8);
   const copies = await eventually("the copy told", async () => {
@@ -346,8 +319,6 @@ test("a selection's copy is told to the page once the clipboard has it", async (
   expect(await page.evaluate(() => harness().copies("only"))).toHaveLength(1);
   await context.close();
 
-  // With the permission denied Chrome refuses the write, and the page is
-  // told.
   const denied = await browser.newContext({ ignoreHTTPSErrors: true });
   const target = await (await denied.newCDPSession(await denied.newPage())).send("Target.getTargetInfo");
   await (await browser.newBrowserCDPSession()).send("Browser.setPermission", {
@@ -383,7 +354,6 @@ test("wait through the client: a match resolves it, an abort cancels it on the s
 
   const aborted = await page.evaluate((s) => harness().wait(s, { output: { text: "never-printed" } }, 200), session);
   expect(aborted).toEqual({ error: { name: "ClientError", kind: "server", code: "cancelled" } });
-  // Aborted before it started: still cancelled by the server.
   const early = await page.evaluate((s) => harness().wait(s, { output: { text: "never-printed" } }, 0), session);
   expect(early).toEqual({ error: { name: "ClientError", kind: "server", code: "cancelled" } });
   await page.context().close();
@@ -434,11 +404,9 @@ test("the client's link, the latest values a late listener gets, and close rejec
   await eventually("the attachment closed", async () => ((await listed(session))?.attachments.length === 0 ? true : undefined));
 });
 
-test("frames wait for animation paints, hidden pages stop, and unfocused pages refresh", async () => {
-  const session = await create("/bin/sh", "-c", "printf first; exec cat");
+async function heldPaintsWithoutFocus(session: string): Promise<{ page: Page; draws: () => Promise<number> }> {
   const page = await opened();
   await page.evaluate((s) => {
-    // Keep the page visible without focus: it must still render.
     Object.defineProperty(document, "hasFocus", { configurable: true, value: () => false });
     harness().holdPaints();
     harness().mount("only", s);
@@ -455,6 +423,19 @@ test("frames wait for animation paints, hidden pages stop, and unfocused pages r
   const draws = () => page.locator("#only").getAttribute("data-draws").then((n) => Number(n ?? 0));
   expect(await draws()).toBe(0);
   expect(await page.evaluate(() => harness().pendingPaints())).toBe(1);
+  return { page, draws };
+}
+
+async function setVisibility(page: Page, state: DocumentVisibilityState): Promise<void> {
+  await page.evaluate((state) => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: state });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }, state);
+}
+
+test("frames wait for animation paints", async () => {
+  const session = await create("/bin/sh", "-c", "printf first; exec cat");
+  const { page, draws } = await heldPaintsWithoutFocus(session);
   await cli("send", session, "second", "--enter");
   await page.waitForTimeout(100);
   expect(await page.evaluate(() => harness().frames().length)).toBe(1);
@@ -462,26 +443,21 @@ test("frames wait for animation paints, hidden pages stop, and unfocused pages r
   await page.evaluate(() => harness().paint());
   expect(await draws()).toBeGreaterThan(0);
   await eventually("the frame after paint acknowledgement", async () => await page.evaluate(() => harness().frames().length === 2 ? true : undefined));
+});
 
-  // Hide with a frame waiting for an animation callback. Hiding must
-  // release it without drawing; otherwise showing can deadlock the worker.
-  const before = await draws();
-  await page.evaluate(() => {
-    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
-    document.dispatchEvent(new Event("visibilitychange"));
-  });
+test("hiding releases a frame waiting for paint without drawing it, so showing again refreshes", async () => {
+  const session = await create("/bin/sh", "-c", "printf first; exec cat");
+  const { page, draws } = await heldPaintsWithoutFocus(session);
+  await setVisibility(page, "hidden");
   expect(await page.evaluate(() => harness().pendingPaints())).toBe(0);
-  await cli("send", session, "third", "--enter");
+  await cli("send", session, "second", "--enter");
   await page.waitForTimeout(100);
-  expect(await page.evaluate(() => harness().frames().length)).toBe(2);
-  expect(await draws()).toBe(before);
-  await page.evaluate(() => {
-    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
-    document.dispatchEvent(new Event("visibilitychange"));
-  });
-  await eventually("a full refresh without focus", async () => await page.evaluate(() => harness().frames().length === 3 ? true : undefined));
+  expect(await page.evaluate(() => harness().frames().length)).toBe(1);
+  expect(await draws()).toBe(0);
+  await setVisibility(page, "visible");
+  await eventually("a full refresh without focus", async () => await page.evaluate(() => harness().frames().length === 2 ? true : undefined));
   expect(await page.evaluate(() => harness().frames().at(-1)!.frame.full)).toBe(true);
-  expect(await draws()).toBe(before);
+  expect(await draws()).toBe(0);
   await page.evaluate(() => harness().paint());
-  expect(await draws()).toBeGreaterThan(before);
+  expect(await draws()).toBeGreaterThan(0);
 });

@@ -1,21 +1,15 @@
-//! The attachments list, `detach`, and the size policies.
-
-mod common;
-
 use std::time::Duration;
 
-use common::*;
 use proto::*;
 use serde_json::{Value, json};
+use testkit::*;
 
-/// A client whose `HELLO` names it `name` at `version`, with the engine.
 async fn client_named(server: &Server, name: &str, version: &str) -> Client {
     let mut c = Client::connect(server).await;
     c.hello_as(name, version, Some(ghostty_vt::ENGINE)).await;
     c
 }
 
-/// The next `session_changed` for `id` whose session `pick` accepts.
 async fn changed_until(c: &mut Client, id: &str, pick: impl Fn(&Session) -> bool) -> Session {
     event_where(c, |event| match event {
         Event::SessionChanged { session } if session.id == id && pick(session) => {
@@ -26,7 +20,6 @@ async fn changed_until(c: &mut Client, id: &str, pick: impl Fn(&Session) -> bool
     .await
 }
 
-/// `CLOSED` on `channel`, after any stream frames before it.
 async fn closed_on(c: &mut Client, channel: u32) -> Closed {
     loop {
         let (header, payload) = c.recv_on(channel).await;
@@ -103,8 +96,6 @@ async fn the_list_follows_open_input_viewport_and_close() {
         ("two", true, None)
     );
 
-    // Input sets `last_input` without an event: the next one is the
-    // label's.
     one.send(FrameType::Input, 1, b"x").await;
     inspect_until(&mut ctl, &session.id, |s| {
         s.attachments[0].last_input.is_some()
@@ -122,7 +113,6 @@ async fn the_list_follows_open_input_viewport_and_close() {
         }
     }
 
-    // A viewport report changes the list and the size.
     one.send_json(FrameType::Viewport, 1, &json!({"cols": 40, "rows": 10}))
         .await;
     let reported = changed_until(&mut ctl, &session.id, |s| {
@@ -162,7 +152,6 @@ async fn detach_closes_another_connections_attachment() {
         }
     );
     ctl.wait_attachments(&session.id, 0).await;
-    // The channel is free again.
     viewer.open(3, json!({"session": session.id})).await;
     viewer.bootstrap(3).await;
 
@@ -187,7 +176,6 @@ async fn detach_closes_another_connections_attachment() {
         .await,
         ErrorCode::LimitExceeded
     );
-    // Without a reason, no message; an exited session's attachment too.
     ctl.ok("end", json!({"session": session.id})).await;
     inspect_until(&mut ctl, &session.id, |s| s.status == Status::Exited).await;
     ctl.ok("detach", detach(json!(reopened))).await;
@@ -205,8 +193,6 @@ async fn each_policy_with_two_attachments() {
     let server = start(fast_limits());
     let mut a = client(&server).await;
     let mut b = client(&server).await;
-    // Requests from a connection with no attachment: `a` and `b` leave
-    // their stream frames unread.
     let mut ctl = client(&server).await;
     let session = ctl
         .create(json!({"argv": ["/bin/cat"], "cols": 20, "rows": 5}))
@@ -227,7 +213,6 @@ async fn each_policy_with_two_attachments() {
     let s = ctl.inspect(id).await;
     let (ca, cb) = (s.attachments[0].channel, s.attachments[1].channel);
 
-    // latest: the most recent report, and who made it.
     assert_eq!((size_of(&s), s.size.owner), ((80, 40), Some(cb)));
     a.send_json(FrameType::Viewport, 1, &json!({"cols": 100, "rows": 30}))
         .await;
@@ -240,7 +225,6 @@ async fn each_policy_with_two_attachments() {
         }
     );
 
-    // smallest: the least columns and the least rows, at once.
     ctl.ok("resize", json!({"session": id, "policy": "smallest"}))
         .await;
     let s = ctl.inspect(id).await;
@@ -254,7 +238,6 @@ async fn each_policy_with_two_attachments() {
     b.send_json(FrameType::Viewport, 1, &json!({"cols": 60, "rows": 20}))
         .await;
     inspect_until(&mut ctl, id, |s| size_of(s) == (60, 20)).await;
-    // `resize` holds until the next report.
     ctl.ok("resize", json!({"session": id, "cols": 200, "rows": 60}))
         .await;
     assert_eq!(size_of(&ctl.inspect(id).await), (200, 60));
@@ -262,8 +245,6 @@ async fn each_policy_with_two_attachments() {
         .await;
     inspect_until(&mut ctl, id, |s| size_of(s) == (60, 20)).await;
 
-    // fixed: reports are recorded, not applied, and the list's change
-    // alone is announced; `resize` applies.
     ctl.ok("resize", json!({"session": id, "policy": "fixed"}))
         .await;
     ctl.ok("subscribe", json!({})).await;
@@ -283,7 +264,6 @@ async fn each_policy_with_two_attachments() {
         .await;
     assert_eq!(size_of(&ctl.inspect(id).await), (90, 25));
 
-    // smallest again, then the smaller one leaves.
     ctl.ok("resize", json!({"session": id, "policy": "smallest"}))
         .await;
     assert_eq!(size_of(&ctl.inspect(id).await), (60, 20));
@@ -291,7 +271,6 @@ async fn each_policy_with_two_attachments() {
     assert_eq!(closed_on(&mut b, 1).await.reason, ClosedReason::Closed);
     inspect_until(&mut ctl, id, |s| size_of(s) == (70, 25)).await;
 
-    // A policy and a size in one request: the policy, then the size.
     ctl.ok(
         "resize",
         json!({"session": id, "policy": "fixed", "cols": 33}),
@@ -315,8 +294,6 @@ async fn each_policy_with_two_attachments() {
 async fn the_policy_is_parked_and_restored() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    // Parked soon after a change, so the policy reaches the disk without
-    // a stop.
     let mut a = Server::start_with_park(fast_limits(), state.clone(), prompt_parks(50, 50, 200));
     let mut c = client(&a).await;
     let session = c.create(json!({"argv": ["/bin/cat"]})).await;
@@ -326,12 +303,10 @@ async fn the_policy_is_parked_and_restored() {
                 .is_ok_and(|file| file["session"]["size"]["policy"] == policy)
         }
     };
-    // The creation's park first, so that the policy's is its own.
     wait_parked(&state, &session.id, "session.json", parked("latest")).await;
     c.ok("resize", json!({"session": session.id, "policy": "fixed"}))
         .await;
     wait_parked(&state, &session.id, "session.json", parked("fixed")).await;
-    // Killed, not stopped: nothing parks on the way out.
     a.shutdown();
     drop(c);
     drop(a);

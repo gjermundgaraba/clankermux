@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::num::NonZeroU32;
 use std::ptr;
 use std::sync::Arc;
 
@@ -36,14 +37,21 @@ impl ColorScheme {
     }
 }
 
-/// Answer to a size query: the grid size in cells and the cell size in
-/// pixels, zero when unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ScrollbackRow(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorPosition {
+    pub col: u16,
+    pub row: u16,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SizeReport {
     pub cols: u16,
     pub rows: u16,
-    pub cell_width: u32,
-    pub cell_height: u32,
+    pub cell_width: Option<NonZeroU32>,
+    pub cell_height: Option<NonZeroU32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,20 +72,17 @@ pub enum ProgramStatusKind {
     Auth,
 }
 
-/// One OSC 7501 report, as parsed by the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramStatus {
     pub state: ProgramStatusState,
     pub kind: ProgramStatusKind,
-    /// -1 when absent.
-    pub progress: i8,
+    pub progress: Option<u8>,
     pub id: String,
     pub app: String,
     pub title: String,
     pub message: String,
 }
 
-/// An OSC 9;4 report's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressState {
     Remove,
@@ -88,29 +93,19 @@ pub enum ProgressState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SemanticPromptKind {
-    PromptStart,
+pub enum SemanticPrompt {
+    PromptStart(PromptKind),
     InputStart,
     OutputStart,
     CommandEnd,
 }
 
-/// Which prompt a `PromptStart` starts (`A`, `N`, or `P` with its `k`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     Primary,
     Right,
     Continuation,
     Secondary,
-}
-
-/// One OSC 133 mark, as parsed by the engine; a `CommandEnd`'s exit
-/// code comes to `Handler::command_end`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SemanticPrompt {
-    pub kind: SemanticPromptKind,
-    /// For a `PromptStart`; `Primary` for the other kinds.
-    pub prompt: PromptKind,
 }
 
 /// Effects raised by the engine while it parses, the ones clankermux
@@ -127,12 +122,10 @@ pub trait Handler: Send + 'static {
     /// OSC 133 `D`, after `semantic_prompt` with `CommandEnd`: the exit
     /// code, when the shell reported one.
     fn command_end(&mut self, _exit: Option<i32>) {}
-    /// BEL.
     fn bell(&mut self) {}
     /// OSC 9 or OSC 777; the title is empty when the sequence has none.
     fn desktop_notification(&mut self, _title: String, _body: String) {}
-    /// OSC 9;4; the percentage is -1 when absent.
-    fn progress_report(&mut self, _state: ProgressState, _progress: i8) {}
+    fn progress_report(&mut self, _state: ProgressState, _progress: Option<u8>) {}
     /// Answer to CSI ? 996 n; `None` leaves the query unanswered.
     fn color_scheme(&mut self) -> Option<ColorScheme> {
         None
@@ -151,7 +144,6 @@ pub trait Handler: Send + 'static {
 
 impl Handler for () {}
 
-/// The mode 2031 report announcing `scheme`.
 pub fn color_scheme_report(scheme: ColorScheme) -> Vec<u8> {
     let mut buf = [0u8; 32];
     let mut written = 0;
@@ -173,7 +165,6 @@ struct Slot<H> {
     xtversion: Vec<u8>,
 }
 
-/// A borrowed terminal handle with read access. [`Terminal`] derefs to it.
 pub struct Term(sys::GhosttyTerminal);
 
 impl Term {
@@ -196,12 +187,11 @@ impl Term {
         self.get(sys::GHOSTTY_TERMINAL_DATA_ROWS).unwrap_or(0)
     }
 
-    /// Cursor column and row, zero-based, within the active area.
-    pub fn cursor(&self) -> (u16, u16) {
-        (
-            self.get(sys::GHOSTTY_TERMINAL_DATA_CURSOR_X).unwrap_or(0),
-            self.get(sys::GHOSTTY_TERMINAL_DATA_CURSOR_Y).unwrap_or(0),
-        )
+    pub fn cursor(&self) -> CursorPosition {
+        CursorPosition {
+            col: self.get(sys::GHOSTTY_TERMINAL_DATA_CURSOR_X).unwrap_or(0),
+            row: self.get(sys::GHOSTTY_TERMINAL_DATA_CURSOR_Y).unwrap_or(0),
+        }
     }
 
     pub fn title(&self) -> String {
@@ -215,26 +205,24 @@ impl Term {
 
     pub fn pwd(&self) -> String {
         let s: sys::GhosttyString = self.get(sys::GHOSTTY_TERMINAL_DATA_PWD).unwrap_or_default();
-        // SAFETY: as in `title`.
         unsafe { string(&s) }
     }
 
-    /// The rows above the screen; `LimitExceeded` when there are more
-    /// than a `u32` row can address.
     pub fn scrollback_rows(&self) -> Result<u32> {
         let rows: usize = self.get(sys::GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS)?;
         u32::try_from(rows).map_err(|_| Error::LimitExceeded)
     }
 
-    /// Whether the alternate screen is the active one.
     pub fn alternate_screen(&self) -> bool {
         self.get::<sys::GhosttyTerminalScreen>(sys::GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN)
             .is_ok_and(|screen| screen == sys::GHOSTTY_TERMINAL_SCREEN_ALTERNATE)
     }
 
-    /// Whether row `y` of the active screen, counted from the top of its
-    /// scrollback, continues the soft-wrapped row above it.
-    pub(crate) fn row_continues(&self, y: u32) -> Result<bool> {
+    pub fn screen_top(&self) -> Result<ScrollbackRow> {
+        self.scrollback_rows().map(ScrollbackRow)
+    }
+
+    pub(crate) fn row_continues(&self, ScrollbackRow(y): ScrollbackRow) -> Result<bool> {
         let point = sys::GhosttyPoint {
             tag: sys::GHOSTTY_POINT_TAG_SCREEN,
             value: sys::GhosttyPointValue {
@@ -261,25 +249,21 @@ impl Term {
         Ok(out)
     }
 
-    /// The first row, counted from the top of the scrollback, of the last
-    /// `lines` logical lines of history: soft-wrapped rows count as one,
-    /// and a line the top of the screen continues is the screen's.
-    pub fn history_start(&self, lines: usize) -> Result<u32> {
-        let mut row = self.scrollback_rows()?;
-        while row > 0 && self.row_continues(row)? {
+    pub fn history_start(&self, lines: usize) -> Result<ScrollbackRow> {
+        let ScrollbackRow(mut row) = self.screen_top()?;
+        while row > 0 && self.row_continues(ScrollbackRow(row))? {
             row -= 1;
         }
         let mut counted = 0;
         while row > 0 && counted < lines {
             row -= 1;
-            if !self.row_continues(row)? {
+            if !self.row_continues(ScrollbackRow(row))? {
                 counted += 1;
             }
         }
-        Ok(row)
+        Ok(ScrollbackRow(row))
     }
 
-    /// Current value of a DEC private mode such as 2031 or 2048.
     pub fn mode(&self, mode: u16) -> Result<bool> {
         let mut config = sys::GhosttyTerminalModeConfig { mode, value: false };
         // SAFETY: output type is GhosttyTerminalModeConfig* with mode set.
@@ -294,10 +278,6 @@ impl Term {
     }
 }
 
-/// A terminal with its effect handler. A [`snapshot::Decoder`](crate::snapshot::Decoder)
-/// holds a second wrapper on the terminal it decodes into while it hands
-/// one out; the terminal is freed with the last wrapper, so neither can
-/// free it under the other.
 pub struct Terminal<H: Handler = ()> {
     term: Term,
     owner: Arc<Owner<H>>,
@@ -341,7 +321,6 @@ impl Terminal<()> {
 }
 
 impl<H: Handler> Terminal<H> {
-    /// A terminal whose effects go to `handler`.
     pub fn with_handler(cols: u16, rows: u16, handler: H) -> Result<Self> {
         let mut raw = ptr::null_mut();
         // SAFETY: a null allocator selects the default allocator.
@@ -350,8 +329,6 @@ impl<H: Handler> Terminal<H> {
         Ok(unsafe { Terminal::install(raw, handler) })
     }
 
-    /// Installs `handler` and the effect callbacks on a caller-owned raw
-    /// terminal.
     pub(crate) unsafe fn install(raw: sys::GhosttyTerminal, handler: H) -> Self {
         let slot = Box::into_raw(Box::new(Slot {
             handler,
@@ -413,8 +390,6 @@ impl<H: Handler> Terminal<H> {
         }
     }
 
-    /// A second wrapper on this terminal; the terminal lives as long as
-    /// either.
     pub(crate) fn share(&self) -> Self {
         Terminal {
             term: Term(self.term.0),
@@ -429,7 +404,6 @@ impl<H: Handler> Terminal<H> {
     }
 
     fn slot_mut(&mut self) -> &mut Slot<H> {
-        // SAFETY: as in `slot`.
         unsafe { &mut *self.owner.slot }
     }
 
@@ -482,7 +456,6 @@ impl<H: Handler> Terminal<H> {
         check(unsafe { sys::ghostty_terminal_set(self.term.0, option, value) })
     }
 
-    /// Sets or clears a default colour.
     pub fn set_color(&mut self, kind: ColorKind, color: Option<Rgb>) -> Result<()> {
         let option = match kind {
             ColorKind::Foreground => sys::GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND,
@@ -517,8 +490,8 @@ impl<H: Handler> Terminal<H> {
 
 mod cb {
     use super::{
-        Handler, ProgramStatus, ProgramStatusKind, ProgramStatusState, ProgressState, PromptKind,
-        SemanticPrompt, SemanticPromptKind, Slot, c_void, string, sys,
+        Handler, NonZeroU32, ProgramStatus, ProgramStatusKind, ProgramStatusState, ProgressState,
+        PromptKind, SemanticPrompt, Slot, c_void, string, sys,
     };
 
     unsafe fn slot<'a, H: Handler>(userdata: *mut c_void) -> &'a mut Slot<H> {
@@ -563,7 +536,7 @@ mod cb {
             ProgramStatus {
                 state,
                 kind,
-                progress: r.progress,
+                progress: u8::try_from(r.progress).ok(),
                 id: string(&r.id),
                 app: string(&r.app),
                 title: string(&r.title),
@@ -580,22 +553,23 @@ mod cb {
     ) {
         // SAFETY: event is valid for this call.
         let e = unsafe { &*event };
-        let kind = match e.kind {
-            sys::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START => SemanticPromptKind::PromptStart,
-            sys::GHOSTTY_SEMANTIC_PROMPT_INPUT_START => SemanticPromptKind::InputStart,
-            sys::GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START => SemanticPromptKind::OutputStart,
-            sys::GHOSTTY_SEMANTIC_PROMPT_COMMAND_END => SemanticPromptKind::CommandEnd,
+        let mark = match e.kind {
+            sys::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START => {
+                SemanticPrompt::PromptStart(match e.prompt_kind {
+                    sys::GHOSTTY_SEMANTIC_PROMPT_PROMPT_RIGHT => PromptKind::Right,
+                    sys::GHOSTTY_SEMANTIC_PROMPT_PROMPT_CONTINUATION => PromptKind::Continuation,
+                    sys::GHOSTTY_SEMANTIC_PROMPT_PROMPT_SECONDARY => PromptKind::Secondary,
+                    _ => PromptKind::Primary,
+                })
+            }
+            sys::GHOSTTY_SEMANTIC_PROMPT_INPUT_START => SemanticPrompt::InputStart,
+            sys::GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START => SemanticPrompt::OutputStart,
+            sys::GHOSTTY_SEMANTIC_PROMPT_COMMAND_END => SemanticPrompt::CommandEnd,
             _ => return,
         };
-        let prompt = match e.prompt_kind {
-            sys::GHOSTTY_SEMANTIC_PROMPT_PROMPT_RIGHT => PromptKind::Right,
-            sys::GHOSTTY_SEMANTIC_PROMPT_PROMPT_CONTINUATION => PromptKind::Continuation,
-            sys::GHOSTTY_SEMANTIC_PROMPT_PROMPT_SECONDARY => PromptKind::Secondary,
-            _ => PromptKind::Primary,
-        };
         let handler = &mut unsafe { slot::<H>(ud) }.handler;
-        handler.semantic_prompt(SemanticPrompt { kind, prompt });
-        if kind == SemanticPromptKind::CommandEnd {
+        handler.semantic_prompt(mark);
+        if mark == SemanticPrompt::CommandEnd {
             handler.command_end(e.has_exit_code.then_some(e.exit_code));
         }
     }
@@ -634,7 +608,7 @@ mod cb {
         };
         unsafe { slot::<H>(ud) }
             .handler
-            .progress_report(state, r.progress);
+            .progress_report(state, u8::try_from(r.progress).ok());
     }
 
     pub(super) unsafe extern "C" fn color_scheme<H: Handler>(
@@ -664,8 +638,8 @@ mod cb {
                     *out = sys::GhosttySizeReportSize {
                         rows: size.rows,
                         columns: size.cols,
-                        cell_width: size.cell_width,
-                        cell_height: size.cell_height,
+                        cell_width: size.cell_width.map_or(0, NonZeroU32::get),
+                        cell_height: size.cell_height.map_or(0, NonZeroU32::get),
                     }
                 };
                 true

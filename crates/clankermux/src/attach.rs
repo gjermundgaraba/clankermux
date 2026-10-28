@@ -1,6 +1,3 @@
-//! The terminal side of `attach`: raw mode, the outer size, passthrough
-//! or repaint, keys, the detach prefix, and reconnecting with resume.
-
 use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
@@ -9,7 +6,7 @@ use std::time::Duration;
 use client::expect::Expect;
 use client::vt::{self, Scan};
 use client::{Action, Attachment, Connection, Endpoint, Error, Frame};
-use ghostty_vt::formatter::{self, Format, Region};
+use ghostty_vt::formatter::{self, Format, Region, VtExtras};
 use proto::{Closed, ClosedReason, Exit, FrameType, Open, Size, Viewport};
 use rustix::termios::{self, OptionalActions, Termios};
 use tokio::io::AsyncReadExt;
@@ -20,11 +17,9 @@ pub struct Options {
     pub endpoint: Endpoint,
     pub session: String,
     pub read_only: bool,
-    /// The prefix byte; followed by `d` it detaches, twice it is sent.
     pub detach_key: u8,
 }
 
-/// `C-x` or `^x` for a control key: a letter, or one of `@ [ \ ] ^ _ ?`.
 pub fn parse_key(spec: &str) -> Option<u8> {
     let key = match spec.as_bytes() {
         [b'C', b'-', c] | [b'^', c] => *c,
@@ -46,12 +41,8 @@ fn kitty_codepoint(byte: u8) -> u32 {
     })
 }
 
-/// The kitty keyboard protocol's `ctrl` modifier bit.
 const KITTY_CTRL: u32 = 4;
 
-/// The first screen row of a `clip_rows`-tall window into `rows`: the
-/// bottom rows, or when the cursor is above them the rows ending at the
-/// cursor.
 fn clip_window(rows: u16, clip_rows: u16, cursor_row: u16) -> u16 {
     let bottom = rows - clip_rows;
     if cursor_row >= bottom {
@@ -61,23 +52,56 @@ fn clip_window(rows: u16, clip_rows: u16, cursor_row: u16) -> u16 {
     }
 }
 
-/// How long to wait for the rest of an escape sequence from stdin.
 const KEY_TIMEOUT: Duration = Duration::from_millis(25);
-/// Coalescing window for repaints while the sizes differ.
 const REPAINT: Duration = Duration::from_millis(16);
 const CHANNEL: u32 = 1;
 
-/// Leaves every mode passthrough or a paint may have set: attributes,
-/// main screen, mouse off (and its encodings), bracketed paste and focus
-/// off, modifyOtherKeys and kitty keys off, cursor keys and keypad
-/// normal, no scrolling region, origin mode off, autowrap on, default
-/// cursor style, synchronized output off. A paint hides the cursor
-/// first; the exit shows it after.
-const RESET_MODES: &[u8] = b"\x1b[0m\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1015l\x1b[?1006l\x1b[?2004l\x1b[?1004l\x1b[>4;0m\x1b[<u\x1b[=0;1u\x1b[?1l\x1b>\x1b[r\x1b[?6l\x1b[?7h\x1b[0 q\x1b[?2026l";
+const SGR_RESET: &[u8] = b"\x1b[0m";
+const ALTERNATE_SCREEN_OFF: &[u8] = b"\x1b[?1049l";
+const MOUSE_CLICKS_OFF: &[u8] = b"\x1b[?1000l";
+const MOUSE_DRAG_OFF: &[u8] = b"\x1b[?1002l";
+const MOUSE_MOTION_OFF: &[u8] = b"\x1b[?1003l";
+const MOUSE_UTF8_OFF: &[u8] = b"\x1b[?1005l";
+const MOUSE_URXVT_OFF: &[u8] = b"\x1b[?1015l";
+const MOUSE_SGR_OFF: &[u8] = b"\x1b[?1006l";
+const BRACKETED_PASTE_OFF: &[u8] = b"\x1b[?2004l";
+const FOCUS_EVENTS_OFF: &[u8] = b"\x1b[?1004l";
+const MODIFY_OTHER_KEYS_OFF: &[u8] = b"\x1b[>4;0m";
+const KITTY_KEYS_POP: &[u8] = b"\x1b[<u";
+const KITTY_KEYS_OFF: &[u8] = b"\x1b[=0;1u";
+const CURSOR_KEYS_NORMAL: &[u8] = b"\x1b[?1l";
+const KEYPAD_NORMAL: &[u8] = b"\x1b>";
+const SCROLL_REGION_RESET: &[u8] = b"\x1b[r";
+const ORIGIN_MODE_OFF: &[u8] = b"\x1b[?6l";
+const AUTOWRAP_ON: &[u8] = b"\x1b[?7h";
+const CURSOR_STYLE_DEFAULT: &[u8] = b"\x1b[0 q";
+const SYNCHRONIZED_OUTPUT_OFF: &[u8] = b"\x1b[?2026l";
+
+const RESET_MODES: [&[u8]; 20] = [
+    SGR_RESET,
+    ALTERNATE_SCREEN_OFF,
+    MOUSE_CLICKS_OFF,
+    MOUSE_DRAG_OFF,
+    MOUSE_MOTION_OFF,
+    MOUSE_UTF8_OFF,
+    MOUSE_URXVT_OFF,
+    MOUSE_SGR_OFF,
+    BRACKETED_PASTE_OFF,
+    FOCUS_EVENTS_OFF,
+    MODIFY_OTHER_KEYS_OFF,
+    KITTY_KEYS_POP,
+    KITTY_KEYS_OFF,
+    CURSOR_KEYS_NORMAL,
+    KEYPAD_NORMAL,
+    SCROLL_REGION_RESET,
+    ORIGIN_MODE_OFF,
+    AUTOWRAP_ON,
+    CURSOR_STYLE_DEFAULT,
+    SYNCHRONIZED_OUTPUT_OFF,
+];
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 
-/// Raw mode on stdin, restored on drop.
 struct Raw {
     original: Termios,
 }
@@ -121,33 +145,22 @@ struct Shell {
     opts: Options,
     attachment: Attachment<Expect>,
     outer: Size,
-    /// A repaint is due by then.
     repaint_at: Option<Instant>,
-    /// Stdin bytes that do not yet form whole key encodings, and when to
-    /// stop waiting for the rest.
     pending: Vec<u8>,
     keys_at: Option<Instant>,
-    /// The detach prefix was pressed: its encoding and any releases
-    /// reported since, sent on if what follows is not `d`.
     armed: Option<Vec<u8>>,
-    /// The attachment is to be made afresh after this loop pass: a lost
-    /// place in the stream or `too_slow`, which the protocol has the
-    /// client recover from by attaching again.
     reopen: bool,
 }
 
-/// Why the attach ended.
 enum Outcome {
     Detached,
     Exited(Exit),
-    /// The session was restored from a previous server: a screen, no process.
     Restored,
     Closed(Closed),
     Failed(String),
 }
 
 impl Outcome {
-    /// What to tell the user, and the exit status.
     fn report(self) -> (String, i32) {
         match self {
             Outcome::Detached => ("detached".to_string(), 0),
@@ -182,7 +195,6 @@ impl Outcome {
     }
 }
 
-/// What a batch of keys asks for.
 enum Keys {
     Send(Vec<u8>),
     Detach,
@@ -202,9 +214,6 @@ impl Shell {
         }
     }
 
-    /// Output goes straight to the outer terminal while its size equals
-    /// the session's; otherwise the screen is repainted from the engine.
-    /// The engine's handler expects answers only in passthrough.
     fn passthrough(&mut self) -> bool {
         let outer = self.outer;
         match self.attachment.term() {
@@ -217,9 +226,6 @@ impl Shell {
         }
     }
 
-    /// Paints the screen (never the history) clipped to the outer
-    /// terminal: the bottom rows, or when the cursor is above them the
-    /// rows ending at the cursor.
     fn paint(&mut self) {
         self.repaint_at = None;
         let outer = self.outer;
@@ -227,35 +233,34 @@ impl Shell {
             return;
         };
         let (cols, rows) = (term.cols(), term.rows());
-        let (cursor_col, cursor_row) = term.cursor();
+        let cursor = term.cursor();
         let clip = (outer.cols.min(cols), outer.rows.min(rows));
-        let from_row = clip_window(rows, clip.1, cursor_row);
+        let screen_row = clip_window(rows, clip.1, cursor.row);
         let painted = formatter::format(
             term,
             formatter::Options {
-                format: Format::Vt,
-                cursor: true,
-                style: true,
-                hyperlink: true,
-                modes: true,
-                keyboard: true,
+                format: Format::Vt(VtExtras {
+                    cursor: true,
+                    style: true,
+                    hyperlink: true,
+                    modes: true,
+                    keyboard: true,
+                }),
                 region: Region::Clip {
-                    from_row,
+                    screen_row,
                     cols: clip.0,
                     rows: clip.1,
                 },
                 ..Default::default()
             },
         );
-        let visible = term.mode(25).unwrap_or(true) && cursor_col < clip.0;
-        let mut out = [HIDE_CURSOR, RESET_MODES, b"\x1b[H\x1b[2J"].concat();
+        let visible = term.mode(25).unwrap_or(true) && cursor.col < clip.0;
+        let mut out = [HIDE_CURSOR, &RESET_MODES.concat(), b"\x1b[H\x1b[2J"].concat();
         if let Ok(painted) = painted {
             out.extend_from_slice(&painted);
         }
-        // The formatter places the cursor where the session has it; the
-        // clip moves it.
         out.extend_from_slice(
-            format!("\x1b[{};{}H", cursor_row - from_row + 1, cursor_col + 1).as_bytes(),
+            format!("\x1b[{};{}H", cursor.row - screen_row + 1, cursor.col + 1).as_bytes(),
         );
         if visible {
             out.extend_from_slice(SHOW_CURSOR);
@@ -268,9 +273,6 @@ impl Shell {
             Action::Screen => {
                 self.passthrough();
                 self.paint();
-                // A session whose stream ended sends no EXITED. A running
-                // one may carry its child's exit while a descendant holds
-                // the PTY; its EXITED comes with the end of the stream.
                 match self.attachment.session.as_ref() {
                     Some(s) if s.status == proto::Status::Restored => {
                         return Some(Outcome::Restored);
@@ -296,35 +298,28 @@ impl Shell {
             }
             Action::Gap(_) => {}
             Action::Exited(exit) => {
-                // The final output may still be waiting for its repaint.
                 if self.repaint_at.is_some() {
                     self.paint();
                 }
                 return Some(Outcome::Exited(exit));
             }
             Action::Closed(closed) => return Some(Outcome::Closed(closed)),
-            Action::Error(error) => {
-                if self.attachment.ended() {
-                    if error.code == proto::ErrorCode::TooSlow {
-                        self.reopen = true;
-                        return None;
-                    }
-                    return Some(Outcome::Failed(Error::Server(error).to_string()));
-                }
-                write_out(b"\x07");
-            }
+            Action::Refused(_) => write_out(b"\x07"),
+            Action::Ended(error) if error.code == proto::ErrorCode::TooSlow => self.reopen = true,
+            Action::Ended(error) => return Some(Outcome::Failed(Error::Server(error).to_string())),
         }
         None
     }
 
     fn is_prefix(&self, unit: &[u8]) -> bool {
         unit == [self.opts.detach_key]
-            || vt::kitty_key(unit) == Some((kitty_codepoint(self.opts.detach_key), KITTY_CTRL))
+            || vt::kitty_key(unit)
+                == Some(vt::KittyKey {
+                    code: kitty_codepoint(self.opts.detach_key),
+                    mods: KITTY_CTRL,
+                })
     }
 
-    /// Takes the whole keys from `pending` (all of it with `flush`), drops
-    /// the outer terminal's answers to forwarded queries, and handles the
-    /// detach prefix.
     fn keys(&mut self, flush: bool) -> Keys {
         let strings = self
             .attachment
@@ -336,8 +331,6 @@ impl Shell {
             vt::complete_prefix(&self.pending, strings)
         };
         let bytes: Vec<u8> = self.pending.drain(..complete).collect();
-        // The wait for the rest of a sequence starts once, with its first
-        // byte.
         self.keys_at = if self.pending.is_empty() {
             None
         } else {
@@ -359,14 +352,18 @@ impl Shell {
             pos += len;
             match self.armed.take() {
                 Some(mut prefix) => {
-                    // A release (the prefix's own, or a modifier's, when the
-                    // program asked for them) is not the next key.
                     if vt::kitty_release(unit) {
                         prefix.extend_from_slice(unit);
                         self.armed = Some(prefix);
                         continue;
                     }
-                    if unit == b"d" || vt::kitty_key(unit) == Some((u32::from(b'd'), 0)) {
+                    if unit == b"d"
+                        || vt::kitty_key(unit)
+                            == Some(vt::KittyKey {
+                                code: u32::from(b'd'),
+                                mods: 0,
+                            })
+                    {
                         return Keys::Detach;
                     }
                     if !self.is_prefix(unit) {
@@ -384,8 +381,6 @@ impl Shell {
 
 type Connecting = Pin<Box<dyn Future<Output = Result<Connection, Error>> + Send>>;
 
-/// Retries with backoff while the server is unreachable; a server that
-/// answers and refuses the handshake ends the attachment.
 fn reconnect(endpoint: Endpoint) -> Connecting {
     Box::pin(async move {
         let mut backoff = Duration::from_millis(250);
@@ -401,7 +396,6 @@ fn reconnect(endpoint: Endpoint) -> Connecting {
     })
 }
 
-/// The connection and the channel's frames, or the reconnect in progress.
 enum Link {
     Up {
         conn: Box<Connection>,
@@ -412,10 +406,8 @@ enum Link {
 
 enum LinkEvent {
     Frame(Frame),
-    /// The connection ended, for this reason.
     Lost(Option<Error>),
     Connected(Box<Connection>),
-    /// The server answered a reconnect and refused the handshake.
     Refused(Error),
 }
 
@@ -448,8 +440,6 @@ fn open(shell: &mut Shell, conn: &Connection) -> Result<client::Receiver<Frame>,
     )
 }
 
-/// Attaches over `conn`, reconnecting to the endpoint when it is lost,
-/// and returns the exit status.
 pub async fn run(opts: Options, conn: Connection) -> Result<i32, Error> {
     let raw = Raw::enter()?;
     let mut shell = Shell::new(opts, outer_size());
@@ -479,24 +469,16 @@ pub async fn run(opts: Options, conn: Connection) -> Result<i32, Error> {
                                 break outcome;
                             }
                         }
-                        // A lost place in the stream is recovered by a fresh
-                        // OPEN, as the protocol says; any other fault would
-                        // only repeat.
                         Err(Error::Desync(_)) => shell.reopen = true,
                         Err(err) => break Outcome::Failed(err.to_string()),
                     }
                     if shell.reopen {
-                        // Afresh, on a new connection: the attachment's
-                        // state is not to be trusted, and a new OPEN
-                        // after CLOSE needs the CLOSED first anyway.
                         shell.reopen = false;
                         shell.attachment = Attachment::new();
                         link = Link::Down(reconnect(shell.opts.endpoint.clone()));
                     }
                     continue;
                 }
-                // A server fault would only repeat; a broken stream is
-                // reconnected.
                 LinkEvent::Lost(Some(err @ (Error::Server(_) | Error::Protocol(_)))) => {
                     break Outcome::Failed(err.to_string());
                 }
@@ -506,7 +488,6 @@ pub async fn run(opts: Options, conn: Connection) -> Result<i32, Error> {
                 }
                 LinkEvent::Refused(err) => break Outcome::Failed(err.to_string()),
                 LinkEvent::Connected(conn) => {
-                    // A `snapshot` answer repaints; `resume` continues.
                     link = match open(&mut shell, &conn) {
                         Ok(frames) => Link::Up { conn, frames },
                         Err(_) => Link::Down(reconnect(shell.opts.endpoint.clone())),
@@ -531,8 +512,6 @@ pub async fn run(opts: Options, conn: Connection) -> Result<i32, Error> {
                 if let (false, Link::Up { conn, .. }) = (shell.opts.read_only, &link) {
                     let _ = conn.send_json(FrameType::Viewport, CHANNEL, &Viewport { size: shell.outer, profile: None });
                 }
-                // Painted even when the sizes now match: the screen must
-                // be whole before passthrough continues on it.
                 shell.passthrough();
                 shell.paint();
                 continue;
@@ -548,13 +527,12 @@ pub async fn run(opts: Options, conn: Connection) -> Result<i32, Error> {
                 if let (false, false, Link::Up { conn, .. }) =
                     (bytes.is_empty(), shell.opts.read_only, &link)
                 {
-                    // A failure here shows as the end of the frames.
                     let _ = conn.send(FrameType::Input, CHANNEL, &bytes);
                 }
             }
         }
     };
-    write_out(&[RESET_MODES, SHOW_CURSOR].concat());
+    write_out(&[&RESET_MODES.concat(), SHOW_CURSOR].concat());
     drop(raw);
     let (message, code) = outcome.report();
     eprintln!("\r\n[clankermux: {message}]");
@@ -610,19 +588,16 @@ mod tests {
             "ctrl+\\ under kitty arms"
         );
         assert_eq!(feed(&mut s, b"\x1b[100u"), None, "kitty d detaches");
-        // With release events reported, the prefix's release comes first.
         let mut s = shell(0x1c);
         assert_eq!(feed(&mut s, b"\x1b[92;5u"), Some(vec![]));
         assert_eq!(feed(&mut s, b"\x1b[92;5:3u"), Some(vec![]), "still armed");
         assert_eq!(feed(&mut s, b"\x1b[100u"), None);
-        // Not `d`: the prefix, its release and the key all go through.
         let mut s = shell(0x1c);
         assert_eq!(feed(&mut s, b"\x1b[92;5u\x1b[92;5:3u"), Some(vec![]));
         assert_eq!(
             feed(&mut s, b"\x1b[120u"),
             Some(b"\x1b[92;5u\x1b[92;5:3u\x1b[120u".to_vec())
         );
-        // Caps lock set, and `d` with an empty modifier field.
         let mut s = shell(0x1c);
         assert_eq!(feed(&mut s, b"\x1b[92;69u"), Some(vec![]));
         assert_eq!(feed(&mut s, b"\x1b[100;;100u"), None);

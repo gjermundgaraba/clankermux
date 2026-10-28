@@ -1,4 +1,3 @@
-// Bundles the page and its worker into dist/, with the wasm and the page.
 import { copyFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 

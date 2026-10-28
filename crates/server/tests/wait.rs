@@ -1,16 +1,9 @@
-//! `send` with text, keys, paste and a wait; `wait`; `cancel`
-//! (PROTOCOL.md, Control).
-
-mod common;
-
 use std::time::Duration;
 
-use common::*;
 use proto::*;
 use serde_json::{Value, json};
+use testkit::*;
 
-/// A session that prints `setup` (escape sequences that set modes), then
-/// `ready`, then the next `count` bytes it reads, as hex.
 async fn byte_reader(c: &mut Client, setup: &str, count: usize) -> Session {
     let script = format!(
         "stty raw -echo; printf '%s' \"$SETUP\"; printf 'ready\\r\\n'; \
@@ -23,7 +16,6 @@ async fn byte_reader(c: &mut Client, setup: &str, count: usize) -> Session {
     s
 }
 
-/// The bytes a `send` with `params` writes, as the program read them.
 async fn written(c: &mut Client, setup: &str, count: usize, params: Value) -> String {
     let s = byte_reader(c, setup, count).await;
     let mut params = params;
@@ -39,7 +31,6 @@ async fn written(c: &mut Client, setup: &str, count: usize, params: Value) -> St
 async fn keys_are_encoded_by_the_session_terminal_modes() {
     let server = start(fast_limits());
     let mut c = client(&server).await;
-    // Cursor keys: normal, then application mode (DECCKM).
     assert_eq!(
         written(&mut c, "", 3, json!({"keys": ["up"]})).await,
         "1b 5b 41"
@@ -48,7 +39,6 @@ async fn keys_are_encoded_by_the_session_terminal_modes() {
         written(&mut c, "\x1b[?1h", 3, json!({"keys": ["up"]})).await,
         "1b 4f 41"
     );
-    // Kitty keyboard, disambiguate: ctrl+c is CSI 99;5u.
     assert_eq!(
         written(&mut c, "\x1b[>1u", 7, json!({"keys": ["ctrl+c"]})).await,
         "1b 5b 39 39 3b 35 75"
@@ -112,14 +102,12 @@ async fn a_paste_is_bracketed_only_when_the_program_asked() {
         .await,
         "1b 5b 32 30 30 7e 61 0a 62 1b 5b 32 30 31 7e"
     );
-    // Without paste, text goes as typed, bracket or not.
     assert_eq!(
         written(&mut c, "\x1b[?2004h", 3, json!({"text": "a\nb"})).await,
         "61 0a 62"
     );
 }
 
-/// `wait` and its reply.
 async fn wait(c: &mut Client, params: Value) -> Waited {
     serde_json::from_value(c.ok("wait", params).await).unwrap()
 }
@@ -129,7 +117,6 @@ async fn each_until_fires() {
     let server = start(fast_limits());
     let mut c = client(&server).await;
 
-    // exited, with the exit.
     let s = c
         .create(json!({"argv": ["/bin/sh", "-c", "sleep 0.3; exit 3"], "on_exit": "keep"}))
         .await;
@@ -141,7 +128,6 @@ async fn each_until_fires() {
     let ended = c.inspect(&s.id).await;
     assert_eq!((w.at.offset, w.at.marker), (ended.offset, ended.marker));
 
-    // output, text and regex, escape sequences aside.
     let s = c
         .create(json!({"argv": ["/bin/sh", "-c",
                                  "sleep 0.3; printf 'one \\033[31mtwo\\033[m three\\r\\n'; exec cat"]}))
@@ -154,7 +140,6 @@ async fn each_until_fires() {
     assert_eq!(w.reason, WaitReason::Matched);
     let m = w.matched.unwrap();
     assert_eq!(m.text, "two three");
-    // "one " is 4 bytes, then the 5-byte colour.
     assert_eq!(m.offset, 9);
     assert_eq!(w.at.offset, 9 + 3 + 3 + 6);
     let w = wait(
@@ -164,7 +149,6 @@ async fn each_until_fires() {
     .await;
     assert_eq!(w.matched.unwrap().text, "one two");
 
-    // status, by state and by record.
     let s = c
         .create(json!({"argv": ["/bin/sh", "-c",
             "sleep 0.3; printf '\\033]7501;state=working:id=a\\033\\\\'; sleep 0.2; printf '\\033]7501;state=done:id=b\\033\\\\'; exec cat"]}))
@@ -183,7 +167,6 @@ async fn each_until_fires() {
     .await;
     assert_eq!(w.record.unwrap().state, "working", "already holds: at once");
 
-    // prompt: the next OSC 133 A.
     let s = c
         .create(json!({"argv": ["/bin/sh", "-c",
             "printf 'before\\r\\n'; sleep 0.4; printf '\\033]133;A\\007$ '; exec cat"]}))
@@ -193,7 +176,6 @@ async fn each_until_fires() {
     assert_eq!(w.reason, WaitReason::Prompt);
     let now = c.inspect(&s.id).await;
     assert!(w.at.offset > 8 && w.at.offset <= now.offset, "{w:?}");
-    // From before it, it already holds.
     let w = wait(
         &mut c,
         json!({"session": s.id, "until": {"prompt": true}, "after": {"offset": 0, "marker": 0}}),
@@ -201,7 +183,6 @@ async fn each_until_fires() {
     .await;
     assert_eq!(w.reason, WaitReason::Prompt);
 
-    // quiet, and timeout as a result.
     let s = c
         .create(json!({"argv": ["/bin/sh", "-c", "printf a; sleep 0.3; printf b; exec cat"]}))
         .await;
@@ -273,7 +254,6 @@ async fn facts_that_already_hold_fire_at_once_and_an_ended_stream_is_not_running
 async fn send_with_a_wait_catches_what_the_program_prints_at_once() {
     let server = start(fast_limits());
     let mut c = client(&server).await;
-    // The terminal echoes the text as soon as it is written.
     for _ in 0..20 {
         let s = c.create(json!({"argv": ["/bin/cat"]})).await;
         let sent: Sent = serde_json::from_value(
@@ -288,10 +268,8 @@ async fn send_with_a_wait_catches_what_the_program_prints_at_once() {
         let waited = sent.wait.clone().unwrap();
         assert_eq!(waited.reason, WaitReason::Matched);
         assert_eq!(waited.matched.unwrap().offset, 0);
-        // The cursor when the text was queued, before the echo.
         assert_eq!(sent.at.offset, 0, "{sent:?}");
     }
-    // A plain send replies with its cursor.
     let s = c.create(json!({"argv": ["/bin/cat"]})).await;
     let sent: Sent =
         serde_json::from_value(c.ok("send", json!({"session": s.id, "text": "x"})).await).unwrap();
@@ -302,7 +280,6 @@ async fn send_with_a_wait_catches_what_the_program_prints_at_once() {
 async fn a_send_waits_for_a_status_set_after_it() {
     let server = start(fast_limits());
     let mut c = client(&server).await;
-    // `done` from the turn before, then a new turn on each line read.
     let s = c
         .create(json!({"argv": ["/bin/sh", "-c",
             "printf '\\033]7501;state=done:id=a\\033\\\\'; read x; \
@@ -347,8 +324,6 @@ async fn cancel_ends_a_wait_and_its_reply_comes_last() {
                  "wait": {"until": {"output": {"text": "never"}}}}}),
     )
     .await;
-    // Other requests are served meanwhile, a send to the same session
-    // too.
     c.list().await;
     c.inspect(&s.id).await;
     let sent: Sent =
@@ -379,8 +354,6 @@ async fn cancel_ends_a_wait_and_its_reply_comes_last() {
         c.ok("cancel", json!({"id": 9999})).await,
         json!({"cancelled": false})
     );
-    // Nothing else arrives for them: the session ends and nothing fires.
-    // Subscribed first: an exit before the subscription is not replayed.
     c.ok("subscribe", json!({})).await;
     c.ok("end", json!({"session": s.id})).await;
     c.wait_exit(&s.id).await;

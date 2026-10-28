@@ -1,5 +1,3 @@
-/** The page side of a terminal: canvas, keyboard, paste and resize, with
- * the engine in the client's worker. */
 import type { CellPoint, PackedFrame } from "../engine/index.ts";
 import type { Scheme, Size } from "../proto/index.ts";
 import { CanvasRenderer, type Metrics } from "../renderer/index.ts";
@@ -84,18 +82,14 @@ export interface Terminal {
   onCopy(listener: (copy: Copy) => void): () => void;
 }
 
-/** The client's side of a terminal: its messages to the worker, and
- * word that it is disposed. */
 export interface MountHost {
   send(message: ToWorker): void;
   disposed(): void;
 }
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
-/** A message for one terminal, without its number. */
 export type ToMount = DistributiveOmit<Extract<ToWorker, { mount: number }>, "mount">;
 
-/** Cell metrics from the font. */
 function measure(font: string): Metrics {
   const ctx = document.createElement("canvas").getContext("2d")!;
   ctx.font = font;
@@ -114,8 +108,10 @@ function measure(font: string): Metrics {
   };
 }
 
-/** Mounts a terminal as `id` of the client `host` serves, and the
- * handler of the worker's messages for it. */
+function isCopyChord(e: KeyboardEvent): boolean {
+  return e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === "KeyC";
+}
+
 export function mountOn(
   host: MountHost,
   id: number,
@@ -141,10 +137,8 @@ export function mountOn(
     };
   }
 
-  /** The canvas backing store for the grid at the current pixel ratio;
-   * the next frame is drawn in full after a change. */
   let grid = { cols: 0, rows: 0, dpr: 0 };
-  let fullNext = false;
+  let backingStoreReset = false;
   function fitCanvas(cols: number, rows: number): void {
     const scale = dpr();
     if (grid.cols === cols && grid.rows === rows && grid.dpr === scale) return;
@@ -155,10 +149,9 @@ export function mountOn(
     canvas.style.height = `${rows * metrics.cellHeight}px`;
     ctx.setTransform(scale, 0, 0, scale, 0, 0);
     ctx.textBaseline = "alphabetic";
-    fullNext = true;
+    backingStoreReset = true;
   }
 
-  /** The keyboard layout, when the browser exposes it (Chromium does). */
   const keyboard: Keyboard = { layout: undefined, mac: /Mac|iPhone|iPad/.test(navigator.platform) };
   (navigator as { keyboard?: { getLayoutMap(): Promise<ReadonlyMap<string, string>> } }).keyboard
     ?.getLayoutMap()
@@ -173,29 +166,14 @@ export function mountOn(
   const scrolls = new Listeners<number>();
   const statuses = new Listeners<string>();
 
-  const copies = new Set<(copy: Copy) => void>();
+  const copies = new Listeners<Copy>("isolateErrors");
 
-  /** The selection's text, for a copy. */
   let selected: string | undefined;
   const copier = new Copier({
     clipboard: () => navigator.clipboard,
     item: typeof ClipboardItem === "undefined" ? undefined : (text) => new ClipboardItem({ "text/plain": text }),
-    // Told from a promise's callback: a listener's throw is reported as
-    // a listener's throw is elsewhere, and the rest are told.
-    report: (copy) => {
-      for (const listener of copies) {
-        try {
-          listener(copy);
-        } catch (err) {
-          queueMicrotask(() => {
-            throw err;
-          });
-        }
-      }
-    },
+    report: (copy) => copies.emit(copy),
   });
-  /** Rows the view is scrolled back, as `onScroll` last reported;
-   * undefined before the first frame. */
   let scrolled: number | undefined;
   const visible = () => document.visibilityState === "visible";
   let pendingFrame: PackedFrame | undefined;
@@ -207,11 +185,10 @@ export function mountOn(
     if (!frame || disposed) return;
     if (visible()) {
       fitCanvas(frame.cols, frame.rows);
-      if (fullNext && !frame.full) {
-        // The backing store was recreated; a partial frame cannot fill it.
+      if (backingStoreReset && !frame.full) {
         send({ type: "repaint" });
       } else {
-        fullNext = false;
+        backingStoreReset = false;
         renderer.draw(frame);
       }
     }
@@ -251,8 +228,6 @@ export function mountOn(
     }
   };
 
-  /** Where the input element goes for a composition: the cursor's cell,
-   * as the latest frame that had the cursor in view placed it. */
   let cursorAt = { x: 0, y: 0 };
   // An input method composes only into an editable element: a textarea
   // after the canvas takes the focus, invisible but at the cursor so the
@@ -282,10 +257,7 @@ export function mountOn(
     caretColor: "transparent",
   });
   canvas.after(input);
-  /** Moves the input element to the cursor, and shows it while composing. */
   function placeInput(composing: boolean): void {
-    // Its position is against its containing block: a positioned
-    // ancestor, or else the document.
     const cell = canvas.getBoundingClientRect();
     const parent = input.offsetParent;
     let left = cell.left + window.scrollX;
@@ -311,8 +283,6 @@ export function mountOn(
     });
   }
   canvas.addEventListener("focus", () => input.focus({ preventScroll: true }), { signal });
-  // Whether the terminal has the keyboard and its window the focus, for
-  // `ackOnFocus`.
   let focused = false;
   const watchFocus = () => {
     const now = document.activeElement === input && document.hasFocus();
@@ -330,9 +300,7 @@ export function mountOn(
   input.addEventListener(
     "keydown",
     (e) => {
-      // Ctrl+Shift+C copies a selection, where Ctrl+C is the terminal's;
-      // without one it is a key.
-      if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === "KeyC" && selected) {
+      if (isCopyChord(e) && selected) {
         copier.write(selected, "keys");
         e.preventDefault();
         return;
@@ -342,8 +310,6 @@ export function mountOn(
         send({ type: "key", input: key });
         e.preventDefault();
       } else if (composing(e)) {
-        // At the cursor before the input method opens its window; shown
-        // once a composition starts.
         placeInput(false);
       }
     },
@@ -377,7 +343,6 @@ export function mountOn(
       const what = typing.compositionend(e.data);
       if (what) typed(what);
       placeInput(false);
-      // Emptied once the composition has left it.
       setTimeout(() => (input.value = ""));
     },
     { signal },
@@ -398,7 +363,6 @@ export function mountOn(
     },
     { signal },
   );
-  // The browser's copy (Cmd+C, Ctrl+C in a menu) copies the selection.
   // WebKit offers Copy on an empty textarea only when `beforecopy` is
   // cancelled.
   input.addEventListener(
@@ -419,7 +383,6 @@ export function mountOn(
     { signal },
   );
 
-  /** The pointer in cells of the grid, fractions included, kept inside it. */
   function cellAt(e: MouseEvent): CellPoint {
     const rect = canvas.getBoundingClientRect();
     const inside = (value: number, cells: number) => Math.min(Math.max(value, 0), Math.max(cells - 0.01, 0));
@@ -428,10 +391,6 @@ export function mountOn(
       y: inside((e.clientY - rect.top) / metrics.cellHeight, grid.rows),
     };
   }
-  // Selection: press, drag (once a frame) and release, followed outside
-  // the canvas until the button is up. A release the page never saw (the
-  // button let go over another window) ends the drag at the next move or
-  // press.
   let endDrag: ((at: CellPoint, time: number) => void) | undefined;
   canvas.addEventListener(
     "mousedown",
@@ -470,8 +429,6 @@ export function mountOn(
     },
     { signal },
   );
-  // The wheel scrolls the history in whole rows; what a trackpad sends in
-  // pixels adds up until it makes one. Ctrl+wheel stays the browser's zoom.
   let wheeled = 0;
   canvas.addEventListener(
     "wheel",
@@ -493,47 +450,37 @@ export function mountOn(
     { passive: false, signal },
   );
 
-  /** The profile last reported, to tell when it changed. */
   let reported = "";
   const profile = () => {
     const current = profileFrom(colors(), scheme());
     reported = JSON.stringify(current);
     return current;
   };
-  /** Whether the user is looking at this page: it is visible and its
-   * window has the focus. Only then does the session get its size, so
-   * of several clients the one in use sets it. */
   const active = () => visible() && document.hasFocus();
   const report = () => send({ type: "viewport", size: viewport(), profile: profile(), active: active() });
   const resizes = new ResizeObserver(report);
   resizes.observe(container);
   light.addEventListener("change", report, { signal });
-  // Shown or focused: the session takes this page's size again; hidden or
-  // blurred: the worker stops reporting.
+  const releaseFrameWhileHidden = () => {
+    if (visible() || !pendingFrame) return;
+    cancelAnimationFrame(paintRequest);
+    paintRequest = 0;
+    pendingFrame = undefined;
+    send({ type: "painted" });
+  };
   document.addEventListener("visibilitychange", () => {
     send({ type: "visibility", visible: visible() });
-    if (!visible() && pendingFrame) {
-      cancelAnimationFrame(paintRequest);
-      paintRequest = 0;
-      pendingFrame = undefined;
-      // Hidden documents may never get another animation callback. Release
-      // the frame after hiding the worker; showing requests a full refresh.
-      send({ type: "painted" });
-    }
+    releaseFrameWhileHidden();
     report();
   }, { signal });
   window.addEventListener("focus", report, { signal });
   window.addEventListener("blur", report, { signal });
-  // A page pins its scheme (and its colours with it) with an attribute or
-  // a class on the canvas or an ancestor, which no event announces.
   const restyles = new MutationObserver(() => {
     if (JSON.stringify(profileFrom(colors(), scheme())) !== reported) report();
   });
   for (let element: Element | null = canvas; element; element = element.parentElement) {
     restyles.observe(element, { attributes: true });
   }
-  // Zoom or a move to another screen changes the pixel ratio: the canvas
-  // is refitted on the next frame; the cell size in pixels is re-reported.
   const watchRatio = () => {
     matchMedia(`(resolution: ${dpr()}dppx)`).addEventListener(
       "change",
@@ -591,10 +538,7 @@ export function mountOn(
     onLink: (listener) => links.add(listener),
     onScroll: (listener) => scrolls.add(listener),
     onStatus: (listener) => statuses.add(listener),
-    onCopy: (listener) => {
-      copies.add(listener);
-      return () => void copies.delete(listener);
-    },
+    onCopy: (listener) => copies.add(listener),
   };
   return { terminal, receive };
 }
