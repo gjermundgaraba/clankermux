@@ -560,6 +560,40 @@ test("a retryable OPEN error backs off, and a detach during the backoff sends no
   expect(server.bodies(FrameType.Open)).toHaveLength(1);
 });
 
+test("an unretryable OPEN error opens nothing more, even after a reconnect", async () => {
+  const worker = await start();
+  worker.mount(1, "nosuchid");
+  const server = await socket(0);
+  await server.serve([]);
+  server.push(FrameType.Error, await server.opened("nosuchid"), { code: "no_such_session", message: "no session nosuchid" });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  expect(server.bodies(FrameType.Open)).toHaveLength(1);
+
+  server.close();
+  const next = await socket(1);
+  await next.serve([]);
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: undefined }));
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  expect(next.bodies(FrameType.Open)).toEqual([]);
+});
+
+test("a detach while the connection is down opens nothing when it comes back", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  bootstrap(server, await server.opened("s"), session("s"));
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+
+  server.close();
+  worker.to(1, { type: "detach" });
+  const next = await socket(1);
+  await next.serve([session("s")]);
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: undefined }));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(next.bodies(FrameType.Open)).toEqual([]);
+});
+
 test("only a page in use reports its size: OPEN and VIEWPORT carry none until it is active", async () => {
   const worker = await start();
   worker.mount(1, "s", { active: false });
