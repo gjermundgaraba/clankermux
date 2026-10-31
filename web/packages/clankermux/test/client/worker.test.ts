@@ -523,6 +523,43 @@ test("the link: detached by another client, for good", async () => {
   expect(next.bodies(FrameType.Open)).toEqual([]);
 });
 
+test("a desync reopens after the backoff on a fresh channel and attaches again", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const first = await server.opened("s");
+  bootstrap(server, first, session("s"));
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+  server.pushRaw(encodeFrame(FrameType.Output, first, output(3, "x")));
+  expect(worker.links().at(-1)).toEqual({ state: "ended", reason: "error", message: "OUTPUT at 3, expected 0", retry: true });
+  expect(server.sent.some((f) => f.header.type === FrameType.Close && f.header.channel === first)).toBe(true);
+  expect(server.bodies(FrameType.Open)).toHaveLength(1);
+
+  await vi.waitFor(() => expect(server.bodies(FrameType.Open)).toHaveLength(2));
+  const reopened = server.bodies(FrameType.Open).at(-1)!;
+  expect(reopened.channel).not.toBe(first);
+  expect(reopened.body).toEqual({ session: "s", viewport: { cols: 80, rows: 24 }, profile: {} });
+  bootstrap(server, reopened.channel, session("s"), "again");
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+  expect(worker.screens().at(-1)).toBe("attached");
+});
+
+test("a retryable OPEN error backs off, and a detach during the backoff sends no further OPEN", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  server.push(FrameType.Error, await server.opened("s"), { code: "internal", message: "try later" });
+  expect(worker.links().at(-1)).toEqual({ state: "ended", reason: "error", code: "internal", message: "try later", retry: true });
+  expect(worker.screens().at(-1)).toBe("internal: try later");
+
+  worker.to(1, { type: "detach" });
+  expect(worker.links().at(-1)).toEqual({ state: "connected", session: undefined });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  expect(server.bodies(FrameType.Open)).toHaveLength(1);
+});
+
 test("only a page in use reports its size: OPEN and VIEWPORT carry none until it is active", async () => {
   const worker = await start();
   worker.mount(1, "s", { active: false });
