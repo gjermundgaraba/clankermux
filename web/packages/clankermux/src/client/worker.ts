@@ -505,6 +505,8 @@ class Mount {
     const prev = this.snapshot;
     const [next] = mountMachine.transition(prev, event);
     if (next === prev) return;
+    const link = linkOf(next);
+    if (link?.state === "ended") this.link(link);
     const { attachment } = prev.context;
     if (attachment && attachment !== next.context.attachment) this.close(attachment, lineOf(prev));
     if (prev.value === "backoff") clearTimeout(this.reopenTimer);
@@ -513,9 +515,8 @@ class Mount {
     if (next.value === "backoff") {
       this.reopenTimer = setTimeout(() => this.step({ type: "reopen.due", open: this.offerIfLive() }), this.backoff.next());
     }
-    const link = linkOf(next);
-    if (!link) return;
-    if (link.state === "connected" && link.session === undefined) this.status("no session");
+    if (link?.state !== "connected") return;
+    if (link.session === undefined) this.status("no session");
     this.link(link);
   }
 

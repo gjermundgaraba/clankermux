@@ -654,6 +654,34 @@ test("a colour change while the connection reconnects repaints the screen", asyn
   expect(next.bodies(FrameType.Viewport)).toEqual([]);
 });
 
+test.each([
+  ["CLOSED removed", (server: FakeSocket, channel: number) => server.push(FrameType.Closed, channel, { reason: "removed" }), "closed: removed"],
+  ["a desync", (server: FakeSocket, channel: number) => server.pushRaw(encodeFrame(FrameType.Output, channel, output(3, "x"))), "ClientError: OUTPUT at 3, expected 0"],
+  ["an ending ERROR", (server: FakeSocket, channel: number) => server.push(FrameType.Error, channel, { code: "internal", message: "later" }), "internal: later"],
+])("%s while text is selected posts its status, then the ended link, then clears the selection", async (_, end, status) => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const channel = await server.opened("s");
+  bootstrap(server, channel, session("s"), "one two");
+  await vi.waitFor(() => expect(worker.scrollbar()).toBeDefined());
+  worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0 }, time: 0 });
+  worker.to(1, { type: "select", action: "drag", at: { x: 3, y: 0 }, time: 1 });
+  worker.to(1, { type: "select", action: "release", at: { x: 3, y: 0 }, time: 2, copy: 1 });
+  expect(worker.selections().at(-1)?.text).toBe("one");
+
+  const before = worker.posted.length;
+  end(server, channel);
+  const link = worker.links().at(-1);
+  expect(link?.state).toBe("ended");
+  expect(worker.posted.slice(before).filter((m) => m.type === "status" || m.type === "link" || m.type === "selection")).toEqual<ToPage[]>([
+    { type: "status", mount: 1, text: status },
+    { type: "link", mount: 1, link: link! },
+    { type: "selection", mount: 1, text: undefined },
+  ]);
+});
+
 test("only a page in use reports its size: OPEN and VIEWPORT carry none until it is active", async () => {
   const worker = await start();
   worker.mount(1, "s", { active: false });
