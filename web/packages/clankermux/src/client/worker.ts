@@ -732,17 +732,13 @@ class Mount {
 
   private sendInput(bytes: Uint8Array): void {
     const line = lineOf(this.snapshot);
-    if (!line) return;
-    this.queueInput(bytes, line, async () => {
-      line.conn.send(FrameType.Input, line.channel, bytes);
-    });
+    this.queueInput(bytes, line && (async () => line.conn.send(FrameType.Input, line.channel, bytes)));
   }
 
   private sendPaste(bytes: Uint8Array): void {
-    const { conn } = this.hub;
-    const { session, attachment } = this.snapshot.context;
-    if (!conn || session === undefined || !attachment) return;
-    this.queueInput(bytes, { conn, attachment }, async () => {
+    const { session } = this.snapshot.context;
+    if (session === undefined) return;
+    this.queueInput(bytes, async (conn) => {
       const chunk = pasteChunkSize(conn.welcome.limits);
       for (let at = 0; at < bytes.length; at += chunk) {
         await conn.call("send", { session, data: base64(bytes.subarray(at, at + chunk)) });
@@ -750,22 +746,21 @@ class Mount {
     });
   }
 
-  private queueInput(
-    bytes: Uint8Array,
-    target: { conn: Connection; attachment: Attachment },
-    deliver: () => Promise<void>,
-  ): void {
-    if (bytes.length === 0 || this.readOnly || target.attachment.ended()) return;
+  private queueInput(bytes: Uint8Array, deliver: ((conn: Connection) => Promise<void>) | undefined): void {
+    const { conn } = this.hub;
+    const { attachment } = this;
+    if (bytes.length === 0 || this.readOnly || !conn || !attachment || attachment.ended()) return;
     this.claim();
     this.backToLive();
     this.unselect();
+    if (!deliver) return;
     this.inputQueue.enqueueUnlessDetached(
-      () => this.attachment === target.attachment,
+      () => this.attachment === attachment,
       async () => {
         try {
-          await deliver();
+          await deliver(conn);
         } catch (err) {
-          if (target.conn === this.hub.conn) this.status(String(err));
+          if (conn === this.hub.conn) this.status(String(err));
         }
       },
     );
@@ -835,11 +830,12 @@ class Mount {
     this.viewport = size;
     this.profile = profile;
     this.active = active;
-    const line = lineOf(this.snapshot);
-    if (!line || line.attachment.ended()) return;
-    this.applyProfile(line.attachment.term());
+    const { attachment } = this;
+    if (!this.hub.conn || !attachment || attachment.ended()) return;
+    this.applyProfile(attachment.term());
     this.paint();
-    if (active) this.report(line);
+    const line = lineOf(this.snapshot);
+    if (active && line) this.report(line);
   }
 
   private report({ conn, channel }: Line): void {

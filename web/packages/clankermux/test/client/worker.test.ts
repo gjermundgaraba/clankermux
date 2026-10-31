@@ -610,6 +610,50 @@ test("a paste while the connection reconnects goes to its session on the new con
   expect((await next.request("send")).params).toEqual({ session: "s", data: btoa("pasted") });
 });
 
+test("a key while the connection reconnects clears the selection and goes back to the live screen", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  bootstrap(server, await server.opened("s"), session("s"), "l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6");
+  await vi.waitFor(() => expect(worker.scrollbar()).toEqual({ total: 6, offset: 3, len: 3 }));
+  worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0 }, time: 0 });
+  worker.to(1, { type: "select", action: "drag", at: { x: 2, y: 0 }, time: 1 });
+  worker.to(1, { type: "select", action: "release", at: { x: 2, y: 0 }, time: 2, copy: 1 });
+  worker.to(1, { type: "wheel", rows: -1 });
+  expect(worker.selections().map((s) => s.text)).toEqual(["l4"]);
+  expect(worker.scrollbar()).toEqual({ total: 6, offset: 2, len: 3 });
+
+  server.close();
+  const next = await socket(1);
+  await next.welcome();
+  await next.request("subscribe");
+  worker.to(1, { type: "text", text: "k" });
+  expect(worker.selections().map((s) => s.text)).toEqual(["l4", undefined]);
+  expect(worker.scrollbar()).toEqual({ total: 6, offset: 3, len: 3 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(next.sent.filter((f) => f.header.type === FrameType.Input)).toEqual([]);
+});
+
+test("a colour change while the connection reconnects repaints the screen", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  bootstrap(server, await server.opened("s"), session("s"));
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+
+  server.close();
+  const next = await socket(1);
+  await next.welcome();
+  await next.request("subscribe");
+  const before = worker.posted.length;
+  worker.to(1, { type: "viewport", size: { cols: 80, rows: 24 }, profile: { bg: "#102030" }, active: true });
+  expect(worker.posted.slice(before).map((m) => m.type)).toEqual(["frame"]);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(next.bodies(FrameType.Viewport)).toEqual([]);
+});
+
 test("only a page in use reports its size: OPEN and VIEWPORT carry none until it is active", async () => {
   const worker = await start();
   worker.mount(1, "s", { active: false });
