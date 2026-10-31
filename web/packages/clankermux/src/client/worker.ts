@@ -26,47 +26,10 @@ import {
 
 import { type Action, Attachment } from "./attachment.ts";
 import { ClientError, Connection, type ErrorKind, type Transport, hello } from "./connection.ts";
+import { type Link, type LinkEnd, endedWith } from "./link.ts";
 import { Osc52Scanner } from "./osc52.ts";
 
-/** Why the link to the session ended. `closed`: the connection closed
- * (not a `CLOSED` frame, which the worker does not wait for when it
- * detaches); `removed`, `stopping` and `detached` (another client's
- * `detach`): the server's `CLOSED`; `exited`:
- * the session's program exited; `no_such_session` and `engine_mismatch`:
- * an `OPEN` refused; `error`: any other error, the server's or the
- * client's own. */
-export type LinkEnd =
-  | "closed"
-  | "removed"
-  | "stopping"
-  | "detached"
-  | "exited"
-  | "no_such_session"
-  | "engine_mismatch"
-  | "error";
-
-/** A terminal's link to its session, through the client's connection and
- * the terminal's attachment. */
-export type Link =
-  /** Opening a connection; `attempt` counts from 1 and starts again once
-   * a server answers. */
-  | { state: "connecting"; attempt: number }
-  /** Connected, and showing `session` as `ATTACHED` described it (its
-   * `status` may be `restored` or `exited`), or attached to none. */
-  | { state: "connected"; session: Session | undefined }
-  /** The link ended. `code` and `message` are the error's, when there is
-   * one, and `message` the reason a `detach` gave; `exit` is the
-   * program's, for `exited`. `retry`: the worker
-   * reconnects or attaches again by itself, so `connecting` or
-   * `connected` follows; otherwise nothing does until the page attaches. */
-  | {
-      state: "ended";
-      reason: LinkEnd;
-      code?: ErrorCode;
-      message?: string;
-      exit?: Exit;
-      retry: boolean;
-    };
+export type { Link, LinkEnd } from "./link.ts";
 
 /** A failed request, as it crosses to the page. */
 export interface Failure {
@@ -245,13 +208,6 @@ function failureOf(err: unknown): Failure {
   return err instanceof ClientError
     ? { kind: err.kind, message: err.message, ...(err.server && { server: err.server }) }
     : { kind: "protocol", message: err instanceof Error ? err.message : String(err) };
-}
-
-function endedWith(err: unknown, retry: boolean): Link {
-  const server = err instanceof ClientError ? err.server : undefined;
-  return server
-    ? { state: "ended", reason: linkEnd(server.code), code: server.code, message: server.message, retry }
-    : { state: "ended", reason: "error", message: err instanceof Error ? err.message : String(err), retry };
 }
 
 class Hub {
