@@ -654,6 +654,31 @@ test("a colour change while the connection reconnects repaints the screen", asyn
   expect(next.bodies(FrameType.Viewport)).toEqual([]);
 });
 
+test("a page that keys in a reconnect handshake after another client took the size does not take it back after the resume", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const first = await server.opened("s");
+  bootstrap(server, first, session("s"));
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+  server.push(FrameType.Resized, first, { seq: 1, offset: 0, cols: 20, rows: 5 });
+
+  server.close();
+  const next = await socket(1);
+  await next.welcome();
+  const subscribe = await next.request("subscribe");
+  worker.to(1, { type: "key", input: key("KeyA", { key: "a" }) });
+  next.push(FrameType.Reply, 0, { id: subscribe.id, result: { oldest: 1, latest: 0, gap: false } });
+  const channel = await next.opened("s");
+  const resume = next.bodies(FrameType.Open).find((o) => o.channel === channel)!.body.resume as Record<string, number>;
+  next.push(FrameType.Attached, channel, { mode: "resume", ...resume, cols: 20, rows: 5, session: session("s") });
+  await vi.waitFor(() => expect(worker.screens().at(-1)).toBe("resumed"));
+  worker.to(1, { type: "key", input: key("KeyB", { key: "b" }) });
+  await vi.waitFor(() => expect(next.sent.filter((f) => f.header.type === FrameType.Input && f.header.channel === channel)).toHaveLength(1));
+  expect(next.bodies(FrameType.Viewport).filter((v) => v.channel === channel)).toEqual([]);
+});
+
 test.each([
   ["CLOSED removed", (server: FakeSocket, channel: number) => server.push(FrameType.Closed, channel, { reason: "removed" }), "closed: removed"],
   ["a desync", (server: FakeSocket, channel: number) => server.pushRaw(encodeFrame(FrameType.Output, channel, output(3, "x"))), "ClientError: OUTPUT at 3, expected 0"],

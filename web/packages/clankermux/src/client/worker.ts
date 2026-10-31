@@ -835,18 +835,18 @@ class Mount {
     if (!this.hub.conn || !attachment || attachment.ended()) return;
     this.applyProfile(attachment.term());
     this.paint();
-    const line = lineOf(this.snapshot);
-    if (active && line) this.report(line);
+    if (active) this.report();
   }
 
-  private report({ conn, channel }: Line): void {
+  private report(): void {
     this.sizeTakenByOtherClient = false;
-    conn.sendJson(FrameType.Viewport, channel, { ...this.viewport, profile: this.profile });
+    const line = lineOf(this.snapshot);
+    line?.conn.sendJson(FrameType.Viewport, line.channel, { ...this.viewport, profile: this.profile });
   }
 
   private claim(): void {
-    const line = lineOf(this.snapshot);
-    if (this.sizeTakenByOtherClient && this.active && line && !line.attachment.ended()) this.report(line);
+    const { attachment } = this;
+    if (this.sizeTakenByOtherClient && this.active && attachment && !attachment.ended()) this.report();
   }
 
   focus(focused: boolean): void {
