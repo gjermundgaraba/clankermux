@@ -594,6 +594,22 @@ test("a detach while the connection is down opens nothing when it comes back", a
   expect(next.bodies(FrameType.Open)).toEqual([]);
 });
 
+test("a paste while the connection reconnects goes to its session on the new connection", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  bootstrap(server, await server.opened("s"), session("s"));
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+
+  server.close();
+  const next = await socket(1);
+  await next.welcome();
+  await next.request("subscribe");
+  worker.to(1, { type: "paste", text: "pasted" });
+  expect((await next.request("send")).params).toEqual({ session: "s", data: btoa("pasted") });
+});
+
 test("only a page in use reports its size: OPEN and VIEWPORT carry none until it is active", async () => {
   const worker = await start();
   worker.mount(1, "s", { active: false });

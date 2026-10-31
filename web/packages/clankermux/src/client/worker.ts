@@ -731,13 +731,18 @@ class Mount {
   }
 
   private sendInput(bytes: Uint8Array): void {
-    this.queueInput(bytes, async ({ conn, channel }) => {
-      conn.send(FrameType.Input, channel, bytes);
+    const line = lineOf(this.snapshot);
+    if (!line) return;
+    this.queueInput(bytes, line, async () => {
+      line.conn.send(FrameType.Input, line.channel, bytes);
     });
   }
 
   private sendPaste(bytes: Uint8Array): void {
-    this.queueInput(bytes, async ({ conn, session }) => {
+    const { conn } = this.hub;
+    const { session, attachment } = this.snapshot.context;
+    if (!conn || session === undefined || !attachment) return;
+    this.queueInput(bytes, { conn, attachment }, async () => {
       const chunk = pasteChunkSize(conn.welcome.limits);
       for (let at = 0; at < bytes.length; at += chunk) {
         await conn.call("send", { session, data: base64(bytes.subarray(at, at + chunk)) });
@@ -745,19 +750,22 @@ class Mount {
     });
   }
 
-  private queueInput(bytes: Uint8Array, deliver: (line: Line) => Promise<void>): void {
-    const line = lineOf(this.snapshot);
-    if (bytes.length === 0 || this.readOnly || !line || line.attachment.ended()) return;
+  private queueInput(
+    bytes: Uint8Array,
+    target: { conn: Connection; attachment: Attachment },
+    deliver: () => Promise<void>,
+  ): void {
+    if (bytes.length === 0 || this.readOnly || target.attachment.ended()) return;
     this.claim();
     this.backToLive();
     this.unselect();
     this.inputQueue.enqueueUnlessDetached(
-      () => this.attachment === line.attachment,
+      () => this.attachment === target.attachment,
       async () => {
         try {
-          await deliver(line);
+          await deliver();
         } catch (err) {
-          if (line.conn === this.hub.conn) this.status(String(err));
+          if (target.conn === this.hub.conn) this.status(String(err));
         }
       },
     );
