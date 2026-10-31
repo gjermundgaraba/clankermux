@@ -274,7 +274,6 @@ export const mountMachine: FSM<{}, MountEvent, keyof Contexts, MountSnapshot, un
   },
 });
 
-
 export function lineOf(snapshot: MountSnapshot): Line | undefined {
   switch (snapshot.value) {
     case "opening":
