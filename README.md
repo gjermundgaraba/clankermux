@@ -8,7 +8,7 @@ A terminal multiplexer server with CLI and browser clients; the wire protocol is
 | --- | --- |
 | [mise](https://mise.jdx.dev) | installs zig 0.16 and just from `mise.toml` (`mise install`) |
 | Rust | 1.98 |
-| pnpm | 12 (`web/package.json`), Node 24+ |
+| pnpm | 12 (`web/package.json`), Node 26.13 (`.node-version`) |
 | Playwright Chromium | for the browser tests: `cd web && pnpm install && pnpm -C apps/client browsers` |
 
 ## Commands
