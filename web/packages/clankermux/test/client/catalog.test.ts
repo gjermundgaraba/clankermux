@@ -1,11 +1,15 @@
+import { readFileSync } from "node:fs";
+
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { afterAll, beforeAll, expect, test } from "vitest";
 
-import pkg from "../../package.json" with { type: "json" };
 import { type Catalog, VERSION } from "../../src/proto/index.ts";
 import { Connection, hello } from "../../src/client/connection.ts";
 import { vectors } from "../proto/messages.ts";
 import { type Served, StreamTransport, serve } from "./server.ts";
+
+const manifest = readFileSync(new URL("../../../../../crates/clankermux/Cargo.toml", import.meta.url), "utf8");
+const serverRelease = /^version = "(.+)"$/m.exec(manifest)?.[1];
 
 let served: Served;
 let conn: Connection;
@@ -30,9 +34,9 @@ function validator(schema: unknown): (value: unknown) => boolean {
   return (value) => validate(value) as boolean;
 }
 
-test("describe answers this protocol and the package's release", async () => {
+test("describe answers this protocol and the server's release", async () => {
   expect(catalog.protocol).toBe(VERSION);
-  expect(catalog.version).toBe(pkg.version);
+  expect(catalog.version).toBe(serverRelease);
   const one = await conn.describe("send");
   expect(one.method).toEqual(catalog.methods.find((m) => m.name === "send"));
   await expect(conn.describe("write")).rejects.toMatchObject({ server: { code: "invalid_request" } });
