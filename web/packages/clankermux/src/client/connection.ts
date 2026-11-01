@@ -19,7 +19,7 @@ import {
 import pkg from "../../package.json" with { type: "json" };
 
 export interface Transport {
-  send(bytes: Uint8Array): void;
+  send(bytes: Uint8Array<ArrayBuffer>): void;
   close(): void;
   onMessage: ((bytes: Uint8Array) => void) | undefined;
   onClose: (() => void) | undefined;

@@ -63,7 +63,7 @@ export function parseHeader(bytes: Uint8Array, maxFrame: number): Header {
   return { type, channel, length };
 }
 
-export function encodeFrame(type: FrameType, channel: number, payload: Uint8Array): Uint8Array {
+export function encodeFrame(type: FrameType, channel: number, payload: Uint8Array): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(HEADER_LEN + payload.length);
   const view = new DataView(out.buffer);
   out[0] = type;

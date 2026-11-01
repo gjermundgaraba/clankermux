@@ -178,7 +178,7 @@ class SocketTransport implements Transport {
     });
   }
 
-  send(bytes: Uint8Array): void {
+  send(bytes: Uint8Array<ArrayBuffer>): void {
     this.socket.send(bytes);
   }
 
