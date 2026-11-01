@@ -10,7 +10,6 @@ import {
   type Terminal,
 } from "../engine/index.ts";
 import {
-  type ErrorCode,
   type ErrorMessage,
   type Event,
   type Exit,
@@ -26,47 +25,20 @@ import {
 
 import { type Action, Attachment } from "./attachment.ts";
 import { ClientError, Connection, type ErrorKind, type Transport, hello } from "./connection.ts";
+import {
+  type Line,
+  type Link,
+  type MountEvent,
+  type MountSnapshot,
+  type Open,
+  endedWith,
+  lineOf,
+  linkOf,
+  mountMachine,
+} from "./link.ts";
 import { Osc52Scanner } from "./osc52.ts";
 
-/** Why the link to the session ended. `closed`: the connection closed
- * (not a `CLOSED` frame, which the worker does not wait for when it
- * detaches); `removed`, `stopping` and `detached` (another client's
- * `detach`): the server's `CLOSED`; `exited`:
- * the session's program exited; `no_such_session` and `engine_mismatch`:
- * an `OPEN` refused; `error`: any other error, the server's or the
- * client's own. */
-export type LinkEnd =
-  | "closed"
-  | "removed"
-  | "stopping"
-  | "detached"
-  | "exited"
-  | "no_such_session"
-  | "engine_mismatch"
-  | "error";
-
-/** A terminal's link to its session, through the client's connection and
- * the terminal's attachment. */
-export type Link =
-  /** Opening a connection; `attempt` counts from 1 and starts again once
-   * a server answers. */
-  | { state: "connecting"; attempt: number }
-  /** Connected, and showing `session` as `ATTACHED` described it (its
-   * `status` may be `restored` or `exited`), or attached to none. */
-  | { state: "connected"; session: Session | undefined }
-  /** The link ended. `code` and `message` are the error's, when there is
-   * one, and `message` the reason a `detach` gave; `exit` is the
-   * program's, for `exited`. `retry`: the worker
-   * reconnects or attaches again by itself, so `connecting` or
-   * `connected` follows; otherwise nothing does until the page attaches. */
-  | {
-      state: "ended";
-      reason: LinkEnd;
-      code?: ErrorCode;
-      message?: string;
-      exit?: Exit;
-      retry: boolean;
-    };
+export type { Link, LinkEnd } from "./link.ts";
 
 /** A failed request, as it crosses to the page. */
 export interface Failure {
@@ -169,7 +141,6 @@ const SCROLL_KEYS: Record<string, number | "top" | "bottom"> = {
 const PAINT_COALESCE_MS = 16;
 const BACKOFF_MIN_MS = 250;
 const BACKOFF_MAX_MS = 5000;
-const UNRETRYABLE_OPEN_ERRORS = new Set<ErrorMessage["code"]>(["no_such_session", "engine_mismatch", "invalid_request"]);
 const ACKABLE_ATTENTION_STATES = new Set(["done", "error"]);
 const ALTERNATE_SCROLL_MODE = 1007;
 const SEND_REQUEST_OVERHEAD_BYTES = 1024;
@@ -247,13 +218,6 @@ function failureOf(err: unknown): Failure {
     : { kind: "protocol", message: err instanceof Error ? err.message : String(err) };
 }
 
-function endedWith(err: unknown, retry: boolean): Link {
-  const server = err instanceof ClientError ? err.server : undefined;
-  return server
-    ? { state: "ended", reason: linkEnd(server.code), code: server.code, message: server.message, retry }
-    : { state: "ended", reason: "error", message: err instanceof Error ? err.message : String(err), retry };
-}
-
 class Hub {
   constructor(readonly post: WorkerPort["postMessage"]) {}
 
@@ -328,6 +292,7 @@ class Hub {
     conn.onEnd = (err) => {
       if (this.conn !== conn) return;
       this.conn = undefined;
+      for (const mount of this.mounts.values()) mount.disconnected();
       if (err.kind === "server") {
         this.refuse(err);
       } else {
@@ -348,7 +313,7 @@ class Hub {
     this.connectionLink = { state: "connected", session: undefined };
     this.statusText = "connected";
     this.post({ type: "connection", link: this.connectionLink });
-    for (const mount of this.mounts.values()) mount.connected();
+    for (const mount of this.mounts.values()) mount.connected(conn);
   }
 
   private async subscribe(conn: Connection): Promise<void> {
@@ -442,9 +407,10 @@ class Hub {
     const mount = new Mount(this, id, init);
     this.mounts.set(id, mount);
     mount.status(this.statusText);
-    if (this.connectionLink.state === "ended") this.reattach(mount);
-    else if (this.live()) mount.connected();
-    else mount.link(this.connectionLink);
+    const conn = this.live();
+    if (conn) mount.connected(conn);
+    else if (this.connectionLink.state !== "ended") mount.link(this.connectionLink);
+    this.reconnectIfEnded();
   }
 
   unmount(id: number): void {
@@ -452,22 +418,17 @@ class Hub {
     this.mounts.delete(id);
   }
 
-  reattach(mount: Mount): void {
-    if (this.connectionLink.state === "ended") {
-      this.attempt = 0;
-      void this.connect();
-    } else {
-      mount.open();
-    }
+  reconnectIfEnded(): void {
+    if (this.connectionLink.state !== "ended") return;
+    this.attempt = 0;
+    void this.connect();
   }
 }
 
 class Mount {
-  private attachment: Attachment | undefined;
-  private channel = 0;
-  private openOn: Connection | undefined;
+  private snapshot: MountSnapshot = mountMachine.initialState;
+  private reopenTimer: ReturnType<typeof setTimeout> | undefined;
   private acking = false;
-  private session: string | undefined;
   private viewport: Size;
   private profile: Profile;
   private active: boolean;
@@ -486,15 +447,12 @@ class Mount {
   private frameInFlight = false;
   private fullNext = false;
   private readonly backoff = new Backoff();
-  private reopenTimer: ReturnType<typeof setTimeout> | undefined;
-  private disposed = false;
 
   constructor(
     private readonly hub: Hub,
     readonly id: number,
     init: MountInit,
   ) {
-    this.session = init.session;
     this.viewport = init.viewport;
     this.profile = init.profile;
     this.active = init.active;
@@ -503,10 +461,19 @@ class Mount {
     this.ackOnFocus = init.ackOnFocus;
     this.render = new RenderState(hub.engine);
     this.gesture = new SelectionGesture(hub.engine);
+    if (init.session !== undefined) this.step({ type: "page.attach", session: init.session, open: undefined });
+  }
+
+  private get attachment(): Attachment | undefined {
+    return this.snapshot.context.attachment;
+  }
+
+  private get session(): string | undefined {
+    return this.snapshot.context.session;
   }
 
   private post(message: ToPage, options?: StructuredSerializeOptions): void {
-    if (!this.disposed) this.hub.post(message, options);
+    if (this.snapshot.value !== "disposed") this.hub.post(message, options);
   }
 
   link(link: Link): void {
@@ -517,27 +484,47 @@ class Mount {
     this.post({ type: "status", mount: this.id, text });
   }
 
-  connected(): void {
-    if (this.session !== undefined) {
-      this.open();
-    } else {
-      this.status("no session");
-      this.link({ state: "connected", session: undefined });
-    }
+  connected(conn: Connection): void {
+    this.step({ type: "hub.live", open: this.offer(conn) });
   }
 
-  open(): void {
+  disconnected(): void {
+    this.step({ type: "hub.down" });
+  }
+
+  private offer(conn: Connection): Open {
+    return { conn, channel: this.hub.nextChannel(), fresh: new Attachment(this.hub.engine) };
+  }
+
+  private offerIfLive(): Open | undefined {
     const conn = this.hub.live();
-    if (!conn || this.session === undefined || this.disposed || this.openOn === conn) return;
-    if (!this.attachment) this.attachment = new Attachment(this.hub.engine);
-    const attachment = this.attachment;
+    return conn && this.offer(conn);
+  }
+
+  private step(event: MountEvent): void {
+    const prev = this.snapshot;
+    const [next] = mountMachine.transition(prev, event);
+    if (next === prev) return;
+    const link = linkOf(next);
+    if (link?.state === "ended") this.link(link);
+    const { attachment } = prev.context;
+    if (attachment && attachment !== next.context.attachment) this.close(attachment, lineOf(prev));
+    if (prev.value === "backoff") clearTimeout(this.reopenTimer);
+    this.snapshot = next;
+    if (next.value === "opening") this.open(next.context);
+    if (next.value === "backoff") {
+      this.reopenTimer = setTimeout(() => this.step({ type: "reopen.due", open: this.offerIfLive() }), this.backoff.next());
+    }
+    if (link?.state !== "connected") return;
+    if (link.session === undefined) this.status("no session");
+    this.link(link);
+  }
+
+  private open({ session, attachment, channel, conn }: Line): void {
     attachment.openOn(conn.welcome);
-    const channel = this.hub.nextChannel();
-    this.channel = channel;
-    this.openOn = conn;
     const resume = attachment.resume();
     const open = {
-      session: this.session,
+      session,
       ...(this.readOnly && { read_only: true }),
       ...(this.active && { viewport: this.viewport, profile: this.profile }),
       ...(resume && { resume }),
@@ -549,34 +536,20 @@ class Mount {
         actions = attachment.handle(frame);
       } catch (err) {
         this.status(String(err));
-        const desync = err instanceof ClientError && err.kind === "desync";
-        this.link(endedWith(err, desync));
-        if (desync) this.reopen();
-        else this.giveUp();
+        this.step({ type: "attachment.threw", error: err });
         return;
       }
       for (const action of actions) this.apply(action);
     });
   }
 
-  private attached(session: Session | undefined): void {
-    this.link({ state: "connected", session });
-    if (session?.status === "exited") {
-      this.link({ state: "ended", reason: "exited", ...(session.exit && { exit: session.exit }), retry: false });
+  private close(attachment: Attachment, line: Line | undefined): void {
+    this.forgetSelection(attachment.term());
+    if (line) {
+      line.conn.release(line.channel);
+      if (!attachment.closed()) line.conn.send(FrameType.Close, line.channel, new Uint8Array());
     }
-  }
-
-  private giveUp(): void {
-    this.close();
-    this.session = undefined;
-  }
-
-  private reopen(): void {
-    this.close();
-    this.reopenTimer ??= setTimeout(() => {
-      this.reopenTimer = undefined;
-      if (this.session !== undefined && !this.attachment) this.open();
-    }, this.backoff.next());
+    attachment.free();
   }
 
   private apply(action: Action): void {
@@ -595,13 +568,14 @@ class Mount {
               ? `exited: ${describe(session.exit)}`
               : "attached";
         this.status(text);
-        this.attached(session);
+        this.step({ type: "frame.screen", session });
+        if (session?.status === "exited") this.step({ type: "frame.exited", exit: session.exit });
         if (session) this.changed(session);
         break;
       }
       case "resumed":
         this.status("resumed");
-        this.link({ state: "connected", session: this.attachment?.session });
+        this.step({ type: "frame.resumed", session: this.attachment?.session });
         break;
       case "output":
         if (this.selected && !this.attachment?.term()?.selected) this.unselected();
@@ -620,7 +594,7 @@ class Mount {
       case "exited":
         this.paint();
         this.status(`exited: ${describe(action.exit)}`);
-        this.link({ state: "ended", reason: "exited", exit: action.exit, retry: false });
+        this.step({ type: "frame.exited", exit: action.exit });
         break;
       case "gap":
         this.clipboard.reset();
@@ -629,24 +603,12 @@ class Mount {
         break;
       case "closed":
         this.status(`closed: ${action.reason}`);
-        this.link({
-          state: "ended",
-          reason: action.reason,
-          ...(action.message !== undefined && { message: action.message }),
-          retry: action.reason === "stopping",
-        });
-        if (action.reason === "removed" || action.reason === "detached") this.giveUp();
+        this.step({ type: "frame.closed", reason: action.reason, message: action.message });
         break;
-      case "error": {
+      case "error":
         this.status(`${action.error.code}: ${action.error.message}`);
-        if (!this.attachment?.closed()) break;
-        const { code, message } = action.error;
-        const retry = !UNRETRYABLE_OPEN_ERRORS.has(code);
-        this.link({ state: "ended", reason: linkEnd(code), code, message, retry });
-        if (retry) this.reopen();
-        else this.giveUp();
+        this.step({ type: "frame.error", error: action.error, endsAttachment: this.attachment?.closed() === true });
         break;
-      }
     }
   }
 
@@ -689,7 +651,7 @@ class Mount {
     }
     this.paintPending = true;
     const term = this.attachment?.term();
-    if (!term || this.disposed || !this.visible || this.frameInFlight) return;
+    if (!term || !this.visible || this.frameInFlight) return;
     if (this.fullNext) {
       this.render.free();
       this.render = new RenderState(this.hub.engine);
@@ -751,53 +713,33 @@ class Mount {
     if (this.selected) this.unselected();
   }
 
-  private close(): void {
-    if (!this.attachment) return;
-    this.forgetSelection(this.attachment.term());
-    const conn = this.hub.conn;
-    if (conn) {
-      conn.release(this.channel);
-      if (!this.attachment.closed()) conn.send(FrameType.Close, this.channel, new Uint8Array());
-    }
-    this.attachment.free();
-    this.attachment = undefined;
-    this.openOn = undefined;
-  }
-
   attach(session: string): void {
-    this.close();
+    this.step({ type: "page.attach", session, open: this.offerIfLive() });
     this.inputQueue.stopWaitingOnSendsUnderWay();
-    this.session = session;
-    this.hub.reattach(this);
+    this.hub.reconnectIfEnded();
   }
 
   detach(): void {
-    const had = this.session !== undefined;
-    this.giveUp();
+    this.step({ type: "page.detach", live: this.hub.live() !== undefined });
     this.inputQueue.stopWaitingOnSendsUnderWay();
-    if (had && this.hub.conn) {
-      this.status("no session");
-      this.link({ state: "connected", session: undefined });
-    }
   }
 
   dispose(): void {
-    this.close();
-    this.disposed = true;
+    this.step({ type: "page.unmount" });
     if (this.paintTimer !== undefined) clearTimeout(this.paintTimer);
-    if (this.reopenTimer !== undefined) clearTimeout(this.reopenTimer);
     this.render.free();
     this.gesture.forget(undefined);
   }
 
   private sendInput(bytes: Uint8Array): void {
-    this.queueInput(bytes, async ({ conn, channel }) => {
-      conn.send(FrameType.Input, channel, bytes);
-    });
+    const line = lineOf(this.snapshot);
+    this.queueInput(bytes, line && (async () => line.conn.send(FrameType.Input, line.channel, bytes)));
   }
 
   private sendPaste(bytes: Uint8Array): void {
-    this.queueInput(bytes, async ({ conn, session }) => {
+    const { session } = this.snapshot.context;
+    if (session === undefined) return;
+    this.queueInput(bytes, async (conn) => {
       const chunk = pasteChunkSize(conn.welcome.limits);
       for (let at = 0; at < bytes.length; at += chunk) {
         await conn.call("send", { session, data: base64(bytes.subarray(at, at + chunk)) });
@@ -805,25 +747,19 @@ class Mount {
     });
   }
 
-  private queueInput(
-    bytes: Uint8Array,
-    deliver: (target: { conn: Connection; session: string; channel: number }) => Promise<void>,
-  ): void {
-    const conn = this.hub.conn;
-    const attachment = this.attachment;
-    const session = this.session;
-    const channel = this.channel;
-    if (bytes.length === 0 || this.readOnly || !conn || !attachment || attachment.ended() || session === undefined) {
-      return;
-    }
+  private queueInput(bytes: Uint8Array, deliver: ((conn: Connection) => Promise<void>) | undefined): void {
+    const { conn } = this.hub;
+    const { attachment } = this;
+    if (bytes.length === 0 || this.readOnly || !conn || !attachment || attachment.ended()) return;
     this.claim();
     this.backToLive();
     this.unselect();
+    if (!deliver) return;
     this.inputQueue.enqueueUnlessDetached(
       () => this.attachment === attachment,
       async () => {
         try {
-          await deliver({ conn, session, channel });
+          await deliver(conn);
         } catch (err) {
           if (conn === this.hub.conn) this.status(String(err));
         }
@@ -895,7 +831,7 @@ class Mount {
     this.viewport = size;
     this.profile = profile;
     this.active = active;
-    const attachment = this.attachment;
+    const { attachment } = this;
     if (!this.hub.conn || !attachment || attachment.ended()) return;
     this.applyProfile(attachment.term());
     this.paint();
@@ -904,11 +840,13 @@ class Mount {
 
   private report(): void {
     this.sizeTakenByOtherClient = false;
-    this.hub.conn?.sendJson(FrameType.Viewport, this.channel, { ...this.viewport, profile: this.profile });
+    const line = lineOf(this.snapshot);
+    line?.conn.sendJson(FrameType.Viewport, line.channel, { ...this.viewport, profile: this.profile });
   }
 
   private claim(): void {
-    if (this.sizeTakenByOtherClient && this.active && this.attachment && !this.attachment.ended()) this.report();
+    const { attachment } = this;
+    if (this.sizeTakenByOtherClient && this.active && attachment && !attachment.ended()) this.report();
   }
 
   focus(focused: boolean): void {
@@ -935,10 +873,6 @@ class Mount {
       () => (this.acking = false),
     );
   }
-}
-
-function linkEnd(code: ErrorCode): LinkEnd {
-  return code === "no_such_session" || code === "engine_mismatch" ? code : "error";
 }
 
 function describe(exit: Exit): string {

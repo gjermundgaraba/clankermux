@@ -47,6 +47,9 @@
     "test": "vitest run",
     "build": "tsc -p tsconfig.build.json"
   },
+  "dependencies": {
+    "xstate": "6.0.0-alpha.71"
+  },
   "devDependencies": {
     "@types/ws": "^8.18.0",
     "ajv": "^8.20.0",

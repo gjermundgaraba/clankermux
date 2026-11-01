@@ -190,6 +190,10 @@ importers:
         version: 1.64.1
 
   packages/clankermux:
+    dependencies:
+      xstate:
+        specifier: 6.0.0-alpha.71
+        version: 6.0.0-alpha.71
     devDependencies:
       '@types/ws':
         specifier: ^8.18.0
@@ -806,6 +810,10 @@ packages:
       utf-8-validate:
         optional: true
 
+  xstate@6.0.0-alpha.71:
+    resolution: {integrity: sha512-ABNE8jHjqzpQd/gX8huQYvSlbrOEaJcvzBtt6qWMooQuvxKoarkEKT0JFr3ymhI5Jza72YmfsWnFEophersmhQ==}
+    hasBin: true
+
 snapshots:
 
   '@esbuild/aix-ppc64@0.28.2':
@@ -1275,3 +1283,5 @@ snapshots:
       stackback: 0.0.2
 
   ws@8.22.0: {}
+
+  xstate@6.0.0-alpha.71: {}

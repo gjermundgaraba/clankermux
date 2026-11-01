@@ -523,6 +523,190 @@ test("the link: detached by another client, for good", async () => {
   expect(next.bodies(FrameType.Open)).toEqual([]);
 });
 
+test("a desync reopens after the backoff on a fresh channel and attaches again", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const first = await server.opened("s");
+  bootstrap(server, first, session("s"));
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+  server.pushRaw(encodeFrame(FrameType.Output, first, output(3, "x")));
+  expect(worker.links().at(-1)).toEqual({ state: "ended", reason: "error", message: "OUTPUT at 3, expected 0", retry: true });
+  expect(server.sent.some((f) => f.header.type === FrameType.Close && f.header.channel === first)).toBe(true);
+  expect(server.bodies(FrameType.Open)).toHaveLength(1);
+
+  await vi.waitFor(() => expect(server.bodies(FrameType.Open)).toHaveLength(2));
+  const reopened = server.bodies(FrameType.Open).at(-1)!;
+  expect(reopened.channel).not.toBe(first);
+  expect(reopened.body).toEqual({ session: "s", viewport: { cols: 80, rows: 24 }, profile: {} });
+  bootstrap(server, reopened.channel, session("s"), "again");
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+  expect(worker.screens().at(-1)).toBe("attached");
+});
+
+test("a retryable OPEN error backs off, and a detach during the backoff sends no further OPEN", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  server.push(FrameType.Error, await server.opened("s"), { code: "internal", message: "try later" });
+  expect(worker.links().at(-1)).toEqual({ state: "ended", reason: "error", code: "internal", message: "try later", retry: true });
+  expect(worker.screens().at(-1)).toBe("internal: try later");
+
+  worker.to(1, { type: "detach" });
+  expect(worker.links().at(-1)).toEqual({ state: "connected", session: undefined });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  expect(server.bodies(FrameType.Open)).toHaveLength(1);
+});
+
+test("an unretryable OPEN error opens nothing more, even after a reconnect", async () => {
+  const worker = await start();
+  worker.mount(1, "nosuchid");
+  const server = await socket(0);
+  await server.serve([]);
+  server.push(FrameType.Error, await server.opened("nosuchid"), { code: "no_such_session", message: "no session nosuchid" });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  expect(server.bodies(FrameType.Open)).toHaveLength(1);
+
+  server.close();
+  const next = await socket(1);
+  await next.serve([]);
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: undefined }));
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  expect(next.bodies(FrameType.Open)).toEqual([]);
+});
+
+test("a detach while the connection is down opens nothing when it comes back", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  bootstrap(server, await server.opened("s"), session("s"));
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+
+  server.close();
+  worker.to(1, { type: "detach" });
+  const next = await socket(1);
+  await next.serve([session("s")]);
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: undefined }));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(next.bodies(FrameType.Open)).toEqual([]);
+});
+
+test("a paste while the connection reconnects goes to its session on the new connection", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  bootstrap(server, await server.opened("s"), session("s"));
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+
+  server.close();
+  const next = await socket(1);
+  await next.welcome();
+  await next.request("subscribe");
+  worker.to(1, { type: "paste", text: "pasted" });
+  expect((await next.request("send")).params).toEqual({ session: "s", data: btoa("pasted") });
+});
+
+test("a key while the connection reconnects clears the selection and goes back to the live screen", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  bootstrap(server, await server.opened("s"), session("s"), "l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6");
+  await vi.waitFor(() => expect(worker.scrollbar()).toEqual({ total: 6, offset: 3, len: 3 }));
+  worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0 }, time: 0 });
+  worker.to(1, { type: "select", action: "drag", at: { x: 2, y: 0 }, time: 1 });
+  worker.to(1, { type: "select", action: "release", at: { x: 2, y: 0 }, time: 2, copy: 1 });
+  worker.to(1, { type: "wheel", rows: -1 });
+  expect(worker.selections().map((s) => s.text)).toEqual(["l4"]);
+  expect(worker.scrollbar()).toEqual({ total: 6, offset: 2, len: 3 });
+
+  server.close();
+  const next = await socket(1);
+  await next.welcome();
+  await next.request("subscribe");
+  worker.to(1, { type: "text", text: "k" });
+  expect(worker.selections().map((s) => s.text)).toEqual(["l4", undefined]);
+  expect(worker.scrollbar()).toEqual({ total: 6, offset: 3, len: 3 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(next.sent.filter((f) => f.header.type === FrameType.Input)).toEqual([]);
+});
+
+test("a colour change while the connection reconnects repaints the screen", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  bootstrap(server, await server.opened("s"), session("s"));
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+
+  server.close();
+  const next = await socket(1);
+  await next.welcome();
+  await next.request("subscribe");
+  const before = worker.posted.length;
+  worker.to(1, { type: "viewport", size: { cols: 80, rows: 24 }, profile: { bg: "#102030" }, active: true });
+  expect(worker.posted.slice(before).map((m) => m.type)).toEqual(["frame"]);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(next.bodies(FrameType.Viewport)).toEqual([]);
+});
+
+test("a page that keys in a reconnect handshake after another client took the size does not take it back after the resume", async () => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const first = await server.opened("s");
+  bootstrap(server, first, session("s"));
+  await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
+  server.push(FrameType.Resized, first, { seq: 1, offset: 0, cols: 20, rows: 5 });
+
+  server.close();
+  const next = await socket(1);
+  await next.welcome();
+  const subscribe = await next.request("subscribe");
+  worker.to(1, { type: "key", input: key("KeyA", { key: "a" }) });
+  next.push(FrameType.Reply, 0, { id: subscribe.id, result: { oldest: 1, latest: 0, gap: false } });
+  const channel = await next.opened("s");
+  const resume = next.bodies(FrameType.Open).find((o) => o.channel === channel)!.body.resume as Record<string, number>;
+  next.push(FrameType.Attached, channel, { mode: "resume", ...resume, cols: 20, rows: 5, session: session("s") });
+  await vi.waitFor(() => expect(worker.screens().at(-1)).toBe("resumed"));
+  worker.to(1, { type: "key", input: key("KeyB", { key: "b" }) });
+  await vi.waitFor(() => expect(next.sent.filter((f) => f.header.type === FrameType.Input && f.header.channel === channel)).toHaveLength(1));
+  expect(next.bodies(FrameType.Viewport).filter((v) => v.channel === channel)).toEqual([]);
+});
+
+test.each([
+  ["CLOSED removed", (server: FakeSocket, channel: number) => server.push(FrameType.Closed, channel, { reason: "removed" }), "closed: removed"],
+  ["a desync", (server: FakeSocket, channel: number) => server.pushRaw(encodeFrame(FrameType.Output, channel, output(3, "x"))), "ClientError: OUTPUT at 3, expected 0"],
+  ["an ending ERROR", (server: FakeSocket, channel: number) => server.push(FrameType.Error, channel, { code: "internal", message: "later" }), "internal: later"],
+])("%s while text is selected posts its status, then the ended link, then clears the selection", async (_, end, status) => {
+  const worker = await start();
+  worker.mount(1, "s");
+  const server = await socket(0);
+  await server.serve([session("s")]);
+  const channel = await server.opened("s");
+  bootstrap(server, channel, session("s"), "one two");
+  await vi.waitFor(() => expect(worker.scrollbar()).toBeDefined());
+  worker.to(1, { type: "select", action: "press", at: { x: 0, y: 0 }, time: 0 });
+  worker.to(1, { type: "select", action: "drag", at: { x: 3, y: 0 }, time: 1 });
+  worker.to(1, { type: "select", action: "release", at: { x: 3, y: 0 }, time: 2, copy: 1 });
+  expect(worker.selections().at(-1)?.text).toBe("one");
+
+  const before = worker.posted.length;
+  end(server, channel);
+  const link = worker.links().at(-1);
+  expect(link?.state).toBe("ended");
+  expect(worker.posted.slice(before).filter((m) => m.type === "status" || m.type === "link" || m.type === "selection")).toEqual<ToPage[]>([
+    { type: "status", mount: 1, text: status },
+    { type: "link", mount: 1, link: link! },
+    { type: "selection", mount: 1, text: undefined },
+  ]);
+});
+
 test("only a page in use reports its size: OPEN and VIEWPORT carry none until it is active", async () => {
   const worker = await start();
   worker.mount(1, "s", { active: false });
