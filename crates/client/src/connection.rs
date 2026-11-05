@@ -91,8 +91,7 @@ struct Routes {
     pending: HashMap<i64, oneshot::Sender<Result<Value, ErrorMessage>>>,
     channels: HashMap<u32, Channel>,
     events: Option<Sender<Numbered>>,
-    stop: watch::Sender<bool>,
-    closed: Option<Error>,
+    ended: watch::Sender<Option<Error>>,
 }
 
 pub struct Reply {
@@ -160,13 +159,12 @@ impl Connection {
             }
         };
         let (tx, rx) = queue::channel(OUTGOING_QUEUE_BYTES);
-        let (stop, stopped) = watch::channel(false);
+        let (ended, stopped) = watch::channel(None);
         let routes = Arc::new(Mutex::new(Routes {
             pending: HashMap::new(),
             channels: HashMap::new(),
             events: None,
-            closed: None,
-            stop,
+            ended,
         }));
         let max_frame = welcome.limits.max_frame;
         tokio::spawn(write_loop(writer, rx, routes.clone(), stopped.clone()));
@@ -229,8 +227,8 @@ impl Connection {
         let (reply_tx, reply_rx) = oneshot::channel();
         {
             let mut routes = self.routes.lock().unwrap();
-            if let Some(closed) = &routes.closed {
-                return Err(closed.clone());
+            if let Some(ended) = routes.ended.borrow().clone() {
+                return Err(ended);
             }
             routes.pending.insert(id, reply_tx);
         }
@@ -267,8 +265,8 @@ impl Connection {
         let (tx, rx) = queue::channel(ATTACHMENT_QUEUE_BYTES);
         {
             let mut routes = self.routes.lock().unwrap();
-            if let Some(closed) = &routes.closed {
-                return Err(closed.clone());
+            if let Some(ended) = routes.ended.borrow().clone() {
+                return Err(ended);
             }
             if routes.channels.contains_key(&channel) {
                 return Err(Error::Protocol("attachment channel is still open".into()));
@@ -282,14 +280,14 @@ impl Connection {
     pub fn events(&self) -> Receiver<Numbered> {
         let (tx, rx) = queue::channel(EVENT_QUEUE_BYTES);
         let mut routes = self.routes.lock().unwrap();
-        if routes.closed.is_none() {
+        if routes.ended.borrow().is_none() {
             routes.events = Some(tx);
         }
         rx
     }
 
     pub fn ended(&self) -> Option<Error> {
-        self.routes.lock().unwrap().closed.clone()
+        self.routes.lock().unwrap().ended.borrow().clone()
     }
 }
 
@@ -299,11 +297,11 @@ async fn read_loop<R: AsyncRead + Unpin>(
     max_frame: u64,
     routes: Arc<Mutex<Routes>>,
     outgoing: WeakSender<Vec<u8>>,
-    mut stopped: watch::Receiver<bool>,
+    mut stopped: watch::Receiver<Option<Error>>,
 ) {
     let mut buf = vec![0u8; 64 * 1024];
     let reason = loop {
-        if *stopped.borrow() {
+        if stopped.borrow().is_some() {
             return;
         }
         match decoder.next_frame(max_frame) {
@@ -334,7 +332,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut rx: Receiver<Vec<u8>>,
     routes: Arc<Mutex<Routes>>,
-    mut stopped: watch::Receiver<bool>,
+    mut stopped: watch::Receiver<Option<Error>>,
 ) {
     let reason = loop {
         let next = tokio::select! {
@@ -373,7 +371,7 @@ fn loss_frame(channel: u32, message: &str) -> Frame {
 
 fn end_routes(routes: &Mutex<Routes>, reason: Error) {
     let mut routes = routes.lock().unwrap();
-    if routes.closed.is_some() {
+    if routes.ended.borrow().is_some() {
         return;
     }
     for (channel, state) in routes.channels.drain() {
@@ -381,10 +379,9 @@ fn end_routes(routes: &Mutex<Routes>, reason: Error) {
             tx.end(loss_frame(channel, message));
         }
     }
-    routes.closed = Some(reason);
     routes.pending.clear();
     routes.events = None;
-    routes.stop.send_replace(true);
+    routes.ended.send_replace(Some(reason));
 }
 
 fn route(
@@ -394,7 +391,7 @@ fn route(
 ) -> Result<(), Error> {
     let mut routes = routes.lock().unwrap();
     let channel = frame.header.channel;
-    if routes.closed.is_some() {
+    if routes.ended.borrow().is_some() {
         return Ok(());
     }
     if channel != 0 {
@@ -546,13 +543,12 @@ mod tests {
     use std::time::Duration;
 
     fn routes() -> Mutex<Routes> {
-        let (stop, _) = watch::channel(false);
+        let (ended, _) = watch::channel(None);
         Mutex::new(Routes {
             pending: HashMap::new(),
             channels: HashMap::new(),
             events: None,
-            closed: None,
-            stop,
+            ended,
         })
     }
 
@@ -628,7 +624,7 @@ mod tests {
             reply_rx.try_recv().unwrap().unwrap(),
             serde_json::json!({"ok": true})
         );
-        assert!(routes.lock().unwrap().closed.is_none());
+        assert!(routes.lock().unwrap().ended.borrow().is_none());
         route(
             &routes,
             &out,
@@ -673,7 +669,7 @@ mod tests {
         assert_eq!(events_rx.recv().await.unwrap().seq, 1);
         assert!(events_rx.recv().await.is_none());
         assert!(matches!(
-            routes.lock().unwrap().closed,
+            *routes.lock().unwrap().ended.borrow(),
             Some(Error::Desync(_))
         ));
         assert_eq!(
