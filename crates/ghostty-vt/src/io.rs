@@ -2,6 +2,8 @@ use std::ffi::c_void;
 
 use ghostty_vt_sys as sys;
 
+use crate::error::{Error, Result, check};
+
 unsafe extern "C" fn write_to_vec(userdata: *mut c_void, data: *const u8, len: usize) -> bool {
     // SAFETY: userdata is the `*mut Vec<u8>` passed by the caller that owns
     // the writer, and data points at len readable bytes for this call.
@@ -35,4 +37,22 @@ pub(crate) unsafe fn string(s: &sys::GhosttyString) -> String {
     // SAFETY: the library guarantees ptr points at len bytes for the
     // duration of the call this string was received in.
     String::from_utf8_lossy(unsafe { bytes(s.ptr, s.len) }).into_owned()
+}
+
+pub(crate) fn encoded(
+    capacity: usize,
+    mut encode: impl FnMut(&mut [u8], &mut usize) -> sys::GhosttyResult,
+) -> Result<Vec<u8>> {
+    let mut out = vec![0u8; capacity];
+    loop {
+        let mut written = 0;
+        match check(encode(&mut out, &mut written)) {
+            Ok(()) => {
+                out.truncate(written);
+                return Ok(out);
+            }
+            Err(Error::OutOfSpace) if written > out.len() => out.resize(written, 0),
+            Err(err) => return Err(err),
+        }
+    }
 }
