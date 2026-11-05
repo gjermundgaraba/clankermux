@@ -1,3 +1,6 @@
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 pub const HEADER_LEN: usize = 10;
 
 macro_rules! frame_types {
@@ -63,13 +66,28 @@ impl FrameType {
         }
     }
 
-    pub fn is_json(self) -> bool {
+    pub fn payload(self) -> Payload {
         use FrameType::*;
-        !matches!(
-            self,
-            Input | Close | Snapshot | SnapshotReady | SnapshotEnd | Output
-        )
+        match self {
+            Hello | Request | Open | Viewport | Welcome | Reply | Event | Error | Attached
+            | Resized | Exited | Gap | Closed => Payload::Json,
+            Input | Snapshot | Output => Payload::Raw,
+            Close | SnapshotReady | SnapshotEnd => Payload::Empty,
+        }
     }
+
+    pub fn is_json(self) -> bool {
+        self.payload() == Payload::Json
+    }
+}
+
+/// What a frame's payload holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Payload {
+    Json,
+    Raw,
+    Empty,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -3,8 +3,8 @@ use std::fmt::Write as _;
 
 use serde_json::{Map, Value};
 
-use crate::ErrorCode;
-use crate::catalog::{Catalog, Description, Payload, refs};
+use crate::catalog::{Catalog, Description, refs};
+use crate::{ErrorCode, Payload};
 
 const BEGIN: &str = "<!-- generated: ";
 const END: &str = "<!-- end generated -->";

@@ -7,9 +7,9 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     AckParams, Acked, CancelParams, Cancelled, ChannelKind, CreateParams, DetachParams, Empty,
-    ErrorCode, ErrorMessage, FrameType, LabelParams, ListParams, Numbered, Page, Read, ReadParams,
-    ResizeParams, SendParams, Sent, Session, SessionParams, SignalParams, SubscribeParams,
-    Subscribed, Tail, TailParams, VERSION, WaitParams, Waited,
+    ErrorCode, ErrorMessage, FrameType, LabelParams, ListParams, Numbered, Page, Payload, Read,
+    ReadParams, ResizeParams, SendParams, Sent, Session, SessionParams, SignalParams,
+    SubscribeParams, Subscribed, Tail, TailParams, VERSION, WaitParams, Waited,
 };
 
 pub(crate) const VECTORS: &str = include_str!("../vectors/messages.json");
@@ -115,15 +115,6 @@ pub struct EventInfo {
 pub enum Direction {
     Client,
     Server,
-}
-
-/// What a frame's payload holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Payload {
-    Json,
-    Raw,
-    Empty,
 }
 
 /// One frame type.
@@ -289,9 +280,9 @@ fn frame_schema(
     frame_type: FrameType,
     server_reads: &mut SchemaGenerator,
     server_writes: &mut SchemaGenerator,
-) -> Option<schemars::Schema> {
+) -> schemars::Schema {
     use FrameType::*;
-    Some(match frame_type {
+    match frame_type {
         Hello => server_reads.subschema_for::<crate::Hello>(),
         Request => server_reads.subschema_for::<crate::Request>(),
         Open => server_reads.subschema_for::<crate::Open>(),
@@ -305,8 +296,10 @@ fn frame_schema(
         Exited => server_writes.subschema_for::<crate::Exited>(),
         Gap => server_writes.subschema_for::<crate::Gap>(),
         Closed => server_writes.subschema_for::<crate::Closed>(),
-        Input | Close | Snapshot | SnapshotReady | SnapshotEnd | Output => return None,
-    })
+        Input | Close | Snapshot | SnapshotReady | SnapshotEnd | Output => {
+            unreachable!("{frame_type:?} has no JSON payload")
+        }
+    }
 }
 
 fn frame_name(frame_type: FrameType) -> String {
@@ -346,13 +339,11 @@ fn frame_info(
             ChannelKind::Either => "0 or n",
         }
         .into(),
-        payload: match t {
-            t if t.is_json() => Payload::Json,
-            FrameType::Close | FrameType::SnapshotReady | FrameType::SnapshotEnd => Payload::Empty,
-            _ => Payload::Raw,
-        },
+        payload: t.payload(),
         summary: frame_summary(t).into(),
-        schema: frame_schema(t, server_reads, server_writes).map(schemars::Schema::to_value),
+        schema: t
+            .is_json()
+            .then(|| frame_schema(t, server_reads, server_writes).to_value()),
     }
 }
 

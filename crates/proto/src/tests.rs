@@ -348,18 +348,6 @@ fn every_method_event_and_error_code_says_what_it_does() {
 }
 
 #[test]
-fn a_frame_has_a_schema_exactly_when_its_payload_is_json() {
-    for frame in catalog::catalog(Some("0")).frames {
-        assert_eq!(
-            frame.schema.is_some(),
-            frame.payload == catalog::Payload::Json,
-            "{}",
-            frame.name
-        );
-    }
-}
-
-#[test]
 fn references_and_definitions_match_and_nothing_is_null() {
     let catalog = catalog::catalog(Some("0"));
     let json = serde_json::to_value(&catalog).unwrap();
