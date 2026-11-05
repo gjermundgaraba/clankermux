@@ -5,8 +5,8 @@ use std::time::Duration;
 use ghostty_vt::snapshot;
 use proto::{
     AttachMode, Attached, ClientPeer, Closed, ClosedReason, ErrorCode, Event, Exited, FrameType,
-    Gap, OUTPUT_OFFSET_LEN, Open, Peer, Resized, Resume, Status, Viewport, encode_frame,
-    encode_json_frame, encode_output_frame,
+    Gap, OUTPUT_OFFSET_LEN, Open, Peer, Resized, Resume, Status, StreamCursor, Viewport,
+    encode_frame, encode_json_frame, encode_output_frame,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -163,7 +163,7 @@ pub fn open(
         finished,
         ended: ended.clone(),
         max_frame: proto::cap(registry.config.limits.max_frame),
-        cursor: Cursor {
+        cursor: StreamCursor {
             offset: 0,
             marker: 0,
         },
@@ -183,12 +183,6 @@ pub fn open(
 
 fn client_text(text: &str) -> String {
     truncate(printable(text), CLIENT_TEXT)
-}
-
-#[derive(Clone, Copy)]
-struct Cursor {
-    offset: u64,
-    marker: u64,
 }
 
 struct PendingSnapshot {
@@ -226,7 +220,7 @@ struct Task {
     finished: Arc<AtomicBool>,
     ended: Arc<AtomicBool>,
     max_frame: usize,
-    cursor: Cursor,
+    cursor: StreamCursor,
     snapshot: Option<PendingSnapshot>,
     last_output: Option<Instant>,
     done: bool,
@@ -303,19 +297,7 @@ impl Task {
             Err(end) => return end,
             Ok(Some(cursor)) => {
                 let session = self.session.lock().unwrap().to_proto(false);
-                self.cursor = cursor;
-                self.send_json(
-                    FrameType::Attached,
-                    &Attached {
-                        mode: AttachMode::Resume,
-                        offset: cursor.offset,
-                        marker: cursor.marker,
-                        cols: session.cols,
-                        rows: session.rows,
-                        session,
-                        snapshot_bytes: None,
-                    },
-                );
+                self.send_attached(cursor, session, None);
             }
             Ok(None) => {
                 if let Err(end) = self.bootstrap(None).await {
@@ -385,7 +367,32 @@ impl Task {
         }
     }
 
-    fn resume_cursor(&self, resume: Option<Resume>) -> Result<Option<Cursor>, End> {
+    fn send_attached(
+        &mut self,
+        cursor: StreamCursor,
+        session: proto::Session,
+        snapshot_bytes: Option<u64>,
+    ) {
+        self.cursor = cursor;
+        self.send_json(
+            FrameType::Attached,
+            &Attached {
+                mode: if snapshot_bytes.is_some() {
+                    AttachMode::Snapshot
+                } else {
+                    AttachMode::Resume
+                },
+                offset: cursor.offset,
+                marker: cursor.marker,
+                cols: session.cols,
+                rows: session.rows,
+                session,
+                snapshot_bytes,
+            },
+        );
+    }
+
+    fn resume_cursor(&self, resume: Option<Resume>) -> Result<Option<StreamCursor>, End> {
         let Some(resume) = resume.filter(|r| r.incarnation == self.registry.incarnation) else {
             return Ok(None);
         };
@@ -409,7 +416,7 @@ impl Task {
         let retained = live.stream.retained_start() <= resume.offset
             && resume.offset <= live.stream.offset()
             && live.stream.markers_retained_after(resume.marker);
-        Ok(retained.then_some(Cursor {
+        Ok(retained.then_some(StreamCursor {
             offset: resume.offset,
             marker: resume.marker,
         }))
@@ -430,28 +437,14 @@ impl Task {
                 .map_err(|e| internal(format!("park file unreadable: {e}")))?;
             self.done = true;
             let s = self.session.lock().unwrap();
-            let Some(parked) = s.parked() else {
+            if s.parked().is_none() {
                 return Err(internal("session changed while reading its park".into()));
-            };
-            (
-                bytes,
-                Cursor {
-                    offset: parked.offset,
-                    marker: parked.marker,
-                },
-                s.to_proto(false),
-            )
+            }
+            (bytes, s.cursor(), s.to_proto(false))
         } else {
             let taken = tokio::select! {
-                taken = snapshot_with_retry(&self.session, SNAPSHOT_RETRY, |s, live, bytes| {
-                    (
-                        bytes,
-                        Cursor {
-                            offset: live.stream.offset(),
-                            marker: live.stream.latest_seq(),
-                        },
-                        s.to_proto(false),
-                    )
+                taken = snapshot_with_retry(&self.session, SNAPSHOT_RETRY, |s, _, bytes| {
+                    (bytes, s.cursor(), s.to_proto(false))
                 }) => taken,
                 ending = self.close.recv() => return Err(End::received(ending)),
             };
@@ -482,19 +475,7 @@ impl Task {
                 },
             );
         }
-        self.cursor = cursor;
-        self.send_json(
-            FrameType::Attached,
-            &Attached {
-                mode: AttachMode::Snapshot,
-                offset: cursor.offset,
-                marker: cursor.marker,
-                cols: session.cols,
-                rows: session.rows,
-                session,
-                snapshot_bytes: Some(bytes.len() as u64),
-            },
-        );
+        self.send_attached(cursor, session, Some(bytes.len() as u64));
         for chunk in bytes[..ready].chunks(self.max_frame) {
             if self.writer.over_high_water() {
                 tokio::select! {
