@@ -91,47 +91,44 @@ pub fn dispatch(
     request: Request,
 ) {
     let id = request.id;
-    if registry.catalog().method(&request.method).is_none() {
-        let fail = (
+    let outcome = match request.method.as_str() {
+        method if registry.catalog().method(method).is_none() => Err((
             ErrorCode::InvalidRequest,
-            format!("unknown method {}", request.method),
-        );
-        return reply(writer, id, Err(fail));
+            format!("unknown method {method}"),
+        )),
+        "send" => send(registry, writer, pending, id, request.params).map(|()| None),
+        "wait" => wait(registry, writer, pending, id, request.params).map(|()| None),
+        "cancel" => cancel(writer, pending, id, request.params).map(Some),
+        "list" => params::<proto::ListParams>(request.params).map(|p| {
+            registry.reply_page(writer, id, p.after.as_deref());
+            None
+        }),
+        "subscribe" => params(request.params).map(|p| {
+            *subscribed |= registry.subscribe(writer, id, p, !*subscribed);
+            None
+        }),
+        _ => handle(registry, request).map(Some),
+    };
+    if let Some(outcome) = outcome.transpose() {
+        reply(writer, id, outcome);
     }
-    match request.method.as_str() {
-        "send" => send(registry, writer, pending, id, request.params),
-        "wait" => {
-            if let Err(fail) = wait(registry, writer, pending, id, request.params) {
-                reply(writer, id, Err(fail));
-            }
+}
+
+fn cancel(writer: &Writer, pending: &Pending, id: i64, p: Value) -> Result<Value, Fail> {
+    let p: proto::CancelParams = params(p)?;
+    let cancelled = {
+        let mut pending = pending.lock().unwrap();
+        let cancelled = pending.by_id.remove(&p.id).is_some();
+        if cancelled {
+            reply(
+                writer,
+                p.id,
+                Err((ErrorCode::Cancelled, format!("cancelled by request {id}"))),
+            );
         }
-        "cancel" => match params::<proto::CancelParams>(request.params) {
-            Ok(p) => {
-                let mut pending = pending.lock().unwrap();
-                let cancelled = pending.by_id.remove(&p.id).is_some();
-                if cancelled {
-                    reply(
-                        writer,
-                        p.id,
-                        Err((ErrorCode::Cancelled, format!("cancelled by request {id}"))),
-                    );
-                }
-                reply(writer, id, Ok(json!(proto::Cancelled { cancelled })));
-            }
-            Err(fail) => reply(writer, id, Err(fail)),
-        },
-        "list" => match params::<proto::ListParams>(request.params) {
-            Ok(p) => registry.reply_page(writer, id, p.after.as_deref()),
-            Err(fail) => reply(writer, id, Err(fail)),
-        },
-        "subscribe" => match params::<proto::SubscribeParams>(request.params) {
-            Ok(p) => {
-                *subscribed |= registry.subscribe(writer, id, p, !*subscribed);
-            }
-            Err(fail) => reply(writer, id, Err(fail)),
-        },
-        _ => reply(writer, id, handle(registry, request)),
-    }
+        cancelled
+    };
+    Ok(json!(proto::Cancelled { cancelled }))
 }
 
 enum Payload {
@@ -164,77 +161,78 @@ fn payload(p: &mut proto::SendParams) -> Result<Payload, Fail> {
     }
 }
 
-fn send(registry: &Arc<Registry>, writer: &Writer, pending: &Pending, id: i64, p: Value) {
-    let started = (|| {
-        let mut p: proto::SendParams = params(p)?;
-        let payload = payload(&mut p)?;
-        let facts = match p.wait {
-            Some(w) => Some((Facts::new(w.until)?, w.timeout_ms)),
-            None => None,
+fn send(
+    registry: &Arc<Registry>,
+    writer: &Writer,
+    pending: &Pending,
+    id: i64,
+    p: Value,
+) -> Result<(), Fail> {
+    let mut p: proto::SendParams = params(p)?;
+    let payload = payload(&mut p)?;
+    let facts = match p.wait {
+        Some(w) => Some((Facts::new(w.until)?, w.timeout_ms)),
+        None => None,
+    };
+    let session = registry.get(&p.session)?;
+    let mut s = session.lock().unwrap();
+    let live = s.running()?;
+    let bytes = match payload {
+        Payload::Bytes(bytes) if p.paste => {
+            encode_paste(&bytes, live.term.mode(2004).unwrap_or(false)).map_err(internal)?
+        }
+        Payload::Bytes(bytes) => bytes,
+        Payload::Keys(keys) => {
+            let mut encoder = KeyEncoder::new().map_err(internal)?;
+            let mut bytes = Vec::new();
+            for key in &keys {
+                bytes.extend(encoder.encode(&live.term, key).map_err(internal)?);
+            }
+            bytes
+        }
+    };
+    let at = s.cursor();
+    let armed = facts.map(|(facts, timeout)| {
+        (
+            Waiter::for_send(facts, &s),
+            timeout.map(Duration::from_millis),
+        )
+    });
+    let written = s
+        .running()?
+        .input
+        .push(bytes)
+        .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?;
+    s.touch();
+    let claim = armed.as_ref().map(|_| register(pending, id));
+    let previous = s.send_chain.take();
+    let (writer, pending) = (writer.clone(), pending.clone());
+    let shared = session.clone();
+    s.send_chain = Some(tokio::spawn(async move {
+        if let Some(previous) = previous {
+            let _ = previous.await;
+        }
+        if written.await.is_err() {
+            let fail = internal("the PTY refused the bytes");
+            match claim {
+                Some((claim, _)) => finish(&pending, &writer, &claim, Err(fail)),
+                None => reply(&writer, id, Err(fail)),
+            }
+            return;
+        }
+        let (Some((waiter, timeout)), Some(claim)) = (armed, claim) else {
+            reply(&writer, id, Ok(json!(Sent { at, wait: None })));
+            return;
         };
-        let session = registry.get(&p.session)?;
-        let mut s = session.lock().unwrap();
-        let live = s.running()?;
-        let bytes = match payload {
-            Payload::Bytes(bytes) if p.paste => {
-                encode_paste(&bytes, live.term.mode(2004).unwrap_or(false)).map_err(internal)?
-            }
-            Payload::Bytes(bytes) => bytes,
-            Payload::Keys(keys) => {
-                let mut encoder = KeyEncoder::new().map_err(internal)?;
-                let mut bytes = Vec::new();
-                for key in &keys {
-                    bytes.extend(encoder.encode(&live.term, key).map_err(internal)?);
-                }
-                bytes
-            }
+        let answer = move |waited| {
+            json!(Sent {
+                at,
+                wait: Some(waited)
+            })
         };
-        let at = s.cursor();
-        let armed = facts.map(|(facts, timeout)| {
-            (
-                Waiter::for_send(facts, &s),
-                timeout.map(Duration::from_millis),
-            )
-        });
-        let written = s
-            .running()?
-            .input
-            .push(bytes)
-            .ok_or((ErrorCode::InputOverflow, "input queue full".into()))?;
-        s.touch();
-        let claim = armed.as_ref().map(|_| register(pending, id));
-        let previous = s.send_chain.take();
-        let (writer, pending) = (writer.clone(), pending.clone());
-        let shared = session.clone();
-        s.send_chain = Some(tokio::spawn(async move {
-            if let Some(previous) = previous {
-                let _ = previous.await;
-            }
-            if written.await.is_err() {
-                let fail = internal("the PTY refused the bytes");
-                match claim {
-                    Some((claim, _)) => finish(&pending, &writer, &claim, Err(fail)),
-                    None => reply(&writer, id, Err(fail)),
-                }
-                return;
-            }
-            let (Some((waiter, timeout)), Some(claim)) = (armed, claim) else {
-                reply(&writer, id, Ok(json!(Sent { at, wait: None })));
-                return;
-            };
-            let answer = move |waited| {
-                json!(Sent {
-                    at,
-                    wait: Some(waited)
-                })
-            };
-            spawn_wait(&pending, &writer, claim, shared, waiter, timeout, answer);
-        }));
-        Ok(())
-    })();
-    if let Err(fail) = started {
-        reply(writer, id, Err(fail));
-    }
+        spawn_wait(&pending, &writer, claim, shared, waiter, timeout, answer);
+    }));
+    Ok(())
 }
 
 fn wait(
