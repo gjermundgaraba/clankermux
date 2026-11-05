@@ -6,9 +6,8 @@ pub mod snapshot;
 mod terminal;
 
 pub use error::{Error, Result};
+pub use ghostty_vt_sys::ENGINE;
 pub use terminal::*;
-
-pub const ENGINE: &str = concat!("ghostty-vt@", env!("GHOSTTY_VT_VERSION"));
 
 #[cfg(test)]
 mod tests;
