@@ -247,19 +247,9 @@ fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &m
         }
     }
 
-    let mut names = Vec::new();
-    catalog::refs(schema, &mut names);
-    let mut seen = std::collections::BTreeSet::new();
-    let mut stack = vec![schema.clone()];
-    while let Some(name) = names.pop() {
-        if seen.insert(name.clone()) {
-            let def = defs[&name].clone();
-            catalog::refs(&def, &mut names);
-            stack.push(def);
-        }
-    }
-    for s in &stack {
-        walk(s, out);
+    walk(schema, out);
+    for name in catalog::reachable(&[schema], defs) {
+        walk(&defs[&name], out);
     }
 }
 

@@ -464,17 +464,7 @@ pub fn catalog(release: Option<&str>) -> Catalog {
 impl Catalog {
     pub fn describe(&self, name: &str) -> Option<Description> {
         let method = self.method(name)?.clone();
-        let mut wanted = Vec::new();
-        refs(&method.params, &mut wanted);
-        refs(&method.result, &mut wanted);
-        let mut used = BTreeSet::new();
-        while let Some(name) = wanted.pop() {
-            if used.insert(name.clone())
-                && let Some(schema) = self.defs.get(&name)
-            {
-                refs(schema, &mut wanted);
-            }
-        }
+        let used = reachable(&[&method.params, &method.result], &self.defs);
         Some(Description {
             protocol: self.protocol,
             version: self.version.clone(),
@@ -491,6 +481,22 @@ impl Catalog {
     pub fn method(&self, name: &str) -> Option<&MethodInfo> {
         self.methods.iter().find(|m| m.name == name)
     }
+}
+
+pub(crate) fn reachable(roots: &[&Value], defs: &Map<String, Value>) -> BTreeSet<String> {
+    let mut wanted = Vec::new();
+    for root in roots {
+        refs(root, &mut wanted);
+    }
+    let mut used = BTreeSet::new();
+    while let Some(name) = wanted.pop() {
+        if used.insert(name.clone())
+            && let Some(schema) = defs.get(&name)
+        {
+            refs(schema, &mut wanted);
+        }
+    }
+    used
 }
 
 pub(crate) fn refs(schema: &Value, out: &mut impl Extend<String>) {
