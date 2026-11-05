@@ -610,7 +610,7 @@ test("a paste while the connection reconnects goes to its session on the new con
   expect((await next.request("send")).params).toEqual({ session: "s", data: btoa("pasted") });
 });
 
-test("a key while the connection reconnects clears the selection and goes back to the live screen", async () => {
+test("a key while the connection is down clears the selection and goes back to the live screen, and sends nothing", async () => {
   const worker = await start();
   worker.mount(1, "s");
   const server = await socket(0);
@@ -625,17 +625,17 @@ test("a key while the connection reconnects clears the selection and goes back t
   expect(worker.scrollbar()).toEqual({ total: 6, offset: 2, len: 3 });
 
   server.close();
-  const next = await socket(1);
-  await next.welcome();
-  await next.request("subscribe");
   worker.to(1, { type: "text", text: "k" });
   expect(worker.selections().map((s) => s.text)).toEqual(["l4", undefined]);
   expect(worker.scrollbar()).toEqual({ total: 6, offset: 3, len: 3 });
+  const next = await socket(1);
+  await next.serve([session("s")]);
+  await next.opened("s");
   await new Promise((resolve) => setTimeout(resolve, 20));
-  expect(next.sent.filter((f) => f.header.type === FrameType.Input)).toEqual([]);
+  expect([...server.sent, ...next.sent].filter((f) => f.header.type === FrameType.Input)).toEqual([]);
 });
 
-test("a colour change while the connection reconnects repaints the screen", async () => {
+test("a colour change while the connection is down repaints the screen at once and reaches the session in the reopen", async () => {
   const worker = await start();
   worker.mount(1, "s");
   const server = await socket(0);
@@ -644,17 +644,18 @@ test("a colour change while the connection reconnects repaints the screen", asyn
   await vi.waitFor(() => expect(worker.links().at(-1)).toEqual({ state: "connected", session: session("s") }));
 
   server.close();
-  const next = await socket(1);
-  await next.welcome();
-  await next.request("subscribe");
   const before = worker.posted.length;
-  worker.to(1, { type: "viewport", size: { cols: 80, rows: 24 }, profile: { bg: "#102030" }, active: true });
+  const profile = { bg: "#102030" };
+  worker.to(1, { type: "viewport", size: { cols: 80, rows: 24 }, profile, active: true });
   expect(worker.posted.slice(before).map((m) => m.type)).toEqual(["frame"]);
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  expect(next.bodies(FrameType.Viewport)).toEqual([]);
+  const next = await socket(1);
+  await next.serve([session("s")]);
+  const channel = await next.opened("s");
+  expect(next.bodies(FrameType.Open).find((o) => o.channel === channel)?.body.profile).toEqual(profile);
+  expect([...server.bodies(FrameType.Viewport), ...next.bodies(FrameType.Viewport)]).toEqual([]);
 });
 
-test("a page that keys in a reconnect handshake after another client took the size does not take it back after the resume", async () => {
+test("a reopen takes the size back in its OPEN, so the page's next input after the resume sends no VIEWPORT", async () => {
   const worker = await start();
   worker.mount(1, "s");
   const server = await socket(0);
@@ -666,12 +667,11 @@ test("a page that keys in a reconnect handshake after another client took the si
 
   server.close();
   const next = await socket(1);
-  await next.welcome();
-  const subscribe = await next.request("subscribe");
-  worker.to(1, { type: "key", input: key("KeyA", { key: "a" }) });
-  next.push(FrameType.Reply, 0, { id: subscribe.id, result: { oldest: 1, latest: 0, gap: false } });
+  await next.serve([session("s")]);
   const channel = await next.opened("s");
-  const resume = next.bodies(FrameType.Open).find((o) => o.channel === channel)!.body.resume as Record<string, number>;
+  const open = next.bodies(FrameType.Open).find((o) => o.channel === channel)!.body;
+  expect(open.viewport).toEqual({ cols: 80, rows: 24 });
+  const resume = open.resume as Record<string, number>;
   next.push(FrameType.Attached, channel, { mode: "resume", ...resume, cols: 20, rows: 5, session: session("s") });
   await vi.waitFor(() => expect(worker.screens().at(-1)).toBe("resumed"));
   worker.to(1, { type: "key", input: key("KeyB", { key: "b" }) });

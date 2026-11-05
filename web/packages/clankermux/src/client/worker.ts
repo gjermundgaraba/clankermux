@@ -529,6 +529,7 @@ class Mount {
       ...(this.active && { viewport: this.viewport, profile: this.profile }),
       ...(resume && { resume }),
     };
+    if (this.active) this.sizeTakenByOtherClient = false;
     conn.open(channel, open, (frame) => {
       if (this.attachment !== attachment) return;
       let actions: Action[];
@@ -732,14 +733,17 @@ class Mount {
   }
 
   private sendInput(bytes: Uint8Array): void {
+    if (!this.typed(bytes)) return;
     const line = lineOf(this.snapshot);
-    this.queueInput(bytes, line && (async () => line.conn.send(FrameType.Input, line.channel, bytes)));
+    if (line) this.deliver(line.conn, async () => line.conn.send(FrameType.Input, line.channel, bytes));
   }
 
   private sendPaste(bytes: Uint8Array): void {
-    const { session } = this.snapshot.context;
-    if (session === undefined) return;
-    this.queueInput(bytes, async (conn) => {
+    if (!this.typed(bytes)) return;
+    const { conn } = this.hub;
+    const { session } = this;
+    if (!conn || session === undefined) return;
+    this.deliver(conn, async () => {
       const chunk = pasteChunkSize(conn.welcome.limits);
       for (let at = 0; at < bytes.length; at += chunk) {
         await conn.call("send", { session, data: base64(bytes.subarray(at, at + chunk)) });
@@ -747,19 +751,22 @@ class Mount {
     });
   }
 
-  private queueInput(bytes: Uint8Array, deliver: ((conn: Connection) => Promise<void>) | undefined): void {
-    const { conn } = this.hub;
+  private typed(bytes: Uint8Array): boolean {
     const { attachment } = this;
-    if (bytes.length === 0 || this.readOnly || !conn || !attachment || attachment.ended()) return;
+    if (bytes.length === 0 || this.readOnly || !attachment || attachment.ended()) return false;
     this.claim();
     this.backToLive();
     this.unselect();
-    if (!deliver) return;
+    return true;
+  }
+
+  private deliver(conn: Connection, send: () => Promise<void>): void {
+    const { attachment } = this;
     this.inputQueue.enqueueUnlessDetached(
       () => this.attachment === attachment,
       async () => {
         try {
-          await deliver(conn);
+          await send();
         } catch (err) {
           if (conn === this.hub.conn) this.status(String(err));
         }
@@ -832,16 +839,17 @@ class Mount {
     this.profile = profile;
     this.active = active;
     const { attachment } = this;
-    if (!this.hub.conn || !attachment || attachment.ended()) return;
+    if (!attachment || attachment.ended()) return;
     this.applyProfile(attachment.term());
     this.paint();
     if (active) this.report();
   }
 
   private report(): void {
-    this.sizeTakenByOtherClient = false;
     const line = lineOf(this.snapshot);
-    line?.conn.sendJson(FrameType.Viewport, line.channel, { ...this.viewport, profile: this.profile });
+    if (!line) return;
+    this.sizeTakenByOtherClient = false;
+    line.conn.sendJson(FrameType.Viewport, line.channel, { ...this.viewport, profile: this.profile });
   }
 
   private claim(): void {
