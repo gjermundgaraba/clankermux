@@ -152,10 +152,20 @@ pub fn parse_header(bytes: &[u8; HEADER_LEN], max_frame: u64) -> Result<Header, 
 }
 
 pub fn encode_frame(frame_type: FrameType, channel: u32, payload: &[u8]) -> Vec<u8> {
-    let length = u32::try_from(payload.len()).expect("frame payload longer than u32");
-    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
-    out.extend_from_slice(&encode_header(frame_type, channel, length));
-    out.extend_from_slice(payload);
+    encode_parts(frame_type, channel, &[payload])
+}
+
+fn encode_parts(frame_type: FrameType, channel: u32, parts: &[&[u8]]) -> Vec<u8> {
+    let length: usize = parts.iter().map(|part| part.len()).sum();
+    let mut out = Vec::with_capacity(HEADER_LEN + length);
+    out.extend_from_slice(&encode_header(
+        frame_type,
+        channel,
+        u32::try_from(length).expect("frame payload longer than u32"),
+    ));
+    for part in parts {
+        out.extend_from_slice(part);
+    }
     out
 }
 
@@ -224,24 +234,17 @@ impl FrameDecoder {
 pub const OUTPUT_OFFSET_LEN: usize = 8;
 
 pub fn encode_output(offset: u64, bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(OUTPUT_OFFSET_LEN + bytes.len());
-    out.extend_from_slice(&offset.to_le_bytes());
-    out.extend_from_slice(bytes);
-    out
+    [&offset.to_le_bytes()[..], bytes].concat()
 }
 
+/// The `OUTPUT` frame for `first` then `second`, the two halves a ring
+/// buffer's slice can come in.
 pub fn encode_output_frame(channel: u32, offset: u64, first: &[u8], second: &[u8]) -> Vec<u8> {
-    let length = OUTPUT_OFFSET_LEN + first.len() + second.len();
-    let mut out = Vec::with_capacity(HEADER_LEN + length);
-    out.extend_from_slice(&encode_header(
+    encode_parts(
         FrameType::Output,
         channel,
-        u32::try_from(length).expect("frame payload longer than u32"),
-    ));
-    out.extend_from_slice(&offset.to_le_bytes());
-    out.extend_from_slice(first);
-    out.extend_from_slice(second);
-    out
+        &[&offset.to_le_bytes(), first, second],
+    )
 }
 
 pub fn parse_output(payload: &[u8]) -> Option<(u64, &[u8])> {
