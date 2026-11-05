@@ -316,19 +316,65 @@ struct Ran {
     unfinished: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum Vt {
+    #[default]
     Ground,
-    Esc,
-    EscIntermediate,
+    Escape,
+    Intermediate,
     Csi,
-    String,
-    StringEsc,
+    ControlString,
+    ControlStringEscape,
+}
+
+impl Vt {
+    pub fn ground(&mut self, byte: u8) -> bool {
+        const BEL: u8 = 0x07;
+        const CAN: u8 = 0x18;
+        const SUB: u8 = 0x1a;
+        const ESC: u8 = 0x1b;
+        let (next, ground) = match *self {
+            Vt::Ground if byte == ESC => (Vt::Escape, true),
+            Vt::Ground => (Vt::Ground, true),
+            Vt::Escape => match byte {
+                b'[' => (Vt::Csi, false),
+                b']' | b'P' | b'X' | b'^' | b'_' => (Vt::ControlString, false),
+                0x20..=0x2f => (Vt::Intermediate, false),
+                ESC => (Vt::Escape, false),
+                0x30..=0x7e | CAN | SUB => (Vt::Ground, false),
+                _ => (Vt::Ground, true),
+            },
+            Vt::Intermediate => match byte {
+                0x20..=0x2f => (Vt::Intermediate, false),
+                ESC => (Vt::Escape, false),
+                0x30..=0x7e | CAN | SUB => (Vt::Ground, false),
+                _ => (Vt::Ground, true),
+            },
+            Vt::Csi => match byte {
+                ESC => (Vt::Escape, false),
+                b'\n' | b'\r' | b'\t' => (Vt::Csi, true),
+                0x20..=0x3f | 0x00..=0x17 | 0x19 | 0x1c..=0x1f => (Vt::Csi, false),
+                _ => (Vt::Ground, false),
+            },
+            Vt::ControlString => match byte {
+                BEL | CAN | SUB => (Vt::Ground, false),
+                ESC => (Vt::ControlStringEscape, false),
+                _ => (Vt::ControlString, false),
+            },
+            Vt::ControlStringEscape if byte == b'\\' => (Vt::Ground, false),
+            Vt::ControlStringEscape => {
+                *self = Vt::Escape;
+                return self.ground(byte);
+            }
+        };
+        *self = next;
+        ground
+    }
 }
 
 struct Filter {
     out: String,
-    state: State,
+    vt: Vt,
     utf8: Vec<u8>,
     previous: Option<u8>,
     skip_cut: bool,
@@ -339,7 +385,7 @@ impl Filter {
     fn new(previous: Option<u8>, cut: bool) -> Self {
         Filter {
             out: String::new(),
-            state: State::Ground,
+            vt: Vt::Ground,
             utf8: Vec::new(),
             previous,
             skip_cut: cut,
@@ -358,7 +404,7 @@ impl Filter {
         let mut len = 0;
         for (i, byte) in bytes.into_iter().enumerate() {
             len = i + 1;
-            if self.state == State::Ground && self.utf8.is_empty() {
+            if self.vt == Vt::Ground && self.utf8.is_empty() {
                 boundary = i;
                 if i >= max {
                     return Ran {
@@ -368,7 +414,9 @@ impl Filter {
                 }
             }
             let mark = (self.out.len(), self.json);
-            self.byte(byte);
+            if self.vt.ground(byte) {
+                self.ground(byte);
+            }
             if self.json > budget {
                 self.out.truncate(mark.0);
                 self.json = mark.1;
@@ -378,7 +426,7 @@ impl Filter {
                 };
             }
         }
-        if self.state == State::Ground && self.utf8.is_empty() {
+        if self.vt == Vt::Ground && self.utf8.is_empty() {
             return Ran {
                 consumed: len,
                 unfinished: false,
@@ -412,52 +460,6 @@ impl Filter {
             _ => ch.len_utf8(),
         };
         self.out.push(ch);
-    }
-
-    fn byte(&mut self, byte: u8) {
-        match self.state {
-            State::Ground => self.ground(byte),
-            State::Esc => match byte {
-                b'[' => self.state = State::Csi,
-                b']' | b'P' | b'X' | b'^' | b'_' => self.state = State::String,
-                0x20..=0x2f => self.state = State::EscIntermediate,
-                0x1b => {}
-                0x30..=0x7e | 0x18 | 0x1a => self.state = State::Ground,
-                _ => {
-                    self.state = State::Ground;
-                    self.ground(byte);
-                }
-            },
-            State::EscIntermediate => match byte {
-                0x20..=0x2f => {}
-                0x1b => self.state = State::Esc,
-                0x30..=0x7e | 0x18 | 0x1a => self.state = State::Ground,
-                _ => {
-                    self.state = State::Ground;
-                    self.ground(byte);
-                }
-            },
-            State::Csi => match byte {
-                0x1b => self.state = State::Esc,
-                // The terminal carries these out inside a sequence too.
-                b'\n' | b'\r' | b'\t' => self.ground(byte),
-                0x20..=0x3f | 0x00..=0x17 | 0x19 | 0x1c..=0x1f => {}
-                _ => self.state = State::Ground,
-            },
-            State::String => match byte {
-                0x07 | 0x18 | 0x1a => self.state = State::Ground,
-                0x1b => self.state = State::StringEsc,
-                _ => {}
-            },
-            State::StringEsc => {
-                if byte == b'\\' {
-                    self.state = State::Ground;
-                } else {
-                    self.state = State::Esc;
-                    self.byte(byte);
-                }
-            }
-        }
     }
 
     fn ground(&mut self, byte: u8) {
@@ -500,7 +502,6 @@ impl Filter {
             self.previous = Some(byte);
         }
         match byte {
-            0x1b => self.state = State::Esc,
             b'\n' if previous == Some(b'\r') => {}
             b'\n' | b'\r' => self.emit('\n'),
             b'\t' => self.emit('\t'),
