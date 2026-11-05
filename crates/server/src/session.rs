@@ -909,7 +909,7 @@ impl Session {
         }
     }
 
-    pub fn maybe_end(&mut self) -> Option<Exit> {
+    pub fn maybe_end(&mut self) -> Option<proto::Session> {
         if self.exited_at.is_some() {
             return None;
         }
@@ -928,13 +928,13 @@ impl Session {
         let Body::Live(live) = &mut self.body else {
             return None;
         };
-        live.stream
-            .add_marker(MarkerKind::Exited { exit: exit.clone() });
+        live.stream.add_marker(MarkerKind::Exited { exit });
         self.drop_transient_records(StatusReason::Exit);
-        self.announced = announced(&self.to_proto(false));
+        let ended = self.to_proto(false);
+        self.announced = announced(&ended);
         self.wake.notify_waiters();
         self.park_due.notify_one();
-        Some(exit)
+        Some(ended)
     }
 
     pub fn read_text(&self, scrollback: usize) -> Result<String, ghostty_vt::Error> {
