@@ -683,7 +683,7 @@ test.each([
   ["CLOSED removed", (server: FakeSocket, channel: number) => server.push(FrameType.Closed, channel, { reason: "removed" }), "closed: removed"],
   ["a desync", (server: FakeSocket, channel: number) => server.pushRaw(encodeFrame(FrameType.Output, channel, output(3, "x"))), "ClientError: OUTPUT at 3, expected 0"],
   ["an ending ERROR", (server: FakeSocket, channel: number) => server.push(FrameType.Error, channel, { code: "internal", message: "later" }), "internal: later"],
-])("%s while text is selected posts its status, then the ended link, then clears the selection", async (_, end, status) => {
+])("%s while text is selected posts its status, clears the selection, then posts the ended link", async (_, end, status) => {
   const worker = await start();
   worker.mount(1, "s");
   const server = await socket(0);
@@ -702,8 +702,8 @@ test.each([
   expect(link?.state).toBe("ended");
   expect(worker.posted.slice(before).filter((m) => m.type === "status" || m.type === "link" || m.type === "selection")).toEqual<ToPage[]>([
     { type: "status", mount: 1, text: status },
-    { type: "link", mount: 1, link: link! },
     { type: "selection", mount: 1, text: undefined },
+    { type: "link", mount: 1, link: link! },
   ]);
 });
 
