@@ -404,22 +404,18 @@ fn matching<'a>(sessions: &'a [Session], needle: &str) -> Vec<&'a Session> {
         .unwrap_or_default()
 }
 
-fn here_session(here: bool) -> Option<String> {
-    std::env::var(SESSION_ENV)
-        .ok()
-        .filter(|v| here && !v.is_empty())
-}
-
 async fn resolve(conn: &Connection, here: bool, needle: Option<String>) -> Result<String, Fail> {
-    let needle = match needle.or_else(|| here_session(here)) {
-        Some(needle) => needle,
-        None if std::env::var_os(SESSION_ENV).is_some_and(|v| !v.is_empty()) => {
+    let inside = std::env::var(SESSION_ENV).ok().filter(|v| !v.is_empty());
+    let needle = match (needle, inside) {
+        (Some(needle), _) => needle,
+        (None, Some(inside)) if here => inside,
+        (None, Some(_)) => {
             return Err(Fail::Usage(format!(
                 "a session is needed: ${SESSION_ENV} is a session of the server in \
                  ${SOCKET_ENV}, not of this one"
             )));
         }
-        None => {
+        (None, None) => {
             return Err(Fail::Usage(format!(
                 "a session is needed: name one, or run inside a session (${SESSION_ENV})"
             )));
