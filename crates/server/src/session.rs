@@ -937,30 +937,28 @@ impl Session {
         Some(ended)
     }
 
-    pub fn read_text(&self, scrollback: usize) -> Result<String, ghostty_vt::Error> {
+    pub fn read_text(&self, scrollback: Option<usize>) -> Result<String, ghostty_vt::Error> {
         let (text, history_lines) = match &self.body {
             Body::Live(live) => blocking(|| {
+                let Some(scrollback) = scrollback else {
+                    return live
+                        .text_from(ScrollbackRow(0))
+                        .map(|text| (Cow::Owned(text), 0));
+                };
                 // When the entire screen is blank, trimming also removes
                 // trailing empty history lines. Keep counting from that
                 // trimmed history for a request that includes scrollback.
-                if scrollback > 0
-                    && scrollback != usize::MAX
-                    && live.text_from(live.term.history_start(0)?)?.is_empty()
-                {
+                if scrollback > 0 && live.text_from(live.term.history_start(0)?)?.is_empty() {
                     return live
                         .text()
                         .map(|text| (Cow::Owned(text.all), text.history_lines));
                 }
-                let start = if scrollback == usize::MAX {
-                    ScrollbackRow(0)
-                } else {
-                    live.term.history_start(scrollback)?
-                };
-                live.text_from(start).map(|text| (Cow::Owned(text), 0))
+                live.text_from(live.term.history_start(scrollback)?)
+                    .map(|text| (Cow::Owned(text), 0))
             })?,
             Body::Parked(parked) => (Cow::Borrowed(parked.screen.as_str()), parked.history_lines),
         };
-        let skip = history_lines.saturating_sub(scrollback);
+        let skip = scrollback.map_or(0, |rows| history_lines.saturating_sub(rows));
         Ok(text.lines().skip(skip).collect::<Vec<_>>().join("\n"))
     }
 

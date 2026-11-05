@@ -179,10 +179,7 @@ pub fn read(registry: &Registry, p: &ReadParams) -> Result<proto::Read, Fail> {
             "scrollback is for scope screen only".into(),
         ));
     }
-    let scrollback = match scope {
-        ReadScope::History => usize::MAX,
-        _ => p.scrollback.unwrap_or(0) as usize,
-    };
+    let scrollback = p.scrollback.unwrap_or(0) as usize;
     let limits = &registry.config.limits;
     let budget = proto::cap(limits.max_frame).saturating_sub(REPLY_MARGIN);
     let session = registry.get(&p.session)?;
@@ -218,7 +215,9 @@ pub fn read(registry: &Registry, p: &ReadParams) -> Result<proto::Read, Fail> {
     }
     match &s.body {
         _ if format == ReadFormat::Text && scope != ReadScope::Alternate => {
-            let mut text = s.read_text(scrollback).map_err(internal)?;
+            let mut text = s
+                .read_text((scope == ReadScope::Screen).then_some(scrollback))
+                .map_err(internal)?;
             if !text.is_empty() {
                 text.push('\n');
             }

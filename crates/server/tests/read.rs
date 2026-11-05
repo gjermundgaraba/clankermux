@@ -529,7 +529,7 @@ async fn text_regions_keep_wrapped_lines_trailing_blanks_and_alternate_screen() 
             let mut term = ghostty_vt::Terminal::with_handler(10, 3, Effects::default()).unwrap();
             term.vt_write(input);
             s.live_mut().unwrap().term = term;
-            let scrollback = [0, 1, usize::MAX];
+            let scrollback = [Some(0), Some(1), None];
             let live_text = scrollback.map(|n| s.read_text(n).unwrap());
             let server::session::ScreenText {
                 all: screen,
