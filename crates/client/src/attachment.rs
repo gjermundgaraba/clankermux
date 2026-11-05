@@ -28,12 +28,6 @@ pub enum Action {
     Ended(ErrorMessage),
 }
 
-#[derive(Clone, Copy)]
-struct Cursor {
-    offset: u64,
-    marker: u64,
-}
-
 enum State<H: Handler> {
     Opening,
     Bootstrapping {
@@ -45,17 +39,15 @@ enum State<H: Handler> {
     Ended(Option<Terminal<H>>),
 }
 
-struct NextOpen {
+struct Server {
     incarnation: String,
     continuation: usize,
 }
 
 pub struct Attachment<H: Handler + Default = ()> {
-    incarnation: String,
-    continuation: usize,
-    next: Option<NextOpen>,
+    opened_on: Server,
     state: State<H>,
-    cursor: Cursor,
+    cursor: Resume,
     pub session: Option<Session>,
 }
 
@@ -68,11 +60,13 @@ impl<H: Handler + Default> Default for Attachment<H> {
 impl<H: Handler + Default> Attachment<H> {
     pub fn new() -> Self {
         Attachment {
-            incarnation: String::new(),
-            continuation: 0,
-            next: None,
+            opened_on: Server {
+                incarnation: String::new(),
+                continuation: 0,
+            },
             state: State::Opening,
-            cursor: Cursor {
+            cursor: Resume {
+                incarnation: String::new(),
                 offset: 0,
                 marker: 0,
             },
@@ -81,19 +75,15 @@ impl<H: Handler + Default> Attachment<H> {
     }
 
     pub fn open_on(&mut self, welcome: &Welcome) {
-        self.next = Some(NextOpen {
+        self.opened_on = Server {
             incarnation: welcome.incarnation.clone(),
             continuation: proto::cap(welcome.limits.continuation),
-        });
+        };
     }
 
     pub fn resume(&self) -> Option<Resume> {
         match self.state {
-            State::Streaming(_) => Some(Resume {
-                incarnation: self.incarnation.clone(),
-                offset: self.cursor.offset,
-                marker: self.cursor.marker,
-            }),
+            State::Streaming(_) => Some(self.cursor.clone()),
             _ => None,
         }
     }
@@ -205,15 +195,8 @@ impl<H: Handler + Default> Attachment<H> {
     }
 
     fn attached(&mut self, attached: Attached) -> Result<(), Error> {
-        if let Some(NextOpen {
-            incarnation,
-            continuation,
-        }) = self.next.take()
-        {
-            self.incarnation = incarnation;
-            self.continuation = continuation;
-        }
-        self.cursor = Cursor {
+        self.cursor = Resume {
+            incarnation: self.opened_on.incarnation.clone(),
             offset: attached.offset,
             marker: attached.marker,
         };
@@ -222,7 +205,7 @@ impl<H: Handler + Default> Attachment<H> {
             AttachMode::Snapshot => {
                 let mut decoder = Decoder::with_handler(H::default()).map_err(engine)?;
                 decoder
-                    .set_max_continuation_bytes(self.continuation)
+                    .set_max_continuation_bytes(self.opened_on.continuation)
                     .map_err(engine)?;
                 self.state = State::Bootstrapping {
                     decoder,
@@ -267,15 +250,14 @@ impl<H: Handler + Default> Attachment<H> {
     }
 
     fn stream(&mut self, frame: &Frame, actions: &mut Vec<Action>) -> Result<(), Error> {
-        let cursor = self.cursor;
         match frame.header.frame_type {
             FrameType::Output => {
                 let (offset, bytes) = parse_output(&frame.payload)
                     .ok_or_else(|| Error::Protocol("short OUTPUT".into()))?;
-                if offset != cursor.offset {
+                if offset != self.cursor.offset {
                     return Err(Error::Desync(format!(
                         "OUTPUT at {offset}, expected {}",
-                        cursor.offset
+                        self.cursor.offset
                     )));
                 }
                 let term = self
