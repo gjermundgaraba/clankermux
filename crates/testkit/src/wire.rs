@@ -18,7 +18,7 @@ pub fn start(limits: Limits) -> Server {
 }
 
 pub fn start_with(limits: Limits, state_dir: PathBuf) -> Server {
-    Server::start_with_state(limits, state_dir)
+    Server::start_with_park(limits, state_dir, server::ParkTiming::default())
 }
 
 pub fn b64(data: impl AsRef<[u8]>) -> String {
