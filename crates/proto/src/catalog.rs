@@ -354,7 +354,7 @@ fn event_info(branch: &Value, vectors: &Map<String, Value>) -> EventInfo {
         .to_string();
     let prefix = format!("event/{name}");
     EventInfo {
-        summary: description(branch),
+        summary: description(branch).into(),
         schema: branch.clone(),
         examples: vectors
             .iter()
@@ -431,7 +431,7 @@ pub fn catalog(release: Option<&str>) -> Catalog {
     let errors = variants(&defs["ErrorCode"])
         .map(|branch| ErrorInfo {
             code: serde_json::from_value(branch["const"].clone()).expect("an error code"),
-            summary: description(branch),
+            summary: description(branch).into(),
         })
         .collect();
 
@@ -494,33 +494,35 @@ impl Catalog {
 }
 
 pub(crate) fn refs(schema: &Value, out: &mut impl Extend<String>) {
+    out.extend(ref_name(schema).map(String::from));
     match schema {
-        Value::Object(map) => {
-            for (key, value) in map {
-                match (key.as_str(), value) {
-                    ("$ref", Value::String(r)) => {
-                        if let Some(name) = r.strip_prefix("#/$defs/") {
-                            out.extend([name.to_string()]);
-                        }
-                    }
-                    _ => refs(value, out),
-                }
-            }
-        }
+        Value::Object(map) => map.values().for_each(|v| refs(v, out)),
         Value::Array(items) => items.iter().for_each(|v| refs(v, out)),
         _ => {}
     }
 }
 
-fn variants(schema: &Value) -> impl Iterator<Item = &Value> {
-    schema["oneOf"].as_array().into_iter().flatten()
+pub(crate) fn ref_name(schema: &Value) -> Option<&str> {
+    schema.get("$ref")?.as_str()?.strip_prefix("#/$defs/")
 }
 
-fn description(schema: &Value) -> String {
-    schema["description"]
-        .as_str()
+pub(crate) fn required(schema: &Value) -> BTreeSet<&str> {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default()
-        .to_string()
+}
+
+pub(crate) fn description(schema: &Value) -> &str {
+    schema
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn variants(schema: &Value) -> impl Iterator<Item = &Value> {
+    schema["oneOf"].as_array().into_iter().flatten()
 }
 
 /// Optional fields as the wire has them: absent, never `null` (schemars
@@ -528,6 +530,7 @@ fn description(schema: &Value) -> String {
 /// the protocol leaves an absent field out); and descriptions with doc
 /// comments' line breaks undone.
 fn tidy(schema: &mut Value) {
+    let required: BTreeSet<String> = required(schema).into_iter().map(String::from).collect();
     let Value::Object(map) = schema else {
         if let Value::Array(items) = schema {
             items.iter_mut().for_each(tidy);
@@ -541,15 +544,6 @@ fn tidy(schema: &mut Value) {
             .collect::<Vec<_>>()
             .join("\n\n");
     }
-    let required: BTreeSet<String> = map
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|r| {
-            r.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
     if let Some(Value::Object(properties)) = map.get_mut("properties") {
         for (name, property) in properties.iter_mut() {
             if !required.contains(name) {

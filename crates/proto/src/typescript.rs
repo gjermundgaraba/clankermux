@@ -2,8 +2,7 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
-use crate::catalog::Catalog;
-use crate::render::{ref_name, required};
+use crate::catalog::{Catalog, description, ref_name, required};
 
 pub fn module(catalog: &Catalog) -> String {
     let mut out =
@@ -33,13 +32,6 @@ pub fn module(catalog: &Catalog) -> String {
         }
     }
     out
-}
-
-fn description(schema: &Value) -> &str {
-    schema
-        .get("description")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
 }
 
 fn is_interface(schema: &Value) -> bool {
