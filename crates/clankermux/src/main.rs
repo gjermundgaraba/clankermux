@@ -183,10 +183,11 @@ enum Command {
     /// Mark the session's `done` and `error` records seen: those named,
     /// or all of them.
     Ack {
-        /// The session, `$CLANKERMUX_SESSION` when left out, then the
-        /// record ids.
-        #[arg(value_name = "[SESSION [ID...]]")]
-        args: Vec<String>,
+        #[arg(help = SESSION_HELP)]
+        session: Option<String>,
+        /// The records; all of the session's when left out.
+        #[arg(value_name = "ID")]
+        ids: Vec<String>,
     },
     /// Print the sessions, then their events as JSON lines, each with its
     /// `seq`, until interrupted.
@@ -1280,7 +1281,7 @@ async fn dispatch(
         Command::Wait { session, wait } => {
             return wait_for(&conn, here, json, session, &wait).await;
         }
-        Command::Ack { args } => ack(&conn, here, json, args).await?,
+        Command::Ack { session, ids } => ack(&conn, here, json, session, ids).await?,
         Command::Events { after, incarnation } => events(&conn, after, incarnation, json).await?,
     }
     Ok(0)
@@ -1305,10 +1306,14 @@ async fn resize(
     Ok(())
 }
 
-async fn ack(conn: &Connection, here: bool, json: bool, args: Vec<String>) -> Result<(), Fail> {
-    let mut args = args.into_iter();
-    let session = resolve(conn, here, args.next()).await?;
-    let ids: Vec<String> = args.collect();
+async fn ack(
+    conn: &Connection,
+    here: bool,
+    json: bool,
+    session: Option<String>,
+    ids: Vec<String>,
+) -> Result<(), Fail> {
+    let session = resolve(conn, here, session).await?;
     let params = AckParams {
         session,
         record_ids: (!ids.is_empty()).then_some(ids),
