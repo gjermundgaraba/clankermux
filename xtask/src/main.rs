@@ -5,10 +5,9 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let check = args.iter().any(|a| a == "--check");
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let task = args.first().map(String::as_str);
-    let rendered = match task {
-        Some("bindings") => Ok(vec![bindings(&root)]),
-        Some("protocol") => protocol(&root),
+    let (task, rendered) = match args.first().map(String::as_str) {
+        Some(task @ "bindings") => (task, Ok(vec![bindings(&root)])),
+        Some(task @ "protocol") => (task, protocol(&root)),
         _ => {
             eprintln!("usage: cargo xtask bindings|protocol [--check]");
             return ExitCode::from(2);
@@ -26,11 +25,7 @@ fn main() -> ExitCode {
         if !check {
             std::fs::write(&path, text).expect("write a rendered file");
         } else if std::fs::read_to_string(&path).ok() != Some(text) {
-            eprintln!(
-                "{} is stale; run `cargo xtask {}`",
-                path.display(),
-                task.unwrap_or_default()
-            );
+            eprintln!("{} is stale; run `cargo xtask {task}`", path.display());
             code = ExitCode::FAILURE;
         }
     }

@@ -506,11 +506,12 @@ fn variants(schema: &Value) -> impl Iterator<Item = &Value> {
 /// the protocol leaves an absent field out); and descriptions with doc
 /// comments' line breaks undone.
 fn tidy(schema: &mut Value) {
+    if let Value::Array(items) = schema {
+        items.iter_mut().for_each(tidy);
+        return;
+    }
     let required: BTreeSet<String> = required(schema).into_iter().map(String::from).collect();
     let Value::Object(map) = schema else {
-        if let Value::Array(items) = schema {
-            items.iter_mut().for_each(tidy);
-        }
         return;
     };
     if let Some(Value::String(text)) = map.get_mut("description") {
