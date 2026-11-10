@@ -1,10 +1,12 @@
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 pub const HEADER_LEN: usize = 10;
 
 macro_rules! frame_types {
-    ($($name:ident = $value:literal),* $(,)?) => {
+    ($(
+        $name:ident = $value:literal, $channel:ident, $payload:ident $(($schema:ty))?, $summary:literal;
+    )*) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         #[repr(u8)]
         pub enum FrameType {
@@ -13,30 +15,56 @@ macro_rules! frame_types {
 
         impl FrameType {
             pub const ALL: &[FrameType] = &[$(FrameType::$name,)*];
+
+            pub fn channel_kind(self) -> ChannelKind {
+                match self {
+                    $(FrameType::$name => ChannelKind::$channel,)*
+                }
+            }
+
+            pub fn payload(self) -> Payload {
+                match self {
+                    $(FrameType::$name => Payload::$payload,)*
+                }
+            }
+
+            pub fn summary(self) -> &'static str {
+                match self {
+                    $(FrameType::$name => $summary,)*
+                }
+            }
+
+            /// The JSON Schema of a JSON payload, from `generator`.
+            pub fn schema(self, generator: &mut SchemaGenerator) -> Option<Schema> {
+                match self {
+                    $($(FrameType::$name => Some(generator.subschema_for::<$schema>()),)?)*
+                    _ => None,
+                }
+            }
         }
     };
 }
 
 frame_types! {
-    Hello = 0x01,
-    Request = 0x02,
-    Open = 0x10,
-    Input = 0x11,
-    Viewport = 0x12,
-    Close = 0x13,
-    Welcome = 0x81,
-    Reply = 0x82,
-    Event = 0x83,
-    Error = 0x8F,
-    Attached = 0x90,
-    Snapshot = 0x91,
-    SnapshotReady = 0x92,
-    SnapshotEnd = 0x93,
-    Output = 0x94,
-    Resized = 0x95,
-    Exited = 0x96,
-    Gap = 0x97,
-    Closed = 0x99,
+    Hello = 0x01, Control, Json(crate::Hello), "Opens the connection: version, client and engine";
+    Request = 0x02, Control, Json(crate::Request), "A method call, answered by `REPLY` or `ERROR` with its `id`";
+    Open = 0x10, Attachment, Json(crate::Open), "Attaches the channel to a session";
+    Input = 0x11, Attachment, Raw, "Bytes for the PTY";
+    Viewport = 0x12, Attachment, Json(crate::Viewport), "The attachment's size and profile";
+    Close = 0x13, Attachment, Empty, "Detaches the channel";
+    Welcome = 0x81, Control, Json(crate::Welcome), "Accepts the connection: the server's engine, incarnation and limits";
+    Reply = 0x82, Control, Json(crate::Reply), "A method's result";
+    Event = 0x83, Control, Json(crate::Numbered), "A change, once subscribed";
+    Error = 0x8F, Either, Json(crate::ErrorMessage), "A request's or an attachment's failure, or the connection's end";
+    Attached = 0x90, Attachment, Json(crate::Attached), "The attachment's start: snapshot or resume";
+    Snapshot = 0x91, Attachment, Raw, "Snapshot bytes";
+    SnapshotReady = 0x92, Attachment, Empty, "The snapshot holds the screen; stream frames may follow";
+    SnapshotEnd = 0x93, Attachment, Empty, "The last snapshot byte was sent";
+    Output = 0x94, Attachment, Raw, "`offset u64` and PTY bytes from that stream offset";
+    Resized = 0x95, Attachment, Json(crate::Resized), "A size marker in the stream";
+    Exited = 0x96, Attachment, Json(crate::Exited), "The end of the stream";
+    Gap = 0x97, Attachment, Json(crate::Gap), "Bytes were not delivered; a new bootstrap follows";
+    Closed = 0x99, Attachment, Json(crate::Closed), "The attachment ended";
 }
 
 impl FrameType {
@@ -48,31 +76,11 @@ impl FrameType {
         self as u8 & 0x80 != 0
     }
 
-    pub fn channel_kind(self) -> ChannelKind {
-        use FrameType::*;
-        match self {
-            Hello | Request | Welcome | Reply | Event => ChannelKind::Control,
-            Error => ChannelKind::Either,
-            Open | Input | Viewport | Close | Attached | Snapshot | SnapshotReady | SnapshotEnd
-            | Output | Resized | Exited | Gap | Closed => ChannelKind::Attachment,
-        }
-    }
-
     pub fn allowed_on(self, channel: u32) -> bool {
         match self.channel_kind() {
             ChannelKind::Control => channel == 0,
             ChannelKind::Attachment => channel != 0,
             ChannelKind::Either => true,
-        }
-    }
-
-    pub fn payload(self) -> Payload {
-        use FrameType::*;
-        match self {
-            Hello | Request | Open | Viewport | Welcome | Reply | Event | Error | Attached
-            | Resized | Exited | Gap | Closed => Payload::Json,
-            Input | Snapshot | Output => Payload::Raw,
-            Close | SnapshotReady | SnapshotEnd => Payload::Empty,
         }
     }
 

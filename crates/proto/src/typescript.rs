@@ -8,6 +8,19 @@ pub fn module(catalog: &Catalog) -> String {
     let mut out =
         String::from("// Generated from the catalog by `cargo xtask protocol`; do not edit.\n\n");
     let _ = write!(out, "export const VERSION = {};\n\n", catalog.protocol);
+    out.push_str("/** Each frame type's header byte. */\nexport const FrameType = {\n");
+    for frame in &catalog.frames {
+        out.push_str(&doc(&frame.summary, "  "));
+        let _ = writeln!(
+            out,
+            "  {}: 0x{:02x},",
+            pascal(&frame.name),
+            frame.frame_type
+        );
+    }
+    out.push_str(
+        "} as const;\n\nexport type FrameType = (typeof FrameType)[keyof typeof FrameType];\n\n",
+    );
     out.push_str("/** Each method's params and result. */\nexport interface Methods {\n");
     for m in &catalog.methods {
         out.push_str(&doc(&m.summary, "  "));
@@ -32,6 +45,12 @@ pub fn module(catalog: &Catalog) -> String {
         }
     }
     out
+}
+
+fn pascal(name: &str) -> String {
+    name.split('_')
+        .map(|word| word[..1].to_string() + &word[1..].to_lowercase())
+        .collect()
 }
 
 fn is_interface(schema: &Value) -> bool {

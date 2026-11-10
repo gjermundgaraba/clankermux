@@ -432,3 +432,15 @@ fn one_method_renders_with_the_types_it_uses() {
     let end = render::method(&catalog.describe("end").unwrap());
     assert!(end.contains("## Result: `{}`"), "{end}");
 }
+
+#[test]
+fn a_frame_has_a_schema_exactly_when_its_payload_is_json() {
+    let mut generator = schemars::SchemaGenerator::default();
+    for &frame in FrameType::ALL {
+        assert_eq!(
+            frame.schema(&mut generator).is_some(),
+            frame.is_json(),
+            "{frame:?}"
+        );
+    }
+}

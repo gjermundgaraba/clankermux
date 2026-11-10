@@ -7,9 +7,9 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     AckParams, Acked, CancelParams, Cancelled, ChannelKind, CreateParams, DetachParams, Empty,
-    ErrorCode, ErrorMessage, FrameType, LabelParams, ListParams, Numbered, Page, Payload, Read,
-    ReadParams, ResizeParams, SendParams, Sent, Session, SessionParams, SignalParams,
-    SubscribeParams, Subscribed, Tail, TailParams, VERSION, WaitParams, Waited,
+    ErrorCode, FrameType, LabelParams, ListParams, Page, Payload, Read, ReadParams, ResizeParams,
+    SendParams, Sent, Session, SessionParams, SignalParams, SubscribeParams, Subscribed, Tail,
+    TailParams, VERSION, WaitParams, Waited,
 };
 
 pub(crate) const VECTORS: &str = include_str!("../vectors/messages.json");
@@ -268,57 +268,6 @@ methods! {
 
 const DESCRIBE_EXAMPLE: &str = "params/describe-method";
 
-fn frame_summary(frame_type: FrameType) -> &'static str {
-    use FrameType::*;
-    match frame_type {
-        Hello => "Opens the connection: version, client and engine",
-        Request => "A method call, answered by `REPLY` or `ERROR` with its `id`",
-        Open => "Attaches the channel to a session",
-        Input => "Bytes for the PTY",
-        Viewport => "The attachment's size and profile",
-        Close => "Detaches the channel",
-        Welcome => "Accepts the connection: the server's engine, incarnation and limits",
-        Reply => "A method's result",
-        Event => "A change, once subscribed",
-        Error => "A request's or an attachment's failure, or the connection's end",
-        Attached => "The attachment's start: snapshot or resume",
-        Snapshot => "Snapshot bytes",
-        SnapshotReady => "The snapshot holds the screen; stream frames may follow",
-        SnapshotEnd => "The last snapshot byte was sent",
-        Output => "`offset u64` and PTY bytes from that stream offset",
-        Resized => "A size marker in the stream",
-        Exited => "The end of the stream",
-        Gap => "Bytes were not delivered; a new bootstrap follows",
-        Closed => "The attachment ended",
-    }
-}
-
-fn frame_schema(
-    frame_type: FrameType,
-    server_reads: &mut SchemaGenerator,
-    server_writes: &mut SchemaGenerator,
-) -> schemars::Schema {
-    use FrameType::*;
-    match frame_type {
-        Hello => server_reads.subschema_for::<crate::Hello>(),
-        Request => server_reads.subschema_for::<crate::Request>(),
-        Open => server_reads.subschema_for::<crate::Open>(),
-        Viewport => server_reads.subschema_for::<crate::Viewport>(),
-        Welcome => server_writes.subschema_for::<crate::Welcome>(),
-        Reply => server_writes.subschema_for::<crate::Reply>(),
-        Event => server_writes.subschema_for::<Numbered>(),
-        Error => server_writes.subschema_for::<ErrorMessage>(),
-        Attached => server_writes.subschema_for::<crate::Attached>(),
-        Resized => server_writes.subschema_for::<crate::Resized>(),
-        Exited => server_writes.subschema_for::<crate::Exited>(),
-        Gap => server_writes.subschema_for::<crate::Gap>(),
-        Closed => server_writes.subschema_for::<crate::Closed>(),
-        Input | Close | Snapshot | SnapshotReady | SnapshotEnd | Output => {
-            unreachable!("{frame_type:?} has no JSON payload")
-        }
-    }
-}
-
 fn frame_name(frame_type: FrameType) -> String {
     let mut name = String::new();
     for (i, c) in format!("{frame_type:?}").chars().enumerate() {
@@ -357,10 +306,14 @@ fn frame_info(
         }
         .into(),
         payload: t.payload(),
-        summary: frame_summary(t).into(),
+        summary: t.summary().into(),
         schema: t
-            .is_json()
-            .then(|| frame_schema(t, server_reads, server_writes).to_value()),
+            .schema(if t.is_server() {
+                server_writes
+            } else {
+                server_reads
+            })
+            .map(schemars::Schema::to_value),
     }
 }
 

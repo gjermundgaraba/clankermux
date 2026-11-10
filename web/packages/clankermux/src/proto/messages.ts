@@ -2,6 +2,50 @@
 
 export const VERSION = 1;
 
+/** Each frame type's header byte. */
+export const FrameType = {
+  /** Opens the connection: version, client and engine */
+  Hello: 0x01,
+  /** A method call, answered by `REPLY` or `ERROR` with its `id` */
+  Request: 0x02,
+  /** Attaches the channel to a session */
+  Open: 0x10,
+  /** Bytes for the PTY */
+  Input: 0x11,
+  /** The attachment's size and profile */
+  Viewport: 0x12,
+  /** Detaches the channel */
+  Close: 0x13,
+  /** Accepts the connection: the server's engine, incarnation and limits */
+  Welcome: 0x81,
+  /** A method's result */
+  Reply: 0x82,
+  /** A change, once subscribed */
+  Event: 0x83,
+  /** A request's or an attachment's failure, or the connection's end */
+  Error: 0x8f,
+  /** The attachment's start: snapshot or resume */
+  Attached: 0x90,
+  /** Snapshot bytes */
+  Snapshot: 0x91,
+  /** The snapshot holds the screen; stream frames may follow */
+  SnapshotReady: 0x92,
+  /** The last snapshot byte was sent */
+  SnapshotEnd: 0x93,
+  /** `offset u64` and PTY bytes from that stream offset */
+  Output: 0x94,
+  /** A size marker in the stream */
+  Resized: 0x95,
+  /** The end of the stream */
+  Exited: 0x96,
+  /** Bytes were not delivered; a new bootstrap follows */
+  Gap: 0x97,
+  /** The attachment ended */
+  Closed: 0x99,
+} as const;
+
+export type FrameType = (typeof FrameType)[keyof typeof FrameType];
+
 /** Each method's params and result. */
 export interface Methods {
   /** Starts a session: a program on a new PTY. */
