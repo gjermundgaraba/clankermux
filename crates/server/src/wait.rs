@@ -4,10 +4,10 @@ use proto::{CursorParams, ErrorCode, Match, StreamCursor, Until, WaitReason, Wai
 use regex::bytes::Regex;
 use tokio::time::Instant;
 
-use crate::read::Vt;
 use crate::records::STATES;
 use crate::registry::Fail;
 use crate::session::{Body, Session, Shared};
+use crate::vt::{Feed, Vt};
 
 const MAX_PLAIN: usize = 256 * 1024;
 
@@ -116,7 +116,9 @@ impl Plain {
         }
         self.next_seen = Some(offset + chunk.len() as u64);
         for (i, &b) in chunk.iter().enumerate() {
-            if self.vt.ground(b) && matches!(b, b'\n' | b'\t' | 0x20..=0x7e | 0x80..=0xff) {
+            if self.vt.feed(b) == Feed::Text
+                && matches!(b, b'\n' | b'\t' | 0x20..=0x7e | 0x80..=0xff)
+            {
                 let at = offset + i as u64;
                 if self.next_kept != Some(at) {
                     self.runs.push((self.bytes.len(), at));

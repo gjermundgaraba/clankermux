@@ -5,6 +5,7 @@ use proto::{ErrorCode, ReadFormat, ReadParams, ReadScope, TailParams};
 
 use crate::registry::{Fail, Registry, internal};
 use crate::session::{Body, Session, blocking};
+use crate::vt::{Feed, Vt};
 
 pub const REPLY_MARGIN: usize = 4096;
 
@@ -329,62 +330,6 @@ struct Ran {
     unfinished: bool,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub enum Vt {
-    #[default]
-    Ground,
-    Escape,
-    Intermediate,
-    Csi,
-    ControlString,
-    ControlStringEscape,
-}
-
-impl Vt {
-    pub fn ground(&mut self, byte: u8) -> bool {
-        const BEL: u8 = 0x07;
-        const CAN: u8 = 0x18;
-        const SUB: u8 = 0x1a;
-        const ESC: u8 = 0x1b;
-        let (next, ground) = match *self {
-            Vt::Ground if byte == ESC => (Vt::Escape, true),
-            Vt::Ground => (Vt::Ground, true),
-            Vt::Escape => match byte {
-                b'[' => (Vt::Csi, false),
-                b']' | b'P' | b'X' | b'^' | b'_' => (Vt::ControlString, false),
-                0x20..=0x2f => (Vt::Intermediate, false),
-                ESC => (Vt::Escape, false),
-                0x30..=0x7e | CAN | SUB => (Vt::Ground, false),
-                _ => (Vt::Ground, true),
-            },
-            Vt::Intermediate => match byte {
-                0x20..=0x2f => (Vt::Intermediate, false),
-                ESC => (Vt::Escape, false),
-                0x30..=0x7e | CAN | SUB => (Vt::Ground, false),
-                _ => (Vt::Ground, true),
-            },
-            Vt::Csi => match byte {
-                ESC => (Vt::Escape, false),
-                b'\n' | b'\r' | b'\t' => (Vt::Csi, true),
-                0x20..=0x3f | 0x00..=0x17 | 0x19 | 0x1c..=0x1f => (Vt::Csi, false),
-                _ => (Vt::Ground, false),
-            },
-            Vt::ControlString => match byte {
-                BEL | CAN | SUB => (Vt::Ground, false),
-                ESC => (Vt::ControlStringEscape, false),
-                _ => (Vt::ControlString, false),
-            },
-            Vt::ControlStringEscape if byte == b'\\' => (Vt::Ground, false),
-            Vt::ControlStringEscape => {
-                *self = Vt::Escape;
-                return self.ground(byte);
-            }
-        };
-        *self = next;
-        ground
-    }
-}
-
 struct Filter {
     out: String,
     vt: Vt,
@@ -427,8 +372,10 @@ impl Filter {
                 }
             }
             let mark = (self.out.len(), self.json);
-            if self.vt.ground(byte) {
-                self.ground(byte);
+            match self.vt.feed(byte) {
+                Feed::Text => self.ground(byte),
+                Feed::Escape => self.interrupt(),
+                Feed::Sequence => {}
             }
             if self.json > budget {
                 self.out.truncate(mark.0);
@@ -475,6 +422,14 @@ impl Filter {
         self.out.push(ch);
     }
 
+    fn interrupt(&mut self) {
+        if !self.utf8.is_empty() {
+            self.utf8.clear();
+            self.emit('\u{fffd}');
+        }
+        self.skip_cut = false;
+    }
+
     fn ground(&mut self, byte: u8) {
         if !self.utf8.is_empty() {
             if (0x80..=0xbf).contains(&byte) {
@@ -506,14 +461,10 @@ impl Filter {
                     self.previous = Some(byte);
                     return;
                 }
-                0x1b => self.skip_cut = false,
                 _ => return,
             }
         }
-        let previous = self.previous;
-        if byte != 0x1b {
-            self.previous = Some(byte);
-        }
+        let previous = self.previous.replace(byte);
         match byte {
             b'\n' if previous == Some(b'\r') => {}
             b'\n' | b'\r' => self.emit('\n'),
@@ -568,6 +519,12 @@ mod tests {
         assert_eq!(f.out, "x");
         assert_eq!(filter(b"50%\r\x1b[K\ndone", 99, false).0, "50%\ndone");
         assert_eq!(filter(b"a\x1b[\n1mb", 99, false).0, "a\nb");
+    }
+
+    #[test]
+    fn an_escape_ends_a_pending_character() {
+        assert_eq!(filter(b"a\xc3\x1b[mb", 99, false).0, "a\u{fffd}b");
+        assert_eq!(filter(b"a\xe2\x82\x1b]0;t\x07b", 99, false).0, "a\u{fffd}b");
     }
 
     #[test]
