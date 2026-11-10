@@ -105,10 +105,10 @@ const createParams = {
 } satisfies CreateParams;
 
 export const vectors = {
-  "hello/full": { version: 1, client: { name: "clankermux", version: "0.1.0" }, engine: ENGINE, capabilities: [] } satisfies Hello,
-  "hello/control-only": { version: 1, client: { name: "bot", version: "1" }, capabilities: [] } satisfies Hello,
+  "hello/full": { version: 2, client: { name: "clankermux", version: "0.1.0" }, engine: ENGINE, capabilities: [] } satisfies Hello,
+  "hello/control-only": { version: 2, client: { name: "bot", version: "1" }, capabilities: [] } satisfies Hello,
   "welcome/basic": {
-    version: 1,
+    version: 2,
     server: { name: "clankermux", version: "0.1.0" },
     engine: ENGINE,
     incarnation: INCARNATION,
@@ -269,7 +269,7 @@ export const vectors = {
   } satisfies Open,
   "open/minimal": { session: SESSION, read_only: true } satisfies Open,
   "viewport/with-profile": { cols: 100, rows: 30, profile: { scheme: "light" } } satisfies Viewport,
-  "attached/snapshot": { mode: "snapshot", offset: 1024, marker: 2, cols: 120, rows: 40, session: running, snapshot_bytes: 65536 } satisfies Attached,
+  "attached/snapshot": { offset: 1024, marker: 2, cols: 120, rows: 40, session: running, snapshot_bytes: 65536 } satisfies Attached,
   "resized/basic": { seq: 3, offset: 2048, cols: 100, rows: 30 } satisfies Resized,
   "exited/code": { seq: 4, offset: 4096, exit: { code: 1 } } satisfies Exited,
   "gap/basic": { from: 100, to: 5000 } satisfies Gap,

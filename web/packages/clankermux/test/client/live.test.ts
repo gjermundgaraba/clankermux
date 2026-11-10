@@ -58,7 +58,7 @@ async function connect(): Promise<Connection> {
 function attach(conn: Connection, a: Attachment, open: unknown): { frames: Frame[]; wake: () => Promise<void> } {
   const frames: Frame[] = [];
   let notify: (() => void) | undefined;
-  a.openOn(conn.welcome);
+  a.open(conn.welcome);
   conn.open(1, open, (f) => {
     frames.push(f);
     notify?.();

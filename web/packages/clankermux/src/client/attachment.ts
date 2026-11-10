@@ -43,22 +43,23 @@ function mustHoldUntilSnapshotEnd(held: readonly Frame[], type: FrameType): bool
 
 export class Attachment {
   private state: State = { kind: "opening" };
-  private cursor = { offset: 0, marker: 0 };
+  private cursor: Resume = { incarnation: "", offset: 0, marker: 0 };
   private incarnation = "";
   private continuation = 0;
-  private pendingServer: { incarnation: string; continuation: number } | undefined;
   session: Session | undefined;
 
   constructor(readonly engine: Engine) {}
 
-  openOn(welcome: Welcome): void {
-    this.pendingServer = { incarnation: welcome.incarnation, continuation: welcome.limits.continuation };
+  /** Readies an `OPEN` on the connection `welcome` began: the cursor to
+   * resume from, when there is one to keep. */
+  open(welcome: Welcome): Resume | undefined {
+    this.incarnation = welcome.incarnation;
+    this.continuation = welcome.limits.continuation;
+    return this.resume();
   }
 
   resume(): Resume | undefined {
-    return this.state.kind === "streaming"
-      ? { incarnation: this.incarnation, offset: this.cursor.offset, marker: this.cursor.marker }
-      : undefined;
+    return this.state.kind === "streaming" ? { ...this.cursor } : undefined;
   }
 
   ended(): boolean {
@@ -109,15 +110,9 @@ export class Attachment {
     switch (type) {
       case FrameType.Attached: {
         const attached = this.json<Attached>(frame);
-        if (this.pendingServer) {
-          this.incarnation = this.pendingServer.incarnation;
-          this.continuation = this.pendingServer.continuation;
-          this.pendingServer = undefined;
-        }
-        this.cursor = { offset: attached.offset, marker: attached.marker };
+        this.cursor = { incarnation: this.incarnation, offset: attached.offset, marker: attached.marker };
         this.session = attached.session;
-        if (attached.mode === "snapshot") {
-          if (attached.snapshot_bytes === undefined) throw ClientError.protocol("ATTACHED without snapshot_bytes");
+        if (attached.snapshot_bytes !== undefined) {
           this.discard();
           const decoder = new Decoder(this.engine, attached.snapshot_bytes);
           try {

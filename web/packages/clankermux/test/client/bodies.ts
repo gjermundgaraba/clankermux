@@ -8,7 +8,7 @@ export const limits: Limits = JSON.parse(readFileSync(`${here}../../../../../cra
 
 export function welcome(incarnation: string): Welcome {
   return {
-    version: 1,
+    version: 2,
     server: { name: "test", version: "0" },
     engine: "x",
     incarnation,

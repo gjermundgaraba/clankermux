@@ -240,7 +240,7 @@ async fn a_graceful_stop_parks_and_a_restart_restores() {
     .await;
     let boot = c.bootstrap(1).await;
     assert_eq!(boot.attached.session.status, Status::Restored);
-    assert_eq!(boot.attached.mode, AttachMode::Snapshot);
+    assert!(boot.attached.snapshot_bytes.is_some());
     assert_eq!(
         (boot.attached.cols, boot.attached.rows),
         (30, 6),

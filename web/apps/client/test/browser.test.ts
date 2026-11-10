@@ -182,7 +182,7 @@ async function typed(page: Page, name: string, line: string): Promise<void> {
   await page.keyboard.type(`${line}\n`);
 }
 
-const screenOf = async (id: string) => await cli("read", id);
+const screenOf = async (id: string) => await cli("read", "-s", id);
 
 test("two terminals mounted from one client share its one connection", async () => {
   const left = await create("/bin/cat");
@@ -219,7 +219,7 @@ test("a lost connection: each terminal resumes, and the events missed meanwhile 
 
   proxy.cut();
   await eventually("the link lost", async () => ((await linkOf(page, "left"))?.state === "connecting" ? true : undefined));
-  await cli("send", left, "\x07rung-while-away", "--enter");
+  await cli("send", "-s", left, "\x07rung-while-away", "--enter");
   await eventually("the line printed", async () => ((await screenOf(left)).split("rung-while-away").length > 2 ? true : undefined));
   proxy.down = false;
 
@@ -378,7 +378,7 @@ test("a terminal that opted in marks its session's done record seen on focus; on
 
   await page.focus("#acks");
   await eventually("the record seen", async () => ((await listed(optedIn))?.attention === undefined ? true : undefined));
-  const record = JSON.parse(await cli("--json", "inspect", optedIn)).program_status.find((r: { id: string }) => r.id === "d");
+  const record = JSON.parse(await cli("--json", "inspect", "-s", optedIn)).program_status.find((r: { id: string }) => r.id === "d");
   expect(record.seen).toBe(true);
   expect((await listed(left))?.attention?.state).toBe("done");
   await page.context().close();
@@ -436,7 +436,7 @@ async function setVisibility(page: Page, state: DocumentVisibilityState): Promis
 test("frames wait for animation paints", async () => {
   const session = await create("/bin/sh", "-c", "printf first; exec cat");
   const { page, draws } = await heldPaintsWithoutFocus(session);
-  await cli("send", session, "second", "--enter");
+  await cli("send", "-s", session, "second", "--enter");
   await page.waitForTimeout(100);
   expect(await page.evaluate(() => harness().frames().length)).toBe(1);
   expect(await draws()).toBe(0);
@@ -450,7 +450,7 @@ test("hiding releases a frame waiting for paint without drawing it, so showing a
   const { page, draws } = await heldPaintsWithoutFocus(session);
   await setVisibility(page, "hidden");
   expect(await page.evaluate(() => harness().pendingPaints())).toBe(0);
-  await cli("send", session, "second", "--enter");
+  await cli("send", "-s", session, "second", "--enter");
   await page.waitForTimeout(100);
   expect(await page.evaluate(() => harness().frames().length)).toBe(1);
   expect(await draws()).toBe(0);

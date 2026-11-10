@@ -3,9 +3,8 @@ use std::time::Duration;
 
 use ghostty_vt::{formatter, snapshot};
 use proto::{
-    AttachMode, Attached, Closed, ClosedReason, ErrorCode, ErrorMessage, Event, FrameDecoder,
-    FrameType, Header, Limits, Numbered, Page, Read, Resized, Session, Welcome, encode_frame,
-    parse_output,
+    Attached, Closed, ClosedReason, ErrorCode, ErrorMessage, Event, FrameDecoder, FrameType,
+    Header, Limits, Numbered, Page, Read, Resized, Session, Welcome, encode_frame, parse_output,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,7 +17,7 @@ pub fn start(limits: Limits) -> Server {
 }
 
 pub fn start_with(limits: Limits, state_dir: PathBuf) -> Server {
-    Server::start_with_state(limits, state_dir)
+    Server::start_with_park(limits, state_dir, server::ParkTiming::default())
 }
 
 pub fn b64(data: impl AsRef<[u8]>) -> String {
@@ -104,7 +103,7 @@ impl Client {
     }
 
     pub async fn hello_as(&mut self, name: &str, version: &str, engine: Option<&str>) -> Welcome {
-        let mut hello = json!({"version": 1, "client": {"name": name, "version": version},
+        let mut hello = json!({"version": proto::VERSION, "client": {"name": name, "version": version},
                                "capabilities": []});
         if let Some(engine) = engine {
             hello["engine"] = json!(engine);
@@ -223,7 +222,7 @@ impl Client {
     }
 
     pub async fn ready_after(&mut self, channel: u32, attached: Attached) -> Bootstrap {
-        assert_eq!(attached.mode, AttachMode::Snapshot);
+        assert!(attached.snapshot_bytes.is_some());
         let mut ready = Vec::new();
         loop {
             let (header, payload) = self.recv_on(channel).await;

@@ -96,7 +96,7 @@ async fn bootstrap_stream_and_resume() {
         resume: None,
     };
     let mut a = Attachment::new();
-    a.open_on(&conn.welcome);
+    assert_eq!(a.open(&conn.welcome), None);
     let mut rx = conn.open(1, &open).unwrap();
     let actions = drive(&mut a, &mut rx, |a, _| a.resume().is_some()).await;
     assert_eq!(actions, vec![Action::Screen]);
@@ -110,7 +110,7 @@ async fn bootstrap_stream_and_resume() {
 
     drop(conn);
     let conn = connect(&server).await;
-    a.open_on(&conn.welcome);
+    assert_eq!(a.open(&conn.welcome), Some(cursor.clone()));
     let mut rx = conn
         .open(
             1,
@@ -229,7 +229,7 @@ async fn an_unpolled_attachment_is_bounded_and_recovers_while_another_keeps_up()
     };
     let mut slow = conn.open(1, &open).unwrap();
     let mut a = Attachment::new();
-    a.open_on(&conn.welcome);
+    assert_eq!(a.open(&conn.welcome), None);
     drive(&mut a, &mut slow, |a, _| a.resume().is_some()).await;
     let mut fast = conn.open(2, &open).unwrap();
     while fast.recv().await.unwrap().header.frame_type != FrameType::SnapshotEnd {}
@@ -273,7 +273,7 @@ async fn an_unpolled_attachment_is_bounded_and_recovers_while_another_keeps_up()
     assert!(held <= 4 * 1024 * 1024, "queued {held} bytes");
     assert!(a.ended() && a.resume().is_none());
     let mut fresh = conn.open(3, &open).unwrap();
-    a.open_on(&conn.welcome);
+    assert_eq!(a.open(&conn.welcome), None);
     drive(&mut a, &mut fresh, |a, _| a.resume().is_some()).await;
     assert_eq!(a.resume().unwrap().offset, received as u64);
     conn.send(FrameType::Close, 2, &[]).unwrap();

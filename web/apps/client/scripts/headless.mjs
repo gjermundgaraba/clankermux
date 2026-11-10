@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { connect } from "node:net";
 
-import { FrameType, StreamFramer, encodeFrame, parseFrame } from "../../../packages/clankermux/src/proto/index.ts";
+import { FrameType, StreamFramer, VERSION, encodeFrame, parseFrame } from "../../../packages/clankermux/src/proto/index.ts";
 
 const [url, socket, session, shot] = process.argv.slice(2);
 if (!url || !socket || !session || !shot) {
@@ -21,7 +21,7 @@ function readScreen() {
     const unix = connect(socket);
     const framer = new StreamFramer(1 << 30);
     const json = (type, body) => unix.write(encodeFrame(type, 0, new TextEncoder().encode(JSON.stringify(body))));
-    unix.on("connect", () => json(FrameType.Hello, { version: 1, client: { name: "headless", version: "0" }, capabilities: [] }));
+    unix.on("connect", () => json(FrameType.Hello, { version: VERSION, client: { name: "headless", version: "0" }, capabilities: [] }));
     unix.on("data", (chunk) => {
       for (const bytes of framer.feed(chunk)) {
         const frame = parseFrame(bytes, 1 << 30);

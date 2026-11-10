@@ -10,6 +10,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ZIG");
 
     let version = fs::read_to_string(vendored.join("VERSION")).unwrap();
+    println!("cargo:rustc-env=GHOSTTY_VT_VERSION={}", version.trim());
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let zig = env::var("ZIG").unwrap_or_else(|_| "zig".into());
     let status = Command::new(&zig)

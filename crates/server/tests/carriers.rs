@@ -109,7 +109,7 @@ async fn greeted(ws: &Ws) -> ClientWs {
     let mut raw = ws.connect(Some("http://allowed")).await.unwrap();
     raw.send(json(
         FrameType::Hello,
-        &json!({"version": 1, "client": {"name": "raw", "version": "0"}, "capabilities": [],
+        &json!({"version": VERSION, "client": {"name": "raw", "version": "0"}, "capabilities": [],
             "engine": ghostty_vt::ENGINE}),
     ))
     .await

@@ -7,6 +7,7 @@ use tokio::time::Instant;
 use crate::records::STATES;
 use crate::registry::Fail;
 use crate::session::{Body, Session, Shared};
+use crate::vt::{Feed, Vt};
 
 const MAX_PLAIN: usize = 256 * 1024;
 
@@ -98,16 +99,7 @@ pub fn anchor(s: &Session, after: Option<CursorParams>) -> Result<StreamCursor, 
     })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Vt {
-    Ground,
-    Escape,
-    Intermediate,
-    Csi,
-    ControlString,
-    ControlStringEscape,
-}
-
+#[derive(Default)]
 struct Plain {
     vt: Vt,
     bytes: Vec<u8>,
@@ -118,25 +110,15 @@ struct Plain {
 }
 
 impl Plain {
-    fn new() -> Self {
-        Plain {
-            vt: Vt::Ground,
-            bytes: Vec::new(),
-            runs: Vec::new(),
-            next_kept: None,
-            next_seen: None,
-            searched: 0,
-        }
-    }
-
     fn push(&mut self, offset: u64, chunk: &[u8]) {
         if self.next_seen.is_some_and(|next| next != offset) {
             self.vt = Vt::Ground;
         }
         self.next_seen = Some(offset + chunk.len() as u64);
         for (i, &b) in chunk.iter().enumerate() {
-            let keep = self.step(b);
-            if keep {
+            if self.vt.feed(b) == Feed::Text
+                && matches!(b, b'\n' | b'\t' | 0x20..=0x7e | 0x80..=0xff)
+            {
                 let at = offset + i as u64;
                 if self.next_kept != Some(at) {
                     self.runs.push((self.bytes.len(), at));
@@ -151,50 +133,6 @@ impl Plain {
         if self.bytes.len() > MAX_PLAIN {
             self.drop_front(self.bytes.len() - MAX_PLAIN / 2);
         }
-    }
-
-    fn step(&mut self, b: u8) -> bool {
-        const ESC: u8 = 0x1b;
-        let abort = b == 0x18 || b == 0x1a;
-        self.vt = match self.vt {
-            Vt::Ground => match b {
-                ESC => Vt::Escape,
-                b'\n' | b'\t' | 0x20..=0x7e | 0x80..=0xff => return true,
-                _ => Vt::Ground,
-            },
-            Vt::Escape => match b {
-                b'[' => Vt::Csi,
-                b']' | b'P' | b'X' | b'^' | b'_' => Vt::ControlString,
-                0x20..=0x2f => Vt::Intermediate,
-                ESC => Vt::Escape,
-                _ => Vt::Ground,
-            },
-            Vt::Intermediate => match b {
-                0x20..=0x2f => Vt::Intermediate,
-                _ => Vt::Ground,
-            },
-            Vt::Csi => match b {
-                _ if abort => Vt::Ground,
-                ESC => Vt::Escape,
-                0x40..=0x7e => Vt::Ground,
-                _ => Vt::Csi,
-            },
-            Vt::ControlString => match b {
-                _ if abort => Vt::Ground,
-                0x07 => Vt::Ground,
-                ESC => Vt::ControlStringEscape,
-                _ => Vt::ControlString,
-            },
-            Vt::ControlStringEscape => {
-                if b == b'\\' {
-                    Vt::Ground
-                } else {
-                    self.vt = Vt::Escape;
-                    return self.step(b);
-                }
-            }
-        };
-        false
     }
 
     fn drop_front(&mut self, n: usize) {
@@ -252,7 +190,7 @@ impl Waiter {
             after,
             status_since: 0,
             scanned: after.offset,
-            plain: Plain::new(),
+            plain: Plain::default(),
             started: Instant::now(),
         }
     }
@@ -428,7 +366,7 @@ mod tests {
     use super::*;
 
     fn plain(chunks: &[&[u8]]) -> Plain {
-        let mut p = Plain::new();
+        let mut p = Plain::default();
         let mut offset = 100;
         for chunk in chunks {
             p.push(offset, chunk);
@@ -453,6 +391,12 @@ mod tests {
     }
 
     #[test]
+    fn plain_text_reads_sequences_as_tail_does() {
+        let p = plain(&[b"a\x1b[1\n2mb\x1b(\x1b[0mc\x1b\td\x1b[1\xc3e"]);
+        assert_eq!(p.bytes, b"a\nbc\tde");
+    }
+
+    #[test]
     fn a_text_needle_is_found_across_chunks_once() {
         let mut p = plain(&[b"xxpi"]);
         let needle = Needle::Text(b"ping".to_vec());
@@ -463,7 +407,7 @@ mod tests {
 
     #[test]
     fn dropping_old_text_keeps_offsets() {
-        let mut p = Plain::new();
+        let mut p = Plain::default();
         p.push(0, &vec![b'a'; MAX_PLAIN]);
         p.push(MAX_PLAIN as u64, b"\x1b[mzz");
         p.trim();

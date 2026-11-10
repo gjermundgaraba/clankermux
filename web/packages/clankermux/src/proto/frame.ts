@@ -1,28 +1,6 @@
+import { FrameType } from "./messages.ts";
+
 export const HEADER_LEN = 10;
-
-export const FrameType = {
-  Hello: 0x01,
-  Request: 0x02,
-  Open: 0x10,
-  Input: 0x11,
-  Viewport: 0x12,
-  Close: 0x13,
-  Welcome: 0x81,
-  Reply: 0x82,
-  Event: 0x83,
-  Error: 0x8f,
-  Attached: 0x90,
-  Snapshot: 0x91,
-  SnapshotReady: 0x92,
-  SnapshotEnd: 0x93,
-  Output: 0x94,
-  Resized: 0x95,
-  Exited: 0x96,
-  Gap: 0x97,
-  Closed: 0x99,
-} as const;
-
-export type FrameType = (typeof FrameType)[keyof typeof FrameType];
 
 const KNOWN_TYPES = new Set<number>(Object.values(FrameType));
 

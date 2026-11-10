@@ -247,19 +247,9 @@ fn closed_objects(schema: &Value, defs: &serde_json::Map<String, Value>, out: &m
         }
     }
 
-    let mut names = Vec::new();
-    catalog::refs(schema, &mut names);
-    let mut seen = std::collections::BTreeSet::new();
-    let mut stack = vec![schema.clone()];
-    while let Some(name) = names.pop() {
-        if seen.insert(name.clone()) {
-            let def = defs[&name].clone();
-            catalog::refs(&def, &mut names);
-            stack.push(def);
-        }
-    }
-    for s in &stack {
-        walk(s, out);
+    walk(schema, out);
+    for name in catalog::reachable(&[schema], defs) {
+        walk(&defs[&name], out);
     }
 }
 
@@ -344,18 +334,6 @@ fn every_method_event_and_error_code_says_what_it_does() {
         );
     for (name, summary) in summaries {
         assert!(!summary.is_empty(), "{name}");
-    }
-}
-
-#[test]
-fn a_frame_has_a_schema_exactly_when_its_payload_is_json() {
-    for frame in catalog::catalog(Some("0")).frames {
-        assert_eq!(
-            frame.schema.is_some(),
-            frame.payload == catalog::Payload::Json,
-            "{}",
-            frame.name
-        );
     }
 }
 
@@ -456,28 +434,13 @@ fn one_method_renders_with_the_types_it_uses() {
 }
 
 #[test]
-fn output_frame_from_slices_is_one_complete_protocol_frame() {
-    for (first, second) in [
-        (&b"abc"[..], &b"def"[..]),
-        (b"", b"xyz"),
-        (b"x", b""),
-        (b"", b""),
-    ] {
-        let frame = encode_output_frame(7, 42, first, second);
-        let (header, payload) = parse_frame(&frame, 1024).unwrap();
-        assert_eq!(header.frame_type, FrameType::Output);
-        assert_eq!(header.channel, 7);
+fn a_frame_has_a_schema_exactly_when_its_payload_is_json() {
+    let mut generator = schemars::SchemaGenerator::default();
+    for &frame in FrameType::ALL {
         assert_eq!(
-            parse_output(payload),
-            Some((42, [first, second].concat().as_slice()))
-        );
-        assert_eq!(
-            frame,
-            encode_frame(
-                FrameType::Output,
-                7,
-                &encode_output(42, &[first, second].concat())
-            )
+            frame.schema(&mut generator).is_some(),
+            frame.is_json(),
+            "{frame:?}"
         );
     }
 }

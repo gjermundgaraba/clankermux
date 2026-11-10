@@ -1,7 +1,12 @@
+use schemars::{JsonSchema, Schema, SchemaGenerator};
+use serde::{Deserialize, Serialize};
+
 pub const HEADER_LEN: usize = 10;
 
 macro_rules! frame_types {
-    ($($name:ident = $value:literal),* $(,)?) => {
+    ($(
+        $name:ident = $value:literal, $channel:ident, $payload:ident $(($schema:ty))?, $summary:literal;
+    )*) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         #[repr(u8)]
         pub enum FrameType {
@@ -10,30 +15,56 @@ macro_rules! frame_types {
 
         impl FrameType {
             pub const ALL: &[FrameType] = &[$(FrameType::$name,)*];
+
+            pub fn channel_kind(self) -> ChannelKind {
+                match self {
+                    $(FrameType::$name => ChannelKind::$channel,)*
+                }
+            }
+
+            pub fn payload(self) -> Payload {
+                match self {
+                    $(FrameType::$name => Payload::$payload,)*
+                }
+            }
+
+            pub fn summary(self) -> &'static str {
+                match self {
+                    $(FrameType::$name => $summary,)*
+                }
+            }
+
+            /// The JSON Schema of a JSON payload, from `generator`.
+            pub fn schema(self, generator: &mut SchemaGenerator) -> Option<Schema> {
+                match self {
+                    $($(FrameType::$name => Some(generator.subschema_for::<$schema>()),)?)*
+                    _ => None,
+                }
+            }
         }
     };
 }
 
 frame_types! {
-    Hello = 0x01,
-    Request = 0x02,
-    Open = 0x10,
-    Input = 0x11,
-    Viewport = 0x12,
-    Close = 0x13,
-    Welcome = 0x81,
-    Reply = 0x82,
-    Event = 0x83,
-    Error = 0x8F,
-    Attached = 0x90,
-    Snapshot = 0x91,
-    SnapshotReady = 0x92,
-    SnapshotEnd = 0x93,
-    Output = 0x94,
-    Resized = 0x95,
-    Exited = 0x96,
-    Gap = 0x97,
-    Closed = 0x99,
+    Hello = 0x01, Control, Json(crate::Hello), "Opens the connection: version, client and engine";
+    Request = 0x02, Control, Json(crate::Request), "A method call, answered by `REPLY` or `ERROR` with its `id`";
+    Open = 0x10, Attachment, Json(crate::Open), "Attaches the channel to a session";
+    Input = 0x11, Attachment, Raw, "Bytes for the PTY";
+    Viewport = 0x12, Attachment, Json(crate::Viewport), "The attachment's size and profile";
+    Close = 0x13, Attachment, Empty, "Detaches the channel";
+    Welcome = 0x81, Control, Json(crate::Welcome), "Accepts the connection: the server's engine, incarnation and limits";
+    Reply = 0x82, Control, Json(crate::Reply), "A method's result";
+    Event = 0x83, Control, Json(crate::Numbered), "A change, once subscribed";
+    Error = 0x8F, Either, Json(crate::ErrorMessage), "A request's or an attachment's failure, or the connection's end";
+    Attached = 0x90, Attachment, Json(crate::Attached), "The attachment's start: snapshot or resume";
+    Snapshot = 0x91, Attachment, Raw, "Snapshot bytes";
+    SnapshotReady = 0x92, Attachment, Empty, "The snapshot holds the screen; stream frames may follow";
+    SnapshotEnd = 0x93, Attachment, Empty, "The last snapshot byte was sent";
+    Output = 0x94, Attachment, Raw, "`offset u64` and PTY bytes from that stream offset";
+    Resized = 0x95, Attachment, Json(crate::Resized), "A size marker in the stream";
+    Exited = 0x96, Attachment, Json(crate::Exited), "The end of the stream";
+    Gap = 0x97, Attachment, Json(crate::Gap), "Bytes were not delivered; a new bootstrap follows";
+    Closed = 0x99, Attachment, Json(crate::Closed), "The attachment ended";
 }
 
 impl FrameType {
@@ -45,16 +76,6 @@ impl FrameType {
         self as u8 & 0x80 != 0
     }
 
-    pub fn channel_kind(self) -> ChannelKind {
-        use FrameType::*;
-        match self {
-            Hello | Request | Welcome | Reply | Event => ChannelKind::Control,
-            Error => ChannelKind::Either,
-            Open | Input | Viewport | Close | Attached | Snapshot | SnapshotReady | SnapshotEnd
-            | Output | Resized | Exited | Gap | Closed => ChannelKind::Attachment,
-        }
-    }
-
     pub fn allowed_on(self, channel: u32) -> bool {
         match self.channel_kind() {
             ChannelKind::Control => channel == 0,
@@ -64,12 +85,17 @@ impl FrameType {
     }
 
     pub fn is_json(self) -> bool {
-        use FrameType::*;
-        !matches!(
-            self,
-            Input | Close | Snapshot | SnapshotReady | SnapshotEnd | Output
-        )
+        self.payload() == Payload::Json
     }
+}
+
+/// What a frame's payload holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Payload {
+    Json,
+    Raw,
+    Empty,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,10 +160,20 @@ pub fn parse_header(bytes: &[u8; HEADER_LEN], max_frame: u64) -> Result<Header, 
 }
 
 pub fn encode_frame(frame_type: FrameType, channel: u32, payload: &[u8]) -> Vec<u8> {
-    let length = u32::try_from(payload.len()).expect("frame payload longer than u32");
-    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
-    out.extend_from_slice(&encode_header(frame_type, channel, length));
-    out.extend_from_slice(payload);
+    encode_parts(frame_type, channel, &[payload])
+}
+
+fn encode_parts(frame_type: FrameType, channel: u32, parts: &[&[u8]]) -> Vec<u8> {
+    let length: usize = parts.iter().map(|part| part.len()).sum();
+    let mut out = Vec::with_capacity(HEADER_LEN + length);
+    out.extend_from_slice(&encode_header(
+        frame_type,
+        channel,
+        u32::try_from(length).expect("frame payload longer than u32"),
+    ));
+    for part in parts {
+        out.extend_from_slice(part);
+    }
     out
 }
 
@@ -206,24 +242,17 @@ impl FrameDecoder {
 pub const OUTPUT_OFFSET_LEN: usize = 8;
 
 pub fn encode_output(offset: u64, bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(OUTPUT_OFFSET_LEN + bytes.len());
-    out.extend_from_slice(&offset.to_le_bytes());
-    out.extend_from_slice(bytes);
-    out
+    [&offset.to_le_bytes()[..], bytes].concat()
 }
 
+/// The `OUTPUT` frame for `first` then `second`, the two halves a ring
+/// buffer's slice can come in.
 pub fn encode_output_frame(channel: u32, offset: u64, first: &[u8], second: &[u8]) -> Vec<u8> {
-    let length = OUTPUT_OFFSET_LEN + first.len() + second.len();
-    let mut out = Vec::with_capacity(HEADER_LEN + length);
-    out.extend_from_slice(&encode_header(
+    encode_parts(
         FrameType::Output,
         channel,
-        u32::try_from(length).expect("frame payload longer than u32"),
-    ));
-    out.extend_from_slice(&offset.to_le_bytes());
-    out.extend_from_slice(first);
-    out.extend_from_slice(second);
-    out
+        &[&offset.to_le_bytes(), first, second],
+    )
 }
 
 pub fn parse_output(payload: &[u8]) -> Option<(u64, &[u8])> {

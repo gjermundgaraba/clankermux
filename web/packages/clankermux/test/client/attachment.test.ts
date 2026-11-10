@@ -26,7 +26,6 @@ const outputFrame = (offset: number, text: string) => frame(FrameType.Output, ou
 
 function attached(offset: number, marker: number, bytes: Uint8Array): Frame {
   const body: Attached = {
-    mode: "snapshot",
     offset,
     marker,
     cols: 10,
@@ -49,7 +48,7 @@ test("bootstraps, holds after a resize, and resumes", () => {
   const bytes = snapshotOf("one\r\ntwo\r\n");
   const ready = readyEnd(bytes)!;
   const a = new Attachment(engine);
-  a.openOn(welcome("inc"));
+  a.open(welcome("inc"));
   expect(a.handle(attached(100, 2, bytes))).toEqual([]);
   expect(a.handle(frame(FrameType.Snapshot, bytes.subarray(0, ready - 1)))).toEqual([]);
   expect(a.handle(frame(FrameType.Snapshot, bytes.subarray(ready - 1, ready)))).toEqual([{ type: "screen" }]);
@@ -66,7 +65,7 @@ test("bootstraps, holds after a resize, and resumes", () => {
   expect(a.term()!.formatPlain().trimEnd()).toBe("one\ntwo\nxy");
   expect(a.term()!.cols).toBe(20);
   expect(a.resume()).toEqual({ incarnation: "inc", offset: 102, marker: 3 });
-  const resumed: Attached = { mode: "resume", offset: 102, marker: 3, cols: 20, rows: 5, session: session("s") };
+  const resumed: Attached = { offset: 102, marker: 3, cols: 20, rows: 5, session: session("s") };
   expect(a.handle(json(FrameType.Attached, resumed))).toEqual([{ type: "resumed" }]);
   expect(() => a.handle(outputFrame(5, "z"))).toThrow(expect.objectContaining({ kind: "desync", message: expect.stringMatching(/OUTPUT at 5/) }));
   expect(() => a.handle(json(FrameType.Resized, { seq: 9, offset: 102, cols: 1, rows: 1 }))).toThrow(
@@ -84,11 +83,19 @@ test("bootstraps, holds after a resize, and resumes", () => {
   a.free();
 });
 
+test("a resume needs a terminal", () => {
+  const a = new Attachment(engine);
+  a.open(welcome("inc"));
+  const resumed: Attached = { offset: 0, marker: 0, cols: 10, rows: 3, session: session("s") };
+  expect(() => a.handle(json(FrameType.Attached, resumed))).toThrow(/resume without a terminal/);
+  a.free();
+});
+
 test("an EXITED during a bootstrap waits for SNAPSHOT_END", () => {
   const bytes = snapshotOf("one\r\ntwo\r\n");
   const ready = readyEnd(bytes)!;
   const a = new Attachment(engine);
-  a.openOn(welcome("inc"));
+  a.open(welcome("inc"));
   a.handle(attached(100, 0, bytes));
   expect(a.handle(frame(FrameType.Snapshot, bytes.subarray(0, ready)))).toEqual([{ type: "screen" }]);
   a.handle(frame(FrameType.SnapshotReady, new Uint8Array()));
@@ -106,7 +113,7 @@ test("a snapshot cut before FINISH is a protocol error", () => {
   const bytes = snapshotOf("one\r\ntwo\r\n");
   const ready = readyEnd(bytes)!;
   const a = new Attachment(engine);
-  a.openOn(welcome("inc"));
+  a.open(welcome("inc"));
   a.handle(attached(0, 0, bytes));
   a.handle(frame(FrameType.Snapshot, bytes.subarray(0, ready)));
   a.handle(frame(FrameType.SnapshotReady, new Uint8Array()));
@@ -126,11 +133,10 @@ test("the cursor keeps the incarnation it was obtained under", () => {
     a.handle(frame(FrameType.SnapshotReady, new Uint8Array()));
     a.handle(frame(FrameType.SnapshotEnd, new Uint8Array()));
   };
-  a.openOn(welcome("first"));
+  a.open(welcome("first"));
   bootstrap();
   expect(a.resume()!.incarnation).toBe("first");
-  a.openOn(welcome("second"));
-  expect(a.resume()!.incarnation).toBe("first");
+  expect(a.open(welcome("second"))!.incarnation).toBe("first");
   bootstrap();
   expect(a.resume()!.incarnation).toBe("second");
   a.free();
@@ -155,7 +161,7 @@ test("held bootstrap overflow ends without a resume and allows a fresh open", ()
   const bytes = snapshotOf("before");
   const ready = readyEnd(bytes)!;
   const a = new Attachment(engine);
-  a.openOn(welcome("inc"));
+  a.open(welcome("inc"));
   a.handle(attached(100, 0, bytes));
   a.handle(frame(FrameType.Snapshot, bytes.subarray(0, ready)));
   a.handle(json(FrameType.Resized, { seq: 1, offset: 100, cols: 20, rows: 5 }));
@@ -167,7 +173,7 @@ test("held bootstrap overflow ends without a resume and allows a fresh open", ()
   expect(a.resume()).toBeUndefined();
   expect(a.term()!.cols).toBe(10);
   expect(a.term()!.formatPlain().trimEnd()).toBe("before");
-  a.openOn(welcome("inc"));
+  a.open(welcome("inc"));
   a.handle(attached(200, 1, bytes));
   a.handle(frame(FrameType.Snapshot, bytes));
   a.handle(frame(FrameType.SnapshotEnd, new Uint8Array()));

@@ -764,7 +764,7 @@ async fn read_pty(registry: Arc<Registry>, session: Shared, master: Arc<AsyncFd<
         if let Some(live) = s.live_mut() {
             live.pty_eof = true;
         }
-        s.maybe_end().map(|_| s.to_proto(false))
+        s.maybe_end()
     };
     registry.ended(&session, ended);
 }
@@ -780,7 +780,7 @@ async fn wait_child(registry: Arc<Registry>, session: Shared, mut child: tokio::
             Ok(status) => exit_of(status),
             Err(_) => Exit::Code { code: -1 },
         });
-        s.maybe_end().map(|_| s.to_proto(false))
+        s.maybe_end()
     };
     registry.ended(&session, ended);
 }

@@ -163,9 +163,8 @@ async fn markers_bound_what_a_resume_can_find() {
         "resume": {"incarnation": incarnation, "offset": inspected.offset, "marker": first}}),
     )
     .await;
-    assert_eq!(
-        c.bootstrap(2).await.attached.mode,
-        AttachMode::Snapshot,
+    assert!(
+        c.bootstrap(2).await.attached.snapshot_bytes.is_some(),
         "marker no longer retained"
     );
     c.send(FrameType::Close, 2, &[]).await;
@@ -177,8 +176,8 @@ async fn markers_bound_what_a_resume_can_find() {
     )
     .await;
     assert_eq!(
-        c.attached(3).await.mode,
-        AttachMode::Resume,
+        c.attached(3).await.snapshot_bytes,
+        None,
         "within the retained markers"
     );
 }

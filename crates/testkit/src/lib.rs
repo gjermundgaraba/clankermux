@@ -34,10 +34,6 @@ impl Server {
         Server::start_in(limits, dir, state_dir, server::ParkTiming::default())
     }
 
-    pub fn start_with_state(limits: Limits, state_dir: PathBuf) -> Server {
-        Server::start_with_park(limits, state_dir, server::ParkTiming::default())
-    }
-
     pub fn start_with_park(limits: Limits, state_dir: PathBuf, park: server::ParkTiming) -> Server {
         Server::start_in(limits, tempfile::tempdir().unwrap(), state_dir, park)
     }

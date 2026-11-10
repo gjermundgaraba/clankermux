@@ -5,6 +5,7 @@ use proto::{ErrorCode, ReadFormat, ReadParams, ReadScope, TailParams};
 
 use crate::registry::{Fail, Registry, internal};
 use crate::session::{Body, Session, blocking};
+use crate::vt::{Feed, Vt};
 
 pub const REPLY_MARGIN: usize = 4096;
 
@@ -122,21 +123,43 @@ fn format_rows(
     })
 }
 
-fn from_terminal(
-    term: &Term,
-    scope: ReadScope,
-    format: ReadFormat,
-    scrollback: usize,
-    budget: usize,
-) -> Result<Text, Fail> {
-    let from = match scope {
-        ReadScope::Screen => term.history_start(scrollback).map_err(internal)?,
-        ReadScope::History => ScrollbackRow(0),
-        ReadScope::Alternate if term.alternate_screen() => term.screen_top().map_err(internal)?,
-        ReadScope::Alternate => {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rows {
+    Screen { history: Option<usize> },
+    Alternate,
+    LastCommand,
+}
+
+impl Rows {
+    fn of(p: &ReadParams) -> Result<Rows, Fail> {
+        Ok(match (p.scope.unwrap_or_default(), p.scrollback) {
+            (ReadScope::Screen, history) => Rows::Screen {
+                history: Some(history.unwrap_or(0) as usize),
+            },
+            (_, Some(_)) => {
+                return Err((
+                    ErrorCode::InvalidRequest,
+                    "scrollback is for scope screen only".into(),
+                ));
+            }
+            (ReadScope::History, None) => Rows::Screen { history: None },
+            (ReadScope::Alternate, None) => Rows::Alternate,
+            (ReadScope::LastCommand, None) => Rows::LastCommand,
+        })
+    }
+}
+
+fn from_terminal(term: &Term, rows: Rows, format: ReadFormat, budget: usize) -> Result<Text, Fail> {
+    let from = match rows {
+        Rows::Screen {
+            history: Some(history),
+        } => term.history_start(history).map_err(internal)?,
+        Rows::Screen { history: None } => ScrollbackRow(0),
+        Rows::Alternate if term.alternate_screen() => term.screen_top().map_err(internal)?,
+        Rows::Alternate => {
             return Err(unavailable("the session is not on the alternate screen"));
         }
-        ReadScope::LastCommand => unreachable!("read from the stream"),
+        Rows::LastCommand => unreachable!("read from the stream"),
     };
     format_rows(term, format, from, budget)
 }
@@ -172,17 +195,7 @@ fn replay(
 
 pub fn read(registry: &Registry, p: &ReadParams) -> Result<proto::Read, Fail> {
     let format = p.format.unwrap_or_default();
-    let scope = p.scope.unwrap_or_default();
-    if p.scrollback.is_some() && scope != ReadScope::Screen {
-        return Err((
-            ErrorCode::InvalidRequest,
-            "scrollback is for scope screen only".into(),
-        ));
-    }
-    let scrollback = match scope {
-        ReadScope::History => usize::MAX,
-        _ => p.scrollback.unwrap_or(0) as usize,
-    };
+    let rows = Rows::of(p)?;
     let limits = &registry.config.limits;
     let budget = proto::cap(limits.max_frame).saturating_sub(REPLY_MARGIN);
     let session = registry.get(&p.session)?;
@@ -203,7 +216,7 @@ pub fn read(registry: &Registry, p: &ReadParams) -> Result<proto::Read, Fail> {
         status: info.status,
         truncated,
     };
-    if scope == ReadScope::LastCommand {
+    if rows == Rows::LastCommand {
         let (bytes, gone) = last_command_bytes(&s)?;
         let size = s.size();
         let reply = reply(Text::default());
@@ -216,19 +229,19 @@ pub fn read(registry: &Registry, p: &ReadParams) -> Result<proto::Read, Fail> {
             ..reply
         });
     }
-    match &s.body {
-        _ if format == ReadFormat::Text && scope != ReadScope::Alternate => {
-            let mut text = s.read_text(scrollback).map_err(internal)?;
+    match (&s.body, rows) {
+        (_, Rows::Screen { history }) if format == ReadFormat::Text => {
+            let mut text = s.read_text(history).map_err(internal)?;
             if !text.is_empty() {
                 text.push('\n');
             }
             let truncated = fit_json(&mut text, budget);
             Ok(reply(Text { text, truncated }))
         }
-        Body::Live(live) => {
-            blocking(|| from_terminal(&live.term, scope, format, scrollback, budget)).map(reply)
+        (Body::Live(live), _) => {
+            blocking(|| from_terminal(&live.term, rows, format, budget)).map(reply)
         }
-        Body::Parked(parked) => {
+        (Body::Parked(parked), _) => {
             if parked.engine != ghostty_vt::ENGINE {
                 return Err((
                     ErrorCode::EngineMismatch,
@@ -244,7 +257,7 @@ pub fn read(registry: &Registry, p: &ReadParams) -> Result<proto::Read, Fail> {
             let read = blocking(|| {
                 let bytes = std::fs::read(&path).map_err(internal)?;
                 let term = ghostty_vt::snapshot::decode(&bytes).map_err(internal)?;
-                from_terminal(&term, scope, format, scrollback, budget)
+                from_terminal(&term, rows, format, budget)
             })?;
             Ok(proto::Read {
                 text: read.text,
@@ -317,19 +330,9 @@ struct Ran {
     unfinished: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum State {
-    Ground,
-    Esc,
-    EscIntermediate,
-    Csi,
-    String,
-    StringEsc,
-}
-
 struct Filter {
     out: String,
-    state: State,
+    vt: Vt,
     utf8: Vec<u8>,
     previous: Option<u8>,
     skip_cut: bool,
@@ -340,7 +343,7 @@ impl Filter {
     fn new(previous: Option<u8>, cut: bool) -> Self {
         Filter {
             out: String::new(),
-            state: State::Ground,
+            vt: Vt::Ground,
             utf8: Vec::new(),
             previous,
             skip_cut: cut,
@@ -359,7 +362,7 @@ impl Filter {
         let mut len = 0;
         for (i, byte) in bytes.into_iter().enumerate() {
             len = i + 1;
-            if self.state == State::Ground && self.utf8.is_empty() {
+            if self.vt == Vt::Ground && self.utf8.is_empty() {
                 boundary = i;
                 if i >= max {
                     return Ran {
@@ -369,7 +372,11 @@ impl Filter {
                 }
             }
             let mark = (self.out.len(), self.json);
-            self.byte(byte);
+            match self.vt.feed(byte) {
+                Feed::Text => self.ground(byte),
+                Feed::Escape => self.interrupt(),
+                Feed::Sequence => {}
+            }
             if self.json > budget {
                 self.out.truncate(mark.0);
                 self.json = mark.1;
@@ -379,7 +386,7 @@ impl Filter {
                 };
             }
         }
-        if self.state == State::Ground && self.utf8.is_empty() {
+        if self.vt == Vt::Ground && self.utf8.is_empty() {
             return Ran {
                 consumed: len,
                 unfinished: false,
@@ -415,50 +422,12 @@ impl Filter {
         self.out.push(ch);
     }
 
-    fn byte(&mut self, byte: u8) {
-        match self.state {
-            State::Ground => self.ground(byte),
-            State::Esc => match byte {
-                b'[' => self.state = State::Csi,
-                b']' | b'P' | b'X' | b'^' | b'_' => self.state = State::String,
-                0x20..=0x2f => self.state = State::EscIntermediate,
-                0x1b => {}
-                0x30..=0x7e | 0x18 | 0x1a => self.state = State::Ground,
-                _ => {
-                    self.state = State::Ground;
-                    self.ground(byte);
-                }
-            },
-            State::EscIntermediate => match byte {
-                0x20..=0x2f => {}
-                0x1b => self.state = State::Esc,
-                0x30..=0x7e | 0x18 | 0x1a => self.state = State::Ground,
-                _ => {
-                    self.state = State::Ground;
-                    self.ground(byte);
-                }
-            },
-            State::Csi => match byte {
-                0x1b => self.state = State::Esc,
-                // The terminal carries these out inside a sequence too.
-                b'\n' | b'\r' | b'\t' => self.ground(byte),
-                0x20..=0x3f | 0x00..=0x17 | 0x19 | 0x1c..=0x1f => {}
-                _ => self.state = State::Ground,
-            },
-            State::String => match byte {
-                0x07 | 0x18 | 0x1a => self.state = State::Ground,
-                0x1b => self.state = State::StringEsc,
-                _ => {}
-            },
-            State::StringEsc => {
-                if byte == b'\\' {
-                    self.state = State::Ground;
-                } else {
-                    self.state = State::Esc;
-                    self.byte(byte);
-                }
-            }
+    fn interrupt(&mut self) {
+        if !self.utf8.is_empty() {
+            self.utf8.clear();
+            self.emit('\u{fffd}');
         }
+        self.skip_cut = false;
     }
 
     fn ground(&mut self, byte: u8) {
@@ -492,16 +461,11 @@ impl Filter {
                     self.previous = Some(byte);
                     return;
                 }
-                0x1b => self.skip_cut = false,
                 _ => return,
             }
         }
-        let previous = self.previous;
-        if byte != 0x1b {
-            self.previous = Some(byte);
-        }
+        let previous = self.previous.replace(byte);
         match byte {
-            0x1b => self.state = State::Esc,
             b'\n' if previous == Some(b'\r') => {}
             b'\n' | b'\r' => self.emit('\n'),
             b'\t' => self.emit('\t'),
@@ -555,6 +519,12 @@ mod tests {
         assert_eq!(f.out, "x");
         assert_eq!(filter(b"50%\r\x1b[K\ndone", 99, false).0, "50%\ndone");
         assert_eq!(filter(b"a\x1b[\n1mb", 99, false).0, "a\nb");
+    }
+
+    #[test]
+    fn an_escape_ends_a_pending_character() {
+        assert_eq!(filter(b"a\xc3\x1b[mb", 99, false).0, "a\u{fffd}b");
+        assert_eq!(filter(b"a\xe2\x82\x1b]0;t\x07b", 99, false).0, "a\u{fffd}b");
     }
 
     #[test]

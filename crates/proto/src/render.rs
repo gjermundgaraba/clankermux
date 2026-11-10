@@ -3,8 +3,8 @@ use std::fmt::Write as _;
 
 use serde_json::{Map, Value};
 
-use crate::ErrorCode;
-use crate::catalog::{Catalog, Description, Payload, refs};
+use crate::catalog::{Catalog, Description, description, ref_name, refs, required};
+use crate::{ErrorCode, Payload};
 
 const BEGIN: &str = "<!-- generated: ";
 const END: &str = "<!-- end generated -->";
@@ -199,10 +199,6 @@ fn code(shape: &str) -> String {
     }
 }
 
-pub(crate) fn ref_name(schema: &Value) -> Option<&str> {
-    schema.get("$ref")?.as_str()?.strip_prefix("#/$defs/")
-}
-
 fn resolve<'a>(schema: &'a Value, defs: &'a Map<String, Value>) -> &'a Value {
     ref_name(schema)
         .and_then(|name| defs.get(name))
@@ -210,23 +206,14 @@ fn resolve<'a>(schema: &'a Value, defs: &'a Map<String, Value>) -> &'a Value {
 }
 
 fn about(schema: &Value) -> String {
-    schema
-        .get("description")
-        .and_then(Value::as_str)
-        .map(|text| format!("{}\n\n", one_line(text)))
-        .unwrap_or_default()
+    match description(schema) {
+        "" => String::new(),
+        text => format!("{}\n\n", one_line(text)),
+    }
 }
 
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-pub(crate) fn required(schema: &Value) -> BTreeSet<&str> {
-    schema
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|r| r.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default()
 }
 
 fn field_names(schema: &Value) -> String {
@@ -325,15 +312,7 @@ fn fields_table(schema: &Value, defs: &Map<String, Value>) -> String {
                 }
                 shape.push('?');
             }
-            vec![
-                format!("`{name}`"),
-                shape,
-                property
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(one_line)
-                    .unwrap_or_default(),
-            ]
+            vec![format!("`{name}`"), shape, one_line(description(property))]
         });
     table(&["Field", "Type", "Meaning"], rows)
 }

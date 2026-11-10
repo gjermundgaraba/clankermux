@@ -7,9 +7,9 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     AckParams, Acked, CancelParams, Cancelled, ChannelKind, CreateParams, DetachParams, Empty,
-    ErrorCode, ErrorMessage, FrameType, LabelParams, ListParams, Numbered, Page, Read, ReadParams,
-    ResizeParams, SendParams, Sent, Session, SessionParams, SignalParams, SubscribeParams,
-    Subscribed, Tail, TailParams, VERSION, WaitParams, Waited,
+    ErrorCode, FrameType, LabelParams, ListParams, Page, Payload, Read, ReadParams, ResizeParams,
+    SendParams, Sent, Session, SessionParams, SignalParams, SubscribeParams, Subscribed, Tail,
+    TailParams, VERSION, WaitParams, Waited,
 };
 
 pub(crate) const VECTORS: &str = include_str!("../vectors/messages.json");
@@ -117,15 +117,6 @@ pub enum Direction {
     Server,
 }
 
-/// What a frame's payload holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Payload {
-    Json,
-    Raw,
-    Empty,
-}
-
 /// One frame type.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct FrameInfo {
@@ -162,7 +153,7 @@ struct Spec {
 
 macro_rules! methods {
     ($(
-        $name:literal $class:ident ($params:ty) -> $result:ty,
+        $variant:ident $name:literal $class:ident ($params:ty) -> $result:ty,
         errors [$($error:ident),*],
         examples [$(($p:literal, $r:literal)),*],
         $summary:literal;
@@ -179,6 +170,23 @@ macro_rules! methods {
             }),*]
         }
 
+        /// A request's method, with its params.
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum Call {
+            $($variant($params),)*
+        }
+
+        impl Call {
+            /// The call `method` names, with `params` as its type; `None`
+            /// for a method the protocol does not define.
+            pub fn parse(method: &str, params: Value) -> Option<Result<Call, serde_json::Error>> {
+                Some(match method {
+                    $($name => serde_json::from_value(params).map(Call::$variant),)*
+                    _ => return None,
+                })
+            }
+        }
+
         #[cfg(test)]
         pub(crate) fn typed() -> Vec<(&'static str, crate::tests::Check, crate::tests::Check)> {
             use crate::tests::same;
@@ -188,126 +196,77 @@ macro_rules! methods {
 }
 
 methods! {
-    "create" Mutation (CreateParams) -> Session,
+    Create "create" Mutation (CreateParams) -> Session,
         errors [InvalidRequest, LimitExceeded, Internal],
         examples [("params/create", "session/created")],
         "Starts a session: a program on a new PTY.";
-    "list" Read (ListParams) -> Page,
+    List "list" Read (ListParams) -> Page,
         errors [InvalidRequest],
         examples [("params/list-first", "page/with-next"), ("params/list", "page/last")],
         "A page of sessions, ordered by id, without their records.";
-    "inspect" Read (SessionParams) -> Session,
+    Inspect "inspect" Read (SessionParams) -> Session,
         errors [InvalidRequest, NoSuchSession],
         examples [("params/inspect", "session/inspect")],
         "One session, with its program status records.";
-    "end" Mutation (SessionParams) -> Empty,
+    End "end" Mutation (SessionParams) -> Empty,
         errors [InvalidRequest, NoSuchSession, NotRunning, SignalFailed],
         examples [("params/end", "empty/basic")],
         "Sends SIGHUP to the session's processes.";
-    "signal" Mutation (SignalParams) -> Empty,
+    Signal "signal" Mutation (SignalParams) -> Empty,
         errors [InvalidRequest, NoSuchSession, NotRunning, SignalFailed],
         examples [("params/signal", "empty/basic")],
         "Sends a signal, by name, to the session's processes.";
-    "remove" Mutation (SessionParams) -> Empty,
+    Remove "remove" Mutation (SessionParams) -> Empty,
         errors [InvalidRequest, NoSuchSession, Running, Internal],
         examples [("params/remove", "empty/basic")],
         "Deletes a session that is not running, with its files.";
-    "label" Mutation (LabelParams) -> Session,
+    Label "label" Mutation (LabelParams) -> Session,
         errors [InvalidRequest, NoSuchSession, LimitExceeded],
         examples [("params/label", "session/running")],
         "Sets the session's label.";
-    "resize" Mutation (ResizeParams) -> Empty,
+    Resize "resize" Mutation (ResizeParams) -> Empty,
         errors [InvalidRequest, NoSuchSession, NotRunning],
         examples [("params/resize", "empty/basic"), ("params/resize-policy", "empty/basic")],
         "Sets the session's size, its size policy, or both.";
-    "read" Read (ReadParams) -> Read,
+    Read "read" Read (ReadParams) -> Read,
         errors [InvalidRequest, NoSuchSession, ScopeUnavailable, EngineMismatch, Internal],
         examples [("params/read", "read/running"), ("params/read-scoped", "read/truncated")],
         "The session's screen, history or last command, as text, VT or HTML.";
-    "tail" Read (TailParams) -> Tail,
+    Tail "tail" Read (TailParams) -> Tail,
         errors [InvalidRequest, NoSuchSession, Internal],
         examples [("params/tail", "tail/basic"), ("params/tail-from", "tail/truncated")],
         "The output stream as plain text, from a stream offset.";
-    "send" Mutation (SendParams) -> Sent,
+    Send "send" Mutation (SendParams) -> Sent,
         errors [InvalidRequest, NoSuchSession, NotRunning, InputOverflow, Cancelled, Internal],
         examples [("params/send", "sent/plain"), ("params/send-text", "sent/wait")],
         "Writes text, named keys or bytes to the PTY; with `wait`, answers when it ends.";
-    "wait" Read (WaitParams) -> Waited,
+    Wait "wait" Read (WaitParams) -> Waited,
         errors [InvalidRequest, NoSuchSession, NotRunning, Cancelled],
         examples [("params/wait", "waited/status-done"), ("params/wait-output", "waited/timeout")],
         "Answers when the session exits, its output matches, a record is in a state, a prompt shows or output stops.";
-    "cancel" Mutation (CancelParams) -> Cancelled,
+    Cancel "cancel" Mutation (CancelParams) -> Cancelled,
         errors [InvalidRequest],
         examples [("params/cancel", "cancelled/yes")],
         "Ends a pending `wait`, or `send` with `wait`, of this connection.";
-    "detach" Mutation (DetachParams) -> Empty,
+    Detach "detach" Mutation (DetachParams) -> Empty,
         errors [InvalidRequest, NoSuchSession, NoSuchAttachment, LimitExceeded],
         examples [("params/detach", "empty/basic")],
         "Ends an attachment of any connection.";
-    "subscribe" Stream (SubscribeParams) -> Subscribed,
+    Subscribe "subscribe" Stream (SubscribeParams) -> Subscribed,
         errors [InvalidRequest],
         examples [("params/subscribe", "subscribed/first"), ("params/subscribe-after", "subscribed/after")],
         "Starts `EVENT` frames on this connection: from now, or replayed after a `seq`.";
-    "ack" Mutation (AckParams) -> Acked,
+    Ack "ack" Mutation (AckParams) -> Acked,
         errors [InvalidRequest, NoSuchSession],
         examples [("params/ack", "acked/basic")],
         "Marks `done` and `error` records seen.";
-    "describe" Read (DescribeParams) -> Described,
+    Describe "describe" Read (DescribeParams) -> Described,
         errors [InvalidRequest],
         examples [],
         "This catalog, or one method of it.";
 }
 
 const DESCRIBE_EXAMPLE: &str = "params/describe-method";
-
-fn frame_summary(frame_type: FrameType) -> &'static str {
-    use FrameType::*;
-    match frame_type {
-        Hello => "Opens the connection: version, client and engine",
-        Request => "A method call, answered by `REPLY` or `ERROR` with its `id`",
-        Open => "Attaches the channel to a session",
-        Input => "Bytes for the PTY",
-        Viewport => "The attachment's size and profile",
-        Close => "Detaches the channel",
-        Welcome => "Accepts the connection: the server's engine, incarnation and limits",
-        Reply => "A method's result",
-        Event => "A change, once subscribed",
-        Error => "A request's or an attachment's failure, or the connection's end",
-        Attached => "The attachment's start: snapshot or resume",
-        Snapshot => "Snapshot bytes",
-        SnapshotReady => "The snapshot holds the screen; stream frames may follow",
-        SnapshotEnd => "The last snapshot byte was sent",
-        Output => "`offset u64` and PTY bytes from that stream offset",
-        Resized => "A size marker in the stream",
-        Exited => "The end of the stream",
-        Gap => "Bytes were not delivered; a new bootstrap follows",
-        Closed => "The attachment ended",
-    }
-}
-
-fn frame_schema(
-    frame_type: FrameType,
-    server_reads: &mut SchemaGenerator,
-    server_writes: &mut SchemaGenerator,
-) -> Option<schemars::Schema> {
-    use FrameType::*;
-    Some(match frame_type {
-        Hello => server_reads.subschema_for::<crate::Hello>(),
-        Request => server_reads.subschema_for::<crate::Request>(),
-        Open => server_reads.subschema_for::<crate::Open>(),
-        Viewport => server_reads.subschema_for::<crate::Viewport>(),
-        Welcome => server_writes.subschema_for::<crate::Welcome>(),
-        Reply => server_writes.subschema_for::<crate::Reply>(),
-        Event => server_writes.subschema_for::<Numbered>(),
-        Error => server_writes.subschema_for::<ErrorMessage>(),
-        Attached => server_writes.subschema_for::<crate::Attached>(),
-        Resized => server_writes.subschema_for::<crate::Resized>(),
-        Exited => server_writes.subschema_for::<crate::Exited>(),
-        Gap => server_writes.subschema_for::<crate::Gap>(),
-        Closed => server_writes.subschema_for::<crate::Closed>(),
-        Input | Close | Snapshot | SnapshotReady | SnapshotEnd | Output => return None,
-    })
-}
 
 fn frame_name(frame_type: FrameType) -> String {
     let mut name = String::new();
@@ -346,13 +305,15 @@ fn frame_info(
             ChannelKind::Either => "0 or n",
         }
         .into(),
-        payload: match t {
-            t if t.is_json() => Payload::Json,
-            FrameType::Close | FrameType::SnapshotReady | FrameType::SnapshotEnd => Payload::Empty,
-            _ => Payload::Raw,
-        },
-        summary: frame_summary(t).into(),
-        schema: frame_schema(t, server_reads, server_writes).map(schemars::Schema::to_value),
+        payload: t.payload(),
+        summary: t.summary().into(),
+        schema: t
+            .schema(if t.is_server() {
+                server_writes
+            } else {
+                server_reads
+            })
+            .map(schemars::Schema::to_value),
     }
 }
 
@@ -363,7 +324,7 @@ fn event_info(branch: &Value, vectors: &Map<String, Value>) -> EventInfo {
         .to_string();
     let prefix = format!("event/{name}");
     EventInfo {
-        summary: description(branch),
+        summary: description(branch).into(),
         schema: branch.clone(),
         examples: vectors
             .iter()
@@ -440,7 +401,7 @@ pub fn catalog(release: Option<&str>) -> Catalog {
     let errors = variants(&defs["ErrorCode"])
         .map(|branch| ErrorInfo {
             code: serde_json::from_value(branch["const"].clone()).expect("an error code"),
-            summary: description(branch),
+            summary: description(branch).into(),
         })
         .collect();
 
@@ -473,17 +434,7 @@ pub fn catalog(release: Option<&str>) -> Catalog {
 impl Catalog {
     pub fn describe(&self, name: &str) -> Option<Description> {
         let method = self.method(name)?.clone();
-        let mut wanted = Vec::new();
-        refs(&method.params, &mut wanted);
-        refs(&method.result, &mut wanted);
-        let mut used = BTreeSet::new();
-        while let Some(name) = wanted.pop() {
-            if used.insert(name.clone())
-                && let Some(schema) = self.defs.get(&name)
-            {
-                refs(schema, &mut wanted);
-            }
-        }
+        let used = reachable(&[&method.params, &method.result], &self.defs);
         Some(Description {
             protocol: self.protocol,
             version: self.version.clone(),
@@ -502,34 +453,52 @@ impl Catalog {
     }
 }
 
-pub(crate) fn refs(schema: &Value, out: &mut impl Extend<String>) {
-    match schema {
-        Value::Object(map) => {
-            for (key, value) in map {
-                match (key.as_str(), value) {
-                    ("$ref", Value::String(r)) => {
-                        if let Some(name) = r.strip_prefix("#/$defs/") {
-                            out.extend([name.to_string()]);
-                        }
-                    }
-                    _ => refs(value, out),
-                }
-            }
+pub(crate) fn reachable(roots: &[&Value], defs: &Map<String, Value>) -> BTreeSet<String> {
+    let mut wanted = Vec::new();
+    for root in roots {
+        refs(root, &mut wanted);
+    }
+    let mut used = BTreeSet::new();
+    while let Some(name) = wanted.pop() {
+        if used.insert(name.clone())
+            && let Some(schema) = defs.get(&name)
+        {
+            refs(schema, &mut wanted);
         }
+    }
+    used
+}
+
+pub(crate) fn refs(schema: &Value, out: &mut impl Extend<String>) {
+    out.extend(ref_name(schema).map(String::from));
+    match schema {
+        Value::Object(map) => map.values().for_each(|v| refs(v, out)),
         Value::Array(items) => items.iter().for_each(|v| refs(v, out)),
         _ => {}
     }
 }
 
-fn variants(schema: &Value) -> impl Iterator<Item = &Value> {
-    schema["oneOf"].as_array().into_iter().flatten()
+pub(crate) fn ref_name(schema: &Value) -> Option<&str> {
+    schema.get("$ref")?.as_str()?.strip_prefix("#/$defs/")
 }
 
-fn description(schema: &Value) -> String {
-    schema["description"]
-        .as_str()
+pub(crate) fn required(schema: &Value) -> BTreeSet<&str> {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default()
-        .to_string()
+}
+
+pub(crate) fn description(schema: &Value) -> &str {
+    schema
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn variants(schema: &Value) -> impl Iterator<Item = &Value> {
+    schema["oneOf"].as_array().into_iter().flatten()
 }
 
 /// Optional fields as the wire has them: absent, never `null` (schemars
@@ -537,10 +506,12 @@ fn description(schema: &Value) -> String {
 /// the protocol leaves an absent field out); and descriptions with doc
 /// comments' line breaks undone.
 fn tidy(schema: &mut Value) {
+    if let Value::Array(items) = schema {
+        items.iter_mut().for_each(tidy);
+        return;
+    }
+    let required: BTreeSet<String> = required(schema).into_iter().map(String::from).collect();
     let Value::Object(map) = schema else {
-        if let Value::Array(items) = schema {
-            items.iter_mut().for_each(tidy);
-        }
         return;
     };
     if let Some(Value::String(text)) = map.get_mut("description") {
@@ -550,15 +521,6 @@ fn tidy(schema: &mut Value) {
             .collect::<Vec<_>>()
             .join("\n\n");
     }
-    let required: BTreeSet<String> = map
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|r| {
-            r.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
     if let Some(Value::Object(properties)) = map.get_mut("properties") {
         for (name, property) in properties.iter_mut() {
             if !required.contains(name) {

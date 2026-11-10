@@ -2,7 +2,8 @@ use std::ptr;
 
 use ghostty_vt_sys as sys;
 
-use crate::error::{Error, Result, check};
+use crate::error::{Result, check};
+use crate::io::encoded;
 use crate::terminal::Term;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -226,28 +227,18 @@ impl KeyEncoder {
                 key.unshifted.map_or(0, u32::from),
             );
         }
-        let mut buf = vec![0u8; 64];
-        loop {
-            let mut written = 0;
+        encoded(64, |buf, written| {
             // SAFETY: buf holds buf.len() writable bytes.
-            let result = unsafe {
+            unsafe {
                 sys::ghostty_key_encoder_encode(
                     self.encoder,
                     self.event,
                     buf.as_mut_ptr().cast(),
                     buf.len(),
-                    &raw mut written,
+                    written,
                 )
-            };
-            match check(result) {
-                Ok(()) => {
-                    buf.truncate(written);
-                    return Ok(buf);
-                }
-                Err(Error::OutOfSpace) if written > buf.len() => buf.resize(written, 0),
-                Err(err) => return Err(err),
             }
-        }
+        })
     }
 }
 
@@ -266,33 +257,19 @@ impl Drop for KeyEncoder {
 /// set), else its newlines become carriage returns. The encoding the
 /// engine gives a paste from a person.
 pub fn encode_paste(data: &[u8], bracketed: bool) -> Result<Vec<u8>> {
-    let mut input = data.to_vec();
-    let mut out = vec![0u8; data.len() + 16];
-    loop {
-        let mut written = 0;
-        // SAFETY: input and out hold their lengths in bytes; input may be
-        // modified in place, and is a copy.
-        let result = unsafe {
+    encoded(data.len() + 16, |out, written| {
+        let mut input = data.to_vec();
+        // SAFETY: input and out hold their lengths in bytes; the engine
+        // may modify input in place, so every attempt gets a fresh copy.
+        unsafe {
             sys::ghostty_paste_encode(
                 input.as_mut_ptr().cast(),
                 input.len(),
                 bracketed,
                 out.as_mut_ptr().cast(),
                 out.len(),
-                &raw mut written,
+                written,
             )
-        };
-        match check(result) {
-            Ok(()) => {
-                out.truncate(written);
-                return Ok(out);
-            }
-            Err(Error::OutOfSpace) if written > out.len() => {
-                // The input was changed in place; start from a fresh copy.
-                input = data.to_vec();
-                out.resize(written, 0);
-            }
-            Err(err) => return Err(err),
         }
-    }
+    })
 }
