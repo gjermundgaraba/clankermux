@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use ghostty_vt::keys::{KeyEncoder, KeyPress, encode_paste};
+use proto::catalog::Call;
 use proto::{Closed, ClosedReason, ErrorCode, Event, Request, Sent, Size, Viewport};
 use rustix::process::Signal;
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -78,11 +78,6 @@ fn register(pending: &Pending, id: i64) -> (Claim, oneshot::Receiver<()>) {
     (Claim { id, serial }, stop)
 }
 
-fn params<T: DeserializeOwned>(value: Value) -> Result<T, Fail> {
-    serde_json::from_value(value)
-        .map_err(|e| (ErrorCode::InvalidRequest, format!("bad params: {e}")))
-}
-
 pub fn dispatch(
     registry: &Arc<Registry>,
     writer: &Writer,
@@ -91,31 +86,78 @@ pub fn dispatch(
     request: Request,
 ) {
     let id = request.id;
-    let outcome = match request.method.as_str() {
-        method if registry.catalog().method(method).is_none() => Err((
+    let outcome = match Call::parse(&request.method, request.params) {
+        None => Err((
             ErrorCode::InvalidRequest,
-            format!("unknown method {method}"),
+            format!("unknown method {}", request.method),
         )),
-        "send" => send(registry, writer, pending, id, request.params).map(|()| None),
-        "wait" => wait(registry, writer, pending, id, request.params).map(|()| None),
-        "cancel" => cancel(writer, pending, id, request.params).map(Some),
-        "list" => params::<proto::ListParams>(request.params).map(|p| {
-            registry.reply_page(writer, id, p.after.as_deref());
-            None
-        }),
-        "subscribe" => params(request.params).map(|p| {
-            *subscribed |= registry.subscribe(writer, id, p, !*subscribed);
-            None
-        }),
-        _ => handle(registry, request).map(Some),
+        Some(Err(e)) => Err((ErrorCode::InvalidRequest, format!("bad params: {e}"))),
+        Some(Ok(call)) => answer(registry, writer, pending, subscribed, id, call),
     };
     if let Some(outcome) = outcome.transpose() {
         reply(writer, id, outcome);
     }
 }
 
-fn cancel(writer: &Writer, pending: &Pending, id: i64, p: Value) -> Result<Value, Fail> {
-    let p: proto::CancelParams = params(p)?;
+fn answer(
+    registry: &Arc<Registry>,
+    writer: &Writer,
+    pending: &Pending,
+    subscribed: &mut bool,
+    id: i64,
+    call: Call,
+) -> Result<Option<Value>, Fail> {
+    let value = match call {
+        Call::Send(p) => return send(registry, writer, pending, id, p).map(|()| None),
+        Call::Wait(p) => return wait(registry, writer, pending, id, p).map(|()| None),
+        Call::List(p) => {
+            registry.reply_page(writer, id, p.after.as_deref());
+            return Ok(None);
+        }
+        Call::Subscribe(p) => {
+            *subscribed |= registry.subscribe(writer, id, p, !*subscribed);
+            return Ok(None);
+        }
+        Call::Cancel(p) => cancel(writer, pending, id, &p),
+        Call::Create(p) => json!(registry.create(p)?),
+        Call::Inspect(p) => {
+            let session = registry.get(&p.session)?;
+            let out = session.lock().unwrap().to_proto(true);
+            json!(out)
+        }
+        Call::End(p) => send_signal(registry, &p.session, Signal::HUP)?,
+        Call::Signal(p) => {
+            let signal = pty::signal_by_name(&p.signal).ok_or((
+                ErrorCode::InvalidRequest,
+                format!("unknown signal {}", p.signal),
+            ))?;
+            send_signal(registry, &p.session, signal)?
+        }
+        Call::Remove(p) => {
+            registry.remove(&p.session)?;
+            json!({})
+        }
+        Call::Ack(p) => ack(registry, &p)?,
+        Call::Label(p) => label(registry, p)?,
+        Call::Resize(p) => resize(registry, &p)?,
+        Call::Detach(p) => detach(registry, &p)?,
+        Call::Describe(p) => {
+            let catalog = registry.catalog();
+            match p.method {
+                None => json!(catalog),
+                Some(name) => catalog
+                    .describe(&name)
+                    .map(|one| json!(one))
+                    .ok_or((ErrorCode::InvalidRequest, format!("no method {name}")))?,
+            }
+        }
+        Call::Read(p) => json!(read::read(registry, &p)?),
+        Call::Tail(p) => json!(read::tail(registry, &p)?),
+    };
+    Ok(Some(value))
+}
+
+fn cancel(writer: &Writer, pending: &Pending, id: i64, p: &proto::CancelParams) -> Value {
     let cancelled = {
         let mut pending = pending.lock().unwrap();
         let cancelled = pending.by_id.remove(&p.id).is_some();
@@ -128,7 +170,7 @@ fn cancel(writer: &Writer, pending: &Pending, id: i64, p: Value) -> Result<Value
         }
         cancelled
     };
-    Ok(json!(proto::Cancelled { cancelled }))
+    json!(proto::Cancelled { cancelled })
 }
 
 enum Payload {
@@ -166,9 +208,8 @@ fn send(
     writer: &Writer,
     pending: &Pending,
     id: i64,
-    p: Value,
+    mut p: proto::SendParams,
 ) -> Result<(), Fail> {
-    let mut p: proto::SendParams = params(p)?;
     let payload = payload(&mut p)?;
     let facts = match p.wait {
         Some(w) => Some((Facts::new(w.until)?, w.timeout_ms)),
@@ -240,9 +281,8 @@ fn wait(
     writer: &Writer,
     pending: &Pending,
     id: i64,
-    p: Value,
+    p: proto::WaitParams,
 ) -> Result<(), Fail> {
-    let p: proto::WaitParams = params(p)?;
     let facts = Facts::new(p.until)?;
     let session = registry.get(&p.session)?;
     let waiter = Waiter::new(facts, wait::anchor(&session.lock().unwrap(), p.after)?);
@@ -252,54 +292,6 @@ fn wait(
         json!(waited)
     });
     Ok(())
-}
-
-fn handle(registry: &Arc<Registry>, request: Request) -> Result<Value, Fail> {
-    let p = request.params;
-    match request.method.as_str() {
-        "create" => Ok(json!(registry.create(params(p)?)?)),
-        "inspect" => {
-            let p: proto::SessionParams = params(p)?;
-            let session = registry.get(&p.session)?;
-            let out = session.lock().unwrap().to_proto(true);
-            Ok(json!(out))
-        }
-        "end" => {
-            let p: proto::SessionParams = params(p)?;
-            send_signal(registry, &p.session, Signal::HUP)
-        }
-        "signal" => {
-            let p: proto::SignalParams = params(p)?;
-            let signal = pty::signal_by_name(&p.signal).ok_or((
-                ErrorCode::InvalidRequest,
-                format!("unknown signal {}", p.signal),
-            ))?;
-            send_signal(registry, &p.session, signal)
-        }
-        "remove" => {
-            let p: proto::SessionParams = params(p)?;
-            registry.remove(&p.session)?;
-            Ok(json!({}))
-        }
-        "ack" => ack(registry, &params(p)?),
-        "label" => label(registry, params(p)?),
-        "resize" => resize(registry, &params(p)?),
-        "detach" => detach(registry, &params(p)?),
-        "describe" => {
-            let p: proto::catalog::DescribeParams = params(p)?;
-            let catalog = registry.catalog();
-            match p.method {
-                None => Ok(json!(catalog)),
-                Some(name) => catalog
-                    .describe(&name)
-                    .map(|one| json!(one))
-                    .ok_or((ErrorCode::InvalidRequest, format!("no method {name}"))),
-            }
-        }
-        "read" => Ok(json!(read::read(registry, &params(p)?)?)),
-        "tail" => Ok(json!(read::tail(registry, &params(p)?)?)),
-        other => Err((ErrorCode::InvalidRequest, format!("unknown method {other}"))),
-    }
 }
 
 fn send_signal(registry: &Registry, id: &str, signal: Signal) -> Result<Value, Fail> {

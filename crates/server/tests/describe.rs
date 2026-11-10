@@ -1,6 +1,6 @@
 use proto::catalog::{Catalog, Description};
 use proto::*;
-use serde_json::{Value, json};
+use serde_json::json;
 use testkit::*;
 
 #[tokio::test]
@@ -41,20 +41,9 @@ async fn describe_with_a_method_answers_that_entry_alone() {
 }
 
 #[tokio::test]
-async fn the_catalog_lists_exactly_the_methods_the_server_dispatches() {
+async fn a_method_outside_the_catalog_is_unknown() {
     let server = start(fast_limits());
     let mut c = client(&server).await;
-    let catalog: Catalog = serde_json::from_value(c.ok("describe", json!({})).await).unwrap();
-    for method in &catalog.methods {
-        let err = c.request(&method.name, Value::Null).await.unwrap_err();
-        assert_eq!(err.code, ErrorCode::InvalidRequest, "{}", method.name);
-        assert!(
-            !err.message.starts_with("unknown method"),
-            "{}: {}",
-            method.name,
-            err.message
-        );
-    }
     for name in ["no_such_method", "List", "api", ""] {
         let err = c.request(name, json!({})).await.unwrap_err();
         assert_eq!(err.message, format!("unknown method {name}"));

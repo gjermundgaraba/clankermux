@@ -153,7 +153,7 @@ struct Spec {
 
 macro_rules! methods {
     ($(
-        $name:literal $class:ident ($params:ty) -> $result:ty,
+        $variant:ident $name:literal $class:ident ($params:ty) -> $result:ty,
         errors [$($error:ident),*],
         examples [$(($p:literal, $r:literal)),*],
         $summary:literal;
@@ -170,6 +170,23 @@ macro_rules! methods {
             }),*]
         }
 
+        /// A request's method, with its params.
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum Call {
+            $($variant($params),)*
+        }
+
+        impl Call {
+            /// The call `method` names, with `params` as its type; `None`
+            /// for a method the protocol does not define.
+            pub fn parse(method: &str, params: Value) -> Option<Result<Call, serde_json::Error>> {
+                Some(match method {
+                    $($name => serde_json::from_value(params).map(Call::$variant),)*
+                    _ => return None,
+                })
+            }
+        }
+
         #[cfg(test)]
         pub(crate) fn typed() -> Vec<(&'static str, crate::tests::Check, crate::tests::Check)> {
             use crate::tests::same;
@@ -179,71 +196,71 @@ macro_rules! methods {
 }
 
 methods! {
-    "create" Mutation (CreateParams) -> Session,
+    Create "create" Mutation (CreateParams) -> Session,
         errors [InvalidRequest, LimitExceeded, Internal],
         examples [("params/create", "session/created")],
         "Starts a session: a program on a new PTY.";
-    "list" Read (ListParams) -> Page,
+    List "list" Read (ListParams) -> Page,
         errors [InvalidRequest],
         examples [("params/list-first", "page/with-next"), ("params/list", "page/last")],
         "A page of sessions, ordered by id, without their records.";
-    "inspect" Read (SessionParams) -> Session,
+    Inspect "inspect" Read (SessionParams) -> Session,
         errors [InvalidRequest, NoSuchSession],
         examples [("params/inspect", "session/inspect")],
         "One session, with its program status records.";
-    "end" Mutation (SessionParams) -> Empty,
+    End "end" Mutation (SessionParams) -> Empty,
         errors [InvalidRequest, NoSuchSession, NotRunning, SignalFailed],
         examples [("params/end", "empty/basic")],
         "Sends SIGHUP to the session's processes.";
-    "signal" Mutation (SignalParams) -> Empty,
+    Signal "signal" Mutation (SignalParams) -> Empty,
         errors [InvalidRequest, NoSuchSession, NotRunning, SignalFailed],
         examples [("params/signal", "empty/basic")],
         "Sends a signal, by name, to the session's processes.";
-    "remove" Mutation (SessionParams) -> Empty,
+    Remove "remove" Mutation (SessionParams) -> Empty,
         errors [InvalidRequest, NoSuchSession, Running, Internal],
         examples [("params/remove", "empty/basic")],
         "Deletes a session that is not running, with its files.";
-    "label" Mutation (LabelParams) -> Session,
+    Label "label" Mutation (LabelParams) -> Session,
         errors [InvalidRequest, NoSuchSession, LimitExceeded],
         examples [("params/label", "session/running")],
         "Sets the session's label.";
-    "resize" Mutation (ResizeParams) -> Empty,
+    Resize "resize" Mutation (ResizeParams) -> Empty,
         errors [InvalidRequest, NoSuchSession, NotRunning],
         examples [("params/resize", "empty/basic"), ("params/resize-policy", "empty/basic")],
         "Sets the session's size, its size policy, or both.";
-    "read" Read (ReadParams) -> Read,
+    Read "read" Read (ReadParams) -> Read,
         errors [InvalidRequest, NoSuchSession, ScopeUnavailable, EngineMismatch, Internal],
         examples [("params/read", "read/running"), ("params/read-scoped", "read/truncated")],
         "The session's screen, history or last command, as text, VT or HTML.";
-    "tail" Read (TailParams) -> Tail,
+    Tail "tail" Read (TailParams) -> Tail,
         errors [InvalidRequest, NoSuchSession, Internal],
         examples [("params/tail", "tail/basic"), ("params/tail-from", "tail/truncated")],
         "The output stream as plain text, from a stream offset.";
-    "send" Mutation (SendParams) -> Sent,
+    Send "send" Mutation (SendParams) -> Sent,
         errors [InvalidRequest, NoSuchSession, NotRunning, InputOverflow, Cancelled, Internal],
         examples [("params/send", "sent/plain"), ("params/send-text", "sent/wait")],
         "Writes text, named keys or bytes to the PTY; with `wait`, answers when it ends.";
-    "wait" Read (WaitParams) -> Waited,
+    Wait "wait" Read (WaitParams) -> Waited,
         errors [InvalidRequest, NoSuchSession, NotRunning, Cancelled],
         examples [("params/wait", "waited/status-done"), ("params/wait-output", "waited/timeout")],
         "Answers when the session exits, its output matches, a record is in a state, a prompt shows or output stops.";
-    "cancel" Mutation (CancelParams) -> Cancelled,
+    Cancel "cancel" Mutation (CancelParams) -> Cancelled,
         errors [InvalidRequest],
         examples [("params/cancel", "cancelled/yes")],
         "Ends a pending `wait`, or `send` with `wait`, of this connection.";
-    "detach" Mutation (DetachParams) -> Empty,
+    Detach "detach" Mutation (DetachParams) -> Empty,
         errors [InvalidRequest, NoSuchSession, NoSuchAttachment, LimitExceeded],
         examples [("params/detach", "empty/basic")],
         "Ends an attachment of any connection.";
-    "subscribe" Stream (SubscribeParams) -> Subscribed,
+    Subscribe "subscribe" Stream (SubscribeParams) -> Subscribed,
         errors [InvalidRequest],
         examples [("params/subscribe", "subscribed/first"), ("params/subscribe-after", "subscribed/after")],
         "Starts `EVENT` frames on this connection: from now, or replayed after a `seq`.";
-    "ack" Mutation (AckParams) -> Acked,
+    Ack "ack" Mutation (AckParams) -> Acked,
         errors [InvalidRequest, NoSuchSession],
         examples [("params/ack", "acked/basic")],
         "Marks `done` and `error` records seen.";
-    "describe" Read (DescribeParams) -> Described,
+    Describe "describe" Read (DescribeParams) -> Described,
         errors [InvalidRequest],
         examples [],
         "This catalog, or one method of it.";
