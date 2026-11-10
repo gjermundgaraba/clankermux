@@ -122,21 +122,43 @@ fn format_rows(
     })
 }
 
-fn from_terminal(
-    term: &Term,
-    scope: ReadScope,
-    format: ReadFormat,
-    scrollback: usize,
-    budget: usize,
-) -> Result<Text, Fail> {
-    let from = match scope {
-        ReadScope::Screen => term.history_start(scrollback).map_err(internal)?,
-        ReadScope::History => ScrollbackRow(0),
-        ReadScope::Alternate if term.alternate_screen() => term.screen_top().map_err(internal)?,
-        ReadScope::Alternate => {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rows {
+    Screen { history: Option<usize> },
+    Alternate,
+    LastCommand,
+}
+
+impl Rows {
+    fn of(p: &ReadParams) -> Result<Rows, Fail> {
+        Ok(match (p.scope.unwrap_or_default(), p.scrollback) {
+            (ReadScope::Screen, history) => Rows::Screen {
+                history: Some(history.unwrap_or(0) as usize),
+            },
+            (_, Some(_)) => {
+                return Err((
+                    ErrorCode::InvalidRequest,
+                    "scrollback is for scope screen only".into(),
+                ));
+            }
+            (ReadScope::History, None) => Rows::Screen { history: None },
+            (ReadScope::Alternate, None) => Rows::Alternate,
+            (ReadScope::LastCommand, None) => Rows::LastCommand,
+        })
+    }
+}
+
+fn from_terminal(term: &Term, rows: Rows, format: ReadFormat, budget: usize) -> Result<Text, Fail> {
+    let from = match rows {
+        Rows::Screen {
+            history: Some(history),
+        } => term.history_start(history).map_err(internal)?,
+        Rows::Screen { history: None } => ScrollbackRow(0),
+        Rows::Alternate if term.alternate_screen() => term.screen_top().map_err(internal)?,
+        Rows::Alternate => {
             return Err(unavailable("the session is not on the alternate screen"));
         }
-        ReadScope::LastCommand => unreachable!("read from the stream"),
+        Rows::LastCommand => unreachable!("read from the stream"),
     };
     format_rows(term, format, from, budget)
 }
@@ -172,14 +194,7 @@ fn replay(
 
 pub fn read(registry: &Registry, p: &ReadParams) -> Result<proto::Read, Fail> {
     let format = p.format.unwrap_or_default();
-    let scope = p.scope.unwrap_or_default();
-    if p.scrollback.is_some() && scope != ReadScope::Screen {
-        return Err((
-            ErrorCode::InvalidRequest,
-            "scrollback is for scope screen only".into(),
-        ));
-    }
-    let scrollback = p.scrollback.unwrap_or(0) as usize;
+    let rows = Rows::of(p)?;
     let limits = &registry.config.limits;
     let budget = proto::cap(limits.max_frame).saturating_sub(REPLY_MARGIN);
     let session = registry.get(&p.session)?;
@@ -200,7 +215,7 @@ pub fn read(registry: &Registry, p: &ReadParams) -> Result<proto::Read, Fail> {
         status: info.status,
         truncated,
     };
-    if scope == ReadScope::LastCommand {
+    if rows == Rows::LastCommand {
         let (bytes, gone) = last_command_bytes(&s)?;
         let size = s.size();
         let reply = reply(Text::default());
@@ -213,21 +228,19 @@ pub fn read(registry: &Registry, p: &ReadParams) -> Result<proto::Read, Fail> {
             ..reply
         });
     }
-    match &s.body {
-        _ if format == ReadFormat::Text && scope != ReadScope::Alternate => {
-            let mut text = s
-                .read_text((scope == ReadScope::Screen).then_some(scrollback))
-                .map_err(internal)?;
+    match (&s.body, rows) {
+        (_, Rows::Screen { history }) if format == ReadFormat::Text => {
+            let mut text = s.read_text(history).map_err(internal)?;
             if !text.is_empty() {
                 text.push('\n');
             }
             let truncated = fit_json(&mut text, budget);
             Ok(reply(Text { text, truncated }))
         }
-        Body::Live(live) => {
-            blocking(|| from_terminal(&live.term, scope, format, scrollback, budget)).map(reply)
+        (Body::Live(live), _) => {
+            blocking(|| from_terminal(&live.term, rows, format, budget)).map(reply)
         }
-        Body::Parked(parked) => {
+        (Body::Parked(parked), _) => {
             if parked.engine != ghostty_vt::ENGINE {
                 return Err((
                     ErrorCode::EngineMismatch,
@@ -243,7 +256,7 @@ pub fn read(registry: &Registry, p: &ReadParams) -> Result<proto::Read, Fail> {
             let read = blocking(|| {
                 let bytes = std::fs::read(&path).map_err(internal)?;
                 let term = ghostty_vt::snapshot::decode(&bytes).map_err(internal)?;
-                from_terminal(&term, scope, format, scrollback, budget)
+                from_terminal(&term, rows, format, budget)
             })?;
             Ok(proto::Read {
                 text: read.text,
