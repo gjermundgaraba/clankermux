@@ -1,6 +1,6 @@
 // Generated from the catalog by `cargo xtask protocol`; do not edit.
 
-export const VERSION = 1;
+export const VERSION = 2;
 
 /** Each frame type's header byte. */
 export const FrameType = {
@@ -108,10 +108,7 @@ export interface Acked {
   record_ids: string[];
 }
 
-export type AttachMode = "snapshot" | "resume";
-
 export interface Attached {
-  mode: AttachMode;
   /** Cursor offset the attachment continues from. */
   offset: number;
   /**
@@ -123,9 +120,9 @@ export interface Attached {
   rows: number;
   session: Session;
   /**
-   * Required in mode `snapshot`, absent otherwise: the total length of the
-   * snapshot that follows (the sum of the `SNAPSHOT` payloads), so a client can
-   * size its buffer.
+   * Present when a snapshot follows, absent when the attachment resumes: the
+   * total length of the snapshot (the sum of the `SNAPSHOT` payloads, possibly
+   * 0), so a client can size its buffer.
    */
   snapshot_bytes?: number;
 }
@@ -431,13 +428,13 @@ export interface Gap {
 }
 
 export interface Hello {
-  /** Always 1. */
+  /** Always 2. */
   version: number;
   /** Informational. */
   client: ClientPeer;
   /** Engine id; absent for control-only clients. */
   engine?: string;
-  /** Capability ids; version 1 defines none. */
+  /** Capability ids; version 2 defines none. */
   capabilities?: string[];
 }
 
@@ -895,7 +892,7 @@ export interface Waited {
 }
 
 export interface Welcome {
-  /** Always 1. */
+  /** Always 2. */
   version: number;
   server: Peer;
   /** Engine id of the server. */

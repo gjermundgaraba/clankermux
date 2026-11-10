@@ -101,7 +101,6 @@ function bootstrap(socket: FakeSocket, channel: number, s: Session, text = "hell
   const bytes = source.snapshot();
   source.free();
   socket.push(FrameType.Attached, channel, {
-    mode: "snapshot",
     offset: 0,
     marker: 0,
     cols: 10,
@@ -386,7 +385,7 @@ test("after a reconnect each terminal resumes its stream and the events missed m
       offset: 0,
       marker: 0,
     });
-    next.push(FrameType.Attached, channel, { mode: "resume", offset: 0, marker: 0, cols: 10, rows: 3, session: session(id) });
+    next.push(FrameType.Attached, channel, { offset: 0, marker: 0, cols: 10, rows: 3, session: session(id) });
     await vi.waitFor(() => expect(worker.links(mount).slice(-3)).toEqual<Link[]>([
       { state: "ended", reason: "closed", retry: true },
       { state: "connecting", attempt: 1 },
@@ -672,7 +671,7 @@ test("a reopen takes the size back in its OPEN, so the page's next input after t
   const open = next.bodies(FrameType.Open).find((o) => o.channel === channel)!.body;
   expect(open.viewport).toEqual({ cols: 80, rows: 24 });
   const resume = open.resume as Record<string, number>;
-  next.push(FrameType.Attached, channel, { mode: "resume", ...resume, cols: 20, rows: 5, session: session("s") });
+  next.push(FrameType.Attached, channel, { ...resume, cols: 20, rows: 5, session: session("s") });
   await vi.waitFor(() => expect(worker.screens().at(-1)).toBe("resumed"));
   worker.to(1, { type: "key", input: key("KeyB", { key: "b" }) });
   await vi.waitFor(() => expect(next.sent.filter((f) => f.header.type === FrameType.Input && f.header.channel === channel)).toHaveLength(1));
@@ -872,7 +871,7 @@ test("the link: a resume onto a session that exited meanwhile ends once, at its 
   await next.serve([exited]);
   const channel = await next.opened("s");
   expect(next.bodies(FrameType.Open).at(-1)?.body.resume).toEqual({ incarnation: "i", offset: 0, marker: 0 });
-  next.push(FrameType.Attached, channel, { mode: "resume", offset: 0, marker: 0, cols: 10, rows: 3, session: exited });
+  next.push(FrameType.Attached, channel, { offset: 0, marker: 0, cols: 10, rows: 3, session: exited });
   next.push(FrameType.Exited, channel, { seq: 1, offset: 0, exit: { code: 0 } });
   await vi.waitFor(() =>
     expect(worker.links().slice(-2)).toEqual<Link[]>([

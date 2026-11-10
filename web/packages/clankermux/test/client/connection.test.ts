@@ -30,7 +30,7 @@ class Fake implements Transport {
 }
 
 const welcome = {
-  version: 1,
+  version: 2,
   server: { name: "test", version: "0" },
   engine: "x",
   incarnation: "i",
@@ -85,7 +85,7 @@ test("channel frames and events are routed", async () => {
   expect(fake.json(fake.sent.at(-1)!)).toEqual({ session: "s" });
   const events: unknown[] = [];
   conn.onEvent = (e) => events.push(e);
-  fake.push(FrameType.Attached, 1, { mode: "resume" });
+  fake.push(FrameType.Attached, 1, { offset: 0 });
   fake.push(FrameType.Event, 0, { event: "session_removed", id: "s" });
   expect(frames.map((f) => f.header.type)).toEqual([FrameType.Attached]);
   expect(events).toEqual([{ event: "session_removed", id: "s" }]);

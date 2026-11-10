@@ -1,4 +1,4 @@
-# clankermux protocol, version 1
+# clankermux protocol, version 2
 
 A terminal multiplexer daemon with flat sessions, one PTY each. Clients and
 server embed the same pinned libghostty-vt build. A client attaches by
@@ -79,7 +79,7 @@ than `OPEN` on a channel that is not in use is dropped.
 The client sends `HELLO` within `limits.hello_timeout` of connecting, else
 the server closes the connection. The server answers `WELCOME`, or `ERROR
 version_mismatch` and then closes the connection. A `HELLO` that is not a
-JSON object is a `protocol_error`; one of version 1 with a field missing,
+JSON object is a `protocol_error`; one of version 2 with a field missing,
 mistyped or undefined gets `ERROR invalid_request` without `id`, and the
 connection closes.
 
@@ -88,10 +88,10 @@ connection closes.
 <!-- generated: type Hello -->
 | Field          | Type            | Meaning |
 | -------------- | --------------- | ------- |
-| `version`      | int             | Always 1. |
+| `version`      | int             | Always 2. |
 | `client`       | {name, version} | Informational. |
 | `engine`       | string?         | Engine id; absent for control-only clients. |
-| `capabilities` | string[]?       | Capability ids; version 1 defines none. |
+| `capabilities` | string[]?       | Capability ids; version 2 defines none. |
 <!-- end generated -->
 
 `WELCOME`
@@ -99,7 +99,7 @@ connection closes.
 <!-- generated: type Welcome -->
 | Field          | Type            | Meaning |
 | -------------- | --------------- | ------- |
-| `version`      | int             | Always 1. |
+| `version`      | int             | Always 2. |
 | `server`       | {name, version} | |
 | `engine`       | string          | Engine id of the server. |
 | `incarnation`  | string          | UUID, new on every server start. |
@@ -677,25 +677,25 @@ before the session check.
 ### ATTACHED
 
 <!-- generated: type Attached -->
-| Field            | Type                   | Meaning |
-| ---------------- | ---------------------- | ------- |
-| `mode`           | `snapshot` \| `resume` | |
-| `offset`         | int                    | Cursor offset the attachment continues from. |
-| `marker`         | int                    | Cursor marker: latest `seq` reflected in the snapshot, or in the client's terminal when resuming. |
-| `cols`           | int                    | |
-| `rows`           | int                    | |
-| `session`        | Session                | |
-| `snapshot_bytes` | int?                   | Required in mode `snapshot`, absent otherwise: the total length of the snapshot that follows (the sum of the `SNAPSHOT` payloads), so a client can size its buffer. |
+| Field            | Type    | Meaning |
+| ---------------- | ------- | ------- |
+| `offset`         | int     | Cursor offset the attachment continues from. |
+| `marker`         | int     | Cursor marker: latest `seq` reflected in the snapshot, or in the client's terminal when resuming. |
+| `cols`           | int     | |
+| `rows`           | int     | |
+| `session`        | Session | |
+| `snapshot_bytes` | int?    | Present when a snapshot follows, absent when the attachment resumes: the total length of the snapshot (the sum of the `SNAPSHOT` payloads, possibly 0), so a client can size its buffer. |
 <!-- end generated -->
 
-`resume` is chosen when `OPEN.resume.incarnation` equals the server's
+The attachment resumes when `OPEN.resume.incarnation` equals the server's
 incarnation, `OPEN.resume.offset` lies within the retained stream, and
 every marker with `seq` above `OPEN.resume.marker` is retained. Otherwise
-`snapshot`. Under the server's incarnation, a `marker` above the session's
+a snapshot follows. A client tells them apart by `snapshot_bytes`: present
+(even 0) for a snapshot, absent for a resume. Under the server's incarnation, a `marker` above the session's
 latest `seq` fails with `invalid_request`; a cursor from another
 incarnation is not compared.
 
-### Bootstrap, mode `snapshot`
+### Bootstrap from a snapshot
 
 Server, holding the session still:
 
@@ -707,7 +707,7 @@ Server, holding the session still:
 
 Then on the channel:
 
-1. `ATTACHED {mode: "snapshot", offset: cut, marker, ...}`;
+1. `ATTACHED {offset: cut, marker, snapshot_bytes, ...}`;
 2. `SNAPSHOT` frames carrying the snapshot bytes in order, split at
    arbitrary positions;
 3. `SNAPSHOT_READY` once every byte through the end of the `READY` record
@@ -737,10 +737,11 @@ Client:
 The client's decoder must accept continuations up to
 `limits.continuation`.
 
-### Bootstrap, mode `resume`
+### Bootstrap by resuming
 
-`ATTACHED {mode: "resume", offset, marker}` echoes the client's cursor and
-is followed by the stream from it. The client keeps its terminal.
+`ATTACHED {offset, marker}`, without `snapshot_bytes`, echoes the client's
+cursor and is followed by the stream from it. The client keeps its
+terminal.
 
 ### Stream frames
 
@@ -786,7 +787,7 @@ advanced more than `limits.ring` bytes past an attachment's cursor, or a
 marker the cursor has not received is no longer retained, the server
 sends `GAP {from, to}`, meaning bytes from `from` up to `to` were not
 delivered, where `to` is the `offset` of the `ATTACHED` that follows, and
-begins a new bootstrap in mode `snapshot` on the same channel. The client
+begins a new bootstrap from a snapshot on the same channel. The client
 discards its terminal. If the bootstrap that followed a gap is still in
 flight when this happens again, the server sends `ERROR too_slow`.
 
@@ -994,7 +995,7 @@ Over TCP and WebSocket, trust is the tailnet policy alone: any process on
 any node the policy admits, under any user on that node, can do everything
 the server's user can. The `Origin` allowlist only keeps pages from other
 origins, open in a browser on an admitted node, off the server. This is a
-deliberate trade-off for version 1.
+deliberate trade-off for version 2.
 
 ## Limits
 
@@ -1052,7 +1053,7 @@ an attachment channel it ends the attachment, except `read_only`,
 | `internal`           | The server failed, or is stopping. |
 <!-- end generated -->
 
-## Not in version 1
+## Not in version 2
 
 Process survival across a server restart; encryption of parked state;
 authentication beyond socket ownership and tailnet policy; a WebTransport

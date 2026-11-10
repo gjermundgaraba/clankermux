@@ -1,8 +1,8 @@
 use ghostty_vt::snapshot::{Decoder, Step};
 use ghostty_vt::{Handler, Terminal};
 use proto::{
-    AttachMode, Attached, Closed, ErrorMessage, Exit, Exited, FrameType, Gap, Resized, Resume,
-    Session, Welcome, parse_output,
+    Attached, Closed, ErrorMessage, Exit, Exited, FrameType, Gap, Resized, Resume, Session,
+    Welcome, parse_output,
 };
 
 use crate::connection::{Error, Frame};
@@ -39,13 +39,9 @@ enum State<H: Handler> {
     Ended(Option<Terminal<H>>),
 }
 
-struct Server {
+pub struct Attachment<H: Handler + Default = ()> {
     incarnation: String,
     continuation: usize,
-}
-
-pub struct Attachment<H: Handler + Default = ()> {
-    opened_on: Server,
     state: State<H>,
     cursor: Resume,
     pub session: Option<Session>,
@@ -60,10 +56,8 @@ impl<H: Handler + Default> Default for Attachment<H> {
 impl<H: Handler + Default> Attachment<H> {
     pub fn new() -> Self {
         Attachment {
-            opened_on: Server {
-                incarnation: String::new(),
-                continuation: 0,
-            },
+            incarnation: String::new(),
+            continuation: 0,
             state: State::Opening,
             cursor: Resume {
                 incarnation: String::new(),
@@ -74,11 +68,12 @@ impl<H: Handler + Default> Attachment<H> {
         }
     }
 
-    pub fn open_on(&mut self, welcome: &Welcome) {
-        self.opened_on = Server {
-            incarnation: welcome.incarnation.clone(),
-            continuation: proto::cap(welcome.limits.continuation),
-        };
+    /// Readies an `OPEN` on the connection `welcome` began: the cursor to
+    /// resume from, when there is one to keep.
+    pub fn open(&mut self, welcome: &Welcome) -> Option<Resume> {
+        self.incarnation.clone_from(&welcome.incarnation);
+        self.continuation = proto::cap(welcome.limits.continuation);
+        self.resume()
     }
 
     pub fn resume(&self) -> Option<Resume> {
@@ -196,16 +191,16 @@ impl<H: Handler + Default> Attachment<H> {
 
     fn attached(&mut self, attached: Attached) -> Result<(), Error> {
         self.cursor = Resume {
-            incarnation: self.opened_on.incarnation.clone(),
+            incarnation: self.incarnation.clone(),
             offset: attached.offset,
             marker: attached.marker,
         };
         self.session = Some(attached.session);
-        match attached.mode {
-            AttachMode::Snapshot => {
+        match attached.snapshot_bytes {
+            Some(_) => {
                 let mut decoder = Decoder::with_handler(H::default()).map_err(engine)?;
                 decoder
-                    .set_max_continuation_bytes(self.opened_on.continuation)
+                    .set_max_continuation_bytes(self.continuation)
                     .map_err(engine)?;
                 self.state = State::Bootstrapping {
                     decoder,
@@ -213,7 +208,7 @@ impl<H: Handler + Default> Attachment<H> {
                     held_bytes: 0,
                 };
             }
-            AttachMode::Resume => {
+            None => {
                 let State::Streaming(_) = self.state else {
                     return Err(Error::Protocol("resume without a terminal".into()));
                 };
@@ -323,7 +318,7 @@ mod tests {
 
     fn welcome(incarnation: &str) -> Welcome {
         Welcome {
-            version: 1,
+            version: proto::VERSION,
             server: proto::Peer {
                 name: "test".into(),
                 version: "0".into(),
@@ -365,7 +360,6 @@ mod tests {
         json(
             FrameType::Attached,
             &Attached {
-                mode: AttachMode::Snapshot,
                 offset,
                 marker,
                 cols: 10,
@@ -399,7 +393,7 @@ mod tests {
         let bytes = snapshot_of(b"before");
         let ready = snapshot::ready_end(&bytes).unwrap();
         let mut a: Attachment = Attachment::new();
-        a.open_on(&welcome("inc"));
+        a.open(&welcome("inc"));
         a.handle(attached(100, 0, &bytes)).unwrap();
         a.handle(frame(FrameType::Snapshot, bytes[..ready].to_vec()))
             .unwrap();
@@ -429,7 +423,7 @@ mod tests {
         assert!(a.resume().is_none());
         assert_eq!(a.term().unwrap().cols(), 10);
         assert_eq!(text(a.term().unwrap()), "before");
-        a.open_on(&welcome("inc"));
+        a.open(&welcome("inc"));
         a.handle(attached(200, 1, &bytes)).unwrap();
         a.handle(frame(FrameType::Snapshot, bytes)).unwrap();
         a.handle(frame(FrameType::SnapshotEnd, vec![])).unwrap();
@@ -442,7 +436,7 @@ mod tests {
         let ready = snapshot::ready_end(&bytes).unwrap();
 
         let mut a: Attachment = Attachment::new();
-        a.open_on(&welcome("inc"));
+        a.open(&welcome("inc"));
         assert_eq!(a.handle(attached(100, 2, &bytes)).unwrap(), vec![]);
         assert_eq!(
             a.handle(frame(FrameType::Snapshot, bytes[..ready - 1].to_vec()))
@@ -535,7 +529,7 @@ mod tests {
         let bytes = snapshot_of(b"one\r\ntwo\r\n");
         let ready = snapshot::ready_end(&bytes).unwrap();
         let mut a: Attachment = Attachment::new();
-        a.open_on(&welcome("inc"));
+        a.open(&welcome("inc"));
         a.handle(attached(100, 0, &bytes)).unwrap();
         assert_eq!(
             a.handle(frame(FrameType::Snapshot, bytes[..ready].to_vec()))
@@ -566,7 +560,7 @@ mod tests {
         let bytes = snapshot_of(b"one\r\ntwo\r\n");
         let ready = snapshot::ready_end(&bytes).unwrap();
         let mut a: Attachment = Attachment::new();
-        a.open_on(&welcome("inc"));
+        a.open(&welcome("inc"));
         a.handle(attached(0, 0, &bytes)).unwrap();
         a.handle(frame(FrameType::Snapshot, bytes[..ready].to_vec()))
             .unwrap();
@@ -583,17 +577,34 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_snapshot_still_bootstraps_and_a_resume_needs_a_terminal() {
+        let mut a: Attachment = Attachment::new();
+        a.open(&welcome("inc"));
+        a.handle(attached(0, 0, b"")).unwrap();
+        assert!(matches!(a.state, State::Bootstrapping { .. }));
+        let mut fresh: Attachment = Attachment::new();
+        fresh.open(&welcome("inc"));
+        let resumed = Attached {
+            snapshot_bytes: None,
+            ..attached(0, 0, b"").json().unwrap()
+        };
+        assert!(matches!(
+            fresh.handle(json(FrameType::Attached, &resumed)),
+            Err(Error::Protocol(m)) if m.contains("resume without a terminal")
+        ));
+    }
+
+    #[test]
     fn the_cursor_keeps_the_incarnation_it_was_obtained_under() {
         let bytes = snapshot_of(b"");
         let mut a: Attachment = Attachment::new();
-        a.open_on(&welcome("first"));
+        a.open(&welcome("first"));
         a.handle(attached(7, 0, &bytes)).unwrap();
         a.handle(frame(FrameType::Snapshot, bytes.clone())).unwrap();
         a.handle(frame(FrameType::SnapshotReady, vec![])).unwrap();
         a.handle(frame(FrameType::SnapshotEnd, vec![])).unwrap();
         assert_eq!(a.resume().unwrap().incarnation, "first");
-        a.open_on(&welcome("second"));
-        assert_eq!(a.resume().unwrap().incarnation, "first");
+        assert_eq!(a.open(&welcome("second")).unwrap().incarnation, "first");
         a.handle(attached(0, 0, &bytes)).unwrap();
         a.handle(frame(FrameType::Snapshot, bytes.clone())).unwrap();
         a.handle(frame(FrameType::SnapshotReady, vec![])).unwrap();

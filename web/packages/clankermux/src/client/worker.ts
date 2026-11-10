@@ -520,8 +520,7 @@ class Mount {
   }
 
   private open({ session, attachment, channel, conn }: Line): void {
-    attachment.openOn(conn.welcome);
-    const resume = attachment.resume();
+    const resume = attachment.open(conn.welcome);
     const open = {
       session,
       ...(this.readOnly && { read_only: true }),

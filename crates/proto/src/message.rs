@@ -24,21 +24,21 @@ pub struct ClientPeer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Hello {
-    /// Always 1.
+    /// Always 2.
     pub version: u32,
     /// Informational.
     pub client: ClientPeer,
     /// Engine id; absent for control-only clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
-    /// Capability ids; version 1 defines none.
+    /// Capability ids; version 2 defines none.
     #[serde(default)]
     pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Welcome {
-    /// Always 1.
+    /// Always 2.
     pub version: u32,
     pub server: Peer,
     /// Engine id of the server.
@@ -911,16 +911,8 @@ pub struct Open {
     pub resume: Option<Resume>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachMode {
-    Snapshot,
-    Resume,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Attached {
-    pub mode: AttachMode,
     /// Cursor offset the attachment continues from.
     pub offset: u64,
     /// Cursor marker: latest `seq` reflected in the snapshot, or in the
@@ -929,9 +921,9 @@ pub struct Attached {
     pub cols: u16,
     pub rows: u16,
     pub session: Session,
-    /// Required in mode `snapshot`, absent otherwise: the total length of
-    /// the snapshot that follows (the sum of the `SNAPSHOT` payloads), so
-    /// a client can size its buffer.
+    /// Present when a snapshot follows, absent when the attachment
+    /// resumes: the total length of the snapshot (the sum of the
+    /// `SNAPSHOT` payloads, possibly 0), so a client can size its buffer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_bytes: Option<u64>,
 }

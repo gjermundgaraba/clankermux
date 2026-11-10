@@ -9,7 +9,7 @@ pub use frame::*;
 pub use limits::{Limits, cap};
 pub use message::*;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 #[cfg(test)]
 mod props;

@@ -13,13 +13,13 @@ async fn handshake_and_protocol_errors() {
 
     let mut c = Client::connect(&server).await;
     let welcome = c.hello().await;
-    assert_eq!(welcome.version, 1);
+    assert_eq!(welcome.version, VERSION);
     assert_eq!(welcome.engine, ghostty_vt::ENGINE);
     assert_eq!(welcome.limits.page, 2);
     c.send_json(
         FrameType::Hello,
         0,
-        &json!({"version": 1, "client": {"name": "t", "version": "0"}}),
+        &json!({"version": VERSION, "client": {"name": "t", "version": "0"}}),
     )
     .await;
     let (_, body) = c.recv_json().await;
@@ -33,7 +33,7 @@ async fn handshake_and_protocol_errors() {
     c.send_json(
         FrameType::Hello,
         0,
-        &json!({"version": 2, "client": {"name": "t", "version": "0"}}),
+        &json!({"version": 1, "client": {"name": "t", "version": "0"}}),
     )
     .await;
     let (_, body) = c.recv_json().await;
@@ -419,7 +419,7 @@ async fn malformed_requests_pipelining_and_the_hello_deadline() {
     let mut both = encode_frame(
         FrameType::Hello,
         0,
-        br#"{"version":1,"client":{"name":"t","version":"0"}}"#,
+        br#"{"version":2,"client":{"name":"t","version":"0"}}"#,
     );
     both.extend(encode_frame(
         FrameType::Request,
@@ -456,7 +456,7 @@ async fn malformed_requests_pipelining_and_the_hello_deadline() {
     assert!(c.request("list", json!({})).await.is_ok());
 
     let mut c = Client::connect(&server).await;
-    c.send_json(FrameType::Hello, 0, &json!({"version": 2, "peer": "x"}))
+    c.send_json(FrameType::Hello, 0, &json!({"version": 1, "peer": "x"}))
         .await;
     assert_eq!(c.recv_json().await.1["code"], "version_mismatch");
     assert!(c.recv().await.is_none());
@@ -465,7 +465,7 @@ async fn malformed_requests_pipelining_and_the_hello_deadline() {
     let hello = encode_frame(
         FrameType::Hello,
         0,
-        br#"{"version":1,"client":{"name":"t","version":"0"}}"#,
+        br#"{"version":2,"client":{"name":"t","version":"0"}}"#,
     );
     let started = std::time::Instant::now();
     c.stream.write_all(&hello[..1]).await.unwrap();

@@ -164,7 +164,7 @@ async fn resume_when_retained_else_snapshot() {
     )
     .await;
     let attached = c.attached(1).await;
-    assert_eq!(attached.mode, AttachMode::Resume);
+    assert_eq!(attached.snapshot_bytes, None);
     assert_eq!((attached.offset, attached.marker), (cursor, 0));
     assert_eq!((attached.cols, attached.rows), (30, 8));
     assert_eq!(

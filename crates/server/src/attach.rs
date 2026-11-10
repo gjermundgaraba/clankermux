@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use ghostty_vt::snapshot;
 use proto::{
-    AttachMode, Attached, ClientPeer, Closed, ClosedReason, ErrorCode, Event, Exited, FrameType,
-    Gap, OUTPUT_OFFSET_LEN, Open, Peer, Resized, Resume, Status, StreamCursor, Viewport,
-    encode_frame, encode_json_frame, encode_output_frame,
+    Attached, ClientPeer, Closed, ClosedReason, ErrorCode, Event, Exited, FrameType, Gap,
+    OUTPUT_OFFSET_LEN, Open, Peer, Resized, Resume, Status, StreamCursor, Viewport, encode_frame,
+    encode_json_frame, encode_output_frame,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -377,11 +377,6 @@ impl Task {
         self.send_json(
             FrameType::Attached,
             &Attached {
-                mode: if snapshot_bytes.is_some() {
-                    AttachMode::Snapshot
-                } else {
-                    AttachMode::Resume
-                },
                 offset: cursor.offset,
                 marker: cursor.marker,
                 cols: session.cols,

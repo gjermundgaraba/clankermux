@@ -27,7 +27,8 @@ async fn assert_untouched(c: &mut Client, id: &str) {
 #[tokio::test]
 async fn an_unknown_field_in_hello_closes_the_connection() {
     let server = start(fast_limits());
-    let hello = json!({"version": 1, "client": {"name": "t", "version": "0"}, "capabilities": []});
+    let hello =
+        json!({"version": VERSION, "client": {"name": "t", "version": "0"}, "capabilities": []});
     for path in [&[][..], &["client"][..]] {
         let mut c = Client::connect(&server).await;
         c.send_json(FrameType::Hello, 0, &with_extra(hello.clone(), path))
@@ -199,7 +200,7 @@ async fn the_payloads_of_the_0_2_0_web_package_are_accepted() {
     c.send_json(
         FrameType::Hello,
         0,
-        &json!({"version": 1, "client": {"name": "clankermux-web", "version": "0.2.0"},
+        &json!({"version": VERSION, "client": {"name": "clankermux-web", "version": "0.2.0"},
                 "capabilities": [], "engine": ghostty_vt::ENGINE}),
     )
     .await;
@@ -247,7 +248,7 @@ async fn the_payloads_of_the_0_2_0_web_package_are_accepted() {
     .await;
     let resumed: Attached =
         serde_json::from_slice(&until(&mut c, 2, FrameType::Attached).await).unwrap();
-    assert_eq!(resumed.mode, AttachMode::Resume);
+    assert_eq!(resumed.snapshot_bytes, None);
 
     c.send(FrameType::Close, 1, b"").await;
     c.send(FrameType::Close, 2, b"").await;

@@ -178,8 +178,7 @@ async fn follow(
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
-        a.open_on(&conn.welcome);
-        let resume = a.resume();
+        let resume = a.open(&conn.welcome);
         let Ok(mut rx) = conn.open(
             1,
             &Open {
@@ -211,9 +210,9 @@ async fn follow(
             if first && frame.header.frame_type == FrameType::Attached {
                 first = false;
                 let attached: Attached = frame.json().unwrap();
-                match attached.mode {
-                    AttachMode::Resume => seen.resumes += 1,
-                    AttachMode::Snapshot => seen.snapshots += 1,
+                match attached.snapshot_bytes {
+                    None => seen.resumes += 1,
+                    Some(_) => seen.snapshots += 1,
                 }
             }
             let was_bootstrapping = a.term().is_none();

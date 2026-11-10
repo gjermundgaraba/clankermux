@@ -1,6 +1,6 @@
 {
   "hello/full": {
-    "version": 1,
+    "version": 2,
     "client": {
       "name": "clankermux",
       "version": "0.1.0"
@@ -9,7 +9,7 @@
     "capabilities": []
   },
   "hello/control-only": {
-    "version": 1,
+    "version": 2,
     "client": {
       "name": "bot",
       "version": "1"
@@ -17,7 +17,7 @@
     "capabilities": []
   },
   "welcome/basic": {
-    "version": 1,
+    "version": 2,
     "server": {
       "name": "clankermux",
       "version": "0.1.0"
@@ -635,7 +635,6 @@
     }
   },
   "attached/snapshot": {
-    "mode": "snapshot",
     "offset": 1024,
     "marker": 2,
     "cols": 120,

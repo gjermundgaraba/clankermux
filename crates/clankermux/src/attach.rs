@@ -427,7 +427,7 @@ impl Link {
 }
 
 fn open(shell: &mut Shell, conn: &Connection) -> Result<client::Receiver<Frame>, Error> {
-    shell.attachment.open_on(&conn.welcome);
+    let resume = shell.attachment.open(&conn.welcome);
     conn.open(
         CHANNEL,
         &Open {
@@ -435,7 +435,7 @@ fn open(shell: &mut Shell, conn: &Connection) -> Result<client::Receiver<Frame>,
             read_only: shell.opts.read_only,
             viewport: (!shell.opts.read_only).then_some(shell.outer),
             profile: None,
-            resume: shell.attachment.resume(),
+            resume,
         },
     )
 }
