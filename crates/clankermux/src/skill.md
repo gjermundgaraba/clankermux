@@ -15,14 +15,15 @@ A program started by clankermux has two variables in its environment:
 - `CLANKERMUX_SOCKET`: the server's socket.
 
 When they are set, `clankermux` commands talk to that server, and a
-command that takes a session acts on this one when you leave it out. When
-they are not set, you are not inside a session; name the session.
+command that takes a session acts on this one when you leave out
+`-s`/`--session`. When they are not set, you are not inside a session;
+name the session with `-s`.
 
 ## Naming a session
 
-A session argument is the full id; else a label, ignoring case; else four
+`-s SESSION` is the full id; else a label, ignoring case; else four
 or more characters from the start or the end of the id. `list` shows the
-last six characters of each id. When an argument names no session or
+last six characters of each id. When it names no session or
 several, the candidates are printed to stderr and the exit code is 3: pick
 one by id. To keep an id, parse it from `--json` output rather than from
 the human-readable listing.
@@ -35,37 +36,37 @@ the human-readable listing.
     clankermux create --keep -- ./test.sh    # keep it listed after it exits
     clankermux create --wait -- make test    # run it, wait, exit with its status
     clankermux --json create --wait -- make test   # the same; prints {session, wait}
-    clankermux inspect build                 # one session as JSON: program status, attachments
-    clankermux read build --scrollback 200   # its screen, with 200 history lines before it
-    clankermux read build --scope last_command   # the last command's output (needs shell integration)
-    clankermux read build --format html      # the screen as styled HTML (or vt)
-    clankermux tail build --follow           # its output as plain text, as it comes
-    clankermux send build 'make test' --enter   # type text, then Enter
-    clankermux send build --keys ctrl+c         # keys by name: enter, tab, esc, up, f5, shift+tab, alt+x
-    clankermux send build --paste "$(cat notes.txt)"  # a paste, as if pasted by a person
-    clankermux send build --bytes < input.bin   # send stdin's bytes as they are
-    clankermux send build 'make' --enter --wait-match 'error|done' --timeout 5m
+    clankermux inspect -s build              # one session as JSON: program status, attachments
+    clankermux read -s build --scrollback 200   # its screen, with 200 history lines before it
+    clankermux read -s build --scope last_command   # the last command's output (needs shell integration)
+    clankermux read -s build --format html   # the screen as styled HTML (or vt)
+    clankermux tail -s build --follow        # its output as plain text, as it comes
+    clankermux send -s build 'make test' --enter   # type text, then Enter
+    clankermux send -s build --keys ctrl+c      # keys by name: enter, tab, esc, up, f5, shift+tab, alt+x
+    clankermux send -s build --paste "$(cat notes.txt)"  # a paste, as if pasted by a person
+    clankermux send -s build --bytes < input.bin   # send stdin's bytes as they are
+    clankermux send -s build 'make' --enter --wait-match 'error|done' --timeout 5m
                                              # send, then wait for what it prints
-    clankermux wait build --exit             # wait for it to exit
-    clankermux wait build --prompt           # wait for the shell's next prompt (OSC 133)
-    clankermux wait build --status done,error   # wait for a program status (OSC 7501)
-    clankermux wait build --quiet 2000       # wait until it prints nothing for 2 s
-    clankermux label build release           # set the label
-    clankermux resize build 120x40           # set the size (or 120x, x40)
-    clankermux resize build --policy fixed   # only resize sets the size (or latest, smallest)
-    clankermux detach build 42 --reason why  # close attachment 42, by its channel in inspect
-    clankermux signal build INT              # send a signal by name
-    clankermux end build                     # hang up its processes
-    clankermux remove build                  # delete an exited session
-    clankermux ack build                     # mark its done and error reports seen
+    clankermux wait -s build --exit          # wait for it to exit
+    clankermux wait -s build --prompt        # wait for the shell's next prompt (OSC 133)
+    clankermux wait -s build --status done,error   # wait for a program status (OSC 7501)
+    clankermux wait -s build --quiet 2000    # wait until it prints nothing for 2 s
+    clankermux label -s build release        # set the label
+    clankermux resize -s build 120x40        # set the size (or 120x, x40)
+    clankermux resize -s build --policy fixed   # only resize sets the size (or latest, smallest)
+    clankermux detach -s build 42 --reason why  # close attachment 42, by its channel in inspect
+    clankermux signal -s build INT           # send a signal by name
+    clankermux end -s build                  # hang up its processes
+    clankermux remove -s build               # delete an exited session
+    clankermux ack -s build                  # mark its done and error reports seen
     clankermux events                        # session events as JSON lines, each with its seq
     clankermux events --after 41 --incarnation ID   # the events after seq 41, then the live ones
-    clankermux attach build                  # attach this terminal (people, not agents)
+    clankermux attach -s build               # attach this terminal (people, not agents)
     clankermux api list                      # the protocol's methods, from the server
     clankermux api describe send             # one method: params, result, errors, examples
     clankermux api call inspect '{"session": "ID"}'   # one request as it is; prints the result
 
-Inside a session, leave the session out: `clankermux label building`.
+Inside a session, leave `-s` out: `clankermux label building`.
 `events` names the server's incarnation on stderr; `seq` counts from 1
 again when the server restarts, so keep both to resume.
 
@@ -83,9 +84,8 @@ escape sequences, and that includes the terminal's echo of what you
 typed: match on what only the program prints (`--match 'error|done'`
 also matches the echo of `echo done`). Ctrl-C cancels a wait.
 
-`send` with one argument types it into the session you are in; when that
-argument names a session, it refuses: give both SESSION and TEXT. Outside
-a session, or with `--connect` or `--ssh`, name the session.
+Outside a session, or with `--connect` or `--ssh`, name the session with
+`-s`.
 
 ## The protocol underneath
 
@@ -115,7 +115,7 @@ Ack what you have dealt with; leave others' reports alone unless asked.
 | 0 | Done |
 | 1 | Failed: the server refused the request, or the connection broke |
 | 2 | Usage: arguments clap or the command cannot use, or no session given outside a session |
-| 3 | The session argument named no session, or several |
+| 3 | The session named no session, or several |
 | 4 | The server cannot be reached |
 | 124 | A wait timed out |
 | 130 | A wait was cancelled with Ctrl-C |

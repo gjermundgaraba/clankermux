@@ -24,9 +24,6 @@ const DETACH_KEY: &str = "C-\\";
 const SESSION_ENV: &str = "CLANKERMUX_SESSION";
 const SOCKET_ENV: &str = "CLANKERMUX_SOCKET";
 
-const SESSION_HELP: &str = "Id, label, or four or more characters from either end of the id; \
-                            `$CLANKERMUX_SESSION` when left out";
-
 const EXIT_USAGE: i32 = 2;
 const EXIT_TARGET: i32 = 3;
 const EXIT_UNREACHABLE: i32 = 4;
@@ -54,6 +51,10 @@ struct Cli {
     /// Print replies as JSON.
     #[arg(long, global = true)]
     json: bool,
+    /// The session: its id, label, or four or more characters from either
+    /// end of the id; `$CLANKERMUX_SESSION` when left out.
+    #[arg(short, long, global = true)]
+    session: Option<String>,
     /// Relay between stdio and the Unix socket, for `ssh`.
     #[arg(long, conflicts_with_all = ["connect", "ssh", "json"])]
     stdio: bool,
@@ -73,14 +74,9 @@ enum Command {
     /// List sessions.
     List,
     /// Show one session with its program status.
-    Inspect {
-        #[arg(help = SESSION_HELP)]
-        session: Option<String>,
-    },
+    Inspect,
     /// Attach the terminal to a session.
     Attach {
-        #[arg(help = SESSION_HELP)]
-        session: Option<String>,
         #[arg(long)]
         read_only: bool,
         /// Prefix key (`C-x`); followed by `d` it detaches, twice it is
@@ -89,37 +85,24 @@ enum Command {
         detach_key: u8,
     },
     /// Hang up the session's process group.
-    End {
-        #[arg(help = SESSION_HELP)]
-        session: Option<String>,
-    },
+    End,
     /// Send a signal by name (`TERM`, `INT`, `KILL`, ...).
-    #[command(allow_missing_positional = true)]
-    Signal {
-        #[arg(help = SESSION_HELP)]
-        session: Option<String>,
-        signal: String,
-    },
+    Signal { signal: String },
     /// Delete an exited session.
-    Remove {
-        #[arg(help = SESSION_HELP)]
-        session: Option<String>,
-    },
+    Remove,
     /// Set the label.
-    #[command(allow_missing_positional = true)]
-    Label {
-        #[arg(help = SESSION_HELP)]
-        session: Option<String>,
-        label: String,
-    },
+    Label { label: String },
     /// Set the size (`COLSxROWS`, or `COLSx` or `xROWS` to keep the
     /// other), the size policy, or both.
+    #[command(group(
+        clap::ArgGroup::new("change")
+            .args(["size", "policy"])
+            .multiple(true)
+            .required(true)
+    ))]
     Resize {
-        /// The session, `$CLANKERMUX_SESSION` when left out, then the
-        /// size. With `--policy` alone, one argument is the size when it
-        /// reads as one, else the session.
-        #[arg(value_name = "[SESSION] [SIZE]", num_args = 0..=2)]
-        args: Vec<String>,
+        #[arg(value_name = "SIZE", value_parser = parse_size)]
+        size: Option<Sides>,
         /// `latest`: the most recent viewport report wins; `smallest`: the
         /// smallest viewport among the attachments; `fixed`: only resize
         /// changes the size.
@@ -127,10 +110,7 @@ enum Command {
         policy: Option<SizePolicy>,
     },
     /// Close another client's attachment; `inspect` lists them by channel.
-    #[command(allow_missing_positional = true)]
     Detach {
-        #[arg(help = SESSION_HELP)]
-        session: Option<String>,
         channel: u64,
         /// Told to the detached client.
         #[arg(long)]
@@ -138,8 +118,6 @@ enum Command {
     },
     /// Print the screen, with history lines before it, or another scope.
     Read {
-        #[arg(help = SESSION_HELP)]
-        session: Option<String>,
         /// History lines before the screen, for scope `screen`.
         #[arg(long)]
         scrollback: Option<u32>,
@@ -153,8 +131,6 @@ enum Command {
     },
     /// Print the output stream as plain text, from a stream offset.
     Tail {
-        #[arg(help = SESSION_HELP)]
-        session: Option<String>,
         /// The stream offset to start at; by default the oldest byte kept.
         #[arg(long)]
         after: Option<u64>,
@@ -166,7 +142,7 @@ enum Command {
     /// for what follows.
     #[command(group(
         clap::ArgGroup::new("payload")
-            .args(["args", "enter", "keys", "bytes"])
+            .args(["text", "enter", "keys", "bytes"])
             .multiple(true)
             .required(true)
     ))]
@@ -175,16 +151,12 @@ enum Command {
     /// prompt, or fall quiet.
     #[command(mut_group("conditions", |group| group.required(true)))]
     Wait {
-        #[arg(help = SESSION_HELP)]
-        session: Option<String>,
         #[command(flatten)]
         wait: WaitArgs,
     },
     /// Mark the session's `done` and `error` records seen: those named,
     /// or all of them.
     Ack {
-        #[arg(help = SESSION_HELP)]
-        session: Option<String>,
         /// The records; all of the session's when left out.
         #[arg(value_name = "ID")]
         ids: Vec<String>,
@@ -405,11 +377,16 @@ fn matching<'a>(sessions: &'a [Session], needle: &str) -> Vec<&'a Session> {
         .unwrap_or_default()
 }
 
-async fn resolve(conn: &Connection, here: bool, needle: Option<String>) -> Result<String, Fail> {
+struct Target {
+    session: Option<String>,
+    here: bool,
+}
+
+async fn resolve(conn: &Connection, target: &Target) -> Result<String, Fail> {
     let inside = std::env::var(SESSION_ENV).ok().filter(|v| !v.is_empty());
-    let needle = match (needle, inside) {
+    let needle = match (target.session.clone(), inside) {
         (Some(needle), _) => needle,
-        (None, Some(inside)) if here => inside,
+        (None, Some(inside)) if target.here => inside,
         (None, Some(_)) => {
             return Err(Fail::Usage(format!(
                 "a session is needed: ${SESSION_ENV} is a session of the server in \
@@ -454,8 +431,8 @@ fn short_id(id: &str) -> &str {
 
 type Sides = (Option<u16>, Option<u16>);
 
-fn parse_size(spec: &str) -> Result<Sides, Fail> {
-    let bad = || Fail::Usage(format!("{spec:?} is not COLSxROWS, COLSx or xROWS"));
+fn parse_size(spec: &str) -> Result<Sides, String> {
+    let bad = || "not COLSxROWS, COLSx or xROWS".to_string();
     let (cols, rows) = spec.split_once('x').ok_or_else(bad)?;
     let side = |s: &str| {
         (!s.is_empty())
@@ -683,9 +660,9 @@ struct CreateArgs {
 
 #[derive(Args)]
 struct SendArgs {
-    /// The session, `$CLANKERMUX_SESSION` when left out, then the text.
-    #[arg(value_name = "[SESSION] TEXT", num_args = 0..=2)]
-    args: Vec<String>,
+    /// The text, as typed.
+    #[arg(conflicts_with_all = ["keys", "bytes"])]
+    text: Option<String>,
     /// Press Enter after the text.
     #[arg(long, conflicts_with_all = ["bytes", "keys"])]
     enter: bool,
@@ -944,48 +921,6 @@ async fn wait_request(
     Ok((reply, waited))
 }
 
-async fn names_session(conn: &Connection, text: &str) -> Result<bool, Error> {
-    let lower = text.to_lowercase();
-    Ok(all_sessions(conn)
-        .await?
-        .iter()
-        .any(|s| s.id == text || s.label.to_lowercase() == lower))
-}
-
-fn resize_args(
-    mut args: Vec<String>,
-    policy: Option<SizePolicy>,
-) -> Result<(Option<String>, Option<Sides>), Fail> {
-    let size = match (args.len(), policy) {
-        (0, None) => return Err(Fail::Usage("resize takes SIZE, --policy or both".into())),
-        (0, Some(_)) => None,
-        (1, Some(_)) => match parse_size(&args[0]) {
-            Ok(size) => {
-                args.clear();
-                Some(size)
-            }
-            Err(_) => None,
-        },
-        _ => Some(parse_size(&args.pop().expect("an argument"))?),
-    };
-    Ok((args.pop(), size))
-}
-
-fn check_args(command: &Command) -> Result<(), Fail> {
-    match command {
-        Command::Resize { args, policy } => {
-            resize_args(args.clone(), *policy)?;
-        }
-        Command::Send(SendArgs {
-            args, keys, bytes, ..
-        }) if (!keys.is_empty() || *bytes) && args.len() > 1 => {
-            return Err(Fail::Usage("--keys and --bytes take no TEXT".into()));
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 async fn tail(
     conn: &Connection,
     session: String,
@@ -1163,10 +1098,12 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
     let Some(command) = command else {
         return relay(socket).await;
     };
-    check_args(&command)?;
-    let here = cli.connect.is_none()
-        && cli.ssh.is_none()
-        && std::env::var_os(SOCKET_ENV).is_some_and(|env| env == socket.as_os_str());
+    let target = Target {
+        session: cli.session,
+        here: cli.connect.is_none()
+            && cli.ssh.is_none()
+            && std::env::var_os(SOCKET_ENV).is_some_and(|env| env == socket.as_os_str()),
+    };
     let endpoint = match (cli.connect, cli.ssh) {
         (Some(addr), _) => Endpoint::Tcp(addr),
         (None, Some(destination)) => Endpoint::Ssh(destination),
@@ -1178,13 +1115,13 @@ async fn run(cli: Cli) -> Result<i32, Fail> {
         }
         other => other.into(),
     })?;
-    dispatch(conn, endpoint, here, json, command).await
+    dispatch(conn, endpoint, &target, json, command).await
 }
 
 async fn dispatch(
     conn: Connection,
     endpoint: Endpoint,
-    here: bool,
+    target: &Target,
     json: bool,
     command: Command,
 ) -> Result<i32, Fail> {
@@ -1198,17 +1135,16 @@ async fn dispatch(
                 sessions.iter().for_each(session_line);
             });
         }
-        Command::Inspect { session } => {
-            let session = resolve(&conn, here, session).await?;
+        Command::Inspect => {
+            let session = resolve(&conn, target).await?;
             let value = conn.request("inspect", SessionParams { session }).await?;
             emit_json(&value);
         }
         Command::Attach {
-            session,
             read_only,
             detach_key,
         } => {
-            let session = resolve(&conn, here, session).await?;
+            let session = resolve(&conn, target).await?;
             let code = attach::run(
                 attach::Options {
                     endpoint,
@@ -1221,31 +1157,27 @@ async fn dispatch(
             .await?;
             return Ok(code);
         }
-        Command::End { session } => {
-            let session = resolve(&conn, here, session).await?;
+        Command::End => {
+            let session = resolve(&conn, target).await?;
             conn.request("end", SessionParams { session }).await?;
         }
-        Command::Signal { session, signal } => {
-            let session = resolve(&conn, here, session).await?;
+        Command::Signal { signal } => {
+            let session = resolve(&conn, target).await?;
             conn.request("signal", SignalParams { session, signal })
                 .await?;
         }
-        Command::Remove { session } => {
-            let session = resolve(&conn, here, session).await?;
+        Command::Remove => {
+            let session = resolve(&conn, target).await?;
             conn.request("remove", SessionParams { session }).await?;
         }
-        Command::Label { session, label } => {
-            let session = resolve(&conn, here, session).await?;
+        Command::Label { label } => {
+            let session = resolve(&conn, target).await?;
             let updated: Session = conn.call("label", LabelParams { session, label }).await?;
             print(json, &updated, |_| {});
         }
-        Command::Resize { args, policy } => resize(&conn, here, args, policy).await?,
-        Command::Detach {
-            session,
-            channel,
-            reason,
-        } => {
-            let session = resolve(&conn, here, session).await?;
+        Command::Resize { size, policy } => resize(&conn, target, size, policy).await?,
+        Command::Detach { channel, reason } => {
+            let session = resolve(&conn, target).await?;
             let params = DetachParams {
                 session,
                 channel,
@@ -1254,12 +1186,11 @@ async fn dispatch(
             conn.request("detach", params).await?;
         }
         Command::Read {
-            session,
             scrollback,
             format,
             scope,
         } => {
-            let session = resolve(&conn, here, session).await?;
+            let session = resolve(&conn, target).await?;
             let params = ReadParams {
                 session,
                 scrollback,
@@ -1269,19 +1200,13 @@ async fn dispatch(
             let read: Read = conn.call("read", params).await?;
             print(json, &read, |read| emit(&read.text));
         }
-        Command::Tail {
-            session,
-            after,
-            follow,
-        } => {
-            let session = resolve(&conn, here, session).await?;
+        Command::Tail { after, follow } => {
+            let session = resolve(&conn, target).await?;
             tail(&conn, session, after, follow, json).await?;
         }
-        Command::Send(args) => return send(&conn, here, json, args).await,
-        Command::Wait { session, wait } => {
-            return wait_for(&conn, here, json, session, &wait).await;
-        }
-        Command::Ack { session, ids } => ack(&conn, here, json, session, ids).await?,
+        Command::Send(args) => return send(&conn, target, json, args).await,
+        Command::Wait { wait } => return wait_for(&conn, target, json, &wait).await,
+        Command::Ack { ids } => ack(&conn, target, json, ids).await?,
         Command::Events { after, incarnation } => events(&conn, after, incarnation, json).await?,
     }
     Ok(0)
@@ -1289,12 +1214,11 @@ async fn dispatch(
 
 async fn resize(
     conn: &Connection,
-    here: bool,
-    args: Vec<String>,
+    target: &Target,
+    size: Option<Sides>,
     policy: Option<SizePolicy>,
 ) -> Result<(), Fail> {
-    let (session, size) = resize_args(args, policy)?;
-    let session = resolve(conn, here, session).await?;
+    let session = resolve(conn, target).await?;
     let (cols, rows) = size.unwrap_or_default();
     let params = ResizeParams {
         session,
@@ -1306,14 +1230,8 @@ async fn resize(
     Ok(())
 }
 
-async fn ack(
-    conn: &Connection,
-    here: bool,
-    json: bool,
-    session: Option<String>,
-    ids: Vec<String>,
-) -> Result<(), Fail> {
-    let session = resolve(conn, here, session).await?;
+async fn ack(conn: &Connection, target: &Target, json: bool, ids: Vec<String>) -> Result<(), Fail> {
+    let session = resolve(conn, target).await?;
     let params = AckParams {
         session,
         record_ids: (!ids.is_empty()).then_some(ids),
@@ -1389,30 +1307,15 @@ async fn create(
     Ok(0)
 }
 
-async fn send(conn: &Connection, here: bool, json: bool, args: SendArgs) -> Result<i32, Fail> {
+async fn send(conn: &Connection, target: &Target, json: bool, args: SendArgs) -> Result<i32, Fail> {
     let SendArgs {
-        args,
+        text,
         enter,
         paste,
         keys,
         bytes,
         wait,
     } = args;
-    let payload = !keys.is_empty() || bytes;
-    let mut args = args.into_iter();
-    let session = if args.len() > usize::from(!payload) {
-        args.next()
-    } else {
-        None
-    };
-    let text = args.next();
-    if let (None, Some(text)) = (&session, &text)
-        && names_session(conn, text).await?
-    {
-        return Err(Fail::Usage(format!(
-            "{text:?} names a session: give SESSION and TEXT, or --keys enter"
-        )));
-    }
     let mut chunks = match text {
         _ if bytes => {
             let mut data = Vec::new();
@@ -1429,7 +1332,7 @@ async fn send(conn: &Connection, here: bool, json: bool, args: SendArgs) -> Resu
             _ => chunks.push(Chunk::Keys(vec!["enter".into()])),
         }
     }
-    let session = resolve(conn, here, session).await?;
+    let session = resolve(conn, target).await?;
     let until = wait.conditions.until();
     let wait = (until != Until::default()).then_some(SendWait {
         until,
@@ -1449,12 +1352,11 @@ async fn send(conn: &Connection, here: bool, json: bool, args: SendArgs) -> Resu
 
 async fn wait_for(
     conn: &Connection,
-    here: bool,
+    target: &Target,
     json: bool,
-    session: Option<String>,
     wait: &WaitArgs,
 ) -> Result<i32, Fail> {
-    let session = resolve(conn, here, session).await?;
+    let session = resolve(conn, target).await?;
     let (reply, waited) = wait_request(
         conn,
         WaitParams {

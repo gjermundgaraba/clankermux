@@ -167,7 +167,7 @@ async fn attach_types_and_detaches() {
     let server = start();
     let conn = connect(&server).await;
     let session = create(&conn, json!({"argv": ["/bin/cat"], "cols": 80, "rows": 24})).await;
-    let mut term = Term::attach(&server, 80, 24, &[&session.id, "--detach-key", "C-a"]);
+    let mut term = Term::attach(&server, 80, 24, &["-s", &session.id, "--detach-key", "C-a"]);
     term.read_until(b"\x1b[?25h").await;
 
     term.write(b"hello\n");
@@ -192,7 +192,7 @@ async fn repaint_clips_a_larger_session_to_the_bottom() {
         json!({"argv": ["/usr/bin/yes"], "cols": 100, "rows": 40}),
     )
     .await;
-    let mut term = Term::attach(&server, 80, 24, &[&session.id, "--read-only"]);
+    let mut term = Term::attach(&server, 80, 24, &["-s", &session.id, "--read-only"]);
     let out = term.read_until(b"\x1b[24;1H").await;
     assert!(
         count(&out, CLEAR) >= 1,
@@ -219,7 +219,7 @@ async fn detaches_while_the_server_is_gone() {
     let mut server = start();
     let conn = connect(&server).await;
     let session = create(&conn, json!({"argv": ["/bin/cat"], "cols": 80, "rows": 24})).await;
-    let mut term = Term::attach(&server, 80, 24, &[&session.id]);
+    let mut term = Term::attach(&server, 80, 24, &["-s", &session.id]);
     term.read_until(b"\x1b[?25h").await;
     drop(conn);
     server.shutdown();
@@ -233,7 +233,7 @@ async fn a_reconnect_retries_a_bare_close_and_ends_on_a_refusal() {
     let mut server = start();
     let conn = connect(&server).await;
     let session = create(&conn, json!({"argv": ["/bin/cat"], "cols": 80, "rows": 24})).await;
-    let mut term = Term::attach(&server, 80, 24, &[&session.id]);
+    let mut term = Term::attach(&server, 80, 24, &["-s", &session.id]);
     term.read_until(b"\x1b[?25h").await;
     drop(conn);
     server.shutdown();
@@ -277,7 +277,7 @@ async fn attaching_to_an_exited_session_reports_its_exit() {
     )
     .await;
     wait_session(&conn, &session.id, |s| s.status == Status::Exited).await;
-    let mut term = Term::attach(&server, 80, 24, &[&session.id]);
+    let mut term = Term::attach(&server, 80, 24, &["-s", &session.id]);
     let out = term
         .read_until(b"[clankermux: session exited with code 3]")
         .await;
@@ -296,7 +296,11 @@ async fn connect_reaches_a_tcp_carrier() {
     let addr = server.listen_tcp().await.to_string();
     let listed = run(&["--connect", &addr, "list"], &[]).await;
     assert!(listed.contains("over-tcp"), "{listed}");
-    let read = run(&["--connect", &addr, "--json", "read", &session.id], &[]).await;
+    let read = run(
+        &["--connect", &addr, "--json", "read", "-s", &session.id],
+        &[],
+    )
+    .await;
     assert!(read.contains("\"status\": \"running\""), "{read}");
 }
 
@@ -392,6 +396,7 @@ async fn send_chunks_to_the_input_queue() {
             "--socket",
             server.socket.to_str().unwrap(),
             "send",
+            "-s",
             &session.id,
             text,
         ],
@@ -421,6 +426,7 @@ async fn send_sends_one_request_even_for_empty_text() {
             "--socket",
             server.socket.to_str().unwrap(),
             "send",
+            "-s",
             &session.id,
             "",
         ],
@@ -517,8 +523,11 @@ async fn a_session_argument_resolves_by_id_label_and_either_end() {
     let label_of = |needle: &str| {
         let needle = needle.to_string();
         async move {
-            let (code, out, err) =
-                run_status(&["--socket", socket, "--json", "inspect", &needle], &[]).await;
+            let (code, out, err) = run_status(
+                &["--socket", socket, "--json", "inspect", "-s", &needle],
+                &[],
+            )
+            .await;
             assert_eq!(code, 0, "{needle}: {err}");
             serde_json::from_str::<Session>(&out).unwrap().label
         }
@@ -528,16 +537,16 @@ async fn a_session_argument_resolves_by_id_label_and_either_end() {
     assert_eq!(label_of(&alpha.id[..8]).await, "Alpha");
     assert_eq!(label_of(&alpha.id[alpha.id.len() - 6..]).await, "Alpha");
 
-    let (code, _, err) = run_status(&["--socket", socket, "inspect", "Twin"], &[]).await;
+    let (code, _, err) = run_status(&["--socket", socket, "inspect", "-s", "Twin"], &[]).await;
     assert_eq!(code, 3, "{err}");
     for twin in &twins {
         assert!(err.contains(&twin.id[twin.id.len() - 6..]), "{err}");
     }
     assert!(!err.contains(&alpha.id[alpha.id.len() - 6..]), "{err}");
-    let (code, _, err) = run_status(&["--socket", socket, "end", "nosuch"], &[]).await;
+    let (code, _, err) = run_status(&["--socket", socket, "end", "-s", "nosuch"], &[]).await;
     assert_eq!(code, 3, "{err}");
     assert!(err.contains("Alpha") && err.contains("running"), "{err}");
-    let (code, _, err) = run_status(&["--socket", socket, "end", &alpha.id[..3]], &[]).await;
+    let (code, _, err) = run_status(&["--socket", socket, "end", "-s", &alpha.id[..3]], &[]).await;
     assert_eq!(code, 3, "{err}");
 
     let (code, out, err) = run_status(
@@ -570,20 +579,27 @@ async fn exit_codes_tell_failure_usage_target_and_server_apart() {
     let conn = connect(&server).await;
     let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
     let socket = server.socket.to_str().unwrap();
-    let (code, _, err) = run_status(&["--socket", socket, "remove", &session.id], &[]).await;
+    let (code, _, err) = run_status(&["--socket", socket, "remove", "-s", &session.id], &[]).await;
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("running"), "{err}");
     let (code, _, _) = run_status(&["--socket", socket, "resize"], &[]).await;
     assert_eq!(code, 2);
-    let (code, _, err) =
-        run_status(&["--socket", socket, "resize", &session.id, "wide"], &[]).await;
+    let (code, _, err) = run_status(
+        &["--socket", socket, "resize", "-s", &session.id, "wide"],
+        &[],
+    )
+    .await;
     assert_eq!(code, 2, "{err}");
-    let (code, _, err) = run_status(&["--socket", socket, "read", "nothing-here"], &[]).await;
+    let (code, _, err) = run_status(&["--socket", socket, "read", "-s", "nothing-here"], &[]).await;
     assert_eq!(code, 3, "{err}");
     let dead = server.dir.path().join("no-server");
     let (code, _, err) = run_status(&["--socket", dead.to_str().unwrap(), "list"], &[]).await;
     assert_eq!(code, 4, "{err}");
-    let (code, _, err) = run_status(&["--socket", socket, "resize", &session.id, "x30"], &[]).await;
+    let (code, _, err) = run_status(
+        &["--socket", socket, "resize", "-s", &session.id, "x30"],
+        &[],
+    )
+    .await;
     assert_eq!(code, 0, "{err}");
     let resized = wait_session(&conn, &session.id, |s| s.rows == 30).await;
     assert_eq!(resized.cols, 80);
@@ -607,10 +623,10 @@ async fn usage_is_checked_first_and_the_session_default_is_its_server_s() {
     let dead = server.dir.path().join("no-server");
     let dead = dead.to_str().unwrap();
     for args in [
-        &["resize", "build", "wide"][..],
-        &["wait", "build"],
-        &["send", "build", "--keys", "esc", "nokey"],
-        &["send", "build", "text", "--bytes"],
+        &["resize", "-s", "build", "wide"][..],
+        &["wait", "-s", "build"],
+        &["send", "-s", "build", "--keys", "esc", "nokey"],
+        &["send", "-s", "build", "text", "--bytes"],
     ] {
         let (code, _, err) = run_status(&[&["--socket", dead], args].concat(), &[]).await;
         assert_eq!(code, 2, "{args:?}: {err}");
@@ -619,9 +635,6 @@ async fn usage_is_checked_first_and_the_session_default_is_its_server_s() {
         ("CLANKERMUX_SESSION", session.id.as_str()),
         ("CLANKERMUX_SOCKET", socket),
     ];
-    let (code, _, err) = run_status(&["send", "build", "--enter"], &inside).await;
-    assert_eq!(code, 2, "{err}");
-    assert!(err.contains("names a session"), "{err}");
     let (code, _, err) = run_status(&["send", "hello", "--enter"], &inside).await;
     assert_eq!(code, 0, "{err}");
     let elsewhere = [
@@ -726,7 +739,7 @@ async fn wait_exits_128_plus_the_signal_that_ended_the_child() {
     let socket = server.socket.to_str().unwrap();
     let session = create(&conn, json!({"argv": ["/bin/cat"], "on_exit": "keep"})).await;
     let waiting = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
-        .args(["--socket", socket, "wait", &session.id, "--wait-exit"])
+        .args(["--socket", socket, "wait", "-s", &session.id, "--wait-exit"])
         .output();
     let killer = async {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -750,6 +763,7 @@ async fn wait_times_out_with_124_and_send_waits_for_a_match() {
             "--socket",
             socket,
             "wait",
+            "-s",
             &session.id,
             "--match",
             "never",
@@ -765,6 +779,7 @@ async fn wait_times_out_with_124_and_send_waits_for_a_match() {
             "--socket",
             socket,
             "send",
+            "-s",
             &session.id,
             "polo",
             "--enter",
@@ -782,6 +797,7 @@ async fn wait_times_out_with_124_and_send_waits_for_a_match() {
             socket,
             "--json",
             "send",
+            "-s",
             &session.id,
             "--keys",
             "x",
@@ -803,13 +819,14 @@ async fn waits_for_nothing_are_usage_errors() {
     let conn = connect(&server).await;
     let socket = server.socket.to_str().unwrap();
     let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
-    let (code, _, _) = run_status(&["--socket", socket, "wait", &session.id], &[]).await;
+    let (code, _, _) = run_status(&["--socket", socket, "wait", "-s", &session.id], &[]).await;
     assert_eq!(code, 2);
     let (code, _, _) = run_status(
         &[
             "--socket",
             socket,
             "send",
+            "-s",
             &session.id,
             "x",
             "--timeout",
@@ -828,7 +845,7 @@ async fn ctrl_c_cancels_a_wait_with_130() {
     let socket = server.socket.to_str().unwrap();
     let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
     let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
-        .args(["--socket", socket, "wait", &session.id, "--exit"])
+        .args(["--socket", socket, "wait", "-s", &session.id, "--exit"])
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -862,14 +879,22 @@ async fn ack_marks_records_seen_and_list_shows_attention() {
     assert_eq!(code, 0);
     assert!(out.contains(" error "), "{out}");
 
-    let (code, _, err) = run_status(&["--socket", socket, "ack", &session.id, "b"], &[]).await;
+    let inside = [
+        ("CLANKERMUX_SESSION", session.id.as_str()),
+        ("CLANKERMUX_SOCKET", socket),
+    ];
+    let (code, _, err) = run_status(&["ack", "b"], &inside).await;
     assert_eq!(code, 0, "{err}");
     wait_session(&conn, &session.id, |s| attention(s).as_deref() == Some("a")).await;
-    let (code, out, _) = run_status(&["--socket", socket, "--json", "ack", &session.id], &[]).await;
+    let (code, out, _) = run_status(
+        &["--socket", socket, "--json", "ack", "-s", &session.id],
+        &[],
+    )
+    .await;
     assert_eq!(code, 0);
     let acked: Acked = serde_json::from_str(&out).unwrap();
     assert_eq!(acked.record_ids, ["a"]);
-    let (_, out, _) = run_status(&["--socket", socket, "inspect", &session.id], &[]).await;
+    let (_, out, _) = run_status(&["--socket", socket, "inspect", "-s", &session.id], &[]).await;
     assert_eq!(out.matches("\"seen\": true").count(), 2, "{out}");
     let (_, out, _) = run_status(&["--socket", socket, "list"], &[]).await;
     assert!(!out.contains(" error ") && !out.contains(" done "), "{out}");
@@ -938,13 +963,25 @@ async fn read_takes_a_format_and_a_scope_and_tail_follows() {
     })
     .await;
     let id = session.id.as_str();
-    let html = run(&["--socket", socket, "read", id, "--format", "html"], &[]).await;
+    let html = run(
+        &["--socket", socket, "read", "-s", id, "--format", "html"],
+        &[],
+    )
+    .await;
     assert!(
         html.starts_with("<div") && html.contains(">bold</div>"),
         "{html}"
     );
     let last = run(
-        &["--socket", socket, "read", id, "--scope", "last_command"],
+        &[
+            "--socket",
+            socket,
+            "read",
+            "-s",
+            id,
+            "--scope",
+            "last_command",
+        ],
         &[],
     )
     .await;
@@ -954,6 +991,7 @@ async fn read_takes_a_format_and_a_scope_and_tail_follows() {
             "--socket",
             socket,
             "read",
+            "-s",
             id,
             "--scope",
             "history",
@@ -964,10 +1002,14 @@ async fn read_takes_a_format_and_a_scope_and_tail_follows() {
     )
     .await;
     assert_eq!(code, 1, "{stderr}");
-    let (code, _, _) = run_status(&["--socket", socket, "read", id, "--format", "pdf"], &[]).await;
+    let (code, _, _) = run_status(
+        &["--socket", socket, "read", "-s", id, "--format", "pdf"],
+        &[],
+    )
+    .await;
     assert_eq!(code, 2);
     assert_eq!(
-        run(&["--socket", socket, "tail", id], &[]).await,
+        run(&["--socket", socket, "tail", "-s", id], &[]).await,
         "$ bold\n"
     );
 
@@ -979,14 +1021,14 @@ async fn read_takes_a_format_and_a_scope_and_tail_follows() {
     wait_session(&conn, &open.id, |s| s.offset > 3).await;
     let tailed = tokio::time::timeout(
         Duration::from_secs(10),
-        run(&["--socket", socket, "tail", &open.id], &[]),
+        run(&["--socket", socket, "tail", "-s", &open.id], &[]),
     )
     .await
     .expect("tail ends");
     assert_eq!(tailed, "abc");
 
     let follow = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
-        .args(["--socket", socket, "tail", id, "--follow"])
+        .args(["--socket", socket, "tail", "-s", id, "--follow"])
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -1022,19 +1064,10 @@ async fn detach_and_resize_policy_from_the_command_line() {
     let attached = wait_session(&conn, &session.id, |s| s.attachments.len() == 1).await;
     let channel = attached.attachments[0].channel.to_string();
     let socket = server.socket.to_str().unwrap();
+    let on = ["--socket", socket, "-s", &session.id];
 
-    let (code, _, err) = run_status(
-        &[
-            "--socket",
-            socket,
-            "resize",
-            &session.id,
-            "--policy",
-            "fixed",
-        ],
-        &[],
-    )
-    .await;
+    let (code, _, err) =
+        run_status(&[&on[..], &["resize", "--policy", "fixed"]].concat(), &[]).await;
     assert_eq!(code, 0, "{err}");
     assert_eq!(
         inspect(&conn, &session.id).await.size.policy,
@@ -1056,33 +1089,14 @@ async fn detach_and_resize_policy_from_the_command_line() {
         (s.size.policy, s.cols, s.rows),
         (SizePolicy::Smallest, 90, 20)
     );
-    let (code, _, _) = run_status(
-        &[
-            "--socket",
-            socket,
-            "resize",
-            &session.id,
-            "--policy",
-            "widest",
-        ],
-        &[],
-    )
-    .await;
+    let (code, _, _) =
+        run_status(&[&on[..], &["resize", "--policy", "widest"]].concat(), &[]).await;
     assert_eq!(code, 2);
 
-    let (code, _, err) =
-        run_status(&["--socket", socket, "detach", &session.id, "nine"], &[]).await;
+    let (code, _, err) = run_status(&[&on[..], &["detach", "nine"]].concat(), &[]).await;
     assert_eq!(code, 2, "{err}");
     let (code, _, err) = run_status(
-        &[
-            "--socket",
-            socket,
-            "detach",
-            &session.id,
-            &channel,
-            "--reason",
-            "mine now",
-        ],
+        &[&on[..], &["detach", &channel, "--reason", "mine now"]].concat(),
         &[],
     )
     .await;
@@ -1100,8 +1114,7 @@ async fn detach_and_resize_policy_from_the_command_line() {
             message: Some("mine now".into()),
         }
     );
-    let (code, _, err) =
-        run_status(&["--socket", socket, "detach", &session.id, &channel], &[]).await;
+    let (code, _, err) = run_status(&[&on[..], &["detach", &channel]].concat(), &[]).await;
     assert_eq!(code, 1, "{err}");
     assert!(err.contains("no_such_attachment"), "{err}");
 }
