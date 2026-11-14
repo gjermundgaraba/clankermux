@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+step() {
+  local started=$SECONDS
+  echo "==> $1"
+  shift
+  "$@"
+  echo "    done in $((SECONDS - started))s"
+}
+
+# An orb's clock can trail Debian's, which then rejects the index as not yet
+# valid, so apt-get here skips that date check.
+apt_install() {
+  local missing=()
+  for package in "$@"; do
+    dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || missing+=("$package")
+  done
+  if ((${#missing[@]})); then
+    sudo apt-get update -qq -o Acquire::Check-Date=false
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}"
+  fi
+}
+
+libclang_version=18
+
+# xtask's bindgen parses with -std=c23, which libclang takes from 18 on, and
+# Debian 12 ships 14, so this takes it from LLVM's own repository.
+install_libclang() {
+  local codename keyring=/usr/share/keyrings/llvm.gpg
+  codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+  if [[ ! -f "$keyring" ]]; then
+    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o "$keyring"
+  fi
+  echo "deb [signed-by=$keyring] https://apt.llvm.org/$codename/ llvm-toolchain-$codename-$libclang_version main" |
+    sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+  apt_install "libclang-$libclang_version-dev"
+}
+
+rust_version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+mise_shims="$HOME/.local/share/mise/shims"
+
+install_rust() {
+  if ! command -v rustup >/dev/null; then
+    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+  fi
+  rustup toolchain install "$rust_version" --profile minimal --component rustfmt,clippy
+  rustup default "$rust_version"
+}
+
+install_mise() {
+  command -v mise >/dev/null || curl -fsSL https://mise.run | MISE_INSTALL_PATH="$HOME/.local/bin/mise" sh
+  mise trust --quiet mise.toml
+  mise install --yes
+}
+
+# Amp keeps the PATH directories a login profile adds, not other lines.
+add_to_profile() {
+  local line='export PATH="$HOME/.cargo/bin:$HOME/.local/share/mise/shims:$PATH"'
+  grep -Fqx "$line" "$HOME/.bash_profile" 2>/dev/null || printf '\n%s\n' "$line" >>"$HOME/.bash_profile"
+}
+
+browsers() {
+  local missing
+  missing=$({ pnpm -C web/apps/client exec playwright-core install-deps --dry-run chromium || true; } | sed -n 's/^  //p')
+  # shellcheck disable=SC2086
+  apt_install $missing
+  pnpm -C web/apps/client exec playwright-core install chromium
+}
+
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$mise_shims:$PATH"
+
+step "libclang $libclang_version" install_libclang
+step "Rust $rust_version" install_rust
+step "zig and just" install_mise
+step "login profile" add_to_profile
+step "web dependencies" pnpm -C web install --frozen-lockfile
+step "Playwright's Chromium" browsers
+step "Rust dependencies" cargo fetch --locked
