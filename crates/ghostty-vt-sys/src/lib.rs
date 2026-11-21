@@ -1,5 +1,5 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
-#![allow(clippy::all, clippy::pedantic)]
+#![allow(clippy::doc_markdown, clippy::unreadable_literal)]
 
 include!("bindings.rs");
 

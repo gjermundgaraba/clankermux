@@ -186,7 +186,6 @@ impl KeyEncoder {
         let mut event = ptr::null_mut();
         if let Err(err) = check(unsafe { sys::ghostty_key_event_new(ptr::null(), &raw mut event) })
         {
-            // SAFETY: the encoder was just created and is freed once.
             unsafe { sys::ghostty_key_encoder_free(encoder) };
             return Err(err);
         }

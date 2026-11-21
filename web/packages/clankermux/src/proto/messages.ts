@@ -1,5 +1,3 @@
-// Generated from the catalog by `cargo xtask protocol`; do not edit.
-
 export const VERSION = 2;
 
 /** Each frame type's header byte. */

@@ -332,10 +332,4 @@ async fn main() {
         let (rate, gaps) = throughput(&lab, carrier, 64 * MIB).await;
         println!("| {carrier} | {rate:.0} | {gaps} |");
     }
-
-    // The lab (its server and temporary directory) goes before the exit,
-    // which skips `Drop`; the exit ends the process without the runtime's
-    // shutdown wait.
-    drop(lab);
-    std::process::exit(0);
 }

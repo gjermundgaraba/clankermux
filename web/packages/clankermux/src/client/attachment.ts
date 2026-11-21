@@ -50,8 +50,6 @@ export class Attachment {
 
   constructor(readonly engine: Engine) {}
 
-  /** Readies an `OPEN` on the connection `welcome` began: the cursor to
-   * resume from, when there is one to keep. */
   open(welcome: Welcome): Resume | undefined {
     this.incarnation = welcome.incarnation;
     this.continuation = welcome.limits.continuation;

@@ -215,7 +215,6 @@ impl<H: Handler> Decoder<H> {
 
     pub fn ready(&mut self) -> Result<&mut Terminal<H>> {
         let mut raw = ptr::null_mut();
-        // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_ready(self.raw, &raw mut raw) };
         check(result)?;
         // SAFETY: on success raw is a caller-owned terminal.
@@ -224,7 +223,6 @@ impl<H: Handler> Decoder<H> {
 
     pub fn next_page(&mut self) -> Result<Step> {
         self.intact()?;
-        // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_next(self.raw) };
         if result == sys::GHOSTTY_NO_VALUE {
             self.finished = true;
@@ -238,7 +236,6 @@ impl<H: Handler> Decoder<H> {
     /// after `ready`.
     fn decode(&mut self) -> Result<&mut Terminal<H>> {
         let mut raw = ptr::null_mut();
-        // SAFETY: raw is a live decoder.
         let result = unsafe { sys::ghostty_snapshot_decoder_decode(self.raw, &raw mut raw) };
         self.compact();
         check(result)?;

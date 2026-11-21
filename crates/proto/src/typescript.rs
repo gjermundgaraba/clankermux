@@ -5,9 +5,7 @@ use serde_json::Value;
 use crate::catalog::{Catalog, description, ref_name, required};
 
 pub fn module(catalog: &Catalog) -> String {
-    let mut out =
-        String::from("// Generated from the catalog by `cargo xtask protocol`; do not edit.\n\n");
-    let _ = write!(out, "export const VERSION = {};\n\n", catalog.protocol);
+    let mut out = format!("export const VERSION = {};\n\n", catalog.protocol);
     out.push_str("/** Each frame type's header byte. */\nexport const FrameType = {\n");
     for frame in &catalog.frames {
         out.push_str(&doc(&frame.summary, "  "));

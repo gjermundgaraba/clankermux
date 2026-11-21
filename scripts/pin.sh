@@ -27,6 +27,6 @@ jq -n --arg sha "$sha" --arg sha256 "$sum" \
     --arg date "$(date -u +%Y-%m-%d)" \
     '{sha: $sha, sha256: $sha256, date: $date, engine: ("ghostty-vt@" + $version)}' \
     > "$pin"
-jq -r '"// Written by scripts/pin.sh from vendor/pin.json.\n/** Engine id of the vendored libghostty-vt build, matched by the server. */\nexport const ENGINE = \(.engine | tojson);"' \
+jq -r '"export const ENGINE = \(.engine | tojson);"' \
     "$pin" > "$root/web/packages/clankermux/src/engine/pin.ts"
 cat "$pin"

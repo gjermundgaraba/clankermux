@@ -863,11 +863,13 @@ async fn finish_wait(
     reply: client::connection::Reply,
 ) -> Result<serde_json::Value, Fail> {
     let id = reply.id();
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let finished = conn.finish(reply);
     tokio::pin!(finished);
+    tracing::debug!(id, "wait ready for SIGINT");
     tokio::select! {
         outcome = &mut finished => Ok(outcome?),
-        _ = tokio::signal::ctrl_c() => {
+        _ = interrupt.recv() => {
             let _ = conn.request("cancel", CancelParams { id }).await;
             match finished.await {
                 Err(Error::Server(e)) if e.code == proto::ErrorCode::Cancelled => {

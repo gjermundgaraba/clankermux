@@ -63,10 +63,9 @@ add_to_profile() {
 }
 
 browsers() {
-  local missing
-  missing=$({ pnpm -C web/apps/client exec playwright-core install-deps --dry-run chromium || true; } | sed -n 's/^  //p')
-  # shellcheck disable=SC2086
-  apt_install $missing
+  local -a missing
+  mapfile -t missing < <({ pnpm -C web/apps/client exec playwright-core install-deps --dry-run chromium || true; } | sed -n 's/^  //p')
+  apt_install "${missing[@]}"
   pnpm -C web/apps/client exec playwright-core install chromium
 }
 

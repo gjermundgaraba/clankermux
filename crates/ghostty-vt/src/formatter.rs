@@ -129,7 +129,6 @@ pub fn format(term: &Term, options: Options) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     // SAFETY: the writer borrows `out` only for the duration of this call.
     let result = unsafe { sys::ghostty_formatter_format(formatter, io::writer(&mut out)) };
-    // SAFETY: formatter was created above and is freed once.
     unsafe { sys::ghostty_formatter_free(formatter) };
     check(result)?;
     Ok(out)

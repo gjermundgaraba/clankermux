@@ -6,8 +6,8 @@ use base64::Engine as _;
 use client::{Connection, connection::hello};
 use proto::*;
 use serde_json::json;
-use tokio::io::AsyncWriteExt as _;
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::Child;
 
 use testkit::Server;
@@ -844,22 +844,37 @@ async fn ctrl_c_cancels_a_wait_with_130() {
     let conn = connect(&server).await;
     let socket = server.socket.to_str().unwrap();
     let session = create(&conn, json!({"argv": ["/bin/cat"]})).await;
-    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_clankermux"))
         .args(["--socket", socket, "wait", "-s", &session.id, "--exit"])
+        .env("RUST_LOG", "clankermux=debug")
+        .kill_on_drop(true)
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    // Long enough for the binary to start and listen for Ctrl-C on a
-    // loaded machine; before that, SIGINT would kill it outright.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut lines = (&mut stderr).lines();
+    loop {
+        let line = tokio::time::timeout_at(deadline, lines.next_line())
+            .await
+            .expect("the wait installs its SIGINT listener")
+            .unwrap()
+            .expect("the CLI is still running");
+        if line.contains("wait ready for SIGINT") {
+            break;
+        }
+    }
     let pid = rustix::process::Pid::from_raw(i32::try_from(child.id().unwrap()).unwrap()).unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
-    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
-        .await
-        .expect("the wait ends")
-        .unwrap();
-    assert_eq!(output.status.code(), Some(130));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("cancelled"));
+    let mut message = String::new();
+    let (status, _) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::try_join!(child.wait(), stderr.read_to_string(&mut message))
+    })
+    .await
+    .expect("the wait ends")
+    .unwrap();
+    assert_eq!(status.code(), Some(130));
+    assert!(message.contains("cancelled"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
