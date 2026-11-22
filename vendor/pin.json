@@ -1,6 +1,6 @@
 {
-  "sha": "d2865b8f578fa4e85e2f2b85ef97f5ef69de951f",
-  "sha256": "622bf5cd1fce7e982704c157767806e0b93785ea56af72762f269111735ae9c8",
-  "date": "2026-10-18",
-  "engine": "ghostty-vt@1.3.2-main+d2865b8"
+  "version": "1.0.1",
+  "sha256": "333dfce97641ef9b536bb9e08907ad86abaaada50e8f7417b70d9284adef37aa",
+  "date": "2026-11-22",
+  "engine": "ghostty-vt@1.0.1"
 }

@@ -59,10 +59,13 @@ pub const LogFn = *const fn (
 
 /// C: GhosttySysOption
 pub const Option = enum(c_int) {
-    userdata = 0,
-    decode_png = 1,
-    log = 2,
-    random_secure = 3,
+    invalid = 0,
+    userdata = 1,
+    decode_png = 2,
+    log = 3,
+    random_secure = 4,
+
+    _,
 
     pub fn InType(comptime self: Option) type {
         return switch (self) {
@@ -70,6 +73,7 @@ pub const Option = enum(c_int) {
             .decode_png => ?DecodePngFn,
             .log => ?LogFn,
             .random_secure => ?RandomSecureFn,
+            .invalid, _ => void,
         };
     }
 };
@@ -127,13 +131,9 @@ pub fn set(
     option: Option,
     value: ?*const anyopaque,
 ) callconv(lib.calling_conv) Result {
-    if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(Option, @intFromEnum(option)) orelse {
-            return .invalid_value;
-        };
-    }
-
     return switch (option) {
+        .invalid => .invalid_value,
+        _ => .unsupported,
         inline else => |comptime_option| setTyped(
             comptime_option,
             @ptrCast(@alignCast(value)),
@@ -156,6 +156,7 @@ fn setTyped(
             global.random_secure = value;
             terminal_sys.random_secure = if (value != null) &randomSecureWrapper else null;
         },
+        .invalid, _ => comptime unreachable,
     }
     return .success;
 }
@@ -270,9 +271,9 @@ pub fn logStderr(
     // Large enough for a full logFn chunk plus the level/scope prefix.
     var buffer: [LogEmitter.buffer_size + 128]u8 = undefined;
     const line: ?[]const u8 = if (scope.len > 0)
-        std.fmt.bufPrint(&buffer, "[{s}]({s}): {s}\n", .{ level_text, scope, message }) catch null
+        std.mem.print(&buffer, "[{s}]({s}): {s}\n", .{ level_text, scope, message }) catch null
     else
-        std.fmt.bufPrint(&buffer, "[{s}]: {s}\n", .{ level_text, message }) catch null;
+        std.mem.print(&buffer, "[{s}]: {s}\n", .{ level_text, message }) catch null;
     if (line) |v| {
         stderr.write(v);
         return;
@@ -428,7 +429,7 @@ test "logFn message exceeding chunk size is split" {
 
     // Format a message larger than the 2048-byte buffer.
     // 'A' repeated 3000 times via a fill format.
-    const fill: [3000]u8 = .{0x41} ** 3000;
+    const fill: [3000]u8 = @splat(0x41);
     logFn(.info, .default, "{s}", .{@as([]const u8, &fill)});
 
     try std.testing.expect(S.call_count >= 2);
@@ -456,7 +457,7 @@ test "logFn message exactly at chunk boundary" {
     }
 
     // Exactly 2048 bytes — should emit one full chunk, no remainder.
-    const fill: [2048]u8 = .{0x42} ** 2048;
+    const fill: [2048]u8 = @splat(0x42);
     logFn(.info, .default, "{s}", .{@as([]const u8, &fill)});
 
     try std.testing.expectEqual(@as(usize, 1), S.call_count);
@@ -484,7 +485,7 @@ test "logFn message exactly double chunk size" {
     }
 
     // Exactly 4096 bytes — should emit exactly two full chunks.
-    const fill: [4096]u8 = .{0x43} ** 4096;
+    const fill: [4096]u8 = @splat(0x43);
     logFn(.info, .default, "{s}", .{@as([]const u8, &fill)});
 
     try std.testing.expectEqual(@as(usize, 2), S.call_count);

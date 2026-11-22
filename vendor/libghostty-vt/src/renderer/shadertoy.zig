@@ -126,7 +126,7 @@ pub fn loadFromFile(
 
         // SpirV pointer must be aligned to 4 bytes since we expect
         // a slice of words.
-        var list: std.ArrayListAligned(u8, .of(u32)) = .empty;
+        var list: std.array_list.Aligned(u8, .of(u32)) = .empty;
         try list.appendSlice(alloc, stream.written());
         break :spirv list.items;
     };
@@ -225,8 +225,8 @@ pub const SpirvLog = struct {
         const debug = try shader.getDebugInfoLog();
         self.info = "";
         self.debug = "";
-        if (info.len > 0) self.info = try self.alloc.dupeZ(u8, info);
-        if (debug.len > 0) self.debug = try self.alloc.dupeZ(u8, debug);
+        if (info.len > 0) self.info = try self.alloc.dupeSentinel(u8, info, 0);
+        if (debug.len > 0) self.debug = try self.alloc.dupeSentinel(u8, debug, 0);
     }
 
     fn fromProgram(self: *SpirvLog, program: *glslang.Program) !void {
@@ -234,8 +234,8 @@ pub const SpirvLog = struct {
         const debug = try program.getDebugInfoLog();
         self.info = "";
         self.debug = "";
-        if (info.len > 0) self.info = try self.alloc.dupeZ(u8, info);
-        if (debug.len > 0) self.debug = try self.alloc.dupeZ(u8, debug);
+        if (info.len > 0) self.info = try self.alloc.dupeSentinel(u8, info, 0);
+        if (debug.len > 0) self.debug = try self.alloc.dupeSentinel(u8, debug, 0);
     }
 };
 
@@ -343,7 +343,7 @@ fn spvCross(
         return error.SpvcFailed;
     }
 
-    return try alloc.dupeZ(u8, std.mem.sliceTo(result, 0));
+    return try alloc.dupeSentinel(u8, std.mem.sliceTo(result, 0), 0);
 }
 
 /// Convert ShaderToy shader to null-terminated glsl for testing.
@@ -459,7 +459,7 @@ test "shadertoy to msl" {
     try spirvFromGlsl(&buf.writer, null, src);
 
     // TODO: Replace this with an aligned version of Writer.Allocating
-    var spvlist: std.ArrayListAligned(u8, .of(u32)) = .empty;
+    var spvlist: std.array_list.Aligned(u8, .of(u32)) = .empty;
     defer spvlist.deinit(alloc);
     try spvlist.appendSlice(alloc, buf.written());
 
@@ -479,7 +479,7 @@ test "shadertoy to glsl" {
     try spirvFromGlsl(&buf.writer, null, src);
 
     // TODO: Replace this with an aligned version of Writer.Allocating
-    var spvlist: std.ArrayListAligned(u8, .of(u32)) = .empty;
+    var spvlist: std.array_list.Aligned(u8, .of(u32)) = .empty;
     defer spvlist.deinit(alloc);
     try spvlist.appendSlice(alloc, buf.written());
 

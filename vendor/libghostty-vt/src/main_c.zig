@@ -45,8 +45,8 @@ comptime {
     // config in the future but for now we always just export it.
     _ = @import("benchmark/main.zig").CApi;
 
-    // Force-reference our memset override so its export is emitted.
-    // See quirks_memset.zig for details on why this exists.
+    // Force-reference our memset override so its export is emitted
+    // when its needed. See quirks_memset.zig for lots of details.
     _ = @import("quirks_memset.zig");
 }
 
@@ -151,10 +151,10 @@ pub export fn ghostty_cli_try_action() void {
 pub export fn ghostty_info() Info {
     return .{
         .mode = switch (builtin.mode) {
-            .Debug => .debug,
-            .ReleaseSafe => .release_safe,
-            .ReleaseFast => .release_fast,
-            .ReleaseSmall => .release_small,
+            .debug => .debug,
+            .safe => .release_safe,
+            .fast => .release_fast,
+            .small => .release_small,
         },
         .version = build_config.version_string.ptr,
         .version_len = build_config.version_string.len,
@@ -191,7 +191,7 @@ pub export fn ghostty_string_free(str: String) void {
 // but not MSVC. No upstream issue tracks this exact gap as of 2026-03-26.
 // Closest: Codeberg ziglang/zig #30936 (reimplement crt0 code).
 // Remove this DllMain when Zig handles MSVC DLL CRT init natively.
-pub const DllMain = if (builtin.os.tag == .windows) struct {
+pub const DllMain = if (builtin.target.os.tag == .windows) struct {
     const BOOL = windows.BOOL;
     const HINSTANCE = windows.HINSTANCE;
     const DWORD = windows.DWORD;
@@ -209,7 +209,7 @@ pub const DllMain = if (builtin.os.tag == .windows) struct {
 
     pub fn handler(_: HINSTANCE, fdwReason: DWORD, _: LPVOID) callconv(.winapi) BOOL {
         // Only MSVC needs to bootstrap the CRT; MinGW handles it via dllcrt2.obj.
-        if (builtin.abi != .msvc) return TRUE;
+        if (builtin.target.abi != .msvc) return TRUE;
         switch (fdwReason) {
             DLL_PROCESS_ATTACH => {
                 if (__vcrt_initialize() < 0) return FALSE;
@@ -239,7 +239,7 @@ test "ghostty_string_s c string" {
     const testing = std.testing;
 
     const slice: [:0]const u8 = "hello";
-    const allocated_slice = try testing.allocator.dupeZ(u8, slice);
+    const allocated_slice = try testing.allocator.dupeSentinel(u8, slice, 0);
     const c_null_string = String.fromSlice(allocated_slice);
     defer c_null_string.deinit();
 

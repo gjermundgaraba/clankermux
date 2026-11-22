@@ -14,7 +14,7 @@ const max_pw_len = clipboard_command.max_pw_len;
 /// however they want, e.g. Kitty does it per window and the spec
 /// doesn't demand anything.
 pub const Grants = struct {
-    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    entries: std.ArrayList(Entry) = .empty,
 
     const max_entries = 32;
 
@@ -192,13 +192,13 @@ test "grants: capacity evicts the oldest" {
 
     var buf: [8]u8 = undefined;
     for (0..Grants.max_entries + 1) |i| {
-        const pw = try std.fmt.bufPrint(&buf, "pw{}", .{i});
+        const pw = try std.mem.print(&buf, "pw{}", .{i});
         try grants.grant(alloc, pw, .read, false);
     }
 
     // The oldest grant was evicted; the newest survives.
     try testing.expect(!grants.use(alloc, "pw0", .read));
-    const newest = try std.fmt.bufPrint(&buf, "pw{}", .{Grants.max_entries});
+    const newest = try std.mem.print(&buf, "pw{}", .{Grants.max_entries});
     try testing.expect(grants.use(alloc, newest, .read));
 }
 

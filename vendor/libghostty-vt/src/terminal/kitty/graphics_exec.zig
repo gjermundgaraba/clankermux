@@ -72,11 +72,24 @@ pub fn execute(
         .delete => delete(io, alloc, terminal, cmd),
 
         .transmit, .transmit_and_display, .transmit_animation_frame => resp: {
+            const storage = &terminal.screens.active.kitty_images;
+
+            // Only direct (t=d) data can be sent in chunks, so only a
+            // direct command can continue a chunked load. A file, temporary
+            // file, or shared memory command abandons the load and is
+            // handled as a brand new transmission. Kitty does the same for
+            // both image and animation frame loads. If the abandoned load
+            // was replacing an image, that image is deleted too.
+            if (storage.loading != null and
+                cmd.transmission().?.medium != .direct)
+            {
+                abandonLoad(io, alloc, terminal);
+            }
+
             // If we're transmitting, then our `q` setting value is complicated.
             // The `q` setting inherits the value from the starting command
             // unless `q` is set >= 1 on this command. If it is, then we save
             // that as the new `q` setting.
-            const storage = &terminal.screens.active.kitty_images;
             if (storage.loading) |loading| switch (cmd.quiet) {
                 // q=0 we use whatever the start command value is
                 .no => quiet = loading.quiet,
@@ -195,11 +208,12 @@ fn transmit(
     const storage = &terminal.screens.active.kitty_images;
 
     var result: Response = if (storage.loading) |loading| loading: {
-        // Any transmit-like command received while a load is in progress
-        // is a continuation chunk of that load, and the load completes
-        // according to how it started. If an animation frame load (a=f)
-        // is in progress, this chunk belongs to it even when the client
-        // didn't repeat a=f on the chunk.
+        // A load is in progress, so this command is a continuation chunk.
+        // execute has already abandoned the load if this command used a
+        // medium other than direct, so we know this chunk belongs here.
+        // The load completes according to how it started. If an animation
+        // frame load (a=f) is in progress, this chunk belongs to it even
+        // when the client didn't repeat a=f on the chunk.
         if (loading.frame != null) return transmitAnimationFrame(
             io,
             alloc,
@@ -710,14 +724,22 @@ fn completeAnimationFrame(
         // composes into the existing buffer in place and storage
         // usage cannot change. Kitty likewise exempts frame edits
         // from its quota check.
+        //
+        // A frame whose pixels have not arrived yet, such as one
+        // restored from a snapshot, has no buffer to draw into. The
+        // edit is refused before anything about the frame changes.
+        //
+        // The frame data is owned by this storage, so the const cast
+        // is safe (same reasoning as the renderer's image uploads).
+        const dst = @constCast(img.frameData(number) orelse {
+            result.message = "EINVAL: frame data incomplete";
+            return result;
+        });
         if (f.gap_ms != 0) anim.setGapAt(
             number - 1,
             if (f.gap_ms > 0) @intCast(f.gap_ms) else 0,
         );
 
-        // The frame data is owned by this storage, so the const cast
-        // is safe (same reasoning as the renderer's image uploads).
-        const dst = @constCast(img.frameData(number).?);
         pixel.composeRect(
             dst,
             img.width,
@@ -965,11 +987,9 @@ fn delete(
 ) Response {
     const storage = &terminal.screens.active.kitty_images;
 
-    // Every delete command aborts an incomplete chunked upload.
-    if (storage.loading) |loading| {
-        loading.destroy(alloc);
-        storage.loading = null;
-    }
+    // Every delete command aborts an incomplete chunked upload, along
+    // with the image that the upload was replacing.
+    abandonLoad(io, alloc, terminal);
 
     // Then perform the actual deletion request, too.
     storage.delete(
@@ -983,6 +1003,84 @@ fn delete(
     return .{};
 }
 
+/// Returns the ID of the image that `loading` will replace, or null if
+/// it doesn't replace one.
+///
+/// Only an image transmitted with an explicit ID (i=) replaces an
+/// image, and only if an image with that ID exists. This function
+/// doesn't check that it exists, because deleting a missing image does
+/// nothing. These loads never replace an image:
+///
+///   - A load with an image number (I=) or no ID at all. We assign it a
+///     fresh ID, which no other image uses.
+///   - An animation frame load (a=f). It adds a frame to its image
+///     rather than replacing it.
+fn replacedImageId(loading: *const LoadingImage) ?u32 {
+    if (loading.frame != null) return null;
+    const img = &loading.image;
+    if (img.number > 0 or img.metadata.implicit_id) return null;
+    return if (img.id > 0) img.id else null;
+}
+
+/// Delete the image with `image_id` and all of its placements, because
+/// a transmission that reused its ID has ended.
+///
+/// This is the same as the delete command `a=d,d=I,i=<image_id>`. The
+/// uppercase form matters: it also frees any other image that is left
+/// with no placements because they were placed relative to this one.
+fn deleteReplacedImage(
+    io: std.Io,
+    alloc: Allocator,
+    terminal: *Terminal,
+    image_id: u32,
+) void {
+    terminal.screens.active.kitty_images.delete(io, alloc, terminal, .{ .id = .{
+        .image_id = image_id,
+        .delete = true,
+    } });
+}
+
+/// Abandon the chunked load in progress, if there is one, and discard
+/// the data it received so far.
+///
+/// If the load was replacing an image, that image is deleted too. The
+/// client asked for the old image to go away when it reused the ID, so
+/// abandoning the replacement doesn't bring the old image back. See
+/// loadAndAddImage for when the old image is deleted otherwise.
+fn abandonLoad(
+    io: std.Io,
+    alloc: Allocator,
+    terminal: *Terminal,
+) void {
+    const storage = &terminal.screens.active.kitty_images;
+    const loading = storage.loading orelse return;
+    const replaced = replacedImageId(loading);
+    loading.destroy(alloc);
+    storage.loading = null;
+    if (replaced) |id| deleteReplacedImage(io, alloc, terminal, id);
+}
+
+/// Load the image that `cmd` transmits and add it to storage. A chunked
+/// transmission (m=1) is only added to storage on its final chunk
+/// (m=0). Until then, the result has `more` set.
+///
+/// Transmitting an image with the ID of an existing image replaces it.
+/// The old image and all of its placements are deleted, as the Kitty
+/// graphics protocol requires. Placements are not carried over to the
+/// new image, so the client must place it again.
+///
+/// The old image is deleted when the transmission ends, not when it
+/// begins. That keeps the old image on screen while the chunks of its
+/// replacement arrive, instead of showing nothing for a few frames.
+/// For example, replacing image 1 with an image sent in three chunks:
+///
+///     a=t,i=1,f=100,m=1;<chunk 1>   image 1 is the old image
+///     m=1;<chunk 2>                 image 1 is still the old image
+///     m=0;<chunk 3>                 image 1 is the new image
+///
+/// If the transmission fails or is abandoned (see abandonLoad), the old
+/// image is still deleted, so every way a transmission ends leaves the
+/// same images behind as deleting the old image at the start would.
 fn loadAndAddImage(
     io: std.Io,
     alloc: Allocator,
@@ -998,6 +1096,13 @@ fn loadAndAddImage(
 
     // Determine our image. This also handles chunking and early exit.
     var loading: LoadingImage = if (storage.loading) |loading| loading: {
+        // If this chunk is rejected, the image being replaced is deleted.
+        // The load itself stays in progress, so a later chunk can still
+        // complete it.
+        errdefer if (replacedImageId(loading)) |id| {
+            deleteReplacedImage(io, alloc, terminal, id);
+        };
+
         // Note: we do NOT want to call "cmd.toOwnedData" here because
         // we're _copying_ the data. We want the command data to be freed.
         try loading.addData(alloc, cmd.data);
@@ -1015,14 +1120,12 @@ fn loadAndAddImage(
 
         break :loading loading.*;
     } else loading: {
-        // Reusing a specific image ID deletes the old image and all of its
-        // placements when the new transmission begins, not when it completes.
-        if (t.image_id > 0) {
-            storage.delete(io, alloc, terminal, .{ .id = .{
-                .image_id = t.image_id,
-                .delete = true,
-            } });
-        }
+        // If the transmission can't start, the image it would replace is
+        // deleted. There is no LoadingImage to pass to replacedImageId
+        // yet, but a nonzero i= is always an explicit ID.
+        errdefer if (t.image_id > 0) {
+            deleteReplacedImage(io, alloc, terminal, t.image_id);
+        };
 
         break :loading try .init(io, alloc, cmd, storage.image_limits);
     };
@@ -1042,6 +1145,12 @@ fn loadAndAddImage(
         }
     }
 
+    // From here on, a failure deletes the image being replaced. This
+    // must come after the ID assignment above, so that a load with an
+    // assigned ID is never treated as a replacement.
+    const replaced = replacedImageId(&loading);
+    errdefer if (replaced) |id| deleteReplacedImage(io, alloc, terminal, id);
+
     // If this is chunked, this is the beginning of a new chunked transmission.
     // (We checked for an in-progress chunk above.)
     if (t.more_chunks) {
@@ -1057,9 +1166,12 @@ fn loadAndAddImage(
     // Dump the image data before it is decompressed
     // loading.debugDump() catch unreachable;
 
-    // Validate and store our image
+    // Validate and store our image. The old image is deleted only once
+    // the new one is valid, right before the new one takes its ID.
+    // `replaced` was read above because complete resets loading.image.
     var img = try loading.complete(alloc);
     errdefer img.deinit(alloc);
+    if (replaced) |id| deleteReplacedImage(io, alloc, terminal, id);
     try storage.addImage(io, alloc, terminal.screens.active, img);
 
     // Get our display settings
@@ -1479,6 +1591,75 @@ test "kittygfx delete aborts chunked image load" {
     try testing.expectEqual(@as(usize, 6), storage.imageById(1).?.data.len());
 }
 
+test "kittygfx non-direct transmission abandons chunked image load" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    // Allow file (t=f) transmissions and write a 1x1 RGB image file.
+    storage.image_limits.file = true;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const payload = try testFilePayload(alloc, io, tmp_dir.dir, &.{ 1, 2, 3 });
+    defer alloc.free(payload);
+
+    // Begin a two-chunk RGB image.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,s=1,v=2,i=1,m=1;AAAA",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(io, alloc, &t, &cmd) == null);
+    }
+    try testing.expect(storage.loading != null);
+
+    // A file transmission can't be a continuation chunk, so it abandons
+    // the load and transmits a new image from the file.
+    {
+        const str = try std.fmt.allocPrint(
+            alloc,
+            "a=t,t=f,f=24,s=1,v=1,i=2;{s}",
+            .{payload},
+        );
+        defer alloc.free(str);
+        const cmd = try command.Parser.parseString(alloc, str);
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+        try testing.expectEqual(@as(u32, 2), resp.id);
+    }
+    try testing.expect(storage.loading == null);
+    try testing.expect(storage.imageById(1) == null);
+    try testing.expectEqualSlices(
+        u8,
+        &.{ 1, 2, 3 },
+        storage.imageById(2).?.data.bytes().?,
+    );
+}
+
+/// Writes `data` to a file in `dir` and returns the file's absolute path,
+/// base64 encoded. The result is ready to use as the payload of a file
+/// (t=f) transmission. The caller owns the returned memory.
+fn testFilePayload(
+    alloc: Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    data: []const u8,
+) ![]u8 {
+    try dir.writeFile(io, .{ .sub_path = "image.data", .data = data });
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const len = try dir.realPathFile(io, "image.data", &path_buf);
+    const encoder = std.base64.standard.Encoder;
+    const result = try alloc.alloc(u8, encoder.calcSize(len));
+    _ = encoder.encode(result, path_buf[0..len]);
+    return result;
+}
+
 test "kittygfx uppercase id delete preserves image when placement does not match" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1726,46 +1907,72 @@ test "kittygfx retransmit same id removes existing placements" {
     );
 }
 
-test "kittygfx retransmit same id removes image on first chunk" {
+test "kittygfx chunked retransmit same id keeps image until it ends" {
     const testing = std.testing;
     const io = testing.io;
     const alloc = testing.allocator;
 
-    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
-    defer t.deinit(alloc);
-    const storage = &t.screens.active.kitty_images;
-    const tracked = t.screens.active.pages.countTrackedPins();
+    // Every way that a chunked replacement of image 1 can end, and
+    // whether image 1 exists afterwards. The old image is 1x2 RGB.
+    const cases: []const struct {
+        end: []const u8,
+        data_len: ?usize,
+    } = &.{
+        // The final chunk completes a 1x4 RGB image.
+        .{ .end = "m=0;AAAAAAAAAAAA", .data_len = 12 },
+        // The final chunk leaves too few bytes for the image.
+        .{ .end = "m=0;AA==", .data_len = null },
+        // A delete command for another image aborts the load.
+        .{ .end = "a=d,d=I,i=2", .data_len = null },
+    };
 
-    // Store and display the old image.
-    {
-        const cmd = try command.Parser.parseString(
-            alloc,
-            "a=T,t=d,f=24,i=1,s=1,v=2,C=1;////////",
-        );
-        defer cmd.deinit(alloc);
-        try testing.expect(execute(io, alloc, &t, &cmd).?.ok());
-    }
-    try testing.expect(storage.imageById(1) != null);
-    try testing.expectEqual(@as(usize, 1), storage.placements.count());
-    try testing.expectEqual(
-        tracked + 1,
-        t.screens.active.pages.countTrackedPins(),
-    );
+    for (cases) |case| {
+        var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+        defer t.deinit(alloc);
+        const storage = &t.screens.active.kitty_images;
+        const tracked = t.screens.active.pages.countTrackedPins();
 
-    // Starting a replacement for the same explicit ID removes the old image
-    // and placements before the replacement's final chunk arrives.
-    {
-        const cmd = try command.Parser.parseString(
-            alloc,
-            "a=t,t=d,f=24,i=1,s=1,v=2,m=1;AAAA",
+        // Store and display the old image.
+        {
+            const cmd = try command.Parser.parseString(
+                alloc,
+                "a=T,t=d,f=24,i=1,s=1,v=2,C=1;////////",
+            );
+            defer cmd.deinit(alloc);
+            try testing.expect(execute(io, alloc, &t, &cmd).?.ok());
+        }
+        const generation = storage.generation;
+
+        // Starting a replacement for the same explicit ID changes
+        // nothing: the old image and its placement stay.
+        {
+            const cmd = try command.Parser.parseString(
+                alloc,
+                "a=t,t=d,f=24,i=1,s=1,v=4,m=1;AAAA",
+            );
+            defer cmd.deinit(alloc);
+            try testing.expect(execute(io, alloc, &t, &cmd) == null);
+        }
+        try testing.expect(storage.loading != null);
+        try testing.expectEqual(@as(usize, 6), storage.imageById(1).?.data.len());
+        try testing.expectEqual(@as(usize, 1), storage.placements.count());
+        try testing.expectEqual(generation, storage.generation);
+
+        // However the replacement ends, the old image and its placement
+        // are gone.
+        {
+            const cmd = try command.Parser.parseString(alloc, case.end);
+            defer cmd.deinit(alloc);
+            _ = execute(io, alloc, &t, &cmd);
+        }
+        try testing.expect(storage.loading == null);
+        try testing.expectEqual(@as(usize, 0), storage.placements.count());
+        try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
+        try testing.expectEqual(
+            case.data_len,
+            if (storage.imageById(1)) |img| img.data.len() else null,
         );
-        defer cmd.deinit(alloc);
-        try testing.expect(execute(io, alloc, &t, &cmd) == null);
     }
-    try testing.expect(storage.loading != null);
-    try testing.expect(storage.imageById(1) == null);
-    try testing.expectEqual(@as(usize, 0), storage.placements.count());
-    try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
 }
 
 test "kittygfx delete then retransmit same id gets fresh generation" {
@@ -2405,7 +2612,7 @@ test "kittygfx relative placement chain depth limit" {
         var buf: [64]u8 = undefined;
         const cmd = try command.Parser.parseString(
             alloc,
-            try std.fmt.bufPrint(&buf, "a=p,i=1,p={},P=1,Q={}", .{ id, id - 1 }),
+            try std.mem.print(&buf, "a=p,i=1,p={},P=1,Q={}", .{ id, id - 1 }),
         );
         defer cmd.deinit(alloc);
         try testing.expect(execute(io, alloc, &t, &cmd).?.ok());
@@ -3158,6 +3365,72 @@ test "kittygfx animation: chunked frame continuation without a=f" {
 
     const anim = storage.imagePtrByIdOrNumber(1, 0).?.animation.?;
     try testing.expectEqual(@as(usize, 1), anim.frames.items.len);
+}
+
+test "kittygfx animation: non-direct transmission abandons chunked frame load" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    const storage = &t.screens.active.kitty_images;
+
+    // Allow file (t=f) transmissions and write a 2x1 green RGB frame.
+    storage.image_limits.file = true;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const payload = try testFilePayload(alloc, io, tmp_dir.dir, &.{
+        0, 255, 0,
+        0, 255, 0,
+    });
+    defer alloc.free(payload);
+
+    // 2x1 RGB white image.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=t,f=24,s=2,v=1,i=1;////////",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(io, alloc, &t, &cmd).?.ok());
+    }
+
+    // Begin a chunked frame load.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=f,i=1,f=24,s=2,v=1,m=1;/wAA",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(io, alloc, &t, &cmd) == null);
+    }
+    try testing.expect(storage.loading != null);
+
+    // A file transmission can't be a continuation chunk, so it abandons
+    // the chunked frame and loads a new frame from the file instead.
+    {
+        const str = try std.fmt.allocPrint(
+            alloc,
+            "a=f,t=f,i=1,f=24,s=2,v=1;{s}",
+            .{payload},
+        );
+        defer alloc.free(str);
+        const cmd = try command.Parser.parseString(alloc, str);
+        defer cmd.deinit(alloc);
+        const resp = execute(io, alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+        try testing.expectEqual(@as(u32, 2), resp.frame);
+    }
+    try testing.expect(storage.loading == null);
+
+    const anim = storage.imagePtrByIdOrNumber(1, 0).?.animation.?;
+    try testing.expectEqual(@as(usize, 1), anim.frames.items.len);
+    try testing.expectEqualSlices(
+        u8,
+        &.{ 0, 255, 0, 255, 0, 255, 0, 255 },
+        anim.frames.items[0].data,
+    );
 }
 
 test "kittygfx animation: control command sets gap current state and loops" {

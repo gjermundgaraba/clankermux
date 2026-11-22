@@ -145,7 +145,7 @@ fn threadMain_(self: *Thread) !void {
     // Right now, on Darwin, `std.Thread.setName` can only name the current
     // thread, and we have no way to get the current thread from within it,
     // so instead we use this code to name the thread instead.
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         internal_os.macos.pthread_setname_np(&"search".*);
 
         // We can run with lower priority than other threads.
@@ -657,12 +657,15 @@ test {
     );
     try thread.wakeup.notify();
 
-    // Wait for completion
-    try ud.reset.waitTimeout(testing.io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(100) } });
-
-    // Stop the thread
+    // Wait for completion. Stop the thread before checking the result so
+    // a timeout doesn't free memory the thread is still using.
+    const wait_result = ud.reset.waitTimeout(testing.io, .{ .duration = .{
+        .clock = .awake,
+        .raw = .fromSeconds(5),
+    } });
     try thread.stop.notify();
     os_thread.join();
+    try wait_result; // Weird but we need to get the result before stop.
 
     // 1 total matches
     try testing.expectEqual(1, ud.total);

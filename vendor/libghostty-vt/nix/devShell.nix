@@ -18,21 +18,19 @@
   pkg-config,
   python3,
   qemu,
-  scdoc,
   # snapcraft,
   valgrind,
   #, vulkan-loader # unused
   vttest,
-  wabt,
   wasm-tools,
-  wasmtime,
   binaryen,
   twiggy,
   wizer,
   wraptest,
   zig,
   zip,
-  llvmPackages_latest,
+  aflplusplus,
+  llvmPackages_22,
   bzip2,
   expat,
   fontconfig,
@@ -43,6 +41,8 @@
   gtk4-layer-shell,
   gobject-introspection,
   gst_all_1,
+  graphene,
+  libabigail,
   libadwaita,
   blueprint-compiler,
   gettext,
@@ -83,10 +83,19 @@
   # developer shell
   glycin-loaders,
   librsvg,
+  runCommandLocal,
+  withAfl ? false,
 }: let
   # See package.nix. Keep in sync.
   ld_library_path = import ./build-support/ld-library-path.nix {
     inherit pkgs lib stdenv;
+  };
+  # Every library the test binaries link, including the propagated ones
+  # (see ld-library-path.nix). Only the test runs use it; see
+  # LD_LIBRARY_PATH below for why it isn't that.
+  test_library_path = import ./build-support/ld-library-path.nix {
+    inherit pkgs lib stdenv;
+    propagated = true;
   };
   gi_typelib_path = import ./build-support/gi-typelib-path.nix {
     inherit pkgs lib stdenv;
@@ -97,6 +106,16 @@
     python-pkgs.ucs-detect
     python-pkgs.wasmtime
   ]);
+
+  # FIXME: Zig 0.17's pkg-config parser is much stricter than before
+  # and rejects any C flags it does not recognize.
+  patchedPkgConfig = runCommandLocal "patched-pkg-config" {} ''
+    mkdir $out
+    substitute ${graphene.dev}/lib/pkgconfig/graphene-1.0.pc $out/graphene-1.0.pc \
+      --replace-quiet '-mfpmath=sse -msse -msse2' ""
+    substitute ${glib.dev}/lib/pkgconfig/gmodule-2.0.pc $out/gmodule-2.0.pc \
+      --replace-quiet '-Wl,--export-dynamic' ""
+  '';
 in
   mkShell {
     name = "ghostty";
@@ -106,12 +125,10 @@ in
         cmake
         doxygen
         jq
-        llvmPackages_latest.llvm
         minisign
         ncurses
         pandoc
         pkg-config
-        scdoc
         zig
         zip
         zon2nix.packages.${stdenv.hostPlatform.system}.zon2nix
@@ -136,9 +153,7 @@ in
         # wasm
         binaryen
         twiggy
-        wabt
         wasm-tools
-        wasmtime
         wizer
 
         # Localization
@@ -149,12 +164,6 @@ in
 
         # Scripting
         nushell
-
-        # We need these GTK-related deps on all platform so we can build
-        # dist tarballs.
-        blueprint-compiler
-        libadwaita
-        gtk4
       ]
       ++ lib.optionals stdenv.hostPlatform.isLinux [
         # My nix shell environment installs the non-interactive version
@@ -196,6 +205,9 @@ in
         libXrandr
 
         # Only needed for GTK builds
+        blueprint-compiler
+        libadwaita
+        gtk4
         gtk4-layer-shell
         glib
         gobject-introspection
@@ -213,6 +225,21 @@ in
 
         # for benchmarking
         poop
+
+        # libghostty-vt ABI checks (test/abi/check.sh)
+        libabigail
+
+        # llvm-readobj lists the DLLs a Windows DLL needs. The libghostty-vt
+        # release checks the DLLs in its Windows zips with it
+        # (release-lib-vt.yml).
+        llvmPackages_22.llvm
+      ]
+      ++ lib.optionals (stdenv.hostPlatform.isLinux && withAfl) [
+        (aflplusplus.override {
+          clang = llvmPackages_22.clang;
+          llvm = llvmPackages_22.llvm;
+          llvmPackages = llvmPackages_22;
+        })
       ]
       ++ lib.optionals stdenv.hostPlatform.isDarwin [
         swiftlint
@@ -220,7 +247,16 @@ in
 
     # This should be set onto the rpath of the ghostty binary if you want
     # it to be "portable" across the system.
+    #
+    # Every program in the shell sees this, including system programs such
+    # as the curl, ssh and rsync that vm.sh uses on CI runners. A library
+    # from here that needs a glibc library the program hasn't loaded yet
+    # pulls in the Nix one next to a system libc and the program dies, so
+    # keep this to the direct inputs. The test runs, which need the
+    # propagated libraries as well, get them through GHOSTTY_TEST_LIBRARY_PATH
+    # (see Config.addLoaderArgs).
     LD_LIBRARY_PATH = ld_library_path;
+    GHOSTTY_TEST_LIBRARY_PATH = test_library_path;
     GI_TYPELIB_PATH = gi_typelib_path;
 
     shellHook =
@@ -231,6 +267,8 @@ in
         # Minimal subset of env set by wrapGAppsHook4 for icons and global settings
         export XDG_DATA_DIRS=$XDG_DATA_DIRS:${hicolor-icon-theme}/share:${adwaita-icon-theme}/share
         export XDG_DATA_DIRS=$XDG_DATA_DIRS:$GSETTINGS_SCHEMAS_PATH # from glib setup hook
+
+        export PKG_CONFIG_PATH=${patchedPkgConfig}:$PKG_CONFIG_PATH
       '')
       + (lib.optionalString stdenv.hostPlatform.isDarwin ''
         # On macOS, we unset the macOS SDK env vars that Nix sets up because
