@@ -12,6 +12,9 @@ const RECORD_HEADER_LEN = TAG_LEN + PAYLOAD_LENGTH_LEN + CRC32C_LEN;
 const TAG_PAGE = 3;
 const TAG_READY = 5;
 const TAG_FINISH = 6;
+/** The record tags the wasm build decodes. It has no Kitty graphics, so it
+ * skips Kitty records (tags 8 to 10) whole, as it does any unknown record. */
+const LAST_KNOWN_TAG = 7;
 
 function recordAt(buf: Uint8Array, len: number, pos: number): [number, number] | undefined {
   if (pos + RECORD_HEADER_LEN > len) return undefined;
@@ -35,8 +38,31 @@ export function readyEnd(buf: Uint8Array, len = buf.length): number | undefined 
   return endOfStep(buf, len, ENVELOPE_LEN, (tag) => tag === TAG_READY);
 }
 
+/** Where the step one decoder `next` call takes ends, from the first record
+ * it has not returned: just past the next PAGE or FINISH. After a PAGE the
+ * decoder also reads the next known record header, which must be buffered
+ * too and starts the next step. */
 export function stepEnd(buf: Uint8Array, pos: number, len = buf.length): number | undefined {
-  return endOfStep(buf, len, pos, (tag) => tag === TAG_PAGE || tag === TAG_FINISH);
+  for (;;) {
+    const record = recordAt(buf, len, pos);
+    if (!record) return undefined;
+    const [tag, end] = record;
+    if (tag === TAG_FINISH) return end;
+    if (tag === TAG_PAGE) return afterPage(buf, len, end);
+    pos = end;
+  }
+}
+
+function afterPage(buf: Uint8Array, len: number, pos: number): number | undefined {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  for (;;) {
+    if (pos + RECORD_HEADER_LEN > len) return undefined;
+    const tag = view.getUint16(pos, true);
+    if (tag >= 1 && tag <= LAST_KNOWN_TAG) return pos;
+    const record = recordAt(buf, len, pos);
+    if (!record) return undefined;
+    pos = record[1];
+  }
 }
 
 export class Decoder {

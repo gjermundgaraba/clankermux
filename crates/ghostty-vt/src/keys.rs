@@ -196,15 +196,18 @@ impl KeyEncoder {
         // SAFETY: encoder, event and terminal are live; the text outlives
         // the encode call that reads it.
         unsafe {
-            sys::ghostty_key_encoder_setopt_from_terminal(self.encoder, term.raw());
+            check(sys::ghostty_key_encoder_set_from_terminal(
+                self.encoder,
+                term.raw(),
+            ))?;
             // A named `alt` is Alt, never macOS's Option composing text;
             // the call above resets this.
             let option_as_alt = sys::GHOSTTY_OPTION_AS_ALT_TRUE;
-            sys::ghostty_key_encoder_setopt(
+            check(sys::ghostty_key_encoder_set(
                 self.encoder,
                 sys::GHOSTTY_KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT,
                 (&raw const option_as_alt).cast(),
-            );
+            ))?;
             sys::ghostty_key_event_set_action(self.event, sys::GHOSTTY_KEY_ACTION_PRESS);
             sys::ghostty_key_event_set_key(self.event, key.key);
             sys::ghostty_key_event_set_mods(self.event, key.mods.0);
@@ -215,12 +218,11 @@ impl KeyEncoder {
             };
             sys::ghostty_key_event_set_consumed_mods(self.event, consumed);
             sys::ghostty_key_event_set_composing(self.event, false);
-            let text = if key.text.is_empty() {
-                ptr::null()
-            } else {
-                key.text.as_ptr().cast()
+            let text = sys::GhosttyString {
+                ptr: key.text.as_ptr(),
+                len: key.text.len(),
             };
-            sys::ghostty_key_event_set_utf8(self.event, text, key.text.len());
+            check(sys::ghostty_key_event_set_utf8(self.event, text))?;
             sys::ghostty_key_event_set_unshifted_codepoint(
                 self.event,
                 key.unshifted.map_or(0, u32::from),

@@ -15,6 +15,11 @@ const RECORD_HEADER_LEN: usize = 10;
 const TAG_PAGE: u16 = 3;
 const TAG_READY: u16 = 5;
 const TAG_FINISH: u16 = 6;
+const TAG_KITTY_IMAGE_PAYLOAD: u16 = 9;
+const TAG_KITTY_IMAGE_PAGE_PLACEMENTS: u16 = 10;
+/// The record tags this build decodes; the decoder skips any other record
+/// whole. Native builds have Kitty graphics.
+const KNOWN_TAGS: std::ops::RangeInclusive<u16> = 1..=10;
 
 pub fn encode(term: &Term) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -42,10 +47,36 @@ pub fn ready_end(buf: &[u8]) -> Option<usize> {
     end_of_step(buf, ENVELOPE_LEN, |tag| tag == TAG_READY)
 }
 
-/// Position just past the next `PAGE` or `FINISH` record at or after
-/// `pos`, which is what one decoder `next_page` call consumes.
-fn step_end(buf: &[u8], pos: usize) -> Option<usize> {
-    end_of_step(buf, pos, |tag| tag == TAG_PAGE || tag == TAG_FINISH)
+/// Where the step that one decoder `next_page` call takes ends, from the
+/// first record it has not returned: just past the next `PAGE`, `FINISH` or
+/// `KITTY_IMAGE_PAYLOAD`. After a `PAGE` the decoder also reads the next
+/// record header, and the page's `KITTY_IMAGE_PAGE_PLACEMENTS` when that is
+/// what follows, so those must be buffered too; a header it only read
+/// ahead starts the next step.
+fn step_end(buf: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let (tag, end) = record_at(buf, pos)?;
+        match tag {
+            TAG_FINISH | TAG_KITTY_IMAGE_PAYLOAD => return Some(end),
+            TAG_PAGE => return after_page(buf, end),
+            _ => pos = end,
+        }
+    }
+}
+
+fn after_page(buf: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let header = buf.get(pos..pos + RECORD_HEADER_LEN)?;
+        let tag = u16::from_le_bytes([header[0], header[1]]);
+        if KNOWN_TAGS.contains(&tag) && tag != TAG_KITTY_IMAGE_PAGE_PLACEMENTS {
+            return Some(pos);
+        }
+        let (_, end) = record_at(buf, pos)?;
+        if tag == TAG_KITTY_IMAGE_PAGE_PLACEMENTS {
+            return Some(end);
+        }
+        pos = end;
+    }
 }
 
 fn end_of_step(buf: &[u8], mut pos: usize, last: impl Fn(u16) -> bool) -> Option<usize> {
@@ -61,6 +92,8 @@ fn end_of_step(buf: &[u8], mut pos: usize, last: impl Fn(u16) -> bool) -> Option
 struct Source {
     data: Vec<u8>,
     pos: usize,
+    /// The first record the decoder has not returned, at or before `pos`.
+    decoded: usize,
 }
 
 unsafe extern "C" fn read_source(
@@ -123,6 +156,7 @@ impl<H: Handler> Decoder<H> {
         let source = Box::into_raw(Box::new(Source {
             data: Vec::new(),
             pos: 0,
+            decoded: 0,
         }));
         let reader = sys::GhosttyReader {
             read: Some(read_source),
@@ -210,25 +244,31 @@ impl<H: Handler> Decoder<H> {
 
     pub fn step_available(&self) -> bool {
         let source = self.source();
-        !self.finished && step_end(&source.data, source.pos).is_some()
+        !self.finished && step_end(&source.data, source.decoded).is_some()
     }
 
     pub fn ready(&mut self) -> Result<&mut Terminal<H>> {
         let mut raw = ptr::null_mut();
         let result = unsafe { sys::ghostty_snapshot_decoder_ready(self.raw, &raw mut raw) };
         check(result)?;
+        let source = self.source_mut();
+        source.decoded = source.pos;
         // SAFETY: on success raw is a caller-owned terminal.
         Ok(unsafe { self.adopt(raw) })
     }
 
     pub fn next_page(&mut self) -> Result<Step> {
         self.intact()?;
+        let source = self.source();
+        let end = step_end(&source.data, source.decoded).expect("callers check step_available");
         let result = unsafe { sys::ghostty_snapshot_decoder_next(self.raw) };
         if result == sys::GHOSTTY_NO_VALUE {
+            self.source_mut().decoded = end;
             self.finished = true;
             return Ok(Step::Finished);
         }
         check(result)?;
+        self.source_mut().decoded = end;
         Ok(Step::Page)
     }
 
@@ -237,6 +277,8 @@ impl<H: Handler> Decoder<H> {
     fn decode(&mut self) -> Result<&mut Terminal<H>> {
         let mut raw = ptr::null_mut();
         let result = unsafe { sys::ghostty_snapshot_decoder_decode(self.raw, &raw mut raw) };
+        let source = self.source_mut();
+        source.decoded = source.pos;
         self.compact();
         check(result)?;
         self.finished = true;
@@ -257,8 +299,9 @@ impl<H: Handler> Decoder<H> {
 
     fn compact(&mut self) {
         let source = self.source_mut();
-        source.data.drain(..source.pos);
-        source.pos = 0;
+        source.data.drain(..source.decoded);
+        source.pos -= source.decoded;
+        source.decoded = 0;
     }
 }
 
@@ -285,6 +328,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn kitty_images_in_history_stream_at_any_split() {
+        let mut term = Terminal::new(20, 5).unwrap();
+        term.set_scrollback_max_bytes(10 * 1024 * 1024).unwrap();
+        let image = b"\x1b_Gf=24,s=1,v=1,a=T,t=d;AAAA\x1b\\";
+        for _ in 0..2 {
+            term.vt_write(&b"line\r\n".repeat(3000));
+            term.vt_write(image);
+        }
+        term.vt_write(&b"line\r\n".repeat(3000));
+        let bytes = encode(&term).unwrap();
+        let mut tags = Vec::new();
+        let mut pos = ENVELOPE_LEN;
+        while let Some((tag, end)) = record_at(&bytes, pos) {
+            tags.push(tag);
+            pos = end;
+        }
+        assert!(tags.contains(&TAG_KITTY_IMAGE_PAYLOAD), "{tags:?}");
+        assert!(tags.contains(&TAG_KITTY_IMAGE_PAGE_PLACEMENTS), "{tags:?}");
+
+        for chunk in [1, 7, 4096] {
+            let mut decoder = Decoder::new().unwrap();
+            for piece in bytes.chunks(chunk) {
+                decoder.push(piece);
+                if decoder.terminal().is_none() && decoder.ready_available() {
+                    decoder.ready().unwrap();
+                }
+                while decoder.terminal().is_some() && decoder.step_available() {
+                    decoder.next_page().unwrap();
+                }
+            }
+            assert!(decoder.finished(), "chunk {chunk}");
+            assert_eq!(decoder.buffered(), 0, "chunk {chunk}");
+            let restored = decoder.into_terminal().unwrap();
+            assert_eq!(
+                restored.scrollback_rows().unwrap(),
+                term.scrollback_rows().unwrap(),
+                "chunk {chunk}"
+            );
+        }
+    }
+
+    #[test]
     fn pages_stay_in_place_until_the_next_received_chunk() {
         let mut term = Terminal::new(80, 24).unwrap();
         term.set_scrollback_max_bytes(10 * 1024 * 1024).unwrap();
@@ -298,19 +383,23 @@ mod tests {
         assert_eq!(decoder.source().data.len(), split);
         let mut pages = 0;
         while decoder.step_available() {
-            let pos = decoder.source().pos;
+            let before = decoder.source().decoded;
             assert_eq!(decoder.next_page().unwrap(), Step::Page);
-            assert!(decoder.source().pos > pos);
+            assert!(decoder.source().decoded > before);
             assert_eq!(decoder.source().data.len(), split);
             pages += 1;
         }
         assert!(pages > 1);
         assert!(!decoder.finished());
-        let tail = decoder.source().data[decoder.source().pos..].to_vec();
+        let tail = decoder.source().data[decoder.source().decoded..].to_vec();
         decoder.push(&bytes[split..]);
-        assert_eq!(decoder.source().pos, 0);
+        assert_eq!(decoder.source().decoded, 0);
         assert_eq!(&decoder.source().data[..tail.len()], tail);
-        assert!(decoder.step_available());
+        assert_eq!(
+            decoder.next_page().unwrap(),
+            Step::Page,
+            "waited for FINISH's header"
+        );
         assert_eq!(decoder.next_page().unwrap(), Step::Finished);
         assert!(decoder.finished());
         assert_eq!(decoder.buffered(), 0);

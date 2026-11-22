@@ -229,10 +229,7 @@ impl Term {
                 coordinate: sys::GhosttyPointCoordinate { x: 0, y },
             },
         };
-        let mut grid = sys::GhosttyGridRef {
-            size: size_of::<sys::GhosttyGridRef>(),
-            ..Default::default()
-        };
+        let mut grid = sys::GhosttyGridRef::default();
         let mut row = sys::GhosttyRow::default();
         let mut out = false;
         // SAFETY: the terminal is live, the reference is used before any

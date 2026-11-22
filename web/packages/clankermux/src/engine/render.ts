@@ -27,6 +27,7 @@ export interface Cell {
 }
 
 const CURSOR_STYLES = ["bar", "block", "underline", "block_hollow"] as const;
+const STYLE_FLAGS = ["bold", "italic", "faint", "blink", "inverse", "invisible", "strikethrough", "overline"] as const;
 type CursorStyle = (typeof CURSOR_STYLES)[number];
 
 export interface FrameRow<Cells = Cell[]> {
@@ -99,6 +100,7 @@ export class RenderState {
   private readonly tags: { codepoint: number; grapheme: number };
   private readonly wide: { wide: number; tail: number };
   private readonly cell: { tag: BitField; codepoint: BitField; wide: BitField };
+  private readonly style: Record<(typeof STYLE_FLAGS)[number] | "underline", BitField>;
   private readonly cursorStyles: Map<number, CursorStyle>;
 
   constructor(readonly engine: Engine) {
@@ -132,8 +134,11 @@ export class RenderState {
       codepoint: engine.bits("GhosttyCell", "content", "CODEPOINT", "codepoint"),
       wide: engine.bits("GhosttyCell", "wide"),
     };
+    this.style = Object.fromEntries(
+      [...STYLE_FLAGS, "underline" as const].map((key) => [key, engine.bits("GhosttyStyleFlags", key)]),
+    ) as typeof this.style;
     this.cursorStyles = new Map(
-      CURSOR_STYLES.map((style) => [engine.enumValue("GhosttyRenderStateCursorVisualStyle", style.toUpperCase()), style]),
+      CURSOR_STYLES.map((style) => [engine.enumValue("GhosttyCursorStyle", style.toUpperCase()), style]),
     );
   }
 
@@ -248,7 +253,6 @@ export class RenderState {
       e.view.setUint32(out, this.cells, true);
       e.check("ghostty_render_state_row_get", this.iterator, this.keys.row["CELLS"]!, out);
     });
-    const styleSize = e.sizeOf("GhosttyStyle");
     let count = 0;
     const utf8Cap = 64;
     const layout = scratchLayout(e, ["GhosttyCell", "GhosttyColorRgb", "GhosttyStyle", "GhosttyBuffer"]);
@@ -274,18 +278,12 @@ export class RenderState {
         const bg = this.color(this.keys.cell["BG_COLOR"]!, color);
         e.check("ghostty_render_state_row_cells_get", this.cells, this.keys.cell["HAS_STYLING"]!, raw);
         if (e.memory[raw]) {
-          e.view.setUint32(style, styleSize, true);
           e.check("ghostty_render_state_row_cells_get", this.cells, this.keys.cell["STYLE"]!, style);
-          const f = (key: string) => e.field("GhosttyStyle", style, key) !== 0;
-          if (f("bold")) flags |= FLAG.BOLD;
-          if (f("italic")) flags |= FLAG.ITALIC;
-          if (f("faint")) flags |= FLAG.FAINT;
-          if (f("blink")) flags |= FLAG.BLINK;
-          if (f("inverse")) flags |= FLAG.INVERSE;
-          if (f("invisible")) flags |= FLAG.INVISIBLE;
-          if (f("strikethrough")) flags |= FLAG.STRIKETHROUGH;
-          if (f("overline")) flags |= FLAG.OVERLINE;
-          underline = e.field("GhosttyStyle", style, "underline");
+          const styleFlags = style + e.offsetOf("GhosttyStyle", "flags");
+          for (const key of STYLE_FLAGS) {
+            if (e.readBits(styleFlags, this.style[key])) flags |= FLAG[key.toUpperCase() as Uppercase<typeof key>];
+          }
+          underline = e.readBits(styleFlags, this.style.underline);
         }
         write(codepoint, text, fg, bg, flags, underline);
         count++;
@@ -296,7 +294,7 @@ export class RenderState {
   private color(key: number, out: number): number {
     const e = this.engine;
     const code = e.call("ghostty_render_state_row_cells_get", this.cells, key, out);
-    if (code === e.result.INVALID_VALUE) return NO_COLOR;
+    if (code === e.result.NO_VALUE) return NO_COLOR;
     if (code !== e.result.SUCCESS) throw new EngineError("ghostty_render_state_row_cells_get", code);
     return e.readRgb(out);
   }

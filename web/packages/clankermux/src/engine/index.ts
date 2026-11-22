@@ -409,7 +409,6 @@ export class Terminal {
       const coordinate = ptr + e.offsetOf("GhosttyPoint", "value");
       e.view.setUint16(coordinate + e.offsetOf("GhosttyPointCoordinate", "x"), x, true);
       e.view.setUint32(coordinate + e.offsetOf("GhosttyPointCoordinate", "y"), y, true);
-      e.view.setUint32(ptr + point, ref, true);
       // The point is passed by value, which the wasm ABI passes by address.
       e.check("ghostty_terminal_grid_ref", this.handle, ptr, ptr + point);
       return e.memory.slice(ptr + point, ptr + point + ref);
@@ -424,35 +423,23 @@ export class Terminal {
 
   selectionText(): string | undefined {
     const e = this.engine;
-    const options = e.pack("GhosttyTerminalSelectionFormatOptions", {
-      emit: e.enumValue("GhosttyFormatterFormat", "PLAIN"),
-      unwrap: 1,
-      trim: 1,
+    return e.scratch(e.sizeOf("GhosttySelection"), (selection) => {
+      if (!e.present("ghostty_terminal_get", this.handle, e.enumValue("GhosttyTerminalData", "SELECTION"), selection)) {
+        return undefined;
+      }
+      return this.format((set) => {
+        set("SELECTION", selection);
+        set("UNWRAP", new Uint8Array([1]));
+      });
     });
-    return e.withBytes(options, (optionsPtr) =>
-      e.scratch(8, (out) => {
-        e.view.setUint32(out, 0, true);
-        e.view.setUint32(out + 4, 0, true);
-        // The options are passed by value, which the wasm ABI passes by address.
-        if (!e.present("ghostty_terminal_selection_format_alloc", this.handle, 0, optionsPtr, out, out + 4)) return undefined;
-        const ptr = e.view.getUint32(out, true);
-        const len = e.view.getUint32(out + 4, true);
-        try {
-          return new TextDecoder().decode(e.memory.slice(ptr, ptr + len));
-        } finally {
-          e.call("ghostty_free", 0, ptr, len);
-        }
-      }),
-    );
   }
 
   get selected(): boolean {
     const e = this.engine;
     const size = e.sizeOf("GhosttySelection");
-    return e.scratch(size, (out) => {
-      e.view.setUint32(out, size, true);
-      return e.present("ghostty_terminal_get", this.handle, e.enumValue("GhosttyTerminalData", "SELECTION"), out);
-    });
+    return e.scratch(size, (out) =>
+      e.present("ghostty_terminal_get", this.handle, e.enumValue("GhosttyTerminalData", "SELECTION"), out),
+    );
   }
 
   mode(number: number): boolean {
@@ -485,22 +472,25 @@ export class Terminal {
   }
 
   formatPlain(): string {
-    const options = this.engine.pack("GhosttyFormatterTerminalOptions", {
-      emit: this.engine.enumValue("GhosttyFormatterFormat", "PLAIN"),
-      extra: { screen: {} },
-    });
-    return this.engine.withBytes(options, (optionsPtr) => {
-      const formatter = this.engine.construct("ghostty_formatter_terminal_new", this.handle, optionsPtr);
-      try {
-        return new TextDecoder().decode(
-          this.engine.allocated((ptr, len) =>
-            this.engine.check("ghostty_formatter_format_alloc", formatter, 0, ptr, len),
-          ),
-        );
-      } finally {
-        this.engine.call("ghostty_formatter_free", formatter);
-      }
-    });
+    return this.format((set) => set("TRIM", new Uint8Array([0])));
+  }
+
+  /** Plain text from a formatter, after `configure` sets its options. */
+  private format(configure: (set: (option: string, value: Uint8Array | number) => void) => void): string {
+    const e = this.engine;
+    const formatter = e.construct("ghostty_formatter_terminal_new", this.handle);
+    try {
+      configure((option, value) => {
+        const key = e.enumValue("GhosttyFormatterOption", option);
+        if (typeof value === "number") e.check("ghostty_formatter_set", formatter, key, value);
+        else e.withBytes(value, (ptr) => e.check("ghostty_formatter_set", formatter, key, ptr));
+      });
+      return new TextDecoder().decode(
+        e.allocated((ptr, len) => e.check("ghostty_formatter_format_alloc", formatter, 0, ptr, len)),
+      );
+    } finally {
+      e.call("ghostty_formatter_free", formatter);
+    }
   }
 
   free(): void {

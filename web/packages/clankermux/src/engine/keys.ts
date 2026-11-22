@@ -59,7 +59,7 @@ export class KeyEncoder {
 
   encode(term: Terminal, input: KeyInput): Uint8Array {
     const e = this.engine;
-    e.call("ghostty_key_encoder_setopt_from_terminal", this.encoder, term.handle);
+    e.check("ghostty_key_encoder_set_from_terminal", this.encoder, term.handle);
     const name = keyName(input.code);
     const key = e.hasEnumValue("GhosttyKey", name) ? e.enumValue("GhosttyKey", name) : this.unidentified;
     const composed = input.altComposed === true;
@@ -76,7 +76,9 @@ export class KeyEncoder {
     e.call("ghostty_key_event_set_composing", this.event, input.composing ? 1 : 0);
     const utf8 = new TextEncoder().encode(text);
     return e.withBytes(utf8, (textPtr) => {
-      e.call("ghostty_key_event_set_utf8", this.event, textPtr, utf8.length);
+      const string = e.pack("GhosttyString", { ptr: textPtr, len: utf8.length });
+      // The string is passed by value, which the wasm ABI passes by address.
+      e.withBytes(string, (stringPtr) => e.check("ghostty_key_event_set_utf8", this.event, stringPtr));
       const base = input.unshifted ?? (text ? text.toLowerCase() : "");
       e.call("ghostty_key_event_set_unshifted_codepoint", this.event, base ? base.codePointAt(0)! : 0);
       return e.growing("ghostty_key_encoder_encode", 64, (buf, cap, len) =>

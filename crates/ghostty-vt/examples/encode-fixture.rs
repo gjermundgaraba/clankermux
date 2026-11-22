@@ -20,6 +20,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write(&dir, "basic", &basic)?;
 
     let mut history = Terminal::new(20, 5)?;
+    // The server's 10 MiB (proto::Limits::scrollback), not libghostty-vt's
+    // tiny default. The decoder rejects a restored history page whole when
+    // it exceeds the receiving terminal's byte budget, and a page takes
+    // more memory on Apple Silicon than in wasm, so under the default this
+    // fixture's one history page, encoded on macOS, was dropped by the
+    // wasm decoder. That loss is real: a Mac-encoded snapshot decoded in
+    // wasm silently drops its oldest history pages at 10 MiB too (about
+    // 950 lines of 11450 at vt-1.0.1). Shrinking this budget brings the
+    // fixture back over that edge on macOS.
+    history.set_scrollback_max_bytes(10 * 1024 * 1024)?;
     for i in 1..=5000 {
         history.vt_write(format!("history {i}\r\n").as_bytes());
     }
@@ -33,6 +43,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     continuation.set_continuation_max_bytes(1 << 20)?;
     continuation.vt_write(b"partial\x1b[3");
     write(&dir, "continuation", &continuation)?;
+
+    let mut kitty = Terminal::new(20, 5)?;
+    kitty.set_scrollback_max_bytes(10 * 1024 * 1024)?;
+    for _ in 0..2 {
+        kitty.vt_write(&b"line\r\n".repeat(3000));
+        kitty.vt_write(b"\x1b_Gf=24,s=1,v=1,a=T,t=d;AAAA\x1b\\");
+    }
+    kitty.vt_write(&b"line\r\n".repeat(3000));
+    write(&dir, "kitty", &kitty)?;
     Ok(())
 }
 

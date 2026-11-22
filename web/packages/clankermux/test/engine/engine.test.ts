@@ -58,11 +58,15 @@ test("the decoder steps through a snapshot as its bytes arrive", () => {
   expect(decoder.stepAvailable()).toBe(false);
   const page = stepEnd(bytes, ready)!;
   decoder.push(bytes.subarray(ready, page));
+  expect(decoder.stepAvailable()).toBe(false);
+  const nextHeader = page + 10;
+  decoder.push(bytes.subarray(page, nextHeader));
   expect(decoder.stepAvailable()).toBe(true);
   expect(decoder.nextPage()).toBe(true);
   expect(term.scrollbackRows).toBeGreaterThan(before);
-  decoder.push(bytes.subarray(page));
-  expect(decoder.nextPage()).toBe(false);
+  decoder.push(bytes.subarray(nextHeader));
+  while (decoder.stepAvailable() && decoder.nextPage()) {}
+  expect(decoder.finished()).toBe(true);
   expect(decoder.stepAvailable()).toBe(false);
   const released = decoder.release()!;
   expect(released.formatPlain()).toBe(readFileSync(`${here}fixtures/history.txt`, "utf8"));
