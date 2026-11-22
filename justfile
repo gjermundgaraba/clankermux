@@ -29,9 +29,9 @@ bindings:
 protocol:
     cargo xtask protocol
 
-# Re-pin libghostty-vt to an upstream main commit.
-pin sha:
-    scripts/pin.sh {{sha}}
+# Re-pin libghostty-vt to a signed upstream release, such as 1.0.1.
+pin version:
+    scripts/pin.sh {{version}}
 
 # The release binary, as a tagged release builds it.
 release-build:

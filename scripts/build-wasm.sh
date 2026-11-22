@@ -2,7 +2,7 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 out="$root/target/wasm"
-version=$(tr -d '\n' < "$root/vendor/libghostty-vt/VERSION")
+version=$(tr -d '\n' < "$root/vendor/libghostty-vt/LIB_VERSION")
 "${ZIG:-zig}" build -Demit-lib-vt -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall \
     "-Dversion-string=$version" "-Dlib-version-string=$version" \
     --prefix "$out" --cache-dir "$root/target/zig-cache" \
