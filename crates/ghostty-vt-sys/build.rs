@@ -34,7 +34,7 @@ fn main() {
         .arg(zig_cache(&out))
         .current_dir(&vendored)
         .status()
-        .unwrap_or_else(|err| panic!("cannot run {zig} (set ZIG to a zig 0.16.0 binary): {err}"));
+        .unwrap_or_else(|err| panic!("cannot run {zig} (set ZIG to a zig 0.17.0 binary): {err}"));
     assert!(
         status.success(),
         "zig build of libghostty-vt failed: {status}"
