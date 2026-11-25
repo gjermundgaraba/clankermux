@@ -292,7 +292,7 @@ export type Empty = Record<string, unknown>;
 export type ErrorCode =
   /** A connection error under Framing; the connection closes. */
   | "protocol_error"
-  /** `HELLO.version` is not 1; the connection closes. */
+  /** `HELLO.version` is not 2; the connection closes. */
   | "version_mismatch"
   /**
    * Malformed payload, a field the protocol does not define, unknown method, a

@@ -1000,7 +1000,7 @@ an attachment channel it ends the attachment, except `read_only`,
 | Code                 | Meaning |
 | -------------------- | ------- |
 | `protocol_error`     | A connection error under Framing; the connection closes. |
-| `version_mismatch`   | `HELLO.version` is not 1; the connection closes. |
+| `version_mismatch`   | `HELLO.version` is not 2; the connection closes. |
 | `invalid_request`    | Malformed payload, a field the protocol does not define, unknown method, a resume marker above the session's latest, a `subscribe` `after` above the latest event, `read` with `scrollback` and a scope other than `screen`, or `tail` from past the stream's end or with `max_bytes` 0. |
 | `limit_exceeded`     | `label`, `text` or `attachments` exceeded, or a snapshot failed. |
 | `no_such_session`    | No session has the id. |

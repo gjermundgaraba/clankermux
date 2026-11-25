@@ -70,7 +70,7 @@ pub struct Reply {
 pub enum ErrorCode {
     /// A connection error under Framing; the connection closes.
     ProtocolError,
-    /// `HELLO.version` is not 1; the connection closes.
+    /// `HELLO.version` is not 2; the connection closes.
     VersionMismatch,
     /// Malformed payload, a field the protocol does not define, unknown
     /// method, a resume marker above the session's latest, a `subscribe`
