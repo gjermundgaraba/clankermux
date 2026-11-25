@@ -190,12 +190,7 @@ impl<H: Handler> Decoder<H> {
         self.terminal.insert(shared)
     }
 
-    /// Refuses to go on when the terminal handed out was replaced (safe
-    /// code can `mem::replace` through the `&mut`), since the library
-    /// still holds the one it returned. The owner keeps that one alive,
-    /// so another terminal cannot take its address, and whatever was
-    /// moved out stays a valid terminal of its own.
-    fn intact(&self) -> Result<()> {
+    fn refuse_replaced_terminal(&self) -> Result<()> {
         match (&self.terminal, &self.owner) {
             (Some(shared), Some(owner)) if shared.raw() != owner.raw() => Err(Error::InvalidValue),
             _ => Ok(()),
@@ -258,7 +253,7 @@ impl<H: Handler> Decoder<H> {
     }
 
     pub fn next_page(&mut self) -> Result<Step> {
-        self.intact()?;
+        self.refuse_replaced_terminal()?;
         let source = self.source();
         let end = step_end(&source.data, source.decoded).expect("callers check step_available");
         let result = unsafe { sys::ghostty_snapshot_decoder_next(self.raw) };
@@ -291,7 +286,7 @@ impl<H: Handler> Decoder<H> {
     }
 
     pub fn into_terminal(mut self) -> std::result::Result<Terminal<H>, NoTerminal> {
-        if self.intact().is_err() {
+        if self.refuse_replaced_terminal().is_err() {
             return Err(NoTerminal::Replaced);
         }
         self.terminal.take().ok_or(NoTerminal::BeforeReady)

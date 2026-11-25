@@ -444,3 +444,22 @@ fn a_frame_has_a_schema_exactly_when_its_payload_is_json() {
         );
     }
 }
+
+#[test]
+fn the_version_texts_name_the_protocol_version() {
+    let catalog = catalog::catalog(Some("0"));
+    let mismatch = catalog
+        .errors
+        .iter()
+        .find(|e| e.code == ErrorCode::VersionMismatch)
+        .unwrap();
+    assert!(
+        mismatch.summary.contains(&format!("is not {VERSION}")),
+        "{}",
+        mismatch.summary
+    );
+    for name in ["Hello", "Welcome"] {
+        let description = &catalog.defs[name]["properties"]["version"]["description"];
+        assert_eq!(description, &format!("Always {VERSION}."), "{name}");
+    }
+}

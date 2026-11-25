@@ -538,6 +538,7 @@ name = "ghostty-vt"
 version = "0.1.0"
 dependencies = [
  "ghostty-vt-sys",
+ "proto",
 ]
 
 [[package]]

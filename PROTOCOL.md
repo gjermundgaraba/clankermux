@@ -547,12 +547,7 @@ at the next OSC 133 `A`, and when a session is loaded from a park file. The
 root record has the id `""`. Records hold exactly the keys of their last
 report; `inspect` resolves `app` from the nearest ancestor present at that
 moment, as the protocol describes. At most `limits.records` records are
-kept per session; beyond that the least recently updated is evicted. The
-default keeps an `inspect` reply under the default `max_frame` with every
-record at the protocol's maxima and worst-case JSON escaping. The server
-relies on the engine's program-status and semantic-prompt effects, both on
-upstream `main` as of 2026-10-18, and on its bell, desktop-notification
-and progress-report effects for the events of the same names.
+kept per session; beyond that the least recently updated is evicted.
 
 <!-- generated: type StatusRecord -->
 | Field        | Type    | Meaning |
@@ -697,15 +692,9 @@ incarnation is not compared.
 
 ### Bootstrap from a snapshot
 
-Server, holding the session still:
-
-1. record the cursor `{cut, marker}` from the current offset and latest
-   marker `seq`;
-2. encode the terminal as a Ghostty snapshot;
-3. set the attachment's cursor to it;
-4. resume the session.
-
-Then on the channel:
+The server takes the snapshot and the attachment's cursor `{cut, marker}`
+at one instant, so the stream from the cursor continues the snapshot
+exactly. On the channel:
 
 1. `ATTACHED {offset: cut, marker, snapshot_bytes, ...}`;
 2. `SNAPSHOT` frames carrying the snapshot bytes in order, split at
@@ -853,14 +842,9 @@ follows when the size, `owner` or a recorded viewport changed.
 
 Under `latest`, a client with a person in front of it reports only while
 it is in use, so the session takes the size of the client being looked
-at. The web client (each terminal of `client.mount`) reports, in `OPEN` and `VIEWPORT`,
-only while its page is visible and its window has the focus
-(`document.visibilityState` and `document.hasFocus()`), and reports again
-as soon as it is shown or focused, whether or not its size changed, and
-at its next input when another client's report resized the session while
-it kept the focus. A hidden or unfocused web client sends `OPEN` without
-`viewport` or `profile` and no `VIEWPORT`; its terminal follows the
-session's size through `RESIZED` like any other. Under `smallest`, a
+at. A client not in use sends `OPEN` without `viewport` or `profile`
+and no `VIEWPORT`; its terminal follows the session's size through
+`RESIZED` like any other. Under `smallest`, a
 recorded viewport stays until its attachment closes, so a client that
 reported once keeps bounding the size while it is open.
 
@@ -907,28 +891,21 @@ arrives, for up to 5 s, then fails the attach or park with
 `limit_exceeded`. A failed park keeps the previous park files.
 
 A client whose scrollback limit is below the server's receives truncated
-history, by the decoder's own rule.
+history, by the decoder's own rule. A wasm client can also drop the oldest history
+pages of a snapshot a macOS server took, at the same limit, because a page
+takes more memory there ([#4](https://github.com/gjermundgaraba/clankermux/issues/4)).
 
 ## Persisted state
 
 The state directory is `$XDG_STATE_HOME/clankermux`, or
-`~/.local/state/clankermux` when unset. The server holds an exclusive lock
-on `lock` in it for its lifetime and exits if it cannot. Each parked
-session is a directory `sessions/<id>/<generation>/`, with `generation`
-the park time as Unix epoch milliseconds, mode 0700, files 0600:
-
-| File                | Contents                                                     |
-| ------------------- | ------------------------------------------------------------ |
-| `session.json`      | `{version: 2, engine, parked_at, session, history_lines, commands}`: the `inspect` object (`attachments: []`, `size` without `owner`, no `pid`, `program_status` as reported with no inherited `app`, with `seen`, oldest report first; no `attention`), how many leading lines of `screen.txt` are history, and the commands kept (see Commands) |
-| `snapshot.ghostsnp` | The snapshot bytes                                           |
-| `screen.txt`        | The `read` text with all retained history, at `parked_at`   |
-
-A park writes the three files into a temporary directory named with a
-leading dot, syncs each file and the directory, renames the directory to
-its generation name, syncs `sessions/<id>/`, then deletes older
-generations. On start, the newest directory holding all three files whose
-`session.json` parses with `version` 2 is the session's state; the others,
-and any dot-named directory, are deleted.
+`~/.local/state/clankermux` when unset. One server runs per state
+directory: it holds an exclusive lock on `lock` in it for its lifetime and
+exits if it cannot. Each session is parked in a directory under `sessions/<id>/`, mode
+0700, files 0600: its snapshot (`snapshot.ghostsnp`), the `read` text of
+its screen with all retained history (`screen.txt`), and `session.json`,
+which holds the session with its size policy, program status records with
+`seen`, the commands kept and the engine id. A park replaces the previous
+one atomically, so a crash leaves the previous park or the new one.
 
 A running session is parked:
 
@@ -937,39 +914,27 @@ A running session is parked:
   since its last park, whichever comes first, but not within 5 s of the
   start of its last park. Its files are then at most 5 s behind once
   changes stop (2 s when it has not parked in the 5 s before) and 30 s
-  behind while they continue, plus the park's own time, and these parks
-  of a session are at least 5 s apart; a change during a park counts
-  towards the next;
+  behind while they continue, plus the park's own time;
 - when its last attachment closes;
 - every 5 minutes.
 
 These times are the defaults; a server may be configured with others. A
-park that fails is logged and tried again at any of these. A session is
-also parked once at the end of the stream with `on_exit: keep`, and on
-graceful stop when it is not being removed (a kept session's final park
-may still be pending); a stop deletes the files of sessions being
-removed, then sends SIGHUP to each running session's process group.
-While the server stops, `create`, `remove` and `OPEN` fail with
-`internal`.
-An `ack` that marks a record of a running session counts as a change; of
-an exited, kept session it parks the session once more; of a session
-loaded from a park file it replaces `session.json` in the newest
-generation, writing `.session.json` there, syncing it, renaming it over
-`session.json` and syncing the directory.
-The whole `sessions/<id>/` directory is deleted whenever the session is
-removed. On start, a `session.json` whose `session.id` is not its
-directory's name is skipped with a warning.
+park that fails is tried again at any of these. A session is also parked
+once at the end of the stream with `on_exit: keep`, and on graceful stop
+when it is not being removed; a stop deletes the files of sessions being
+removed, then sends SIGHUP to each running session's process group. While
+the server stops, `create`, `remove` and `OPEN` fail with `internal`. An
+`ack` is parked with the session, whatever its status. Removing a session
+deletes `sessions/<id>/`.
 
-On start, each session directory becomes a session: `status` is `exited`
-if `session.json` says so, `restored` otherwise, with the size policy it
-recorded. `read` serves
-`screen.txt` for `text` of `screen` and `history`, with `scrollback`
-taken from its history lines, and decodes `snapshot.ghostsnp` for the
-rest. Stream bytes are not parked: `tail` and `last_command` have none. `OPEN`
-requires `session.json.engine` to equal the server's engine as well as the
-client's; after an engine change only `read` and `remove` work. `OPEN`
-streams `snapshot.ghostsnp` as a bootstrap with no stream frames after
-`SNAPSHOT_END`.
+On start, each parked session becomes a session: `status` is `exited` if
+it had exited, `restored` otherwise, with the size policy it recorded.
+`read` serves `screen.txt` for `text` of `screen` and `history`, and
+decodes the snapshot for the rest. Stream bytes are not parked: `tail` and
+`last_command` have none. `OPEN` requires the engine that wrote the
+snapshot to equal the server's as well as the client's; after an engine
+change only `read` and `remove` work. `OPEN` streams the snapshot as a
+bootstrap with no stream frames after `SNAPSHOT_END`.
 
 ## Carriers
 
@@ -1035,7 +1000,7 @@ an attachment channel it ends the attachment, except `read_only`,
 | Code                 | Meaning |
 | -------------------- | ------- |
 | `protocol_error`     | A connection error under Framing; the connection closes. |
-| `version_mismatch`   | `HELLO.version` is not 1; the connection closes. |
+| `version_mismatch`   | `HELLO.version` is not 2; the connection closes. |
 | `invalid_request`    | Malformed payload, a field the protocol does not define, unknown method, a resume marker above the session's latest, a `subscribe` `after` above the latest event, `read` with `scrollback` and a scope other than `screen`, or `tail` from past the stream's end or with `max_bytes` 0. |
 | `limit_exceeded`     | `label`, `text` or `attachments` exceeded, or a snapshot failed. |
 | `no_such_session`    | No session has the id. |

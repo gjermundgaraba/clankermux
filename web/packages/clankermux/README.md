@@ -40,7 +40,7 @@ A page holds one client: one worker, one WebSocket, the session list and the eve
 
 ## `connect`
 
-`connect({url, worker, wasm, client?})` starts the worker and resolves with the `Client` once the engine is loaded, before the connection is up: the worker connects, and after a loss reconnects, by itself, and the client's `onLink`, and each terminal's, says how that goes (below). Requests need a `connected` link. It rejects when the worker script or the engine cannot be loaded. An exception in the worker after that is the browser's to report, as before: it costs the message being handled, and the client goes on. `client` is the `{name, version}` the connection gives in `HELLO`, which the server lists in each session's `attachments`; `clankermux-web` and this package's version by default.
+`connect({url, worker, wasm, client?})` starts the worker and resolves with the `Client` once the engine is loaded, before the connection is up: the worker connects, and after a loss reconnects, by itself, and the client's `onLink`, and each terminal's, says how that goes (below). Requests need a `connected` link. It rejects when the worker script or the engine cannot be loaded. An exception in the worker after that is the browser's to report: it costs the message being handled, and the client goes on. `client` is the `{name, version}` the connection gives in `HELLO`, which the server lists in each session's `attachments`; `clankermux-web` and this package's version by default.
 
 ## `Client`
 
@@ -113,7 +113,7 @@ The terminal's input element is a textarea the mount places after the canvas: an
 
 A page that holds input back (a pause) holds these events, which the terminal acts on: on the input element `keydown`, `keyup`, `beforeinput`, `compositionstart`, `compositionend`, `paste`, `beforecopy` and `copy`; on the canvas `mousedown` (focus and selection; the drag continues on `window` `mousemove`/`mouseup`) and `wheel` (which sends arrow keys on the alternate screen). macOS press-and-hold accents send the base letter on its keydown and then the accented one, as in xterm.js.
 
-Verified in headless Chrome on macOS through CDP (`Input.imeSetComposition`, `Input.insertText`, `Input.dispatchKeyEvent`): a Japanese composition sent once at its end, nothing during it; a dead key (Option+E, then é) with no Alt+E sent; an emoji inserted with no key; plain keys sent once. Not verified by hand with a real input method, in Safari or in Firefox.
+No test covers input methods; they are untested with a real input method, in Safari and in Firefox.
 
 ## `onSessions`
 
@@ -195,7 +195,7 @@ The selection is the engine's, drawn inverted, and the engine keeps it on its ce
 
 It is cleared by a click (a press that selects nothing), by input sent to the session (a key that sends something, a paste, composed text; not a modifier alone), by a switch to the alternate screen (it is not back when the program leaves it), by a full reset (RIS), and by a new screen (attaching, a gap).
 
-The copy on release starts within `mouseup`, as Safari requires: `navigator.clipboard.write` with a `ClipboardItem` whose text arrives when the worker has it, a few milliseconds later; when nothing was selected it fails and the clipboard is left alone. Where `ClipboardItem` is missing, or takes no text to come, it is `writeText` once the text arrives, which a browser that wants the gesture still running may refuse; Cmd+C then copies. Verified in headless Chrome only. A `beforecopy` listener lets WebKit offer Copy on the empty input element while there is a selection. Where the browser keeps Ctrl+Shift+C for itself (a developer tools shortcut), Cmd+C or the Copy menu copies. Programs that ask for mouse reports get none from this client, so the mouse always selects.
+The copy on release starts within `mouseup`, as Safari requires: `navigator.clipboard.write` with a `ClipboardItem` whose text arrives when the worker has it, a few milliseconds later; when nothing was selected it fails and the clipboard is left alone. Where `ClipboardItem` is missing, or takes no text to come, it is `writeText` once the text arrives, which a browser that wants the gesture still running may refuse; Cmd+C then copies. A `beforecopy` listener lets WebKit offer Copy on the empty input element while there is a selection. Where the browser keeps Ctrl+Shift+C for itself (a developer tools shortcut), Cmd+C or the Copy menu copies. Programs that ask for mouse reports get none from this client, so the mouse always selects.
 
 ### Copy outcome
 
@@ -214,7 +214,7 @@ type CopySource = "release" | "keys" | "browser" | "program";
 - `refused`: the browser rejected the write, `message` its error (`NotAllowedError: …`): a permission denied, a document without the focus, an Electron shell that does not allow it. `timeout`: the copy did not finish within two seconds (the worker's text or the write); without the worker's text it has no `chars`. `unavailable`: the page has no `navigator.clipboard` (it is not a secure context).
 - A release that selected nothing (a click) is no copy and tells nothing; nor does a release whose copy a newer one replaced before its text arrived. Each copy is told once.
 
-A page shows a brief notification on `ok: true` ("Copied 42 characters"), and on a failure says the clipboard did not take it (with Cmd+C as the way to try again, since the browser's own copy is the one a browser that refuses `navigator.clipboard` still allows). A mouseup with `selection()` is no substitute: it says nothing about whether the write succeeded. `program` copies arrive without the user's gesture, which a browser may refuse; a page that announces only the user's copies leaves them out. Verified in headless Chrome: a double click's copy is told `ok` with the clipboard holding the word, and `refused` with the clipboard permission denied; the rest (timeouts, no `ClipboardItem`, no clipboard) by the package's tests against a stand-in clipboard. Not verified in Safari, Firefox or Electron.
+A page shows a brief notification on `ok: true` ("Copied 42 characters"), and on a failure says the clipboard did not take it (with Cmd+C as the way to try again, since the browser's own copy is the one a browser that refuses `navigator.clipboard` still allows). A mouseup with `selection()` is no substitute: it says nothing about whether the write succeeded. `program` copies arrive without the user's gesture, which a browser may refuse; a page that announces only the user's copies leaves them out. Copying is tested in headless Chrome only, not in Safari, Firefox or Electron.
 
 ## Scrollback
 

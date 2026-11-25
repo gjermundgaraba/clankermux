@@ -9,5 +9,8 @@ publish.workspace = true
 [dependencies]
 ghostty-vt-sys = { workspace = true }
 
+[dev-dependencies]
+proto = { workspace = true }
+
 [lints]
 workspace = true

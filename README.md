@@ -27,9 +27,7 @@ A terminal multiplexer server with CLI and browser clients; the wire protocol is
 
 ## The command line
 
-Every session's child gets `CLANKERMUX_SESSION` (its session's id) and `CLANKERMUX_SOCKET` (the server's socket, an absolute path), whatever `create`'s `env` says, so a command run inside a session needs no flags: `clankermux label building` labels the session it runs in.
-
-A command takes its session as `-s SESSION` (`--session`), resolved in order: the full id; the label, ignoring case; four or more characters from the start or the end of the id. Left out, it is `$CLANKERMUX_SESSION`, when the command talks to the server in `$CLANKERMUX_SOCKET`. `list` shows the last six characters of each id. When it names no session or several, the candidates go to stderr (short id, label, status) and the exit code is 3. A command's socket is `--socket`, else `$CLANKERMUX_SOCKET`, else the default; `serve` ignores `$CLANKERMUX_SOCKET`.
+`clankermux --help` lists the commands and `clankermux <command> --help` their flags. `clankermux skill show` prints a guide for agents, and `clankermux api list` and `clankermux api describe METHOD` describe the server's methods.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -42,30 +40,9 @@ A command takes its session as `-s SESSION` (`--session`), resolved in order: th
 | 130 | A wait was cancelled with Ctrl-C |
 | child's | A wait that ended with the session's exit (`wait --exit`, `send --exit`, `create --wait`): its code, or 128 plus the signal's number; 1 for a `restored` session, which has none |
 
-`send` writes text as typed (`--enter` presses Enter after it), named keys (`--keys ctrl+c up enter`, encoded as the program's modes expect), a paste (`--paste`) or stdin's bytes (`--bytes`). `wait` waits for the session to exit, its output to match a regex, a program status, the next prompt or a quiet spell, with `--timeout`; `send` takes the same flags (`--wait-match` and so on), and its wait starts before the bytes are written; a `--status` wait there counts only a status set after the send. The terminal's echo of what you typed is output too, so match on what only the program prints. `create --wait` runs a program to its end; with `--json` it prints `{session, wait}`.
-
-A program reports its status with OSC 7501 (PROTOCOL.md, "Program status"). `list` prints each session's attention after its status: the most urgent report that wants someone, `blocked` (with its kind, `blocked:permission`), then an unseen `error`, then an unseen `done`, then `working`. `inspect` shows every report, `done` and `error` ones with `seen`; `clankermux ack [ID...]` marks them seen, the named ones or all, and the mark survives parks and restarts.
-
-`clankermux events` prints the sessions, then every event as a JSON line with its `seq`, which counts from 1 on each server start: session changes, program status, `bell`, `notification` (OSC 9 and 777), `progress` (OSC 9;4), `command_started` and `command_ended` (OSC 133 `C` and `D`, at their stream offsets) and attachments opening and closing. `events` first prints the server's incarnation and the latest `seq` on stderr. `events --after SEQ --incarnation ID` starts after that event, replaying the ones the server still holds (up to the latest 4096); when it holds too few, or `ID` names another server start, it says so on stderr and prints the sessions first. Without `--incarnation` it assumes the connected server's.
-
-`read` takes `--format text|vt|html` and `--scope screen|history|alternate|last_command`; `last_command` needs a shell that marks its prompts and commands with OSC 133 (shell integration), and fails without one. `tail S [--after OFFSET] [--follow]` prints the session's output stream as plain text from a stream offset (by default the oldest byte kept) up to where the stream was when it began; `--follow` instead keeps going, with a `wait` for more output at the end of each page, until the stream ends.
-
-`inspect` shows a session's attachments: who is attached (each connection's `HELLO` client), read-only or not, the size each last reported, and when each last typed. `clankermux detach -s S CHANNEL [--reason TEXT]` closes one of them by its `channel`; a CLI attach so closed prints the reason and exits 0, and a web page shows it and does not attach that session again by itself. `clankermux resize -s S [COLSxROWS] [--policy latest|smallest|fixed]` sets the size, the size policy, or both: `latest` (the default) takes the most recent report, `smallest` the smallest columns and rows among the attachments' reports, `fixed` only what `resize` sets.
-
-`clankermux api list` lists the methods the server speaks, from its `describe` (the catalog PROTOCOL.md's tables are rendered from): each with its class (`read`, `mutation` or `stream`) and what it does. `clankermux api describe METHOD` shows one: every field of its params and result with its type and meaning, the error codes it can answer, and examples; `--json` prints the catalog entry with its JSON Schemas. `clankermux api call METHOD [JSON]` sends one request as it is (params `{}` when left out, `-` reads them from stdin) and prints the result as JSON; it assumes no session, a server error exits 1, or 3 for a session the server does not know, and Ctrl-C cancels a call that waits.
-
-`clankermux skill show` (or `--skill`) prints a guide for agents: what a session is, the variables above, each command with an example, the exit codes, and the rules for sessions an agent did not create.
-
 ## Parks
 
-`serve` writes each running session's screen, scrollback and state under `$XDG_STATE_HOME/clankermux/sessions/` (PROTOCOL.md, "Persisted state"):
-
-- within 5 s of its output (or input, a resize, a label) stopping (2 s when it has not parked in the last 5 s), and at least every 30 s while it continues, but no more than once every 5 s;
-- when its last attachment closes;
-- every 5 minutes;
-- on SIGTERM, SIGINT or SIGHUP, before it exits.
-
-A server that dies without a signal (SIGKILL, a machine powered off) starts again with each session `restored` as of its last park. `serve --park-timing INTERVAL,QUIET,GAP,BUSY` sets the times in seconds, fractions allowed (default `300,2,5,30`): every INTERVAL; QUIET after the last change, or BUSY after the first since the last park, whichever is sooner; never within GAP of the last park. A test can kill a server soon after typing and find the line parked: `clankermux serve --park-timing 300,0.2,0.2,1`.
+`serve` parks each session so that a server that dies without a signal restores it (PROTOCOL.md, "Persisted state"). A test can shorten the park times, then kill a server soon after typing and find the line parked: `clankermux serve --park-timing 300,0.2,0.2,1`.
 
 ## Release
 
@@ -99,24 +76,4 @@ Bump `version` in `crates/clankermux/Cargo.toml` and/or `web/packages/clankermux
 
 ## The web package
 
-`@gjermundgaraba/clankermux` exports the client at `.` (`connect`, `Client`, the `Terminal` a client mounts, and their types), the worker at `./worker` (`runWorker`, with no DOM types), the engine build at `./ghostty-vt.wasm`, and `./proto`, `./engine` and `./renderer` beneath them. A page holds one client, one worker and one WebSocket, whose methods are the protocol's (`create`, `list`, `send`, `wait`, `read`, `tail`, `ack`, ...), and mounts its terminals from it: each is one attachment on that connection. Its [README](web/packages/clankermux/README.md) describes the client's methods and events, the terminal's methods and the link changes `onLink` reports, and the terminal's keys, composed text, selection, scrollback, size between clients and colour scheme.
-
-```ts
-// worker.ts, started as a module worker
-import { runWorker } from "@gjermundgaraba/clankermux/worker";
-runWorker(self);
-
-// page
-import { connect } from "@gjermundgaraba/clankermux";
-import wasm from "@gjermundgaraba/clankermux/ghostty-vt.wasm?url";
-const client = await connect({
-  worker: new Worker(new URL("./worker.ts", import.meta.url), { type: "module" }),
-  wasm, url: "wss://127.0.0.1:7438/",
-});
-const terminal = client.mount({
-  canvas, container, session,
-  font: "14px monospace", colors: () => ({ fg: "#d8dee9", bg: "#282c34", cursor: "#ffffff" }),
-});
-```
-
-From npm: `pnpm add @gjermundgaraba/clankermux`.
+[`@gjermundgaraba/clankermux`](web/packages/clankermux/README.md) is the browser client: `pnpm add @gjermundgaraba/clankermux`.
