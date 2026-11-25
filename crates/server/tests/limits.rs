@@ -358,7 +358,7 @@ async fn a_page_is_cut_to_max_frame() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn continuation_bounds_a_snapshot() {
+async fn continuation_bounds_a_snapshot_until_the_sequence_ends() {
     let server = start(Limits {
         continuation: 4096,
         ..fast_limits()

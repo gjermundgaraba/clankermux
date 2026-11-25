@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write(&dir, "basic", &basic)?;
 
     let mut history = Terminal::new(20, 5)?;
-    history.set_scrollback_max_bytes(10 * 1024 * 1024)?;
+    history.set_scrollback_max_bytes(usize::try_from(proto::Limits::default().scrollback)?)?;
     for i in 1..=5000 {
         history.vt_write(format!("history {i}\r\n").as_bytes());
     }
