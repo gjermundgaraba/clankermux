@@ -190,11 +190,6 @@ impl<H: Handler> Decoder<H> {
         self.terminal.insert(shared)
     }
 
-    /// Refuses to go on when the terminal handed out was replaced (safe
-    /// code can `mem::replace` through the `&mut`), since the library
-    /// still holds the one it returned. The owner keeps that one alive,
-    /// so another terminal cannot take its address, and whatever was
-    /// moved out stays a valid terminal of its own.
     fn intact(&self) -> Result<()> {
         match (&self.terminal, &self.owner) {
             (Some(shared), Some(owner)) if shared.raw() != owner.raw() => Err(Error::InvalidValue),

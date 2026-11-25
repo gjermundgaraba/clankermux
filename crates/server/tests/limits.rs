@@ -372,9 +372,6 @@ async fn continuation_bounds_a_snapshot() {
     c.open(1, json!({"session": session.id})).await;
     assert_eq!(c.expect_error(1).await, ErrorCode::LimitExceeded);
     c.wait_attachments(&session.id, 0).await;
-    // Closing the sequence and writing at ground again makes the session
-    // attachable (the engine's continuation stays unavailable until input
-    // follows the overflowed sequence).
     c.ok(
         "send",
         json!({"session": session.id, "data": b64("\x07done\n")}),
