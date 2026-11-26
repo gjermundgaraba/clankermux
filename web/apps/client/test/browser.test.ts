@@ -78,8 +78,7 @@ async function serve(): Promise<void> {
     ["--socket", socketPath, "serve", "--ws", "127.0.0.1:0", "--origin", origin, "--tls-cert", `${tls}cert.pem`, "--tls-key", `${tls}key.pem`],
     { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, XDG_STATE_HOME: join(dir, "state") } },
   );
-  const started = server;
-  proxy.target = Number(new URL(await listeningOn(started.stderr!)).port);
+  proxy.target = Number(new URL(await listeningOn(server.stderr!)).port);
   await eventually("the server's socket", () => cli("list").then(() => true).catch(() => undefined));
 }
 
