@@ -70,7 +70,7 @@ export async function serve(ws?: { origin: string }): Promise<Served> {
         let seen = "";
         server.stderr!.on("data", (chunk: Buffer) => {
           seen += chunk;
-          const m = /listening on (wss:\/\/\S+)/.exec(seen);
+          const m = /listening on (wss:\/\/\S+)\n/.exec(seen);
           if (m) resolve(m[1]!);
         });
         server.once("exit", (code) => reject(new Error(`server exited: ${code}`)));

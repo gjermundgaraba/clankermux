@@ -82,7 +82,7 @@ async function serve(): Promise<void> {
     let seen = "";
     started.stderr!.on("data", (chunk: Buffer) => {
       seen += chunk;
-      const m = /listening on wss:\/\/[^:]+:(\d+)/.exec(seen);
+      const m = /listening on wss:\/\/[^:]+:(\d+)\n/.exec(seen);
       if (m) resolve(Number(m[1]));
     });
     started.once("exit", (code) => reject(new Error(`server exited: ${code}`)));
