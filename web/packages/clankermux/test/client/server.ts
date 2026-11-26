@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { StreamFramer } from "../../src/proto/index.ts";
 
 import type { Transport } from "../../src/client/connection.ts";
+import { listeningOn } from "./listening.ts";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const binary = `${here}../../../../../target/debug/clankermux`;
@@ -65,17 +66,7 @@ export async function serve(ws?: { origin: string }): Promise<Served> {
     rmSync(dir, { recursive: true, force: true });
   };
   server.stderr!.on("data", (chunk: Buffer) => process.stderr.write(chunk));
-  const wsUrl = ws
-    ? await new Promise<string>((resolve, reject) => {
-        let seen = "";
-        server.stderr!.on("data", (chunk: Buffer) => {
-          seen += chunk;
-          const m = /listening on (wss:\/\/\S+)\n/.exec(seen);
-          if (m) resolve(m[1]!);
-        });
-        server.once("exit", (code) => reject(new Error(`server exited: ${code}`)));
-      })
-    : undefined;
+  const wsUrl = ws ? await listeningOn(server.stderr!) : undefined;
   const deadline = Date.now() + 10_000;
   for (;;) {
     try {
