@@ -13,6 +13,7 @@ import { afterAll, afterEach, beforeAll, expect, test, vi } from "vitest";
 
 import type { Session } from "@gjermundgaraba/clankermux";
 
+import { listeningOn } from "../../../packages/clankermux/test/client/listening.ts";
 
 const run = promisify(execFile);
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -77,16 +78,7 @@ async function serve(): Promise<void> {
     ["--socket", socketPath, "serve", "--ws", "127.0.0.1:0", "--origin", origin, "--tls-cert", `${tls}cert.pem`, "--tls-key", `${tls}key.pem`],
     { stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, XDG_STATE_HOME: join(dir, "state") } },
   );
-  const started = server;
-  proxy.target = await new Promise<number>((resolve, reject) => {
-    let seen = "";
-    started.stderr!.on("data", (chunk: Buffer) => {
-      seen += chunk;
-      const m = /listening on wss:\/\/[^:]+:(\d+)/.exec(seen);
-      if (m) resolve(Number(m[1]));
-    });
-    started.once("exit", (code) => reject(new Error(`server exited: ${code}`)));
-  });
+  proxy.target = Number(new URL(await listeningOn(server.stderr!)).port);
   await eventually("the server's socket", () => cli("list").then(() => true).catch(() => undefined));
 }
 

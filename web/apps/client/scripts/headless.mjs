@@ -54,7 +54,7 @@ const endpoint = await new Promise((resolve, reject) => {
   let err = "";
   proc.stderr.on("data", (chunk) => {
     err += chunk;
-    const m = /DevTools listening on (ws:\/\/\S+)/.exec(err);
+    const m = /DevTools listening on (ws:\/\/\S+)\n/.exec(err);
     if (m) resolve(m[1]);
   });
   proc.on("exit", () => reject(new Error(`chrome exited: ${err}`)));
